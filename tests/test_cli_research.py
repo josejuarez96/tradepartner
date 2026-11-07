@@ -14,6 +14,7 @@ a fixture hypothesis in family `momentum` with holdout `[2024-01-01,
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import shutil
@@ -39,7 +40,12 @@ from tradepartner.research import _issue_run_handle
 from tradepartner.research.event_study.run import run_study
 from tradepartner.research.experiment import hash_file, parse_experiment_file
 from tradepartner.store import registry, research, schema
-from tradepartner.store.db import configure_connection, insert_row, open_for_write
+from tradepartner.store.db import (
+    StoreLockedError,
+    configure_connection,
+    insert_row,
+    open_for_write,
+)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 E1H = "e1h-demand-deterioration-revenue"
@@ -1327,10 +1333,12 @@ DESK_READ = "docs/research/2026-10-31-cash-profitability-long-only-desk-read.md"
 def _exposure_args(
     tmp_path: Path, candidate: str = "#2689", read_at: str = "2026-10-31T20:00:00+00:00"
 ) -> list[str]:
-    """A valid `store` launch in `momentum`; the probe's mtime is an hour before `read_at`."""
+    """A valid `store` launch in `momentum`; the probe's mtime is an hour before `read_at`
+    (before `READ_AT` when `read_at` is naive, which the CLI refuses anyway)."""
     probe = tmp_path / f"probe-{candidate.strip('#')}.py"
     probe.write_text("print('probe')\n", encoding="utf-8")
-    before = (READ_AT - timedelta(hours=1)).timestamp()
+    at = datetime.fromisoformat(read_at)
+    before = ((at if at.tzinfo is not None else READ_AT) - timedelta(hours=1)).timestamp()
     os.utime(probe, (before, before))
     kill = tmp_path / "kill.md"
     kill.write_text("kill line: fail if t < 2\n", encoding="utf-8")
@@ -1417,15 +1425,50 @@ def test_exposure_record_naive_kill_line_time_and_bad_pin_exit_2(tmp_path: Path)
 
 
 def test_exposures_candidates_since_lists_first_read_at(tmp_path: Path) -> None:
-    _cli(*_exposure_args(tmp_path, "#2689", "2026-10-31T20:00:00+00:00"))
-    _cli(*_exposure_args(tmp_path, "#2689", "2026-10-31T21:00:00+00:00"))
-    _cli(*_exposure_args(tmp_path, "#2701", "2026-10-29T20:00:00+00:00"))
+    for candidate, read_at in [
+        ("#2689", "2026-10-31T20:00:00+00:00"),
+        ("#2689", "2026-10-31T21:00:00+00:00"),
+        ("#2701", "2026-10-29T20:00:00+00:00"),  # before --since: listed only without it
+    ]:
+        recorded = _cli(*_exposure_args(tmp_path, candidate, read_at))
+        assert recorded.exit_code == 0, recorded.output
+    assert _count("research_exposures") == 3
+    assert "#2701" in _cli("exposures", "--candidates", "--since", "2026-10-29").stdout
     out = _cli("exposures", "--candidates", "--since", "2026-10-30")
     assert out.exit_code == 0, out.output
     lines = [ln for ln in out.stdout.splitlines() if ln.startswith("#")]
     assert len(lines) == 1, out.stdout
     assert lines[0].startswith("#2689") and "2026-10-31T20:00:00+00:00" in lines[0]
     assert _cli("exposures", "--candidates").exit_code == 2
+
+
+@pytest.mark.parametrize("flag", ["--family", "--candidate"])
+def test_exposures_candidates_refuses_a_filter_it_would_ignore(flag: str) -> None:
+    """`--candidates` lists every candidate since the date (the search tally), so a
+    `--family`/`--candidate` filter is refused, not silently dropped (#3189 docs-10)."""
+    out = _cli("exposures", "--candidates", "--since", "2026-10-30", flag, "x")
+    assert out.exit_code == 2, out.output
+    assert flag in out.output
+
+
+@pytest.mark.parametrize(
+    ("source", "overlaps", "label"),
+    [
+        ("store", True, "spends-holdout"),
+        ("open_data", True, "overlaps-holdout"),
+        ("open_data", False, "-"),
+    ],
+)
+def test_exposure_line_spends_only_a_store_overlap(
+    tmp_path: Path, source: str, overlaps: bool, label: str
+) -> None:
+    """Only a `store` record over a holdout is a spend; an `open_data` one only
+    overlaps (#3189 docs-11)."""
+    assert _cli(*_exposure_args(tmp_path)).exit_code == 0
+    with duckdb.connect(get_settings().store.path, read_only=True) as conn:
+        (record,) = research.list_exposures(conn, include_synthetic=True)
+    line = cli._exposure_line(dataclasses.replace(record, source=source, overlaps_holdout=overlaps))
+    assert f"  {label}  " in line, line
 
 
 def test_exposure_has_no_edit_delete_or_withdraw_subcommand() -> None:
@@ -1491,3 +1534,35 @@ def test_config_that_is_not_an_object_is_echoed_scrubbed(ready: int, tmp_path: P
     out = _open(ready, config)  # _cli asserts the scrub finds no secret in the output
     assert out.exit_code == 2, out.output
     assert "must be a JSON object" in out.output and "<scrubbed>" in out.output
+
+
+@pytest.mark.parametrize(
+    ("command", "shape"),
+    [
+        ("paper status --book", "--book: "),
+        ("ingest --source edgar --restamp-from", "--restamp-from: "),
+        ("ingest --source alpaca_assets --import-dir", "--import-dir: "),
+        ("decision data-release import-file", ""),
+        ("delete-master-rows --release r --manifest", "cannot read the manifest: "),
+    ],
+)
+def test_cli_exception_text_is_echoed_scrubbed(tmp_path: Path, command: str, shape: str) -> None:
+    """An exception's words that repeat a bad value go through the scrub too (#3193)."""
+    out = _cli(*command.split(), str(tmp_path / BAD))  # _cli asserts no secret survives
+    assert out.exit_code == 2, out.output
+    assert shape in out.output and "<scrubbed>" in out.output, out.output
+
+
+def test_store_busy_exception_text_is_echoed_scrubbed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lock error's words go through the scrub on the exit-1 path too (#3193)."""
+    assert _cli(*_exposure_args(tmp_path)).exit_code == 0
+
+    def busy(*_: Any, **__: Any) -> Any:
+        raise StoreLockedError(f"held by {BAD}")
+
+    monkeypatch.setattr(cli, "open_read_only", busy)
+    out = _cli("exposures")  # _cli asserts no secret survives
+    assert out.exit_code == 1, out.output
+    assert "store busy: held by" in out.output and "<scrubbed>" in out.output, out.output

@@ -774,7 +774,7 @@ def _resolve_book(settings: Settings, book: str | None) -> str:
     try:
         return paper_lock.resolve_book(settings, book)
     except ValueError as exc:
-        raise _fail(f"--book: {exc}", USAGE_ERROR) from exc
+        raise _fail(_scrubbed(f"--book: {exc}", settings), USAGE_ERROR) from exc
 
 
 def _print_result(result: IngestResult) -> None:
@@ -1505,7 +1505,12 @@ def _exposure_pins(values: Sequence[str], settings: Callable[[], Settings]) -> d
 
 
 def _exposure_line(r: research.ExposureRecord) -> str:
-    holdout = "spends-holdout" if r.overlaps_holdout else "-"
+    """One `exposures` row. Only a `store` record over a holdout is a spend; an
+    `open_data` one over it only overlaps and spends nothing (amendment, question 2)."""
+    if not r.overlaps_holdout:
+        holdout = "-"
+    else:
+        holdout = "spends-holdout" if r.source == "store" else "overlaps-holdout"
     return (
         f"{r.exposure_id}  {r.candidate_ref}  {r.source}  {_fmt(r.family)}  "
         f"{r.read_at.isoformat()}  {r.window_start}..{r.window_end}  "
@@ -1627,7 +1632,7 @@ def _experiment_study(settings: Settings, run_id: int, *, real: Settings | None 
             handle = research.attach_run(conn, run_id, settings=real_store)
             record = research.get_registration(conn, handle.slug)
     except StoreLockedError as exc:
-        raise _fail(f"store busy: {exc}", 1) from None
+        raise _fail(_scrubbed(f"store busy: {exc}", settings), 1) from None
     except _RESEARCH_REFUSALS as exc:
         raise _refusal(exc, settings) from None
     if handle.database != str(Path(settings.store.path).resolve()):
@@ -1968,14 +1973,14 @@ _BOOK_OPTION = typer.Option(
 )
 
 
-def _checked_book(book: str | None) -> str | None:
+def _checked_book(book: str | None, settings: Callable[[], Settings]) -> str | None:
     """`--book`'s value after the token grammar (`journal.check_book_id`); a usage
     error (2) outside it, before any store is opened."""
     if book is not None:
         try:
             journal.check_book_id(book)
         except ValueError as exc:
-            raise _fail(f"--book: {exc}", USAGE_ERROR) from exc
+            raise _input_fail(f"--book: {exc}", settings) from exc
     return book
 
 
@@ -2904,7 +2909,7 @@ def make_app(
             try:
                 restamp = read_manifest(restamp_from)
             except (OSError, ValueError, KeyError) as exc:
-                raise _fail(f"--restamp-from: {exc}", USAGE_ERROR) from None
+                raise _input_fail(f"--restamp-from: {exc}", settings) from None
         window_ok: WindowEarlierOk | None = None
         if restamp_window_earlier_ok is not None:
             if restamp_from is None:
@@ -2914,7 +2919,7 @@ def make_app(
                     restamp_window_earlier_ok, release=manifest_release(restamp_from)
                 )
             except (OSError, ValueError, TypeError) as exc:
-                raise _fail(f"--restamp-window-earlier-ok: {exc}", USAGE_ERROR) from None
+                raise _input_fail(f"--restamp-window-earlier-ok: {exc}", settings) from None
         named: list[str] | None = None
         if security is not None:
             if not fill_holes_:
@@ -3032,7 +3037,7 @@ def make_app(
             try:
                 imported = import_assets(s, import_dir, clock=clock, dry_run=dry_run)
             except NotADirectoryError as exc:
-                raise _fail(f"--import-dir: {exc}", USAGE_ERROR) from None
+                raise _fail(_scrubbed(f"--import-dir: {exc}", s), USAGE_ERROR) from None
             _print_import(imported)
             raise typer.Exit(imported.exit_code)
         if actions_backfill:
@@ -3167,7 +3172,7 @@ def make_app(
             try:
                 seed = BenchmarkSeed(cik=cik, name=name, exchange=exchange)
             except ValueError as exc:
-                raise _fail(str(exc), USAGE_ERROR) from None
+                raise _input_fail(str(exc), settings) from None
         s = settings()
         if (missing_store := _store_missing(s)) is not None:
             raise missing_store
@@ -3184,9 +3189,9 @@ def make_app(
                 s, prices=prices, symbol=symbol, since=start, seed=seed, clock=clock
             )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except ValueError as exc:
-            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+            raise _fail(_scrubbed(f"refused: {exc}", s), USAGE_ERROR) from None
         state = "seeded" if result.seeded else "already in the store"
         if not result.seeded and seed is not None:
             state += "; --cik, --name and --exchange not used"
@@ -3219,9 +3224,9 @@ def make_app(
                 s, clock=clock, dry_run=dry_run, expect=expect, release=release
             )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except RepairRefused as exc:
-            raise _fail(f"repair refused: {exc}", 1) from None
+            raise _fail(_scrubbed(f"repair refused: {exc}", s), 1) from None
         typer.echo(result.summary())
         for line in result.lines():
             typer.echo(line)
@@ -3262,11 +3267,11 @@ def make_app(
                 release=release,
             )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except RepairRefused as exc:
-            raise _fail(f"repair refused: {exc}", 1) from None
+            raise _fail(_scrubbed(f"repair refused: {exc}", s), 1) from None
         except ValueError as exc:
-            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+            raise _fail(_scrubbed(f"refused: {exc}", s), USAGE_ERROR) from None
         typer.echo(result.summary())
 
     @app.command("recheck-form4-multi-owner")
@@ -3311,7 +3316,7 @@ def make_app(
                 client=edgar_client,
             )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except RequestBudgetStopped:
             assert output is not None
             raise _fail(
@@ -3320,7 +3325,7 @@ def make_app(
                 1,
             ) from None
         except (MultiOwnerRepairRefused, OSError, ValueError) as exc:
-            raise _fail(f"recheck refused: {exc}", 1) from None
+            raise _fail(_scrubbed(f"recheck refused: {exc}", s), 1) from None
         digest = form4_multi_owner_manifest_digest(output)
         typer.echo(f"manifest: {output}; sha256 {digest}")
         typer.echo(f"summary: {output.with_suffix('.summary.json')}; {summary['counts']}")
@@ -3342,9 +3347,9 @@ def make_app(
                 s, manifest, release, expect_rows, dry_run=dry_run, clock=clock
             )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except (MultiOwnerRepairRefused, ValueError) as exc:
-            raise _fail(f"repair refused: {exc}", 1) from None
+            raise _fail(_scrubbed(f"repair refused: {exc}", s), 1) from None
         typer.echo(f"form4 multi-owner: {count} rows {'would change' if dry_run else 'changed'}")
 
     @app.command("repair-form4-roles")
@@ -3363,9 +3368,9 @@ def make_app(
                 s, manifest, release, expect_rows, dry_run=dry_run, clock=clock
             )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except RoleRepairRefused as exc:
-            raise _fail(f"repair refused: {exc}", 1) from None
+            raise _fail(_scrubbed(f"repair refused: {exc}", s), 1) from None
         typer.echo(f"form4 roles: {count} rows {'would change' if dry_run else 'changed'}")
 
     @app.command("build-form4-roles-manifest")
@@ -3380,7 +3385,7 @@ def make_app(
         try:
             count = build_form4_roles_manifest(s, sorted(zip_dir.glob("*_form345.zip")), output)
         except (StoreLockedError, ValueError, OSError) as exc:
-            raise _fail(f"manifest refused: {exc}", 1) from None
+            raise _fail(_scrubbed(f"manifest refused: {exc}", s), 1) from None
         typer.echo(f"form4 roles manifest: {count} rows")
 
     @app.command("repair-form4-titles")
@@ -3399,9 +3404,9 @@ def make_app(
                 s, manifest, release, expect_rows, dry_run=dry_run, clock=clock
             )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except TitleRepairRefused as exc:
-            raise _fail(f"repair refused: {exc}", 1) from None
+            raise _fail(_scrubbed(f"repair refused: {exc}", s), 1) from None
         typer.echo(f"form4 titles: {count} rows {'would change' if dry_run else 'changed'}")
 
     @app.command("build-form4-titles-manifest")
@@ -3419,7 +3424,7 @@ def make_app(
             cache_dir = zip_dir if zip_dir is not None else Path(s.edgar.cache_dir) / "insider"
             count = build_form4_titles_manifest(s, sorted(cache_dir.glob("*_form345.zip")), output)
         except (StoreLockedError, ValueError, OSError) as exc:
-            raise _fail(f"manifest refused: {exc}", 1) from None
+            raise _fail(_scrubbed(f"manifest refused: {exc}", s), 1) from None
         digest = form4_titles_manifest_sha256(output)
         typer.echo(f"form4 titles manifest: {count} rows; sha256 {digest}")
 
@@ -3460,11 +3465,11 @@ def make_app(
                 s, to=last, clock=clock, dry_run=dry_run, expect=expect, release=release
             )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except RepairRefused as exc:
-            raise _fail(f"repair refused: {exc}", 1) from None
+            raise _fail(_scrubbed(f"repair refused: {exc}", s), 1) from None
         except ValueError as exc:
-            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+            raise _fail(_scrubbed(f"refused: {exc}", s), USAGE_ERROR) from None
         typer.echo(result.summary())
         for line in result.stale:
             typer.echo(line)
@@ -3539,7 +3544,7 @@ def make_app(
                 span=span,
             )
         except ValueError as exc:
-            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+            raise _fail(_scrubbed(f"refused: {exc}", s), USAGE_ERROR) from None
         for run in result.runs:
             typer.echo(f"{run.status} {run.chunk_cursor}: {run.message}")
         for line in result.rows:
@@ -3579,11 +3584,11 @@ def make_app(
                 s, clock=clock, dry_run=dry_run, expect=expect, release=release
             )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except RepairRefused as exc:
-            raise _fail(f"repair refused: {exc}", 1) from None
+            raise _fail(_scrubbed(f"repair refused: {exc}", s), 1) from None
         except ValueError as exc:
-            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+            raise _fail(_scrubbed(f"refused: {exc}", s), USAGE_ERROR) from None
         typer.echo(result.summary())
         for line in result.stale:
             typer.echo(line)
@@ -3631,9 +3636,9 @@ def make_app(
                 s, since=start, through=last, release=release, clock=clock, dry_run=dry_run
             )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except (TypeError, ValueError) as exc:
-            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+            raise _fail(_scrubbed(f"refused: {exc}", s), USAGE_ERROR) from None
         _print_result(result)
         raise typer.Exit(result.exit_code)
 
@@ -3664,11 +3669,11 @@ def make_app(
                 s, clock=clock, dry_run=dry_run, expect=expect_rows, release=release
             )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except RepairRefused as exc:
-            raise _fail(f"repair refused: {exc}", 1) from None
+            raise _fail(_scrubbed(f"repair refused: {exc}", s), 1) from None
         except ValueError as exc:
-            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+            raise _fail(_scrubbed(f"refused: {exc}", s), USAGE_ERROR) from None
         typer.echo(result.summary())
         for line in result.lines():
             typer.echo(line)
@@ -3721,7 +3726,7 @@ def make_app(
                     [parent, child, ex_session, value, stamp, stamp, "owner", "owner"],
                 )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         typer.echo(
             f"spinoff allocation {parent} -> {child} {ex_date}: {value:g} at {stamp.isoformat()}"
         )
@@ -3782,11 +3787,11 @@ def make_app(
                 expect_known_at=expected,
             )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except RepairRefused as exc:
-            raise _fail(f"refused: {exc}", 1) from None
+            raise _fail(_scrubbed(f"refused: {exc}", s), 1) from None
         except ValueError as exc:
-            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+            raise _fail(_scrubbed(f"refused: {exc}", s), USAGE_ERROR) from None
         typer.echo(result.summary())
         if dry_run:
             flag = " --reinstate" if reinstate else ""
@@ -3815,9 +3820,9 @@ def make_app(
         try:
             rows = read_master_manifest(manifest)
         except OSError as exc:
-            raise _fail(f"cannot read the manifest: {exc}", USAGE_ERROR) from None
+            raise _input_fail(f"cannot read the manifest: {exc}", settings) from None
         except ValueError as exc:
-            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+            raise _input_fail(f"refused: {exc}", settings) from None
         if not rows:
             raise _fail(f"refused: {manifest.name} lists no rows", USAGE_ERROR)
         s = settings()
@@ -3841,7 +3846,7 @@ def make_app(
                     clock=clock,
                 )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except RepairRefused as exc:
             raise _fail(f"repair refused: {_scrubbed(str(exc), s)}", 1) from None
         except ValueError as exc:
@@ -3917,7 +3922,7 @@ def make_app(
                 release=release,
             )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except RetractRefused as exc:
             raise _fail(f"retract refused: {_scrubbed(str(exc), s)}", 1) from None
         finally:
@@ -3971,10 +3976,11 @@ def make_app(
                     conn, t, s, jumps_before=cutoff, with_coverage_reference=coverage
                 )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except (duckdb.CatalogException, duckdb.BinderException) as exc:
             raise _fail(
-                f"the store has no usable schema; run `tradepartner ingest`: {exc}", 1
+                _scrubbed(f"the store has no usable schema; run `tradepartner ingest`: {exc}", s),
+                1,
             ) from None
         chain_breaks = report.successor_chains.frame.filter(pl.col("price_break")).height
         expected_warnings = (
@@ -4066,7 +4072,7 @@ def make_app(
             with open_read_only(s) as conn:
                 tables = _export(conn, out_dir, s)
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         typer.echo(f"exported {len(tables)} tables to {out_dir}")
 
     @app.command()
@@ -4130,7 +4136,7 @@ def make_app(
                 measured_cost_bps=measured_cost_bps,
             )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except (registry.RegistryError, ValueError) as exc:
             # Raised before a trial is opened (unknown slug, stored parameters that
             # fail their hash, a frozen window that cannot be resolved): a refusal.
@@ -4193,7 +4199,7 @@ def make_app(
         except (HypothesisFileError, registry.RegistryError) as exc:
             raise _fail(_scrubbed(str(exc), s), USAGE_ERROR) from None
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         if decision_id is not None:
             _echo_scrubbed(
                 f"decision {decision_id}: operations_book of {operations_book_of} as "
@@ -4228,11 +4234,11 @@ def make_app(
                 schema.init_schema(conn)  # read-only: checks the version, never migrates
                 listed = registry.list_trials(conn, hypothesis, include_synthetic)
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except schema.RegistryNotInitialised:
             raise _fail("registry not initialised: register a hypothesis first", 1) from None
         except schema.SchemaVersionError as exc:
-            raise _fail(str(exc), 1) from None
+            raise _fail(_scrubbed(str(exc), s), 1) from None
         typer.echo("id  hypothesis  kind  window  status  flags  message")
         for t in listed:
             flags = [
@@ -4291,7 +4297,7 @@ def make_app(
                     trial_id=trial,
                 )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         typer.echo(f"decision {decision_id}: gap_signoff for trial {trial} ({record.slug})")
 
     release_app = typer.Typer(no_args_is_help=True, help="Record a named data release.")
@@ -4315,9 +4321,9 @@ def make_app(
                 schema.init_schema(conn)
                 return write(conn)
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except schema.SchemaVersionError as exc:
-            raise _fail(str(exc), 1) from None
+            raise _fail(_scrubbed(str(exc), s), 1) from None
         except registry.ReleaseRefused as exc:
             raise _fail(f"release refused: {_scrubbed(str(exc), s)}", 1) from None
 
@@ -4414,7 +4420,7 @@ def make_app(
         try:
             entries = registry.read_release_file(path)
         except registry.ReleaseFileError as exc:
-            raise _fail(str(exc), USAGE_ERROR) from None
+            raise _input_fail(str(exc), settings) from None
         s = settings()
         if (missing := _store_missing(s)) is not None:
             raise missing
@@ -4444,11 +4450,11 @@ def make_app(
                 schema.init_schema(conn)
                 decision_id = registry.write_development_boundary(conn, boundary=day, reason=reason)
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except schema.SchemaVersionError as exc:
-            raise _fail(str(exc), 1) from None
+            raise _fail(_scrubbed(str(exc), s), 1) from None
         except registry.BoundaryRefused as exc:
-            raise _fail(f"boundary refused: {exc}", 1) from None
+            raise _fail(_scrubbed(f"boundary refused: {exc}", s), 1) from None
         typer.echo(f"decision {decision_id}: development_boundary {day}")
 
     def _shakedown_write(
@@ -4465,13 +4471,13 @@ def make_app(
                 schema.init_schema(conn)
                 return registry.record_decision(conn, kind=kind, reason=reason, values=values)
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except schema.SchemaVersionError as exc:
-            raise _fail(str(exc), 1) from None
+            raise _fail(_scrubbed(str(exc), s), 1) from None
         except registry.ShakedownRefused as exc:
-            raise _fail(f"shakedown refused: {exc}", 1) from None
+            raise _fail(_scrubbed(f"shakedown refused: {exc}", s), 1) from None
         except ValueError as exc:
-            raise _fail(str(exc), USAGE_ERROR) from None
+            raise _fail(_scrubbed(str(exc), s), USAGE_ERROR) from None
 
     @decision_app.command("shakedown-span")
     def shakedown_span(
@@ -4521,9 +4527,9 @@ def make_app(
                 schema.init_schema(conn)
                 registration = lab_sweep.register(conn, file, s, registered_by=_REGISTERED_BY)
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except schema.SchemaVersionError as exc:
-            raise _fail(str(exc), 1) from None
+            raise _fail(_scrubbed(str(exc), s), 1) from None
         except (LabNotInitialised, *_LAB_REFUSALS) as exc:
             raise _lab_fail(exc, s) from None
         record = registration.sweep
@@ -4570,9 +4576,9 @@ def make_app(
                 if lab_registry.sweep_by_slug(conn, slug) is None:
                     raise ValueError(f"no sweep is registered as {slug!r}")
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except schema.SchemaVersionError as exc:
-            raise _fail(str(exc), 1) from None
+            raise _fail(_scrubbed(str(exc), s), 1) from None
         except (LabNotInitialised, schema.RegistryNotInitialised, *_LAB_REFUSALS) as exc:
             raise _lab_fail(exc, s) from None
         try:
@@ -4584,7 +4590,7 @@ def make_app(
                 clock=sweep_clock,
             )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except (LabNotInitialised, *_SWEEP_RUN_REFUSALS) as exc:
             raise _lab_fail(exc, s) from None
         except Exception as exc:
@@ -4613,9 +4619,9 @@ def make_app(
                 schema.init_schema(conn)  # read-only: checks the version, never migrates
                 text = _sweep_status_text(conn, slug)
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except schema.SchemaVersionError as exc:
-            raise _fail(str(exc), 1) from None
+            raise _fail(_scrubbed(str(exc), s), 1) from None
         except (LabNotInitialised, schema.RegistryNotInitialised, *_LAB_REFUSALS) as exc:
             raise _lab_fail(exc, s) from None
         _echo_scrubbed(text, s)
@@ -4633,9 +4639,9 @@ def make_app(
                 schema.init_schema(conn)  # read-only: checks the version, never migrates
                 text = sweep_report.format_report(sweep_report.sweep_report(conn, slug))
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except schema.SchemaVersionError as exc:
-            raise _fail(str(exc), 1) from None
+            raise _fail(_scrubbed(str(exc), s), 1) from None
         except (LabNotInitialised, schema.RegistryNotInitialised, *_LAB_REFUSALS) as exc:
             raise _lab_fail(exc, s) from None
         _echo_scrubbed(text, s)
@@ -4661,9 +4667,9 @@ def make_app(
                     conn, slug, file, reason, s, registered_by=_REGISTERED_BY
                 )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except schema.SchemaVersionError as exc:
-            raise _fail(str(exc), 1) from None
+            raise _fail(_scrubbed(str(exc), s), 1) from None
         except (LabNotInitialised, *_LAB_REFUSALS) as exc:
             raise _lab_fail(exc, s) from None
         promoted = outcome.promoted
@@ -4691,9 +4697,9 @@ def make_app(
                 schema.init_schema(conn)
                 decision_id = promotion.retire(conn, slug, reason)
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except schema.SchemaVersionError as exc:
-            raise _fail(str(exc), 1) from None
+            raise _fail(_scrubbed(str(exc), s), 1) from None
         except (LabNotInitialised, *_LAB_REFUSALS) as exc:
             raise _lab_fail(exc, s) from None
         _echo_scrubbed(f"decision {decision_id}: sweep_retired for {slug}", s)
@@ -4717,9 +4723,9 @@ def make_app(
                     ledger=window.committed_ledger(window.read_ledger_texts(fetch=False)),
                 )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except schema.SchemaVersionError as exc:
-            raise _fail(str(exc), 1) from None
+            raise _fail(_scrubbed(str(exc), s), 1) from None
         except (LabNotInitialised, schema.RegistryNotInitialised, *_LAB_REFUSALS) as exc:
             raise _lab_fail(exc, s) from None
         _echo_scrubbed(sweep_report.format_lab_status(status), s)
@@ -4741,7 +4747,7 @@ def make_app(
                 schema.init_schema(conn)
                 record = research.register_experiment(conn, parsed, _REGISTERED_BY)
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except _RESEARCH_REFUSALS as exc:
             raise _refusal(exc, s) from None
         basis = "confirmatory" if record.confirmatory else "exploratory"
@@ -4815,7 +4821,7 @@ def make_app(
                 )
                 listed = research.list_runs(conn, registration=handle.slug)
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except _RESEARCH_REFUSALS as exc:
             raise _refusal(exc, s) from None
         if handle.refusal is not None:
@@ -4849,7 +4855,7 @@ def make_app(
                 handle = research.attach_run(conn, run, settings=s)
                 research.close_run(conn, handle, "abandoned", reason)
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except _RESEARCH_REFUSALS as exc:
             raise _refusal(exc, s) from None
         typer.echo(f"run {run}: abandoned ({handle.slug})")
@@ -4877,11 +4883,11 @@ def make_app(
                 schema.init_schema(conn)  # read-only: checks the version, never migrates
                 listed = research.list_runs(conn, registration, family, kind, include_synthetic)
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except (schema.ResearchNotInitialised, schema.RegistryNotInitialised):
             raise _fail("research registry not initialised", 1) from None
         except schema.SchemaVersionError as exc:
-            raise _fail(str(exc), 1) from None
+            raise _fail(_scrubbed(str(exc), s), 1) from None
         typer.echo("id  experiment  kind  split  outcome  verdict  basis  flags  message")
         for r in listed:
             basis = "confirmatory" if r.confirmatory else "exploratory"
@@ -4966,7 +4972,7 @@ def make_app(
                 schema.init_schema(conn)
                 record = research.record_exposure(conn, spec, _REGISTERED_BY, settings=s)
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except (*_RESEARCH_REFUSALS, OSError) as exc:
             raise _refusal(exc, s) from None
         _echo_scrubbed(f"exposure {record.exposure_id}", s)
@@ -4977,7 +4983,11 @@ def make_app(
         candidate: Annotated[str | None, typer.Option(help="only this candidate")] = None,
         include_synthetic: Annotated[bool, typer.Option(help="list synthetic records too")] = False,
         candidates: Annotated[
-            bool, typer.Option(help="list each candidate with its first read (needs --since)")
+            bool,
+            typer.Option(
+                help="list each candidate with its first read (needs --since; no --family "
+                "or --candidate)"
+            ),
         ] = False,
         since: Annotated[str | None, typer.Option(help="with --candidates, YYYY-MM-DD")] = None,
     ) -> None:
@@ -4986,6 +4996,12 @@ def make_app(
         s = settings()
         if candidates != (since is not None):
             raise _fail("--candidates and --since go together", USAGE_ERROR)
+        if candidates and (family is not None or candidate is not None):
+            raise _fail(
+                "--candidates lists every candidate since the date: drop --family and "
+                "--candidate (use them without --candidates)",
+                USAGE_ERROR,
+            )
         since_day = _parse_day("--since", since, settings)
         if (missing := _store_missing(s)) is not None:
             raise missing
@@ -4999,13 +5015,13 @@ def make_app(
                     found = []
                     listed = research.list_exposures(conn, family, candidate, include_synthetic)
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except research.ExposuresNotInitialised as exc:
-            raise _fail(str(exc), 1) from None
+            raise _fail(_scrubbed(str(exc), s), 1) from None
         except (schema.ResearchNotInitialised, schema.RegistryNotInitialised):
             raise _fail("research registry not initialised", 1) from None
         except schema.SchemaVersionError as exc:
-            raise _fail(str(exc), 1) from None
+            raise _fail(_scrubbed(str(exc), s), 1) from None
         if since_day is not None:
             _echo_scrubbed("candidate  first_read_at  records  verdicts  earlier_records", s)
             for c in found:
@@ -5039,7 +5055,7 @@ def make_app(
                 s, now=clock(), git_commit=commit, code_dirty=dirty
             )
         except store_backup_module.BackupError as exc:
-            raise _fail(f"backup refused: {exc}", 1) from exc
+            raise _fail(_scrubbed(f"backup refused: {exc}", s), 1) from exc
         typer.echo(f"copy matches the store byte for byte: {result.copy_path}")
         if result.wal_copy_path is not None:
             typer.echo(f"log copy: {result.wal_copy_path}")
@@ -5070,14 +5086,14 @@ def make_app(
             try:
                 listed = bank_filers.read_assets_file(assets)
             except (OSError, ValueError) as exc:
-                raise _fail(f"--assets {assets}: {exc}", 1) from None
+                raise _fail(_scrubbed(f"--assets {assets}: {exc}", s), 1) from None
         filers = bank_filers.load_bank_filers()
         try:
             with open_read_only(s) as conn:
                 rows = bank_filers.census(conn, filers)
                 held = bank_filers.held_tickers(conn) if listed is not None else frozenset()
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         for r in rows:
             f = r.filer
             exit_ = f"{f.exit_kind} closed {f.closed_on} last {f.last_exchange_session}"
@@ -5293,7 +5309,7 @@ def make_app(
                     note=note,
                 )
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except _DATASET_REFUSALS as exc:
             raise _refusal(exc, s) from None
         typer.echo(
@@ -5842,7 +5858,7 @@ def make_app(
         ] = False,
     ) -> None:
         """Open a paper window for a signed-off hypothesis in the book (spec req 14)."""
-        chosen = _checked_book(book)
+        chosen = _checked_book(book, settings)
         s = paper_settings()
         paper_schema_gate(s)
         bk = _resolve_book(s, chosen)
@@ -5876,7 +5892,7 @@ def make_app(
     ) -> None:
         """Request the book's window's stop, or close it once the stop run is done
         (req 14)."""
-        chosen = _checked_book(book)
+        chosen = _checked_book(book, settings)
         s = paper_settings(reason)
         paper_schema_gate(s)
         bk = _resolve_book(s, chosen)
@@ -5894,7 +5910,7 @@ def make_app(
     def paper_run_(book: Annotated[str | None, _BOOK_OPTION] = None) -> None:
         """The tracking run on the clock's session for the book, or with no `--book`
         for every book with an open window (spec req 7; the scheduler's job)."""
-        chosen = _checked_book(book)
+        chosen = _checked_book(book, settings)
         s = _writer_settings(paper_settings())
         try:
             paper_schema_gate(s)
@@ -5966,7 +5982,7 @@ def make_app(
     @paper_app.command("reconcile")
     def paper_reconcile(book: Annotated[str | None, _BOOK_OPTION] = None) -> None:
         """Reconcile the book's journal with its broker now (spec req 6)."""
-        chosen = _checked_book(book)
+        chosen = _checked_book(book, settings)
         s = paper_settings()
         paper_schema_gate(s)
         bk = _resolve_book(s, chosen)
@@ -5999,7 +6015,7 @@ def make_app(
     ) -> None:
         """Engage the book's kill switch, or `--all` books' (spec req 5; ADR 0017
         B.5); takes no run lock."""
-        chosen = _checked_book(book)
+        chosen = _checked_book(book, settings)
         if every_book and chosen is not None:
             raise _fail("--all and --book cannot be combined", USAGE_ERROR)
         if _blank_text(reason):
@@ -6107,7 +6123,7 @@ def make_app(
         ] = False,
     ) -> None:
         """Settle, collect, reconcile and release the book's kill switch (spec req 5)."""
-        chosen = _checked_book(book)
+        chosen = _checked_book(book, settings)
         s = paper_settings(reason)
         paper_schema_gate(s)
         bk = _resolve_book(s, chosen)
@@ -6147,7 +6163,7 @@ def make_app(
     @paper_app.command("report")
     def paper_report_(book: Annotated[str | None, _BOOK_OPTION] = None) -> None:
         """Open the book's tracking trial and compare paper with it (spec req 10)."""
-        chosen = _checked_book(book)
+        chosen = _checked_book(book, settings)
         s = paper_settings()
         paper_schema_gate(s, read_only=True)
 
@@ -6223,7 +6239,7 @@ def make_app(
     ) -> None:
         """The book's measured per-side cost against the open, from its own orders and
         fills (paper spec amendment 2026-11-07 #3118 item 3); read-only."""
-        chosen = _checked_book(book)
+        chosen = _checked_book(book, settings)
         last = _parse_day("--through", through, settings)
         if last is not None and not _is_session(last):
             raise _fail(f"--through must be an XNYS session, got {through}", USAGE_ERROR)
@@ -6272,7 +6288,7 @@ def make_app(
         ] = False,
     ) -> None:
         """The book's four exit-criteria checks; exit 0 only when all pass (req 15)."""
-        chosen = _checked_book(book)
+        chosen = _checked_book(book, settings)
         s = paper_settings()
         paper_schema_gate(s, read_only=True)
 
@@ -6350,7 +6366,7 @@ def make_app(
     ) -> None:
         """The operations page's numbers (spec req 12) for one book, or `--all`
         books' summary rows; read-only."""
-        chosen = _checked_book(book)
+        chosen = _checked_book(book, settings)
         if every_book and chosen is not None:
             raise _fail("--all and --book cannot be combined", USAGE_ERROR)
         s = paper_settings()
@@ -6484,7 +6500,7 @@ def make_app(
         book: Annotated[str | None, _BOOK_OPTION] = None,
     ) -> None:
         """End the book's window without flattening, owner-only (#247 Q13)."""
-        chosen = _checked_book(book)
+        chosen = _checked_book(book, settings)
         s = paper_settings(reason)
         paper_schema_gate(s)
         bk = _resolve_book(s, chosen)
@@ -6513,7 +6529,7 @@ def make_app(
         """Append an override to the book's window through the override page's
         writer (spec req 9)."""
         day = _parse_day("--session", session, settings)
-        chosen = _checked_book(book)
+        chosen = _checked_book(book, settings)
         s = paper_settings(reason)
         if kind != "engage_kill_switch":
             paper_schema_gate(s)
@@ -6541,7 +6557,7 @@ def make_app(
         if _blank_text(order[0]):
             raise _fail("--order must be non-blank", USAGE_ERROR)
         (client_order_id,) = order
-        chosen = _checked_book(book)
+        chosen = _checked_book(book, settings)
         s = paper_settings(reason)
         paper_schema_gate(s)
         bk = _resolve_book(s, chosen)
@@ -6586,7 +6602,7 @@ def make_app(
             if _blank_text(break_id[0]):
                 raise _fail("--break must be non-blank", USAGE_ERROR)
             (chosen_break,) = break_id
-        chosen = _checked_book(book)
+        chosen = _checked_book(book, settings)
         s = paper_settings(reason)
         paper_schema_gate(s)
         bk = _resolve_book(s, chosen)
@@ -6619,7 +6635,7 @@ def make_app(
         book: Annotated[str | None, _BOOK_OPTION] = None,
     ) -> None:
         """Compare a broker 1099-B export with the lot ledger; writes nothing."""
-        chosen = _checked_book(book)
+        chosen = _checked_book(book, settings)
         s = settings()
 
         def refuse(code: str, message: str) -> typer.Exit:
@@ -6694,7 +6710,7 @@ def make_app(
         except idx.IndexCheckFailed as exc:
             raise _fail(_scrubbed(f"index-check failed: {exc}", s), 1) from None
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except duckdb.Error as exc:
             raise _fail(
                 _scrubbed(f"index-check failed: {type(exc).__name__}: {exc}", s), 1
@@ -6732,7 +6748,7 @@ def make_app(
         except (ValueError, OSError, pl.exceptions.PolarsError) as exc:
             raise _fail(_scrubbed(f"close-gap failed: {exc}", s), USAGE_ERROR) from None
         except StoreLockedError as exc:
-            raise _fail(f"store busy: {exc}", 1) from None
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         typer.echo(
             f"close-gap {symbol}: {gaps.height} of {official.height} official sessions "
             f"off by more than {s.index_check.max_close_gap:.2%} (nothing written)"
