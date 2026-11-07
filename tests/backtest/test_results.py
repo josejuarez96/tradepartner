@@ -600,26 +600,41 @@ class TestFamilyN:
         write_results(conn, pending, _run(settings, pending), settings)
         assert family_n(conn, "momentum") == 2 == _result_row(conn, pending.trial_id)["n_trials"]
 
-    @pytest.mark.parametrize(
-        ("column", "value"),
-        [
-            ("data_vintage", "TIMESTAMPTZ '2001-01-01 00:00:00+00'"),
-            ("code_tree_sha256", "NULL"),
-            ("code_dirty", "TRUE"),
-            ("data_vintage", "NULL"),
-            ("code_dirty", "NULL"),
-        ],
-        ids=["other-vintage", "unknown-code", "dirty", "unknown-vintage", "unknown-dirty"],
-    )
-    def test_a_rerun_with_another_or_unknown_stamp_is_a_new_series(
-        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, column: str, value: str
+    def test_a_rerun_on_another_data_vintage_is_a_new_series(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
     ) -> None:
         settings = _settings(tmp_path)
         _register(conn, settings)
         _trial(conn, settings, tmp_path)
         _trial(conn, settings, tmp_path)
         assert family_n(conn, "momentum") == 1
-        conn.execute(f"UPDATE trials SET {column} = {value} WHERE trial_id = 1")
+        conn.execute(
+            "UPDATE trials SET data_vintage = TIMESTAMPTZ '2001-01-01 00:00:00+00' "
+            "WHERE trial_id = 1"
+        )
+        assert family_n(conn, "momentum") == 2
+
+    @pytest.mark.parametrize(
+        ("column", "value"),
+        [
+            ("code_tree_sha256", "NULL"),
+            ("code_dirty", "TRUE"),
+            ("data_vintage", "NULL"),
+            ("code_dirty", "NULL"),
+        ],
+        ids=["unknown-code", "dirty", "unknown-vintage", "unknown-dirty"],
+    )
+    def test_two_reruns_with_the_same_unknown_or_dirty_stamp_stay_two_series(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, column: str, value: str
+    ) -> None:
+        """Both trials carry the same unknown or dirty stamp, so only the fail-closed
+        guard keeps them apart (#3127)."""
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        _trial(conn, settings, tmp_path)
+        _trial(conn, settings, tmp_path)
+        assert family_n(conn, "momentum") == 1
+        conn.execute(f"UPDATE trials SET {column} = {value} WHERE trial_id IN (1, 2)")
         assert family_n(conn, "momentum") == 2
 
     def test_a_rerun_with_no_stored_outcome_is_a_new_series(
@@ -631,7 +646,7 @@ class TestFamilyN:
         _trial(conn, settings, tmp_path)
         assert family_n(conn, "momentum") == 1
         conn.execute(
-            "DELETE FROM trial_metrics WHERE trial_id = 1 AND series = 'strategy' "
+            "DELETE FROM trial_metrics WHERE trial_id IN (1, 2) AND series = 'strategy' "
             "AND cost_level_kind = 'base' "
             "AND metric IN ('n_periods', 'sharpe_period', 'sharpe_period_excess_spy')"
         )
