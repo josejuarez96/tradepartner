@@ -59,6 +59,11 @@ LATE_SPIN_OFF_COLUMNS: Final[tuple[str, ...]] = (
     "known_at",
 )
 
+#: `DataProvider.late_splits`' columns, in order: the security, the ex-date and the
+#: factor a value carried across that ex-date under `t_prev`'s splits is multiplied by
+#: to match `t`'s (#3096).
+LATE_SPLIT_COLUMNS: Final[tuple[str, ...]] = ("security_id", "ex_date", "ratio")
+
 
 #: `DataProvider.delisting_reasons`' columns, in order: the Form 25 episode key, the
 #: reason, its evidence source and the row's `known_at` (plan T328b).
@@ -203,6 +208,19 @@ class DataProvider(Protocol):
         `t_prev`'s session, however late (req 5): `security_id`, `ex_date`,
         `ratio_or_amount`, `known_at`. Whether the name was held on the ex-date is the
         engine's to decide; it passes the names it may have held."""
+        ...
+
+    def late_splits(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        """Splits on `ids` whose ex-date is at or before `t_prev`'s session and that `t`
+        knows differently from `t_prev` (#3096): one row per `(security_id, ex_date)`
+        whose split factor changed (`LATE_SPLIT_COLUMNS`). `ratio` is the factor known
+        at `t` over the factor known at `t_prev` on that ex-date, the latest revision per
+        action identity at each (#108): `r` for a split first known in `(t_prev, t]`,
+        `1 / r` for one a re-date moved off that ex-date or a cancellation withdrew.
+        Every step before `t` marked those sessions with `t_prev`'s splits, so a value
+        carried across the ex-date is `ratio` times too small. A chained predecessor's
+        splits (#821) are keyed by the successor known at `t` on both sides. Whether
+        the name was held across the ex-date is the engine's to decide."""
         ...
 
     def unvalued_spin_offs(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
