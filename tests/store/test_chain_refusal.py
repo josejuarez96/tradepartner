@@ -6,8 +6,10 @@ chained to the post-reorganisation equity (NEW, first print 25) turned a -50% bo
 predecessor's latest Form 25 episode has a reason other than a merger or a voluntary
 delisting (`bankruptcy`, `performance_failure`) at `t`, or whose hand-over comes more than
 `master.chain_window_sessions` sessions after the predecessor's end (last bar or Form 25
-effective day), is
-refused: `live_chains` leaves it out, so no read re-keys the predecessor and its own bars
+effective day), or whose hand-over close breaks one share for one share (#3108: the
+successor's first close over the predecessor's last, after any split or spin-off between
+them known at `t`, outside `master.chain_max_price_ratio` either way), is refused:
+`live_chains` leaves it out, so no read re-keys the predecessor and its own bars
 stay its own (the engine then exits it by the normal delisting path). `stored_chains` still
 names it, and `refused_chains` says why. Legitimate chains (a same-ticker holding-company
 reorganisation such as XOM's, with a Form 25 and no reason row; a merger-reason
@@ -58,10 +60,12 @@ def _store(
     successor_from: date = date(2023, 3, 1),
     successor_known: datetime = datetime(2023, 2, 27, 13, tzinfo=UTC),
     chain_known: datetime = CHAIN_KNOWN,
+    successor_close: float = 1.02,
 ) -> duckdb.DuckDBPyConnection:
-    """s10b's shape: OLD (ABC, NYSE) prints 20 -> 1.0 through 2023-02-28, its Form 25 is
-    filed 03-03; NEW (ABC, NYSE) is listed from `successor_from` and prints 25; a chain
-    OLD -> NEW is known at `chain_known`. No reason row yet."""
+    """s10b's shape: OLD (ABC, NYSE) prints 1.2, 1.0 through 2023-02-28, its Form 25 is
+    filed 03-03; NEW (ABC, NYSE) is listed from `successor_from` and prints
+    `successor_close` there (1.02, one share for one share; s10b's is 25); a chain OLD ->
+    NEW is known at `chain_known`. No reason row yet."""
     conn = duckdb.connect(":memory:")
     schema.init_schema(conn)
     for sid, valid_from, known_at in (
@@ -88,27 +92,10 @@ def _store(
     bars = [
         (OLD, date(2023, 2, 27), 1.2),
         (OLD, date(2023, 2, 28), 1.0),
-        (NEW, successor_from, 25.0),
+        (NEW, successor_from, successor_close),
     ]
     for sid, session, close in bars:
-        known = session_close(session)
-        insert_row(
-            conn,
-            "prices_daily",
-            {
-                "security_id": sid,
-                "session": session,
-                "open": close,
-                "high": close,
-                "low": close,
-                "close": close,
-                "volume": 1000,
-                "known_at": known,
-                "ingested_at": known,
-                "source": "alpaca",
-                "provenance": "bar",
-            },
-        )
+        _bar(conn, sid, session, close)
     insert_row(
         conn,
         "delistings",
@@ -136,6 +123,61 @@ def _store(
         | _fact(chain_known),
     )
     return conn
+
+
+def _bar(
+    conn: duckdb.DuckDBPyConnection,
+    sid: str,
+    session: date,
+    close: float,
+    known: datetime | None = None,
+) -> None:
+    known = known or session_close(session)
+    insert_row(
+        conn,
+        "prices_daily",
+        {
+            "security_id": sid,
+            "session": session,
+            "open": close,
+            "high": close,
+            "low": close,
+            "close": close,
+            "volume": 1000,
+            "known_at": known,
+            "ingested_at": known,
+            "source": "alpaca",
+            "provenance": "bar",
+        },
+    )
+
+
+def _action(
+    conn: duckdb.DuckDBPyConnection,
+    sid: str,
+    action_type: str,
+    ex_date: date,
+    ratio: float,
+    known: datetime,
+    parent: str = "",
+) -> None:
+    insert_row(
+        conn,
+        "corporate_actions",
+        {
+            "security_id": sid,
+            "action_type": action_type,
+            "ex_date": ex_date,
+            "ratio_or_amount": ratio,
+            "source_action_id": parent,
+            "announced_at": None,
+            "cancelled": False,
+            "known_at": known,
+            "ingested_at": known,
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    )
 
 
 def _reason(
@@ -184,7 +226,7 @@ def test_a_failed_predecessor_chain_is_refused(
     assert refused_chains(conn, T) == (RefusedChain(OLD, NEW, f"predecessor_reason:{reason}"),)
     assert chained_read_ids(conn, T, [OLD]) == ({OLD: OLD}, {})
     prices = prices_as_of(conn, T, [OLD, NEW]).sort("security_id", "session")
-    assert prices.select("security_id", "close").rows() == [(OLD, 1.2), (OLD, 1.0), (NEW, 25.0)]
+    assert prices.select("security_id", "close").rows() == [(OLD, 1.2), (OLD, 1.0), (NEW, 1.02)]
 
 
 @pytest.mark.parametrize("reason", ["merger_acquisition", "voluntary_other"])
@@ -196,7 +238,7 @@ def test_a_merger_or_voluntary_predecessor_chain_stays_live(
     _reason(conn, reason)
     assert live_chains(conn, T) == ((OLD, NEW),)
     assert refused_chains(conn, T) == ()
-    assert set(prices_as_of(conn, T, [NEW])["close"].to_list()) == {1.2, 1.0, 25.0}
+    assert set(prices_as_of(conn, T, [NEW])["close"].to_list()) == {1.2, 1.0, 1.02}
 
 
 def test_a_form25_without_a_reason_row_stays_live(conn: duckdb.DuckDBPyConnection) -> None:
@@ -429,5 +471,117 @@ def test_a_notes_form25_does_not_stretch_the_window() -> None:
             | _fact(notes),
         )
         assert [r.why for r in refused_chains(conn, t)] == ["hand_over_window:97"]
+    finally:
+        conn.close()
+
+
+# --- the hand-over close (#3108) ---------------------------------------------------
+
+
+def _price_store(successor_close: float) -> duckdb.DuckDBPyConnection:
+    return _store(successor_close=successor_close)
+
+
+def test_s10b_without_a_reason_is_refused_on_the_hand_over_close() -> None:
+    """Audit A s10b as written: no reason row, OLD's last close 1.0, NEW's first 25. A 1:1
+    rename cannot jump x25, so the chain is refused and OLD's bars stay its own."""
+    conn = _price_store(25.0)
+    try:
+        assert live_chains(conn, T) == ()
+        assert refused_chains(conn, T) == (RefusedChain(OLD, NEW, "hand_over_price:25"),)
+        assert chained_read_ids(conn, T, [OLD]) == ({OLD: OLD}, {})
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("close", "live"), [(1.10, True), (0.90, True), (1.20, False), (0.85, False)]
+)
+def test_the_ratio_bound_is_either_way(close: float, live: bool) -> None:
+    """Inside [1/1.15, 1.15] the chain is live; outside it either way it is refused."""
+    conn = _price_store(close)
+    try:
+        assert (live_chains(conn, T) == ((OLD, NEW),)) is live
+    finally:
+        conn.close()
+
+
+def test_the_ratio_bound_is_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = _price_store(1.20)
+    try:
+        assert live_chains(conn, T) == ()
+        monkeypatch.setenv("MASTER__CHAIN_MAX_PRICE_RATIO", "1.25")
+        assert live_chains(conn, T) == ((OLD, NEW),)
+    finally:
+        conn.close()
+
+
+def test_a_rename_with_a_same_day_split_passes() -> None:
+    """NEW opens 2-for-1 on the hand-over (ex 03-01, ratio 2): its 0.51 is OLD's 1.0 / 2,
+    one share for one share before the split, so the chain is live."""
+    conn = _price_store(0.51)
+    try:
+        _action(conn, NEW, "split", date(2023, 3, 1), 2.0, datetime(2023, 3, 1, 12, tzinfo=UTC))
+        assert live_chains(conn, T) == ((OLD, NEW),)
+    finally:
+        conn.close()
+
+
+def test_a_split_known_after_t_is_not_applied() -> None:
+    conn = _price_store(0.51)
+    try:
+        late = datetime(2023, 4, 3, 21, tzinfo=UTC)
+        _action(conn, NEW, "split", date(2023, 3, 1), 2.0, late)
+        assert [r.why for r in refused_chains(conn, T)] == ["hand_over_price:0.51"]
+        assert live_chains(conn, late) == ((OLD, NEW),)
+    finally:
+        conn.close()
+
+
+def test_a_rename_with_a_same_day_spin_off_passes() -> None:
+    """NEW goes ex a spin-off on the hand-over (0.5 CHILD per share, CHILD closes 0.4):
+    OLD's 1.0 is worth 1.0 - 0.2 = 0.8 ex, and NEW's 0.8 matches it."""
+    conn = _price_store(0.8)
+    try:
+        child = "0000000900"
+        _bar(conn, child, date(2023, 3, 1), 0.4)
+        _action(
+            conn,
+            child,
+            "spinoff",
+            date(2023, 3, 1),
+            0.5,
+            datetime(2023, 2, 20, tzinfo=UTC),
+            parent=NEW,
+        )
+        assert live_chains(conn, T) == ((OLD, NEW),)
+    finally:
+        conn.close()
+
+
+def test_a_successor_with_no_bar_known_at_t_is_not_judged() -> None:
+    """No evidence passes: while NEW's first bar is not yet known (stamped 03-10, after
+    the chain's 03-02) there is no ratio to judge; from its stamp the x25 is refused."""
+    conn = _price_store(25.0)
+    try:
+        late = datetime(2023, 3, 10, 21, tzinfo=UTC)
+        conn.execute("DELETE FROM prices_daily WHERE security_id = ?", [NEW])
+        _bar(conn, NEW, date(2023, 3, 1), 25.0, known=late)
+        assert live_chains(conn, late - PROBE_EPSILON) == ((OLD, NEW),)
+        assert live_chains(conn, late) == ()
+    finally:
+        conn.close()
+
+
+def test_a_close_judged_across_a_long_gap_is_not_a_hand_over() -> None:
+    """OLD's last bar 02-28, NEW's first 03-31 (22 sessions, beyond
+    `master.transfer_window_sessions`, 5): the x25 measures the gap, not the hand-over,
+    so the price check does not judge it (the overlay's acquirer pair, #3006, has a 21
+    session gap); within the span it is judged."""
+    conn = _price_store(25.0)
+    try:
+        conn.execute("DELETE FROM prices_daily WHERE security_id = ?", [NEW])
+        _bar(conn, NEW, date(2023, 3, 31), 25.0)
+        assert live_chains(conn, T) == ((OLD, NEW),)
     finally:
         conn.close()

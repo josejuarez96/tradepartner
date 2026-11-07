@@ -4,9 +4,10 @@ by the normal delisting path (#3097, Audit A s10b).
 OLD (ABC, NYSE) is bought at 20 on 2023-02-01, falls to 1.0 and last prints 02-28; its
 Form 25 is filed 03-03 with an 8-K Item 1.03 (bankruptcy) beside it. NEW, the
 post-reorganisation equity, lists ABC from 03-01 at 25, and a chain OLD -> NEW is known
-03-02. With the bankruptcy reason the chain is refused: OLD exits at 1.0
-(`n_delisting_exits`), nothing is renamed and `n_refused_chains` is 1. Without the reason
-row (the control) the chain is live and OLD's position becomes NEW's at 25, the s10b bug.
+03-02. With the bankruptcy reason (#3097), or with no reason row at all (#3108: x25 at the
+hand-over breaks one share for one share), the chain is refused: OLD exits at 1.0
+(`n_delisting_exits`), nothing is renamed and `n_refused_chains` is 1. The control, a
+legitimate rename whose NEW opens at 1.02, keeps the chain live and renames OLD into NEW.
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ def _fact(known_at: datetime) -> dict[str, Any]:
     }
 
 
-def _build(path: Path, *, bankruptcy: bool) -> None:
+def _build(path: Path, *, bankruptcy: bool, new_close: float) -> None:
     conn = duckdb.connect(str(path))
     try:
         configure_connection(conn)
@@ -85,7 +86,7 @@ def _build(path: Path, *, bankruptcy: bool) -> None:
             if session <= date(2023, 2, 28):
                 closes[OLD] = 20.0 if session <= date(2023, 2, 1) else 1.0
             if session >= date(2023, 3, 1):
-                closes[NEW] = 25.0
+                closes[NEW] = new_close
             for sid, close in closes.items():
                 known = session_close(session)
                 insert_row(
@@ -153,9 +154,15 @@ def _build(path: Path, *, bankruptcy: bool) -> None:
         conn.close()
 
 
-def _run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, bankruptcy: bool) -> Any:
+def _run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    bankruptcy: bool,
+    new_close: float = 25.0,
+) -> Any:
     path = tmp_path / "store.duckdb"
-    _build(path, bankruptcy=bankruptcy)
+    _build(path, bankruptcy=bankruptcy, new_close=new_close)
     settings = Settings(
         _env_file=None,
         store={"path": str(path)},
@@ -228,10 +235,11 @@ def _run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, bankruptcy: bool) -
     return results[10.0]
 
 
+@pytest.mark.parametrize("bankruptcy", [True, False], ids=["reason", "price_break"])
 def test_a_refused_chain_exits_the_held_predecessor_at_its_last_close(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bankruptcy: bool
 ) -> None:
-    result = _run(tmp_path, monkeypatch, bankruptcy=True)
+    result = _run(tmp_path, monkeypatch, bankruptcy=bankruptcy)
     assert sum(row.n_delisting_exits for row in result.rebalances) == 1
     assert sum(row.counts.get("n_refused_chains", 0) for row in result.rebalances) == 1
     assert sum(row.counts.get("n_chained_positions", 0) for row in result.rebalances) == 0
@@ -242,13 +250,12 @@ def test_a_refused_chain_exits_the_held_predecessor_at_its_last_close(
     assert final / CAPITAL - 1 == pytest.approx(-0.4758, abs=2e-3)
 
 
-def test_the_control_without_the_reason_still_renames(
+def test_the_control_rename_at_a_continuous_close_still_renames(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The teeth: the same store with no reason row keeps the chain live, so OLD's
-    position is renamed into NEW (the s10b splice the refusal prevents)."""
-    result = _run(tmp_path, monkeypatch, bankruptcy=False)
+    """The teeth: no reason row and NEW opening at 1.02 (one share for one share), so the
+    chain is live and OLD's position is renamed into NEW."""
+    result = _run(tmp_path, monkeypatch, bankruptcy=False, new_close=1.02)
     assert sum(row.counts.get("n_chained_positions", 0) for row in result.rebalances) == 1
     assert sum(row.counts.get("n_refused_chains", 0) for row in result.rebalances) == 0
-    final = [r for r in result.equity if r.series == engine.STRATEGY_SERIES][-1].equity
-    assert final / CAPITAL - 1 > 0.0
+    assert sum(row.n_delisting_exits for row in result.rebalances) == 0

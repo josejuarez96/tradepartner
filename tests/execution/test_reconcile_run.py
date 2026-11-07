@@ -2134,9 +2134,11 @@ def test_a_predecessor_with_two_live_successors_maps_nothing_and_is_not_sent(
 ) -> None:
     """#3031 (fail closed): two live chains from `SPY` leave which successor holds
     the position unknown. Reconcile follows neither (the break stands) and the
-    order map leaves `SPY` out with a note; nothing is guessed."""
+    order map leaves `SPY` out with a note; nothing is guessed. The second successor
+    has no bar or listing known at the cut, so the chain checks (#3097, #3108) leave it
+    live; MTUM, a real series, would be refused on its hand-over close."""
     _held_chained_predecessor(journal_settings, fake, open_window, CUT - timedelta(minutes=1))
-    _chain(journal_settings, SPY, MTUM, CUT - timedelta(minutes=1))
+    _chain(journal_settings, SPY, "SEC_SUCC2", CUT - timedelta(minutes=1))
 
     found = _held_explanations(journal_settings, open_window)
     mapped = _order_symbols(journal_settings, open_window, SPY)

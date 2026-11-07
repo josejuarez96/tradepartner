@@ -237,14 +237,17 @@ class StoreProvider:
         # #3097: the chain-aware store reads refuse a chain handed over beyond
         # `master.chain_window_sessions`, read live (`store.asof.refused_chains`),
         # so a run whose frozen window differs is refused like the calendar.
-        live_window = get_settings().master.chain_window_sessions
-        if frozen_settings.master.chain_window_sessions != live_window:
-            raise ValueError(
-                f"the live master.chain_window_sessions ({live_window}) differs from the "
-                f"trial's frozen one ({frozen_settings.master.chain_window_sessions}); the "
-                "chain-aware store reads use the live one, so this run would not use its "
-                "frozen chain window"
-            )
+        # #3108: likewise `master.chain_max_price_ratio`, the hand-over close bound,
+        # and `master.transfer_window_sessions`, the span it is judged over.
+        live_master = get_settings().master
+        for key in ("chain_window_sessions", "chain_max_price_ratio", "transfer_window_sessions"):
+            live, frozen = getattr(live_master, key), getattr(frozen_settings.master, key)
+            if frozen != live:
+                raise ValueError(
+                    f"the live master.{key} ({live}) differs from the trial's frozen one "
+                    f"({frozen}); the chain-aware store reads use the live one, so this run "
+                    f"would not use its frozen master.{key}"
+                )
         self._connect = connect
         self.handle = handle
         self.settings = frozen_settings
