@@ -2337,6 +2337,24 @@ def test_a_book_whose_cadence_cannot_be_read_runs_last_and_blocks_no_other(env: 
     assert run_order(env.settings) == ("main", "daily", "aaa", "bbb")
 
 
+@pytest.mark.parametrize("error", [KeyError, TypeError])
+def test_any_error_reading_a_cadence_ranks_that_book_last_and_still_runs_the_rest(
+    monkeypatch: pytest.MonkeyPatch, env: Env, error: type[Exception]
+) -> None:
+    """A dropped family (`KeyError`) or params that are not an object (`TypeError`)
+    in one book's registration never stops `main` (safety review of #3173)."""
+    _cadence_books(env)
+    real = run_module.window_cadence
+
+    def failing(conn: Any, window: Any) -> Any:
+        if window.book_id == "alpha":
+            raise error("scripted: unreadable registration")
+        return real(conn, window)
+
+    monkeypatch.setattr(run_module, "window_cadence", failing)
+    assert run_order(env.settings) == ("main", "weekly", "daily", "alpha")
+
+
 def test_every_book_run_runs_main_before_daily_and_a_crash_in_main_still_runs_daily(
     monkeypatch: pytest.MonkeyPatch, env: Env
 ) -> None:

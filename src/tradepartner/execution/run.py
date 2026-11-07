@@ -1208,10 +1208,11 @@ def run_order(
 ) -> tuple[str, ...]:
     """`open_books` in the order `every_book_run` runs them (spec amendment
     2026-11-07, #3118 item 6): by the open window's frozen cadence, `month_end`,
-    then `week_end`, then `daily`, ties by token. A book whose cadence cannot be
-    read (two open windows, a window naming no hypothesis, a cadence outside
-    `Cadence`) goes last, ties by token, and is still listed: its own run then
-    fails closed on the same read, and no other book waits on it. One short
+    then `week_end`, then `daily`, ties by token. A book with any error reading its
+    cadence (two open windows, a window naming no hypothesis, a cadence outside
+    `Cadence`, malformed stored params) goes last, ties by token, and is still
+    listed: its own run then fails closed on the same read, and no other book is
+    held back by it. Only the listing's own errors propagate. One short
     read-only connection; empty on a store with no journal."""
     with open_read_only(settings, retry=True, on_wait=on_wait) as conn:
         try:
@@ -1229,7 +1230,7 @@ def _run_rank(conn: duckdb.DuckDBPyConnection, book: str) -> int:
         if window is None:
             return _UNREADABLE_RANK
         return _CADENCE_RUN_RANK[window_cadence(conn, window)]
-    except (JournalIntegrityError, registry.UnknownHypothesis, ValueError):
+    except Exception:  # any read error: the book's own run fails closed on it
         return _UNREADABLE_RANK
 
 
