@@ -264,10 +264,10 @@ FAMILY_ONLY_KEYS: Final[Mapping[str, str]] = {
 #: label its signal ignores. `strategy.turnover_top_fraction` left it at T165c (#1358);
 #: `adjust.apply_spin_offs` entered at T211c and left at T211e (#1894);
 #: `strategy.hold_top_fraction` (T238, spec amendment #657) left it at T239, where the
-#: engine applies it. T328a's `backtest.delisting_failure_return` (#2670) is in it until
-#: the engine applies the policy (T328c).
+#: engine applies it. T328a's `backtest.delisting_failure_return` (#2670) left it at
+#: T328c, where the engine applies the policy at delisting exits.
 DELISTING_POLICY_KEY: Final = "backtest.delisting_failure_return"
-NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset({DELISTING_POLICY_KEY})
+NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset()
 
 
 #: The borrow-rate grid a `long_short` file must cover (spec amendment #1872, item 6):

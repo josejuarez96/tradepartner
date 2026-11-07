@@ -48,6 +48,23 @@ that decided the exit: the value sold is the close already marked. It pays
 session on and the proceeds sit in cash.
 Exit notional and costs are added to the row's `turnover` and `cost_paid`.
 
+**The delisting policy** (data-foundation spec amendment #2670, req 2; plan T328c; owner
+2026-10-31): under the frozen `backtest.delisting_failure_return` `none` the delisting
+exit above is untouched and no new read is made. Under `failure_v1` or `severe_v1` each
+ended security's `delisting_reasons` and `merger_exits` rows are read once per run, at
+the run's data cutoff `c` (a row applies when `known_at <= c`, however long after the
+deciding read). The reason is the single row matching the ended listing's
+`(security_id, delisting_form, delisting_filed_at)` and `exchange`, else `unknown`; the
+merger row is the single acquiree row whose `effective_date` falls in
+[`end_session`, `end_session` + the version's window]. A confirmed
+`performance_failure` or `bankruptcy` exit, and under `severe_v1` an `unknown` exit
+with no merger row, is sold at the marked value times `1 + shock` for its exchange (an
+exchange outside the map fails the trial); a `merger_acquisition` exit with a matched
+row is sold at shares x (`cash_per_share` + `share_ratio` x the acquirer's raw close),
+else at the last close (counted). Ordinary costs apply to the sale value, and a short
+delisting exit raises. Every booked delisting exit, under every policy, is recorded in
+the result's `delisting_exits`.
+
 **Late splits** (#3096): a split first known after its ex-date, or re-dated or
 cancelled by the vendor, was marked by the earlier steps with the splits their reads
 knew, so a carried value booked the raw jump. Step i reads `late_splits(t_prev, t)` for
@@ -176,6 +193,7 @@ from tradepartner.calendar import (
     sessions_in_month_window,
 )
 from tradepartner.config import Cadence, HypothesisFamily, Settings
+from tradepartner.config_backtest import DELISTING_POLICIES, DelistingPolicy
 from tradepartner.store.delistings import DELISTED
 from tradepartner.store.registry import EquityRow, RebalanceRow, TrialHandle, WeightRow
 from tradepartner.universe import Universe
@@ -207,10 +225,27 @@ class BacktestResult:
     targets: Mapping[date, Mapping[str, float]]
     rates: pl.DataFrame | None = None
     exposure_summary: ExposureSummary | None = None
+    delisting_exits: tuple[DelistingExit, ...] = ()
 
     def stitched_returns(self) -> pl.DataFrame:
         """`valuation.stitched_returns` over this run's marking frames."""
         return stitched_returns(self.marking_frames)
+
+
+@dataclass(frozen=True)
+class DelistingExit:
+    """One booked delisting exit of a cost level's book, under every policy, `none`
+    included (plan T328c): the security, the `read_time` of the step whose listing read
+    decided it, and the ended listing's `end_session`, `exchange`, `delisting_form` and
+    `delisting_filed_at` from that same read (None where the read has no such column).
+    Kept in memory for T329's coverage counts; never persisted and outside every digest."""
+
+    security_id: str
+    read_time: datetime
+    end_session: date | None
+    exchange: str | None
+    delisting_form: str | None
+    delisting_filed_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -306,6 +341,7 @@ class _Book:
     pending_covers: set[str] = field(default_factory=set)
     exposures: list[tuple[float, float]] = field(default_factory=list)
     borrow_paid: float = 0.0
+    delisting_exits: list[DelistingExit] = field(default_factory=list)
 
 
 def _check_levels(cost_levels: Sequence[float]) -> list[float]:
@@ -561,6 +597,34 @@ def _no_benchmark_members(plan: Plan, benchmarks: Mapping[str, str]) -> Plan:
     return plan
 
 
+#: The listing columns a `DelistingExit` and the reason match read from the current
+#: listing row (`listing_ends_as_of`'s; a fake provider may leave them out).
+_LISTING_EXIT_FIELDS: Final = ("exchange", "delisting_form", "delisting_filed_at")
+
+
+def _ended_listings(listing_ends: pl.DataFrame, session: date) -> dict[str, dict[str, object]]:
+    """Securities whose current listing at the read is `delisted`, each with that row's
+    `end_session`, `exchange`, `delisting_form` and `delisting_filed_at` (None for a
+    column the frame lacks). The current row is chosen as `_ended` documents."""
+    dated = "valid_from" in listing_ends.columns
+    current: dict[str, tuple[date | None, dict[str, object]]] = {}
+    for row in listing_ends.iter_rows(named=True):
+        valid_from = row["valid_from"] if dated else None
+        if valid_from is not None and valid_from > session:
+            continue
+        held = current.get(row["security_id"])
+        if held is None or (valid_from is not None and (held[0] is None or valid_from > held[0])):
+            current[row["security_id"]] = (valid_from, row)
+    return {
+        sid: {
+            "end_session": row["end_session"],
+            **{name: row.get(name) for name in _LISTING_EXIT_FIELDS},
+        }
+        for sid, (_, row) in current.items()
+        if row["status"] == DELISTED
+    }
+
+
 def _ended(listing_ends: pl.DataFrame, session: date) -> dict[str, date | None]:
     """Securities whose current listing at the read is `delisted`, each with its final
     session (`end_session`, None when it has none).
@@ -575,16 +639,122 @@ def _ended(listing_ends: pl.DataFrame, session: date) -> dict[str, date | None]:
     current row is still the old exchange's, status `transferred`, not `listed`. Rows
     without `valid_from` (one listing per security) are taken as they are.
     """
-    dated = "valid_from" in listing_ends.columns
-    current: dict[str, tuple[date | None, str, date | None]] = {}
-    for row in listing_ends.iter_rows(named=True):
-        valid_from = row["valid_from"] if dated else None
-        if valid_from is not None and valid_from > session:
-            continue
-        held = current.get(row["security_id"])
-        if held is None or (valid_from is not None and (held[0] is None or valid_from > held[0])):
-            current[row["security_id"]] = (valid_from, row["status"], row["end_session"])
-    return {sid: end for sid, (_, status, end) in current.items() if status == DELISTED}
+    return {
+        sid: cast(date | None, row["end_session"])
+        for sid, row in _ended_listings(listing_ends, session).items()
+    }
+
+
+#: The confirmed-failure reasons a policy shocks (spec amendment #2670, req 2).
+_FAILURE_REASONS: Final = frozenset({"performance_failure", "bankruptcy"})
+_MERGER_REASON: Final = "merger_acquisition"
+_UNKNOWN_REASON: Final = "unknown"
+#: The step counts a policy other than `none` writes on every rebalance row (plan T328c).
+POLICY_COUNT_NAMES: Final = (
+    "n_failure_shocks",
+    "n_merger_consideration",
+    "n_merger_fallbacks",
+    "n_merger_conflicts",
+    "n_reason_conflicts",
+    "n_unknown_exits",
+)
+
+
+@dataclass(frozen=True)
+class _ExitContext:
+    """What a step's delisting exits are decided and valued from (plan T328c).
+
+    `read_time` is the step's read (the deciding read of every exit it books) and
+    `listings` its ended listings (`_ended_listings`). Under a policy other than `none`,
+    `terms` are the version's frozen terms and `reasons` / `merger_rows` the rows of
+    `DataProvider.delisting_reasons` / `merger_exits`, read at the run's data cutoff
+    (`known_at <= cutoff`, owner 2026-10-31), keyed by security; under `none` `terms` is
+    None and the exit is the last-close one, untouched."""
+
+    read_time: datetime
+    listings: Mapping[str, Mapping[str, object]]
+    policy: str = "none"
+    terms: DelistingPolicy | None = None
+    reasons: Mapping[str, Sequence[Mapping[str, object]]] = field(default_factory=dict)
+    merger_rows: Mapping[str, Sequence[Mapping[str, object]]] = field(default_factory=dict)
+
+
+def _window_end(first: date, sessions: int) -> date:
+    """The trading session `sessions` after `first` (`first` itself at 0)."""
+    every = all_sessions()
+    at = bisect.bisect_left(every, first)
+    return every[min(at + sessions, len(every) - 1)]
+
+
+def _policy_value(
+    sid: str,
+    value: float,
+    shares: float,
+    final: date | None,
+    context: _ExitContext,
+    counts: dict[str, int],
+) -> float:
+    """The sale value of `sid`'s delisting exit under `context`'s policy (plan T328c),
+    from its marked last-close `value` and its `shares`, counting the outcome in
+    `counts`. Raises for a short exit and for a shock on an exchange outside the
+    version's map (a failed trial, never 0%)."""
+    terms = context.terms
+    assert terms is not None
+    if value < 0:
+        raise ValueError(
+            f"refused_delisting_short: {sid} is a short delisting exit under "
+            f"backtest.delisting_failure_return {context.policy!r}; short delisting P&L "
+            "stays closed until ADR 0024 consequence 5"
+        )
+    listing = context.listings.get(sid, {})
+    key = (listing.get("delisting_form"), listing.get("delisting_filed_at"))
+    matched = [
+        row
+        for row in context.reasons.get(sid, ())
+        if (row["delisting_form"], row["delisting_filed_at"]) == key
+        and row["delisting_exchange"] == listing.get("exchange")
+        and None not in key
+    ]
+    reason = str(matched[0]["reason"]) if len(matched) == 1 else _UNKNOWN_REASON
+    counts["n_reason_conflicts"] += len(matched) > 1
+    counts["n_unknown_exits"] += reason == _UNKNOWN_REASON
+    candidates = (
+        []
+        if final is None
+        else [
+            row
+            for row in context.merger_rows.get(sid, ())
+            if final
+            <= cast(date, row["effective_date"])
+            <= _window_end(final, terms.merger_window_sessions)
+        ]
+    )
+    merger = candidates[0] if len(candidates) == 1 else None
+    if reason == _MERGER_REASON:
+        cash = cast(float | None, merger["cash_per_share"]) if merger is not None else None
+        ratio = cast(float | None, merger["share_ratio"]) if merger is not None else None
+        close = cast(float | None, merger["acquirer_raw_close"]) if merger is not None else None
+        if merger is None or (ratio is not None and close is None):
+            counts["n_merger_fallbacks"] += 1
+            counts["n_merger_conflicts"] += len(candidates) > 1
+            return value
+        counts["n_merger_consideration"] += 1
+        stock = 0.0 if ratio is None else ratio * cast(float, close)
+        return shares * ((cash or 0.0) + stock)
+    shocked = reason in _FAILURE_REASONS or (
+        terms.shock_unknown and reason == _UNKNOWN_REASON and merger is None
+    )
+    if not shocked:
+        return value
+    exchange = listing.get("exchange")
+    if exchange not in terms.shocks:
+        raise ValueError(
+            f"{sid}: listing exchange {exchange!r} is outside "
+            f"backtest.delisting_failure_return {context.policy!r}'s exchange map "
+            f"({', '.join(sorted(terms.shocks))}); the policy cannot value this exit"
+        )
+    counts["n_failure_shocks"] += 1
+    return value * (1 + terms.shocks[cast(str, exchange)])
 
 
 def _exits(
@@ -596,8 +766,11 @@ def _exits(
     end: date,
     params: Settings,
     adv: Mapping[str, float],
-) -> list[_Exit]:
-    """The delisting and stale exits of `positions` at one cost level (module docstring)."""
+    context: _ExitContext | None = None,
+) -> tuple[list[_Exit], dict[str, int] | None]:
+    """The delisting and stale exits of `positions` at one cost level (module docstring),
+    and, under a policy other than `none` in `context`, the step's policy counts
+    (`POLICY_COUNT_NAMES`, every one written, zeros included; None otherwise)."""
     frame, raw, ended = reads
     last_bars = dict(
         frame.filter(pl.col("session") <= end)
@@ -608,6 +781,8 @@ def _exits(
     rows = values.select("security_id", "session", "value").iter_rows()
     at = {(sid, session): value for sid, session, value in rows}
     commissions = Commissions.from_config(params.costs)
+    applied = context is not None and context.terms is not None
+    counts = dict.fromkeys(POLICY_COUNT_NAMES, 0) if applied else None
     exits: list[_Exit] = []
     for sid in sorted(positions):
         last = last_bars.get(sid)
@@ -625,10 +800,14 @@ def _exits(
         # A trade's cost is a magnitude: a short's value is negative, and its cover pays
         # the same model as a long's sale (spec amendment #1872, item 7). `abs` is the
         # identity on the positive value a `long_only` book carries.
+        shares = abs(value) / raw_close
+        if counts is not None and not stale:
+            # The policy's sale value; ordinary fill costs on it, the shares unchanged.
+            value = _policy_value(sid, value, shares, final, cast(_ExitContext, context), counts)
         notional = abs(value)
         cost = trade_cost(
             notional,
-            notional / raw_close,
+            shares,
             book.level,
             commissions,
             spread_bps=params.costs.spread_bps,
@@ -636,7 +815,7 @@ def _exits(
             adv=adv.get(sid),
         )
         exits.append(_Exit(sid, session, value, min(cost, notional), stale))
-    return exits
+    return exits, counts
 
 
 def _short_value(positions: Mapping[str, float]) -> float:
@@ -978,6 +1157,7 @@ def _step(
     chains: Sequence[tuple[str, str]] = (),
     decision_frames: Mapping[date, pl.DataFrame] | None = None,
     late_splits: pl.DataFrame | None = None,
+    exit_context: _ExitContext | None = None,
 ) -> None:
     """Carry, fill, value and exit one cost level through the period (T_i, T_{i+1}].
 
@@ -997,7 +1177,12 @@ def _step(
 
     `late_splits` is the step's `late_splits(t_prev, t)` read (#3096): before anything is
     carried, `_rebase_late_splits` re-bases the positions and benchmarks it applies to
-    and the row counts them as `n_late_splits` (written only when non-zero)."""
+    and the row counts them as `n_late_splits` (written only when non-zero).
+
+    `exit_context` (plan T328c) carries the step's read time and ended listings, so every
+    booked delisting exit is recorded in `book.delisting_exits`, and, under a delisting
+    policy other than `none`, the evidence that values those exits; the step's
+    `POLICY_COUNT_NAMES` then join the row's counts. Under `none` no value or count moves."""
     signed = params.portfolio.side == "long_short"
     n_late_splits = 0 if late_splits is None else _rebase_late_splits(book, late_splits, signed)
     fill_price = params.execution.fill_price
@@ -1088,8 +1273,16 @@ def _step(
                 f"negative position value {value} for {sid} on {session}: the backtester is "
                 "long-only (ADR 0014, 0015), a negative value would be silently dropped"
             )
-    exits = _exits(
-        book, fill.positions, values, (frame, raw, ended), plan.fill_session, end, params, adv
+    exits, policy_counts = _exits(
+        book,
+        fill.positions,
+        values,
+        (frame, raw, ended),
+        plan.fill_session,
+        end,
+        params,
+        adv,
+        exit_context,
     )
     values = _book_exits(values, exits)
     totals = dict(values.group_by("session").agg(pl.col("value").sum()).iter_rows())
@@ -1260,6 +1453,24 @@ def _step(
     if n_late_splits:
         counts = dict(counts)
         counts["n_late_splits"] = n_late_splits
+    if policy_counts is not None:
+        counts = dict(counts)
+        counts.update(policy_counts)
+    if exit_context is not None:
+        for e in exits:
+            if e.stale:
+                continue
+            listing = exit_context.listings.get(e.security_id, {})
+            book.delisting_exits.append(
+                DelistingExit(
+                    security_id=e.security_id,
+                    read_time=exit_context.read_time,
+                    end_session=cast(date | None, listing.get("end_session")),
+                    exchange=cast(str | None, listing.get("exchange")),
+                    delisting_form=cast(str | None, listing.get("delisting_form")),
+                    delisting_filed_at=cast(datetime | None, listing.get("delisting_filed_at")),
+                )
+            )
 
     book.cash = cash
     previous_positions = set(book.positions)
@@ -1790,6 +2001,12 @@ class _Variant:
     targets: dict[date, Mapping[str, float]] = field(default_factory=dict)
     rates: pl.DataFrame | None = None
     accruals: dict[date, float] | None = None
+    #: The run's data cutoff `c` and, under a delisting policy other than `none`, the
+    #: exit evidence read at it so far, by security (plan T328c).
+    cutoff: datetime | None = None
+    evidence_ids: set[str] = field(default_factory=set)
+    reasons: dict[str, list[dict[str, object]]] = field(default_factory=dict)
+    merger_rows: dict[str, list[dict[str, object]]] = field(default_factory=dict)
 
     @property
     def trial_id(self) -> int:
@@ -1979,6 +2196,7 @@ def run_many(
                 marking_frames=tuple(variant.frames),
                 targets=dict(variant.targets),
                 rates=variant.rates,
+                delisting_exits=tuple(book.delisting_exits),
                 exposure_summary=(
                     ExposureSummary(
                         gross_mean=math.fsum(gross for gross, _ in book.exposures)
@@ -2028,6 +2246,7 @@ def _run_group(
         sorted(view.benchmark_ids(read_time(sessions[0], cadence), through=sessions[-1]).items())
     )
     for variant in list(group):
+        variant.cutoff = cutoff
         try:
             variant.plan = _no_benchmark_members(plans[variant.trial_id], benchmarks)
         except Exception as exc:
@@ -2273,7 +2492,9 @@ def _variant_step(
     marking_bound = _marking_bound(variant, step_end, family, marked)
     frame = view.marking_prices(t, marked, marking_bound)
     raw = view.raw_prices(t, marked)
-    ended = _ended(view.listing_ends(t, ids), step_end)
+    listings = _ended_listings(view.listing_ends(t, ids), step_end)
+    ended = {sid: cast(date | None, row["end_session"]) for sid, row in listings.items()}
+    exit_context = _exit_context(view, variant, t, listings)
     dropped = view.dropped_dividends(t, ids)
     late = view.late_dividends(t_prev, t, ever_held)
     late_splits = view.late_splits(t_prev, t, _late_split_ids(ever_held, benchmarks))
@@ -2324,8 +2545,43 @@ def _variant_step(
             chains,
             decisions,
             late_splits,
+            exit_context,
         )
         if book.series == STRATEGY_SERIES:
             _benchmark_step(book, plan, step_end, frame, raw, params)
     if next_plan is not None:
         variant.plan = next_plan
+
+
+def _exit_context(
+    view: _SharedReads,
+    variant: _Variant,
+    t: datetime,
+    listings: Mapping[str, Mapping[str, object]],
+) -> _ExitContext:
+    """The step's `_ExitContext` (plan T328c). Under `none` it holds only the read time
+    and the ended listings, and no provider call is made. Otherwise each ended security
+    not yet read has its `delisting_reasons` and `merger_exits` read at the run's data
+    cutoff `c` (a row applies when `known_at <= c`, owner 2026-10-31, however late after
+    this deciding read), so each security's evidence is read once per run, at `c`."""
+    policy = variant.settings.backtest.delisting_failure_return
+    if policy == "none":
+        return _ExitContext(read_time=t, listings=listings)
+    cutoff = cast(datetime, variant.cutoff)
+    new = sorted(set(listings) - variant.evidence_ids)
+    if new:
+        for target, frame in (
+            (variant.reasons, view.delisting_reasons(cutoff, new)),
+            (variant.merger_rows, view.merger_exits(cutoff, new)),
+        ):
+            for row in frame.iter_rows(named=True):
+                target.setdefault(row["security_id"], []).append(row)
+        variant.evidence_ids.update(new)
+    return _ExitContext(
+        read_time=t,
+        listings=listings,
+        policy=policy,
+        terms=DELISTING_POLICIES[policy],
+        reasons=variant.reasons,
+        merger_rows=variant.merger_rows,
+    )
