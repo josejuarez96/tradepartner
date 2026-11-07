@@ -1808,6 +1808,7 @@ class _Run:
             context.actions_as_of,
             context.session,
             self.settings.paper.max_fill_price_deviation,
+            self.settings.paper.max_fill_price_ratio,
         )
 
     def _collect(self) -> Collected:

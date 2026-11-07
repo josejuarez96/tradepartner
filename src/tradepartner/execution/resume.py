@@ -155,7 +155,7 @@ from tradepartner.execution.collect import (
     PriceBand,
     RejectionBreach,
     collect,
-    fill_band_violations,
+    fill_band_halts,
     is_fill_band_fault,
     lag_verdict,
     note_unjudged,
@@ -527,8 +527,14 @@ def _band_view_violations(
     def price_of(name: str) -> float:
         return prices[name]
 
-    band = PriceBand(price_of, actions, session, settings.paper.max_fill_price_deviation)
-    return list(fill_band_violations(group, band))
+    band = PriceBand(
+        price_of,
+        actions,
+        session,
+        settings.paper.max_fill_price_deviation,
+        settings.paper.max_fill_price_ratio,
+    )
+    return list(fill_band_halts(group, band))
 
 
 def _rejudged_band_violations(
@@ -713,6 +719,7 @@ def resume(
             actions,
             session,
             settings.paper.max_fill_price_deviation,
+            settings.paper.max_fill_price_ratio,
         )
         band_error: SystemFaultError | None = None
         try:

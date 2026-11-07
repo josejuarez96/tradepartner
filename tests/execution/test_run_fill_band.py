@@ -21,7 +21,7 @@ from tradepartner.adapters.fake_broker import FillAt
 from tradepartner.calendar import session_open
 from tradepartner.config import PaperConfig
 from tradepartner.errors import SystemFaultError
-from tradepartner.execution.collect import PriceBand, fill_band_violations
+from tradepartner.execution.collect import PriceBand, fill_band_halts, fill_band_violations
 from tradepartner.store.journal import FillRow, OrderedFill, OverrideRow, PaperWindowRow
 
 
@@ -70,14 +70,48 @@ def test_a_normal_fill_and_a_large_real_gap_inside_the_band_pass(
     assert env.alerts("halted") == []
 
 
-def test_the_band_comes_from_config_not_a_constant(env: Env, window: PaperWindowRow) -> None:
-    """A tighter configured band halts the same +20% fill the default passes."""
+def test_the_halt_band_comes_from_config_not_a_constant(env: Env, window: PaperWindowRow) -> None:
+    """A tighter configured halt ratio halts the same +20% fill the default passes."""
     env.settings = env.settings.model_copy(
-        update={"paper": env.settings.paper.model_copy(update={"max_fill_price_deviation": 0.1})}
+        update={"paper": env.settings.paper.model_copy(update={"max_fill_price_ratio": 1.1})}
     )
     _fill_victim_at(env, 1.2)
     with pytest.raises(SystemFaultError, match="fill_price_outside_band"):
         env.run(at(F_0))
+
+
+def test_the_default_halt_ratio_is_three() -> None:
+    """#3130: the halt band is a unit-error band, [1/3, 3] x the reference."""
+    assert PaperConfig().max_fill_price_ratio == 3.0
+
+
+@pytest.mark.parametrize("factor", [0.707, 1.3, 2.5, 0.34])
+def test_a_real_gap_past_the_deviation_is_noted_not_halted(
+    env: Env, window: PaperWindowRow, factor: float
+) -> None:
+    """#3130 (Audit C 4h, INTC 10-30 at -29.3%): a fill past
+    `paper.max_fill_price_deviation` but inside the halt ratio is a real gap. The run
+    goes on and names it in a `fill_price_gap` note; no halt, no kill switch."""
+    victim = _fill_victim_at(env, factor)
+    outcome = env.run(at(F_0))
+    status, _, message = env.result(outcome.run_id)
+    assert status == "ok", message
+    assert env.alerts("halted") == []
+    assert env.query("SELECT count(*) FROM kill_switch")[0][0] == 0
+    assert message is not None and "fill_price_gap" in message and victim in message
+
+
+def test_a_tighter_gap_threshold_from_config_notes_a_smaller_gap(
+    env: Env, window: PaperWindowRow
+) -> None:
+    env.settings = env.settings.model_copy(
+        update={"paper": env.settings.paper.model_copy(update={"max_fill_price_deviation": 0.1})}
+    )
+    _fill_victim_at(env, 1.2)
+    outcome = env.run(at(F_0))
+    status, _, message = env.result(outcome.run_id)
+    assert status == "ok"
+    assert message is not None and "fill_price_gap" in message
 
 
 def test_a_halted_bad_fill_is_not_rejudged_by_the_next_run(
@@ -197,7 +231,9 @@ def _band(
             "ratio_or_amount": pl.Float64,
         },
     )
-    return PriceBand(reference.__getitem__, empty if actions is None else actions, session, 0.25)
+    return PriceBand(
+        reference.__getitem__, empty if actions is None else actions, session, 0.25, 3.0
+    )
 
 
 def test_the_band_edges_are_inclusive_and_a_nonfinite_price_is_a_violation() -> None:
@@ -206,6 +242,24 @@ def test_the_band_edges_are_inclusive_and_a_nonfinite_price_is_a_violation() -> 
     assert len(fill_band_violations([_ordered(125.01)], band)) == 1
     assert len(fill_band_violations([_ordered(74.99)], band)) == 1
     assert len(fill_band_violations([_ordered(float("nan"))], band)) == 1
+
+
+def test_the_halt_band_edges_are_inclusive_and_log_symmetric() -> None:
+    """#3130: halts outside [reference / ratio, reference x ratio]; non-finite or
+    non-positive prices always halt."""
+    band = _band({"SEC_A": 90.0})
+    assert fill_band_halts([_ordered(270.0), _ordered(30.0), _ordered(63.0)], band) == ()
+    assert len(fill_band_halts([_ordered(270.01)], band)) == 1
+    assert len(fill_band_halts([_ordered(29.99)], band)) == 1
+    for bad in (float("nan"), float("inf"), 0.0, -1.0):
+        assert len(fill_band_halts([_ordered(bad)], band)) == 1
+    assert fill_band_halts([_ordered(1e9, "SEC_B")], band) == ()  # unpriced: not judged
+
+
+def test_the_halt_band_keeps_the_spinoff_one_sided_rule() -> None:
+    band = _band({"SEC_A": 100.0}, _spun(F_0), session=F_0)
+    assert fill_band_halts([_ordered(1.0)], band) == ()  # low side off on the ex-date
+    assert len(fill_band_halts([_ordered(300.01)], band)) == 1
 
 
 def test_a_name_with_no_reference_is_not_judged() -> None:

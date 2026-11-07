@@ -559,7 +559,7 @@ def test_halt_read_judges_the_fill_it_journals(
 ) -> None:
     run = _run(journal_settings, open_window, ticking())
     _order(journal_settings, ticking_fake, ticking, run, "tp-bad")
-    ticking_fake.apply("tp-bad", FillAt(price=200.0))
+    ticking_fake.apply("tp-bad", FillAt(price=400.0))
     monkeypatch.setattr(wrapper_module, "reference_prices", lambda *_: {"SEC-AAA": 100.0})
     gate = _wrapper(journal_settings, ticking_fake, ticking, alerter_conn)
 
@@ -583,7 +583,7 @@ def test_halt_read_bad_fill_does_not_record_cancel_failed(
 ) -> None:
     run = _run(journal_settings, open_window, ticking())
     _order(journal_settings, ticking_fake, ticking, run, "tp-bad")
-    ticking_fake.apply("tp-bad", FillAt(price=200.0))
+    ticking_fake.apply("tp-bad", FillAt(price=400.0))
     monkeypatch.setattr(wrapper_module, "reference_prices", lambda *_: {"SEC-AAA": 100.0})
     gate = _wrapper(journal_settings, ticking_fake, ticking, alerter_conn)
 
@@ -603,7 +603,7 @@ def test_stale_halt_bad_fill_engages_switch_and_later_resume_refuses(
 ) -> None:
     run = _run(journal_settings, open_window, ticking())
     _order(journal_settings, ticking_fake, ticking, run, "tp-stale-bad")
-    ticking_fake.apply("tp-stale-bad", FillAt(price=200.0))
+    ticking_fake.apply("tp-stale-bad", FillAt(price=400.0))
     monkeypatch.setattr(wrapper_module, "reference_prices", lambda *_: {"SEC-AAA": 100.0})
     gate = _wrapper(journal_settings, ticking_fake, ticking, alerter_conn)
 

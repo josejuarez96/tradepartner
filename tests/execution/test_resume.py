@@ -386,7 +386,9 @@ def test_a_pending_order_the_fake_filled_is_settled_with_its_fills_before_its_fi
     assert not _engaged(journal_settings, window)
 
 
-@pytest.mark.parametrize("price, expected", [(200.0, REFUSED), (100.0, RELEASED)])
+@pytest.mark.parametrize(
+    "price, expected", [(400.0, REFUSED), (150.0, RELEASED), (100.0, RELEASED)]
+)
 def test_resume_judges_a_new_fill_and_reports_its_price(
     journal_settings: Settings,
     fake: SkewedFake,
@@ -448,7 +450,7 @@ def test_bad_fill_stays_refused_if_fault_engagement_write_fails(
 ) -> None:
     crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=True)
     _order(journal_settings, fake, crashed, "tp-bad-write", 2.0, DAY1 - timedelta(hours=1))
-    fake.apply("tp-bad-write", FillAt(200.0))
+    fake.apply("tp-bad-write", FillAt(400.0))
     if initially_engaged:
         _engage(journal_settings, window, fixed_clock)
     monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
@@ -481,7 +483,7 @@ def test_clock_step_back_rechecks_an_earlier_refused_invocation(
 ) -> None:
     crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=True)
     _order(journal_settings, fake, crashed, "tp-backward-bad", 2.0, DAY1 - timedelta(hours=1))
-    fake.apply("tp-backward-bad", FillAt(200.0))
+    fake.apply("tp-backward-bad", FillAt(400.0))
     _engage(journal_settings, window, fixed_clock)
     monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
     real_engage = switch.engage
@@ -508,7 +510,9 @@ def test_clock_step_back_rechecks_an_earlier_refused_invocation(
         )
 
 
-@pytest.mark.parametrize("price, expected", [(200.0, REFUSED), (100.0, RELEASED)])
+@pytest.mark.parametrize(
+    "price, expected", [(400.0, REFUSED), (150.0, RELEASED), (100.0, RELEASED)]
+)
 def test_a_run_fill_whose_band_engagement_was_never_written_is_rejudged(
     journal_settings: Settings,
     fake: SkewedFake,
