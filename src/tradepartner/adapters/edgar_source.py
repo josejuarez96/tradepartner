@@ -3896,30 +3896,41 @@ class EdgarFilingSource(FilingSource):
         pool = ThreadPoolExecutor(
             max_workers=min(workers, len(todo)), thread_name_prefix="edgar-filename"
         )
-        # The caller's context per job (the retry observer is a ContextVar), and
-        # one future per job, set by its worker. `map` queues every job now;
+        # One future per job, set by its worker, and the caller's context per
+        # job (the retry observer is a ContextVar). `map` queues every job now;
         # the boundary test refuses any `.submit` outside the broker wrapper.
+        # Each job carries its own future, context and record (#3039): the
+        # caller takes futures out of its copy of the dict in order, often
+        # before a worker has picked the job up, so a job must never look its
+        # future up there (a miss died unseen in the pool and the caller
+        # waited on that future forever).
         futures: dict[tuple[str, bool], Future[_FilenameExtract]] = {key: Future() for key in todo}
-        contexts = {key: contextvars.copy_context() for key in todo}
+        work = [
+            (futures[key], contextvars.copy_context(), record, read_document)
+            for key, (record, read_document) in todo.items()
+        ]
 
-        def run(key: tuple[str, bool]) -> None:
-            future = futures[key]
+        def run(
+            job: tuple[Future[_FilenameExtract], contextvars.Context, SubmissionRecord, bool],
+        ) -> None:
+            future, context, record, read_document = job
             if not future.set_running_or_notify_cancel():
                 return
-            record, read_document = todo[key]
             try:
-                extract = self._fetch_filename_extract(cik, record, read_document, on_worker=True)
+                extract = context.run(
+                    self._fetch_filename_extract, cik, record, read_document, on_worker=True
+                )
             except BaseException as error:  # handed to the caller, raised in order there
                 future.set_exception(error)
             else:
                 future.set_result(extract)
 
         try:
-            pool.map(lambda key: contexts[key].run(run, key), list(todo))
+            pool.map(run, work)
         except BaseException:
             pool.shutdown(wait=True, cancel_futures=True)
             raise
-        return pool, futures
+        return pool, dict(futures)
 
     def _first_cover_filing(
         self, cik: str, stamps: Mapping[str, SubmissionRecord]

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import csv
 import errno
+import faulthandler
 import hashlib
 import os
 import re
@@ -50,6 +51,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from _pytest.faulthandler import fault_handler_stderr_fd_key
 
 from tradepartner.adapters import edgar_raw
 from tradepartner.config import Settings
@@ -311,6 +313,39 @@ def _order_shard_items(items: list[pytest.Item], rootdir: Path) -> None:
         return (-_HEAVY_TEST_FILE_WEIGHTS.get(unit, _DEFAULT_TEST_FILE_WEIGHT), unit)
 
     items.sort(key=priority)
+
+
+def _timeout_seconds(item: pytest.Item) -> float:
+    """The pytest-timeout limit for `item`, in its own precedence: the
+    `timeout` mark, else `--timeout`, else the ini."""
+    mark = item.get_closest_marker("timeout")
+    if mark is not None and mark.args:
+        return float(mark.args[0])
+    if mark is not None and "timeout" in mark.kwargs:
+        return float(mark.kwargs["timeout"])
+    option = item.config.getoption("timeout", None)
+    if option is not None:
+        return float(option)
+    return float(item.config.getini("timeout") or 0.0)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item: pytest.Item) -> Iterator[None]:
+    """Dump every thread's stack a few seconds before pytest-timeout fires
+    (#3039). The thread method writes its dump through captured stderr and
+    then kills the xdist worker, so CI showed only "node down"; faulthandler
+    writes to pytest's own copy of the real stderr, which reaches the log,
+    and does not exit (pytest-timeout still ends the test)."""
+    timeout = _timeout_seconds(item)
+    fd = item.config.stash.get(fault_handler_stderr_fd_key, None)
+    armed = timeout > 0 and fd is not None
+    if armed:
+        faulthandler.dump_traceback_later(max(timeout - 5.0, timeout * 0.8), file=fd)
+    try:
+        yield
+    finally:
+        if armed:
+            faulthandler.cancel_dump_traceback_later()
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:

@@ -3624,6 +3624,31 @@ def test_filename_pool_finishes_after_a_leaked_limiter_stamp(tmp_path: Path) -> 
     assert [e.accession for e in result["listings"]] == [_FN_A, _FN_B, _FN_25_NASDAQ, _FN_COVER]
 
 
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("workers", [2, 4])
+def test_filename_pool_job_started_after_its_turn_still_answers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workers: int
+) -> None:
+    """#3039: the second CI hang. The caller takes each prefetched future in
+    order, removing it from the dict it was handed; a job a worker picked up
+    only after its turn came found no future, died in the pool unseen, and
+    the caller waited on that future forever. Here every job starts late, so
+    every turn comes first: the answer is still the sequential one."""
+    real_pool = edgar_source_module.ThreadPoolExecutor
+
+    class LateStart(real_pool):  # type: ignore[misc, valid-type]
+        def map(self, fn: Any, *iterables: Any, **kwargs: Any) -> Any:
+            def late(*args: Any) -> Any:
+                time.sleep(0.2)  # the caller reaches its turn first
+                return fn(*args)
+
+            return super().map(late, *iterables, **kwargs)
+
+    sequential = _fn_run(tmp_path / "one", _fn_router(), 1)
+    monkeypatch.setattr(edgar_source_module, "ThreadPoolExecutor", LateStart)
+    assert _fn_run(tmp_path / "pool", _fn_router(), workers) == sequential
+
+
 def test_filename_pool_of_one_is_todays_sequential_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
