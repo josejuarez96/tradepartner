@@ -35,14 +35,19 @@ In order:
    `holdout.decide` as `kind=in_sample` over its default in-sample window
    (`lab_queries.default_window`, `holdout.default_in_sample_window` at its
    cadence), so every variant has its `TrialHandle` before the group's first
-   provider call. The group runs through `engine.run_many` over a
-   `StoreProvider` that, between steps, waits out any quiet interval with its
-   step connection closed. Each variant is then closed in its own write chunk
-   with one `sweep_trials` row: `ok` through `results.write_results` at
-   `lab.sweep_detail_level`; `failed` with its own error's message when its own
-   computation failed; `failed` with `shared read failed` on every variant
-   still open when a shared read failed; `failed` with `store changed during
-   run` when the data vintage at its own cutoff differs between the trial's
+   provider call. The group runs through `engine.run_many` over a `StoreProvider` that,
+   between steps, waits out any quiet interval with its step connection closed. While
+   the results are in memory, one `delisting_reasons` read at the group's cutoff gives
+   each run variant its delisting exit coverage counts (`run.with_exit_coverage`, plan
+   T329), under every policy, on its base level's last rebalance row; an error there
+   fails every variant of the group with its message. The counts are a run-time
+   snapshot outside the data vintage, so a reason ingested mid-run moves them and
+   fails nothing. Each variant is then closed in
+   its own write chunk with one `sweep_trials` row: `ok` through
+   `results.write_results` at `lab.sweep_detail_level`; `failed` with its own error's
+   message when its own computation failed; `failed` with `shared read failed` on
+   every variant still open when a shared read failed; `failed` with `store changed
+   during run` when the data vintage at its own cutoff differs between the trial's
    open and the write.
 4. **Close the run**: the counts, the seconds, `n_trials_at_end`
    (`results.family_n`, the one N function), `sr_star_annual_at_end`
@@ -100,6 +105,7 @@ from pathlib import Path
 from typing import Final, Literal, Protocol, cast
 
 import duckdb
+import polars as pl
 
 from tradepartner import calendar
 from tradepartner.backtest import engine, placebo, quiet
@@ -110,6 +116,7 @@ from tradepartner.backtest.holdout import Flags, Frozen, Reasons, Window, decide
 from tradepartner.backtest.hypothesis import load_frozen
 from tradepartner.backtest.metrics import expected_max_sharpe
 from tradepartner.backtest.results import family_n, write_results
+from tradepartner.backtest.run import exit_coverage_counts, with_exit_coverage
 from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.store_provider import Connect, StoreProvider
 from tradepartner.config import Cadence, HypothesisFamily, Settings, clean_message, get_settings
@@ -596,6 +603,7 @@ def _run_engine(
                 # write_results writes weights only at full detail (#1448).
                 keep_detail=first.handle.detail_level == "full",
             )
+            coverage = _exit_coverage(running, results, provider)
     except SharedReadFailed as exc:
         error = "".join(traceback.format_exception(exc))
         for entry in running:
@@ -613,7 +621,29 @@ def _run_engine(
             entry.status, entry.message = "failed", _describe(failure)
             entry.error = "".join(traceback.format_exception(failure))
         else:
-            entry.results = results[trial_id]
+            assert entry.frozen_settings is not None
+            entry.results = with_exit_coverage(
+                results[trial_id], entry.frozen_settings.costs.per_side_bps, coverage[trial_id]
+            )
+
+
+def _exit_coverage(
+    running: Sequence[_Opened], results: engine.RunManyResults, provider: StoreProvider
+) -> dict[int, dict[str, int]]:
+    """Each run variant's `run.EXIT_COVERAGE_COUNTS` (plan T329), from **one**
+    `delisting_reasons` read at the group's data cutoff (one window, so one cutoff)
+    for every run variant's base-level delisting exits, made while the results are in
+    memory and before anything is written (module docstring, step 3)."""
+    exits = {
+        o.handle.trial_id: results[o.handle.trial_id][
+            cast(Settings, o.frozen_settings).costs.per_side_bps
+        ].delisting_exits
+        for o in running
+        if o.handle.trial_id in results
+    }
+    ids = sorted({e.security_id for found in exits.values() for e in found})
+    reasons = provider.delisting_reasons(running[0].cutoff, ids) if ids else pl.DataFrame()
+    return {trial_id: exit_coverage_counts(found, reasons) for trial_id, found in exits.items()}
 
 
 def _close_variant(
