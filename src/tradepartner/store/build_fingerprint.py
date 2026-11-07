@@ -56,6 +56,7 @@ HASHED_SETTINGS_KEYS = (
     "edgar.filename_listings_since",
     "edgar.filename_listing_forms",
     "edgar.filename_document_max_bytes",
+    "edgar.form25_html_max_bytes",
     "events.sec_forms",
     "events.sec_forms_enabled",
     "events.sec_forms_backfill_start",

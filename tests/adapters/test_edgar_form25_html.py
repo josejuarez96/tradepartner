@@ -12,6 +12,7 @@ raises `ValueError`.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
+from time import perf_counter
 
 import pytest
 
@@ -152,6 +153,19 @@ def test_the_script_naming_another_exchange_is_not_read() -> None:
         ).exchange
         == "NASDAQ"
     )
+
+
+def test_unclosed_scripts_are_bounded_and_refused_quickly() -> None:
+    document = "<script>" * 131_072  # 1 MiB, with no matching close tag.
+    started = perf_counter()
+    with pytest.raises(ValueError, match="labels not found"):
+        parse(document)
+    assert perf_counter() - started < 1.0
+
+
+def test_unclosed_script_before_form_consumes_remaining_document() -> None:
+    with pytest.raises(ValueError, match="labels not found"):
+        parse("<script>" + form25().split("</head>", 1)[1])
 
 
 @pytest.mark.parametrize("form", ["25-NSE", "25-NSE/A", "10-K"])

@@ -831,6 +831,41 @@ def rebalance_state(
     return RebalanceState.PENDING
 
 
+_FILLED_STATUS = "filled"
+
+
+def traded_at_lapse(
+    states: Sequence[tuple[DecisionRow, DecisionState]],
+    orders: Sequence[OrderRow],
+    order_events: Sequence[OrderEventRow],
+    fills: Sequence[OrderedFill],
+) -> bool:
+    """Whether a pending rebalance whose catch-up has run out traded (#3141): it has
+    decisions, none is in flight, and every one is closed, settled, or open with
+    orders of its own that **all** ended `filled` with a live fill (the remainder a
+    notional cap or rounding left, never written off because a sell was in flight
+    at submit). Such a rebalance is journaled `executed` at its lapse, not `missed`.
+    A decision never sent (open with no order, as after a halt before the buys), or
+    with an order that expired, was cancelled or was rejected, even after a partial
+    fill, keeps the lapse `missed`. No size threshold: what is left is named by the
+    caller."""
+    if not states:
+        return False
+    filled = {item.fill.client_order_id for item in fills}
+    ended_filled = {e.client_order_id for e in order_events if e.status == _FILLED_STATUS}
+    for decision, state in states:
+        if state.state in (State.CLOSED, State.SETTLED):
+            continue
+        if state.state is not State.OPEN:
+            return False
+        mine = _orders_of(decision, orders)
+        if not mine or not all(
+            o.client_order_id in filled and o.client_order_id in ended_filled for o in mine
+        ):
+            return False
+    return True
+
+
 def stop_session(requested_at: datetime) -> date:
     """The stop session (spec reqs 9 and 14): the calendar session containing
     the `requested` row's `at` (its New York date), or the next session when

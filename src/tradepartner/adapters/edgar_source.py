@@ -425,6 +425,10 @@ COVER_VERSION = 7
 #: As `COVER_VERSION`, for per-document `parse_sgml_header` results (T11d).
 HEADER_VERSION = 1
 #: As `COVER_VERSION`, for per-document `parse_delisting` results (T11f).
+#: #3106 (linear script/style strip, size cap) shipped without a bump: its
+#: output differs only for a document with an unclosed script or style tag or
+#: over the cap, which EDGAR rejects or a one-page Form 25 never reaches, so
+#: parses cached before it stand. A bump would re-download every Form 25.
 DELISTING_VERSION = 1
 #: The issuer HTML Form 25s `parse_delisting_html` read and found no class or
 #: exchange in (`delisting_html_unread/v1/`, #3084): bump when that parser reads
@@ -3574,9 +3578,22 @@ class EdgarFilingSource(FilingSource):
         share, but kept in `delisting_html_unread/` and counted on
         `.unread_html_delistings`, so it is never fetched again under this
         `DELISTING_HTML_VERSION`. A 404 or 410 still goes to the failure policy."""
-        path = edgar_raw.download_filing_file(
-            cik, accession, primary_document, settings=self._settings, client=self._client
-        )
+        try:
+            path = edgar_raw.download_filing_file(
+                cik,
+                accession,
+                primary_document,
+                settings=self._settings,
+                client=self._client,
+                max_bytes=self._settings.edgar.form25_html_max_bytes,
+            )
+        except edgar_raw.FilingTooLargeError as why:
+            # A pre-existing raw cache can be over the cap too.
+            edgar_raw.cached_filing_path(
+                cik, accession, primary_document, settings=self._settings
+            ).unlink(missing_ok=True)
+            self._save_unread_html_delisting(accession, str(why), over_cap=True)
+            return None
         try:
             text = path.read_bytes().decode("utf-8", errors="replace")
         finally:
@@ -3586,14 +3603,20 @@ class EdgarFilingSource(FilingSource):
                 text, cik=cik, form=form, accession=accession, accepted_at=accepted_at
             )
         except ValueError as why:
-            data = {"version": DELISTING_HTML_VERSION, "accession": accession, "reason": str(why)}
-            edgar_raw.write_atomic(
-                self._unread_html_path(accession), json.dumps(data).encode("utf-8")
-            )
-            self.unread_html_delistings += 1
+            self._save_unread_html_delisting(accession, str(why))
             return None
         self._save_delisting_cache(accession, parsed)
         return parsed
+
+    def _save_unread_html_delisting(
+        self, accession: str, reason: str, *, over_cap: bool = False
+    ) -> None:
+        """Remember an unreadable issuer Form 25 without failing the run."""
+        data = {"version": DELISTING_HTML_VERSION, "accession": accession, "reason": reason}
+        if over_cap:
+            data["max_bytes"] = self._settings.edgar.form25_html_max_bytes
+        edgar_raw.write_atomic(self._unread_html_path(accession), json.dumps(data).encode("utf-8"))
+        self.unread_html_delistings += 1
 
     def _unread_html_path(self, accession: str) -> Path:
         edgar_raw.validate_accession(accession)
@@ -3616,6 +3639,10 @@ class EdgarFilingSource(FilingSource):
             isinstance(data, dict)
             and data.get("version") == DELISTING_HTML_VERSION
             and data.get("accession") == accession
+            and (
+                "max_bytes" not in data
+                or data["max_bytes"] == self._settings.edgar.form25_html_max_bytes
+            )
         )
 
     def form25_evidence(
