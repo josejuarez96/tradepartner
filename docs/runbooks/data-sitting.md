@@ -595,7 +595,7 @@ Purpose: give each book a survivorship-gap sign-off computed on the post-sitting
   ```
 
   A refused start stops restart; leave jobs stopped and follow the [paper scheduling runbook](scheduling.md). Paste old/new window ids, final stop/abandon reconciliations, broker flatness or matched residues, account-id checks, final health and coverage, all release ids, and job restart evidence on the sitting PRs. The new windows start a new span; the earlier T162 pass remains the gate for *this* sitting.
-- [ ] **Then, after the sitting.** Four owner runs whose code is merged are not part of this sheet: T246, T248f, T164e and T324. Run them in the order and with the checks in [after the sitting](after-the-sitting.md). Read its T164e step **before** `paper start` above: that fill is a named release, which rule 5 of [named data releases](data-releases.md) keeps out of an open paper window.
+- [ ] **Then, after the sitting.** Four owner runs whose code is merged are not part of this sheet: T246, T248f, T164e and T324. Run them in the order and with the checks in [after the sitting](after-the-sitting.md). Read its entry point **before** `paper start` above: its T164e step is a named release, which rule 5 of [named data releases](data-releases.md) keeps out of an open paper window, so the owner chooses whether its first steps run before that start.
 
 ## Restore and gaps
 

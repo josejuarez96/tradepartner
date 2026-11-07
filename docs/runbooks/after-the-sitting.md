@@ -1,6 +1,10 @@
 # Run sheet: the four owner steps after the sitting
 
-Owner and orchestrator only, on the owner's job checkout and real store, after the [data sitting](data-sitting.md) has closed (its **Restart and close** done). The orchestrator runs each step on the owner's go, and the owner decides after each dry run and each stop rule. Follow [named data releases](data-releases.md) for the release record and the restore, and [scheduling](scheduling.md) to unload and reload jobs. Agents never run these steps.
+Owner and orchestrator only, on the owner's job checkout and real store, after the [data sitting](data-sitting.md)'s releases are closed. The orchestrator runs each step on the owner's go, and the owner decides after each dry run and each stop rule. No team window or subagent runs them. Follow [named data releases](data-releases.md) for the release record and the restore, and [scheduling](scheduling.md) to unload and reload jobs.
+
+**Where this sheet starts (`<OWNER>`, one choice).** Step 3 is a named release, and rule 5 of [named data releases](data-releases.md) keeps a release out of an open paper window. The sitting's **Restart and close** ends with daily's `paper start`. So the owner picks one of two:
+- **(a) Before `paper start`.** Run steps 1 to 3 once every sitting release has its `after` row and `health --check` exits 0, with the jobs still stopped and no window open. Then do the sitting's `paper start`. Step 4 may run after the restart.
+- **(b) After the restart.** Run steps 1, 2 and 4 with daily's window open. Step 3 waits until no window is open. Step 4 then seeds without it or waits too (**Why this order**, last paragraph).
 
 The code for all four is merged. What is left are runs that only the owner can make:
 
@@ -16,7 +20,7 @@ The code for all four is merged. What is left are runs that only the owner can m
 ## Why this order
 
 1. **T246 first.** It is the only known-answer check of the store after the sitting rewrote history across its releases. Run it on the sitting's store alone, before anything else writes. A defect it finds stops the rest of this sheet until the owner has read it. Its only write is RSP, which is check-only: `data_vintage` leaves RSP out, so no trial goes stale ([benchmark backfill](benchmark-backfill.md#rsp-a-check-only-series-1598-t243)).
-2. **T248f second.** It is Alpaca-only and touches no EDGAR table. The rows it writes (`mergers`, `symbol_changes`, `spinoff` actions) move no default trial vintage (`store/registry.py`, `_TRIAL_FACT_TABLES` and the `data_vintage` docstring). So its plan check, "`lab status` with no stale trial", can be read cleanly only before step 3, whose release stales trials.
+2. **T248f second.** It is Alpaca-only and touches no EDGAR table. The rows it writes (`mergers`, `symbol_changes`, `spinoff` actions) move no default trial vintage (`store/registry.py`, `_TRIAL_FACT_TABLES` and the `data_vintage` docstring). So its plan check, "`lab status` with no stale trial", can be read cleanly only before step 3, whose release stales trials. Two kinds of trial are the exception: a trial frozen with `adjust.apply_spin_offs = true` counts `spinoff` rows, and one frozen with `backtest.delisting_failure_return` other than `none` counts `mergers` (`data_vintage`'s `spin_offs` and `delisting_policy` gates). Those may go stale.
 3. **T164e before T324.** `edgar.filing_events_enabled` and `edgar.event_forms` are hashed into the build fingerprint (`store/build_fingerprint.py`, `HASHED_SETTINGS_KEYS`). The seed records that fingerprint. If the switch is turned on after the seed, every incremental night fails its EDGAR source and names `--rebuild-index`, which is another full build. So the switch must have its final value before the seed.
 4. **T324 last.** Its seed records the fingerprint of the settings and code in effect. Its five nights of evidence start only after the key is on.
 
@@ -24,7 +28,7 @@ If step 3 cannot run (see its first stop rule), the owner chooses: run T324 with
 
 ## Before any step
 
-- [ ] The sitting is closed. Every release it opened has an `after` row, and `uv run tradepartner health --check` exits 0. Record which books restarted (`uv run tradepartner paper status --all`).
+- [ ] Every release the sitting opened has an `after` row, and `uv run tradepartner health --check` exits 0. Record the entry point chosen above, and which windows are open (`uv run tradepartner paper status --all`).
 - [ ] Nothing else is writing: `pgrep -f "tradepartner "` is empty, and no sweep is running.
 - [ ] **The two jobs.** The paper run is at 08:05 ET and the ingest at 18:30 local. A scheduled writer waits `store.writer_lock_retry_seconds` (300 s) for the store lock, then fails. Start a long step only when it will finish before the next job. Otherwise unload that job first and reload it after ([scheduling](scheduling.md)). With a paper window open, an unloaded paper job means a missed run, so prefer the gap between 08:05 and 18:30.
 - [ ] **Disk.** Before every `store backup`, check free space and stop if it is under what the step needs, plus `ingest.min_free_disk_gb` (5 GB; ingest refuses below it). `health.warn_free_disk_gb` is 15.
@@ -42,6 +46,7 @@ Purpose: store RSP as the check-only equal-weight series, then run `index-check`
 
 **Preconditions.** No release is open. No ingest is running: `backfill-benchmark` waits `store.lock_retry_seconds` for a writer, then fails with `store busy`. The Alpaca keys are in `.env`.
 
+- [ ] **Backup.** Take one before the first write of this sheet: `uv run tradepartner store backup`. Keep its printed paths as `<post-sitting-copy>`. The plan line asks for none, but it is the restore point if the RSP backfill goes wrong, and it is the store the check read.
 - [ ] **Seed values.** `--cik`, `--name` and `--exchange` are labels that no read uses. They are needed only when no benchmark security lists RSP yet. The name is the issuer's display name. The other two were never checked against the issuer ([benchmark backfill](benchmark-backfill.md#rsp-a-check-only-series-1598-t243)):
   - `--cik`: the CIK of the trust that files for the fund, from EDGAR. `<OWNER>`.
   - `--exchange`: the NYSE Arca code as Alpaca spells it. `<OWNER>`.
@@ -75,6 +80,7 @@ Purpose: ask Alpaca for cash, stock and stock-and-cash mergers by process-date m
 
 **Preconditions.** The plan's gate: no ingest, sweep or `paper run` while it runs. `--since` may not be before `alpaca.actions_backfill_floor` (2020-06-01); the CLI refuses earlier. The Alpaca keys are in `.env`.
 
+- [ ] **Trials that may stale.** List the registered trials frozen with `adjust.apply_spin_offs = true` or with `backtest.delisting_failure_return` other than `none` (read-only, from the trial registry). Only those may go stale from this step. `<OWNER>`: whether a stale among them is a stop, since the plan and spec say "no stale trial".
 - [ ] **Books.** The `mergers` table's one reader is paper reconciliation (`_TRIAL_FACT_TABLES` note), and it explains an acquirer position at the stored merger ratio. Save the BOOK IDS list as in sitting step 9: every `security_id` with an open lot or a latest `positions_daily` row, per book.
 - [ ] **Dry run, then the real run.** Each month is its own chunk. A dry run fetches and reports each month, then rolls back its writes and its run row.
 
@@ -92,7 +98,7 @@ Purpose: ask Alpaca for cash, stock and stock-and-cash mergers by process-date m
 **Stop rules.**
 - A month that is not `filled`. The run stops at that month, and earlier months stay. A rerun asks again from `--since`: a repeat adds nothing, and a changed value is a revision stamped at the run.
 - `health --check` fails, including the four merger rules (`mergers_known_at_from_process_date`, `mergers_rates_match_kind`, `mergers_acquirer`, `mergers_unique`). Restore from the backup as in [named data releases](data-releases.md), after saving the failed state.
-- `lab status` shows a stale trial. These rows should stale none at the default `backtest.delisting_failure_return = none`. Stop and report on #1762.
+- `lab status` shows a stale trial that is not on the list above. Stop and report on #1762.
 - A row written on a BOOK ID. Check it read-only right after the write and before the next `paper run`:
 
   ```sql
@@ -114,7 +120,7 @@ Purpose: turn `edgar.filing_events_enabled` on for the owner's store, fill `fili
 **Why a named release.** `filing_events` is in `_TRIAL_FACT_TABLES`, so its rows enter every trial's `data_vintage`. The fill stales every registered trial with a cutoff after the first stored 8-K. The next plain `sweep run` reruns them, and each rerun counts in N. The spec puts the run under a named data release (ADR 0016 point 7).
 
 **Preconditions.**
-- [ ] **No open paper window.** Run `uv run tradepartner paper status --all`. [Named data releases](data-releases.md) rule 5 forbids a release that touches a session inside an open paper window. This fill writes a row for every 8-K accepted since that window opened. If a window is open, stop. `<OWNER>`: run this step before that book's `paper start`, or decide otherwise in writing.
+- [ ] **No open paper window.** Run `uv run tradepartner paper status --all`. [Named data releases](data-releases.md) rule 5 forbids a release that touches a session inside an open paper window. This fill writes a row for every 8-K accepted since that window opened. If a window is open, stop: this step waits (entry point (b) above).
 - [ ] The sitting's step 9 (`rederive-1682`, T198) is closed. The plan line's gate waits on it.
 - [ ] #1382 is closed with the owner's decision. It is closed; confirm that its closing comment is the decision (the spec's fourth condition). The design also asks to confirm that `restamp-1382a3` is done or does not touch universe 8-K stamps. Sitting step 3 records it as done.
 - [ ] `<edgar.cache_dir>/bulk/submissions.zip` and `companyfacts.zip` exist (`ls -lh`). Under `--bulk-from-cache` the items refresh reads the cached `submissions.zip` and its older pages with no request. Without the flag it asks the per-CIK API once per issuer CIK still in the old stamps layout (the request count is not measured). The flag also takes company facts from the cached `companyfacts.zip`, so a fact newer than that file arrives on the next nightly. The commands below use the flag, which is the design's cheap path. `<OWNER>` may drop it.
@@ -159,13 +165,15 @@ Purpose: turn `edgar.filing_events_enabled` on for the owner's store, fill `fili
   uv run tradepartner lab status
   ```
 
-- [ ] **Coverage** (the third condition). For each quarter-end close of 2020Q3 to 2023Q4, take the share of universe CIKs with an `8-K` row whose `items` names `2.02`. Compute it from the store as TP-1 did (`universe_as_of` at the quarter's last session close; `filing_events_as_of(..., forms=["8-K"], items=["2.02"])`). Each quarter must be within one percentage point of TP-1's column; the evidence tables are on PR #1381. No repo command computes this. Prepare and review the read-only query first. `<OWNER>`.
+- [ ] **Coverage** (the third condition). For each calendar quarter 2020Q3 to 2023Q4, take the share of the universe at the quarter's last session close (`universe_as_of`) whose CIK has an `8-K` with Item `2.02` **accepted within that quarter**, as TP-1 defined it on PR #1381. It is per quarter, never cumulative: `filing_events_as_of(..., forms=["8-K"], items=["2.02"])` at a quarter end returns all earlier history too, so the query must filter on `accepted_at` inside the quarter. Each quarter must be within one percentage point of TP-1's column; the evidence tables are on PR #1381. No repo command computes this. Prepare and review the read-only query first. `<OWNER>`.
 
 **Stop rules.**
 - `health --check` fails, either on a `filing_events` rule (`known_at ≠ accepted_at`, a form outside `edgar.event_forms`, NULL `items`, a duplicate `(cik, accession)`) or on any other rule. Follow [named data releases](data-releases.md) to restore `<events-copy>`, after saving the failed state, and do not run `close`.
 - The second run adds a row accepted at or before the first run's start.
 - `filing_events_clock_suspect` or `filing_events_items_missing` above 0. `health` warns on either (spec). `<OWNER>`: whether that blocks the flip. A clock-suspect count is a stamps-clock signal (#1382).
 - A quarter more than one point off TP-1. Do not flip the default (spec).
+
+**Step 3 is done** when the owner has decided the flip below: either it passes and the switch is on for every later run, or the owner writes down that it stays off. Step 4 reads that value.
 
 **The flip** (the owner's, a config change). Only when all four conditions hold: `health --check` green, a zero-row second run, coverage within one point, and #1382 closed.
 - The default: `edgar.filing_events_enabled = true`, a small PR changing `filing_events_enabled: bool = False` to `True` in `src/tradepartner/config_edgar.py`. The design lists it as class B (config).
@@ -183,15 +191,14 @@ Purpose: seed `filing_index` with one full walk, prove one incremental night equ
 **Size and time.** T317's probe seeded a temp copy with 15.3M rows, 2.18 GB, in 487 s (`changelog.d/2659-t317-edgar-probe.md`). The final build is a full pass; the nightly's full pass took 97 to 115 min on 2026-10-26 to 10-28 (#2593). Peak memory of the full pass was about 4.1 GB after #2622.
 
 **Preconditions.**
-- [ ] Step 3 is done, or the owner has chosen to seed without it (see **Why this order**). Every hashed setting must have its final value now, `edgar.filing_events_enabled` included.
+- [ ] Step 3 is done (its flip decided), or the owner has chosen to seed without it (see **Why this order**). Every hashed setting must have its final value now, `edgar.filing_events_enabled` included. If the switch is on, it must be on for the seed itself: `EDGAR__FILING_EVENTS_ENABLED=true` in `.env`, or the default-flip PR merged, not a per-command override. Confirm the effective value with `uv run tradepartner health`, which reports the switch's state. A seed run with the switch off hashes `false`, and turning it on later closes the gate.
 - [ ] **Code.** The sitting's pull (step 5) already brought every T324 dependency. Pull nothing between the seed and turning the key on. A later pull that changes the schema, a cache version or `BUILD_RULES_VERSION` (7 today) changes the fingerprint and closes the gate again. If the owner pulls before the seed, record both hashes and the commit count, as in sitting step 5.
 - [ ] **Disk.** The live store grows by about 2.2 GB. The comparison needs two copies of the seeded store. Required free space is about `S + 2 × (S + 2.2) + 5` GB, where `S` is the store plus WAL size now. Stop if `df -h data` shows less.
 - [ ] Outside the 08:05 and 18:30 jobs. The seed takes most of a working day's gap, so unload the 18:30 ingest if it might overlap ([scheduling](scheduling.md)).
 
-- [ ] **Dry run, then the seed.** A dry run of the seed walks every quarter and builds, writing nothing (`edgar_index_files` included). It costs about one full pass.
+- [ ] **The seed.** No dry run first. On an unseeded store, `--rebuild-index --dry-run` rolls back every quarter chunk, so its final build reads an empty `filing_index` and shows nothing the seed will write. The plan and spec ask for none here (the spec's monthly dry run is on a seeded copy).
 
   ```bash
-  uv run tradepartner ingest --source edgar --rebuild-index --dry-run
   uv run tradepartner store backup
   uv run tradepartner ingest --source edgar --rebuild-index
   uv run tradepartner health --check
@@ -205,9 +212,9 @@ Purpose: seed `filing_index` with one full walk, prove one incremental night equ
   ```
 
   Every quarter has a `partial` row, and the last row is `ok`, with `index seed complete` in its message.
-- [ ] **The comparison, on two copies** (the plan's and spec's "one comparison on a copy of incremental against `--rebuild-index`, which must show no difference"). Right after the seed, take two copies: two `store backup` calls, a minute apart. The pre-seed backup is the restore point; never run a command on it. Each command points the CLI at a copy with `STORE__PATH`. Both runs still use the shared `edgar.cache_dir` and make SEC requests. Run them one after the other, never together and never during the 18:30 ingest: each process has its own `edgar.requests_per_second` limiter (9), and SEC's ceiling is 10.
+- [ ] **The comparison, on two copies** (the plan's and spec's "one comparison on a copy of incremental against `--rebuild-index`, which must show no difference"). Right after the seed, take two copies: two `store backup` calls, a minute apart. They are scratch stores, not backups: label them so on #2629, never restore from them, and delete them after the comparison on the owner's word. The pre-seed backup is the restore point; never run a command on it. Each command points the CLI at a copy with `STORE__PATH`. Both runs still use the shared `edgar.cache_dir` and make SEC requests. Run them one after the other, never together and never during the 18:30 ingest: each process has its own `edgar.requests_per_second` limiter (9), and SEC's ceiling is 10.
 
-  Run them after SEC has listed at least one daily index file since the seed. Otherwise the incremental run has nothing new to read.
+  Run them after SEC has listed at least one daily index file since the seed. Otherwise the incremental run has nothing new to read. Run them back to back when SEC accepts no filings, a Saturday for example: copy B's full build starts one to two hours after copy A's run, and a filing or companyfacts update in between would reach only B and show as a false difference. If they cannot run in such a window, the comparison query must list the rows known between the two runs' starts separately.
 
   ```bash
   uv run tradepartner store backup   # <copy-A>
@@ -226,7 +233,7 @@ Purpose: seed `filing_index` with one full walk, prove one incremental night equ
 - Any difference between copy A and copy B, outside the listed clock columns: do not turn the key on. Paste the difference on #2629.
 - The incremental run on copy A fails its source and names `--rebuild-index`: the fingerprint changed after the seed. Stop and ask.
 
-**Turning the key on** (the owner's, a config change). The key is `edgar.incremental_index = true`. Set it in the jobs' environment, `EDGAR__INCREMENTAL_INDEX=true` in `.env`, before the first 18:30 ingest after the seed. The plan says "the first night after the seed". A settle in a longer gap is caught by T319b's rule. The default stays `false`: it is the rollback, the full walk. The plan line names no default-flip PR.
+**Turning the key on** (the owner's, a config change). The key is `edgar.incremental_index = true`. Set it in the jobs' environment, `EDGAR__INCREMENTAL_INDEX=true` in `.env`, before the first 18:30 ingest **after the comparison passes**. The plan says "the first night after the seed", but the comparison needs a new daily file and a second full pass, so it cannot pass before that night. The nights between the seed and the key are ordinary full walks with the key off. A settle in that gap is caught by T319b's rule. The default stays `false`: it is the rollback, the full walk. The plan line names no default-flip PR.
 
 **After.**
 - [ ] Post on #2629 the wall time and peak RSS of **5 consecutive scheduled runs**, from their `edgar_index` run rows (`started_at`, `finished_at`, and `peak_rss_bytes` in `message`):
@@ -242,7 +249,7 @@ Purpose: seed `filing_index` with one full walk, prove one incremental night equ
 
 ## Open questions for the owner
 
-- **T164e and an open window.** Data-releases rule 5 and an open `daily` window conflict with the spec's named release for the fill. Run step 3 before `daily`'s restart, or decide in writing.
+- **The entry point.** (a) steps 1 to 3 before daily's `paper start`, or (b) after it, with step 3 waiting for a closed window. Rule 5 keeps T164e's named release out of an open window.
 - **T164e before or after T324.** The switch is in the fingerprint, so turning it on after the seed costs one more full `--rebuild-index`.
 - **T164e's cost.** Its dry run, real run and zero-row rerun are three full EDGAR passes on the full walk.
 - **Values no doc settles.** RSP's CIK and Alpaca exchange code; the `index-check --out` folder; T164e's release name and coverage query; T324's comparison query and the monthly dry-run schedule.
