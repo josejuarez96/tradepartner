@@ -6662,6 +6662,53 @@ def test_actions_backfill_floor_dry_run_and_idempotent_month(
     )
 
 
+def test_actions_backfill_name_changes_only_asks_name_changes_from_their_floor(
+    fixture_store_path: Path,
+) -> None:
+    """#3054: the pre-2020 name-change scan asks only name changes, from
+    `alpaca.name_change_backfill_floor`; spin-offs and mergers keep their floor."""
+    from alpaca.data.enums import CorporateActionsType
+
+    from tradepartner.ingest import ingest_actions_backfill
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    calls: list[tuple[CorporateActionsType, ...]] = []
+
+    def scan(types: Sequence[CorporateActionsType], start: date, end: date) -> dict[str, Any]:
+        calls.append(tuple(types))
+        return {"name_changes": []}
+
+    now = datetime(2020, 7, 2, 20, tzinfo=UTC)
+    with pytest.raises(ValueError, match="2016-01-01"):
+        ingest_actions_backfill(
+            settings,
+            since=date(2015, 12, 1),
+            through=date(2015, 12, 31),
+            clock=lambda: now,
+            scan=scan,
+            name_changes_only=True,
+        )
+    result = ingest_actions_backfill(
+        settings,
+        since=date(2019, 5, 1),
+        through=date(2019, 5, 31),
+        clock=lambda: now,
+        scan=scan,
+        dry_run=True,
+        name_changes_only=True,
+    )
+    assert [run.status for run in result.runs] == ["filled"]
+    assert calls == [(CorporateActionsType.NAME_CHANGE,)]
+    with pytest.raises(ValueError, match="2020-06-01"):
+        ingest_actions_backfill(
+            settings,
+            since=date(2019, 5, 1),
+            through=date(2019, 5, 31),
+            clock=lambda: now,
+            scan=scan,
+        )
+
+
 def test_daily_fixture_stores_spinoff_and_symbol_change_once(
     fixture_store_path: Path,
 ) -> None:
