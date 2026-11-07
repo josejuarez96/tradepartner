@@ -375,6 +375,7 @@ from tradepartner.store.filing_index import snapshot_id as index_snapshot_id
 from tradepartner.store.master import (
     ChainCandidate,
     MasterBuild,
+    RenameChange,
     build_chains,
     build_master,
     chain_candidates,
@@ -383,6 +384,7 @@ from tradepartner.store.master import (
     securities_as_of,
     security_cik,
     session_of,
+    stored_rename_changes,
     stored_snapshot_history,
 )
 from tradepartner.store.master import (
@@ -2773,7 +2775,11 @@ def _rotation_report(
         if entry.cik in batch.rotation or entry.ticker in settings.benchmarks
     )
     master, delistings, classes, facts, _unmatched = _build_filings(
-        batch.rotation_recorded, settings, now, earlier_fetches=earlier
+        batch.rotation_recorded,
+        settings,
+        now,
+        earlier_fetches=earlier,
+        renames=stored_rename_changes(conn, now, batch.rotation),
     )
     products: dict[str, Sequence[Row]] = {
         "securities": master.securities,
@@ -4615,7 +4621,11 @@ def _ingest_filings(
             if entry.cik in touched_ciks or entry.ticker in settings.benchmarks
         )
     master, delistings, classes, facts, unmatched = _build_filings(
-        recorded, settings, now, earlier_fetches=earlier
+        recorded,
+        settings,
+        now,
+        earlier_fetches=earlier,
+        renames=stored_rename_changes(conn, now, touched_ciks),
     )
     record_snapshot_sightings(conn, recorded.companies_snapshot(), now, master.listings)
     restamped = ""
@@ -4735,10 +4745,19 @@ def _ingest_filings(
         f"unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
         f"{statements}{events}{sec_forms}{rebuilt}{restamped}{_source_counts(filings)}"
-        f"{_filename_counts(master, delistings, filings)}{chains}{candidates}; "
+        f"{_filename_counts(master, delistings, filings)}{chains}{candidates}"
+        f"{_rename_clause(master)}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
     return added, message
+
+
+def _rename_clause(master: MasterBuild) -> str:
+    """The #3057 name-change clause: refused changes by reason, empty when none."""
+    if not master.rename_refusals:
+        return ""
+    reasons = Counter(refusal.reason for refusal in master.rename_refusals)
+    return "; rename_refused: " + ", ".join(f"{why} {n}" for why, n in sorted(reasons.items()))
 
 
 def _chain_candidate_clause(candidates: Sequence[ChainCandidate]) -> str:
@@ -4934,6 +4953,7 @@ def _build_filings(
     *,
     fetch: bool = False,
     earlier_fetches: Sequence[CompanySnapshotEntry] = (),
+    renames: Sequence[RenameChange] = (),
 ) -> tuple[MasterBuild, Any, ClassificationBuild, tuple[Row, ...], tuple[FactRecord, ...]]:
     """The builds over `filings`, the master also over `earlier_fetches`
     (the store's snapshot rows as fetches, #2291). The fetch pass (`fetch`) also asks
@@ -4943,7 +4963,11 @@ def _build_filings(
     `filing_events` for every issuer CIK while that switch is on (#1358),
     the same way."""
     master = build_master(
-        filings, settings, ingested_at=ingested_at, earlier_fetches=earlier_fetches
+        filings,
+        settings,
+        ingested_at=ingested_at,
+        earlier_fetches=earlier_fetches,
+        renames=renames,
     )
     delistings = build_delistings(filings.delistings(), master, ingested_at=ingested_at)
     classes = build_classifications(filings, master, settings, ingested_at=ingested_at)

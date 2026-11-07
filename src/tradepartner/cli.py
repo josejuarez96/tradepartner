@@ -124,6 +124,13 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   paper window read. Refused without a release name; a dry run lists the rows
   found and refused (exit 1 on any refused), a real run deletes only a
   manifest with none refused, inside the open release named.
+- `tradepartner repair-rename-listings --release <name> [--dry-run |
+  --expect-rows N]` runs `repair.repair_rename_listings` (#3057): it adds the
+  new-ticker `snapshot` listing row each stored `symbol_changes` revision
+  implies where no cover page started the ticker by the change's session
+  (PKI -> RVTY, CHK -> EXE), exactly the rows the EDGAR master derives. The
+  dry run lists the rows and the refused changes with reasons; a real run
+  writes only that count, inside the open data release named.
 - `tradepartner dashboard` runs the Streamlit shell (`dashboard/app.py`) bound to
   localhost with usage telemetry off (ADR 0011), and exits with Streamlit's code.
 - `tradepartner export OUT_DIR` writes every table in the store to
@@ -523,6 +530,7 @@ from tradepartner.repair import (
     delete_bars,
     delete_master_rows,
     read_master_manifest,
+    repair_rename_listings,
     repair_resolution,
     retract_dividends,
     store_resolver,
@@ -3333,6 +3341,42 @@ def make_app(
             raise _fail(
                 f"{len(result.stale)} stale list entries: re-review them before a real run", 1
             )
+
+    @app.command("repair-rename-listings")
+    def repair_rename_listings_cmd(
+        release: Annotated[str, typer.Option(help="the open data release (checked on a real run)")],
+        dry_run: Annotated[bool, typer.Option(help="list the rows and change nothing")] = False,
+        expect_rows: Annotated[
+            int | None, typer.Option(help="the dry run's row count (required to write)")
+        ] = None,
+    ) -> None:
+        """Add the new-ticker listing rows the stored name changes imply (#3057)."""
+        if not dry_run:
+            if expect_rows is None:
+                raise _fail(
+                    "run --dry-run first, then pass its count as --expect-rows", USAGE_ERROR
+                )
+            if _blank_text(release):
+                raise _fail(
+                    "a repair writes only inside a data release: pass --release <name>",
+                    USAGE_ERROR,
+                )
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            result = repair_rename_listings(
+                s, clock=clock, dry_run=dry_run, expect=expect_rows, release=release
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except RepairRefused as exc:
+            raise _fail(f"repair refused: {exc}", 1) from None
+        except ValueError as exc:
+            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+        typer.echo(result.summary())
+        for line in result.lines():
+            typer.echo(line)
 
     @app.command("spinoff-allocation")
     def spinoff_allocation(
