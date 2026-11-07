@@ -29,6 +29,7 @@ from tradepartner.execution.plan import stop_session
 from tradepartner.execution.waiting import WaitingItem
 from tradepartner.store import schema
 from tradepartner.store.db import open_for_write, open_read_only, utc_now
+from tradepartner.store.dividend_reviews import ReviewedGroup
 from tradepartner.store.journal import (
     AlertRow,
     DecisionRow,
@@ -2226,11 +2227,10 @@ def test_a_missing_spy_session_is_the_benchmark_error_naming_it(
     assert data.benchmark_index == () and len(data.equity) == 4
 
 
-def test_a_dividend_after_the_base_enters_the_spy_line(journal_settings: Settings) -> None:
-    """Total return, not price only: a dividend ex 09-30 lowers the earlier closes."""
-    _p_seed(journal_settings)
+def _spy_dividend(settings: Settings, action_id: str = "d1") -> None:
+    """A 51.5 SPY dividend ex 09-30 (`_PT0`), known 09-29."""
     stamp = datetime(2026, 9, 29, 21, 0, tzinfo=UTC)
-    with open_for_write(journal_settings) as conn:
+    with open_for_write(settings) as conn:
         columns = [
             r[0]
             for r in conn.execute(
@@ -2243,7 +2243,7 @@ def test_a_dividend_after_the_base_enters_the_spy_line(journal_settings: Setting
             "action_type": "dividend",
             "ex_date": _PT0,
             "ratio_or_amount": 51.5,
-            "source_action_id": "d1",
+            "source_action_id": action_id,
             "announced_at": stamp,
             "known_at": stamp,
             "ingested_at": stamp,
@@ -2256,6 +2256,12 @@ def test_a_dividend_after_the_base_enters_the_spy_line(journal_settings: Setting
             f"VALUES ({', '.join('?' for _ in used)})",
             [values[c] for c in used],
         )
+
+
+def test_a_dividend_after_the_base_enters_the_spy_line(journal_settings: Settings) -> None:
+    """Total return, not price only: a dividend ex 09-30 lowers the earlier closes."""
+    _p_seed(journal_settings)
+    _spy_dividend(journal_settings)
     data = _p_read(journal_settings)
     assert data is not None and data.benchmark_error is None
     # factor (1 - 51.5/5050) on closes before the ex-date: B and 09-29 fall ~1%
@@ -2263,6 +2269,48 @@ def test_a_dividend_after_the_base_enters_the_spy_line(journal_settings: Setting
     got = dict(data.benchmark_index)
     assert got[_PT0] == pytest.approx(100 * 5_150 / (5_000 * factor))
     assert got[_PB] == pytest.approx(100.0)
+
+
+def test_an_unexplained_spy_duplicate_dividend_is_the_benchmark_error(
+    journal_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3026: two equal-amount SPY dividend rows the reviewed list does not explain are
+    never summed twice: the card fails closed with an error naming the excluded payment."""
+    monkeypatch.setattr(ops, "packaged_dividend_reviews", lambda: ())
+    _p_seed(journal_settings)
+    _spy_dividend(journal_settings, "d1")
+    _spy_dividend(journal_settings, "d2")
+    data = _p_read(journal_settings)
+    assert data is not None
+    assert data.benchmark_error is not None
+    assert "unexplained duplicate" in data.benchmark_error
+    assert "2026-09-30" in data.benchmark_error
+    assert data.benchmark_index == () and data.excess_pp == ()
+    assert len(data.equity) == 4  # the book's own series stand
+
+
+def test_a_reviewed_spy_duplicate_dividend_applies_once(
+    journal_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3026: a listed `duplicate` not yet repaired counts once, as the backtest reads it."""
+    listed = ReviewedGroup(
+        security_id="SEC_SPY",
+        ex_date=_PT0,
+        amount=51.5,
+        verdict="duplicate",
+        retract_source_action_id="d2",
+        ticker="SPY",
+        evidence="test",
+    )
+    monkeypatch.setattr(ops, "packaged_dividend_reviews", lambda: (listed,))
+    _p_seed(journal_settings)
+    _spy_dividend(journal_settings, "d1")
+    _spy_dividend(journal_settings, "d2")
+    data = _p_read(journal_settings)
+    assert data is not None and data.benchmark_error is None
+    factor = 1 - 51.5 / 5_050
+    got = dict(data.benchmark_index)
+    assert got[_PT0] == pytest.approx(100 * 5_150 / (5_000 * factor))
 
 
 def test_an_unreadable_mark_propagates(journal_settings: Settings) -> None:

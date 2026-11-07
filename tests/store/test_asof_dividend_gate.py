@@ -221,3 +221,65 @@ def test_the_spin_off_read_is_gated_too(store: duckdb.DuckDBPyConnection) -> Non
     assert _close(store, (), spin_offs=True) == pytest.approx(100.0)
     pending = (_listed("duplicate", retract="b"),)
     assert _close(store, pending, spin_offs=True) == pytest.approx(99.0)
+
+
+#: #3025: a predecessor whose live chain (#821) re-keys its rows to `SID`, known before
+#: `T`, so `live_actions_as_of` and the gated SQL both read them under the successor.
+PRED = "SEC_PRED"
+
+
+def _chain(conn: duckdb.DuckDBPyConnection) -> None:
+    insert_row(
+        conn,
+        "successor_chains",
+        {
+            "predecessor_id": PRED,
+            "successor_id": SID,
+            "evidence_accession": "0000000001-21-000001",
+            "evidence_form": "8-K12B",
+            "retracted": False,
+            "withdrawn_known_at": None,
+            "known_at": KNOWN,
+            "ingested_at": KNOWN,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+
+def test_a_predecessors_unexplained_pair_is_gated_under_its_successor(
+    store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#3025: the pair stored on the predecessor is classed under the chain-mapped id, so
+    the successor's read leaves both unapplied and reports them under the successor."""
+    _chain(store)
+    _dividend(store, "a", sid=PRED)
+    _dividend(store, "b", sid=PRED)
+    assert _close(store, None) == pytest.approx(100.0 * 0.99 * 0.99)
+    assert _close(store, ()) == pytest.approx(100.0)
+    assert _dropped(store, ()) == [
+        (SID, EX, 1.0, UNEXPLAINED_DUPLICATE),
+        (SID, EX, 1.0, UNEXPLAINED_DUPLICATE),
+    ]
+
+
+def test_a_predecessors_pending_duplicate_listed_under_the_successor_applies_once(
+    store: duckdb.DuckDBPyConnection,
+) -> None:
+    _chain(store)
+    _dividend(store, "a", sid=PRED)
+    _dividend(store, "b", sid=PRED)
+    reviews = (_listed("duplicate", retract="b"),)
+    assert _close(store, reviews) == pytest.approx(99.0)
+    assert _dropped(store, reviews) == []
+
+
+def test_a_pair_split_across_the_chain_is_one_group(store: duckdb.DuckDBPyConnection) -> None:
+    """One identity on the predecessor and one on the successor are one equal-amount
+    group under the successor: unexplained, both unapplied; listed, applied once."""
+    _chain(store)
+    _dividend(store, "a", sid=PRED)
+    _dividend(store, "b")
+    assert _close(store, ()) == pytest.approx(100.0)
+    assert [r[3] for r in _dropped(store, ())] == [UNEXPLAINED_DUPLICATE] * 2
+    assert _close(store, (_listed("duplicate", retract="a"),)) == pytest.approx(99.0)
