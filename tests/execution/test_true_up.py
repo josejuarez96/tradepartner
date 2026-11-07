@@ -30,6 +30,7 @@ from tradepartner.store.journal import (
     append,
     break_events_for,
 )
+from tradepartner.store.schema import AUTO_TRUE_UP_KIND, OWNER_TRUE_UP_KIND
 
 from .test_reconcile_run import (  # noqa: F401  (fixtures used by name)
     FUNDING,
@@ -767,17 +768,19 @@ def test_no_open_window_and_a_held_lock_refuse_before_any_broker_read(
     assert not fake.calls
 
 
-def test_a_reconcile_stated_before_a_later_true_up_reads_the_activity_as_unseen(
+def test_a_reconcile_stated_before_a_later_true_up_refuses_and_writes_nothing(
     journal_settings: Settings,
     fake: BookedFake,  # noqa: F811
     frozen_window: PaperWindowRow,  # noqa: F811
     fixed_clock: FixedClock,
 ) -> None:
-    """#3014: a break opened at S and trued up at S+1 books `ma-1`. The ledger
-    stated through S drops that booking's cash, so the seen set through S must
-    drop `ma-1` too: the catch-up reconcile of S reads the same $30 cash part the
-    break opened with, instead of halting on a book-level cash mismatch. The
-    funding `JNLC` dated before the window start stays in the base throughout."""
+    """#3018: a break opened at S and trued up at S+1 (booking `ma-1`). A
+    catch-up reconcile of S used to write a new `opened` event after `trued_up`,
+    from a session that cannot see the true-up, and its row (stamped now) became
+    the cash base of S+1, which then halted on cash. So it refuses before any
+    broker read or journal write, as #2961 does for a reversal. The funding
+    `JNLC` dated before the window start stays in the base throughout, and
+    reconciling S+1 reads `ok`."""
     opened = _open_quantity_and_cash_break(journal_settings, fake, frozen_window, fixed_clock)
     assert FUNDING in fake.activities and FUNDING.date < frozen_window.started_at.date()
     later = next_session(S)
@@ -790,13 +793,54 @@ def test_a_reconcile_stated_before_a_later_true_up_reads_the_activity_as_unseen(
     ]
     assert {a.session for a in rows} == {later}
     assert {a.broker_activity_id for a in rows} == {None, "ma-1"}
+    before = _snapshot(journal_settings, frozen_window)
+    calls = len(fake.calls)
 
     fixed_clock.advance(seconds=1)
-    assert _reconcile(journal_settings, fake, frozen_window, fixed_clock).status == "breaks"
-    observed = _events(journal_settings, frozen_window)[-1]
-    assert observed.event == "opened" and observed.material
-    assert (observed.ledger_quantity, observed.broker_quantity, observed.cash_amount) == (
-        opened.ledger_quantity,
-        opened.broker_quantity,
-        opened.cash_amount,
+    with pytest.raises(
+        reconcile_run.StatedBeforeTrueUp, match="a true-up is stated for 2026-10-02"
+    ):
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock)
+    assert len(fake.calls) == calls
+    assert _snapshot(journal_settings, frozen_window) == before
+    assert _events(journal_settings, frozen_window)[-1].event == "trued_up"
+
+    fixed_clock.advance(seconds=1)
+    assert (
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=later).status == "ok"
     )
+    fixed_clock.advance(seconds=1)
+    assert (
+        _reconcile(journal_settings, fake, frozen_window, fixed_clock, session=later).status == "ok"
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "explanation", "what"),
+    [
+        (AUTO_TRUE_UP_KIND, None, "a true-up"),
+        (OWNER_TRUE_UP_KIND, None, "a true-up"),
+        (OWNER_TRUE_UP_KIND, '{"reversed_adjustment_id": 1}', "a true-up reversal"),
+    ],
+)
+def test_every_true_up_kind_after_the_stated_session_refuses(
+    kind: str, explanation: str | None, what: str
+) -> None:
+    """#3018: an auto true-up, an owner true-up and its reversal each refuse a
+    ledger stated before their session; at or after it, nothing refuses, and
+    other adjustment kinds never do."""
+    stamp = datetime(2026, 10, 2, 15, tzinfo=UTC)
+    later = next_session(S)
+    row = AdjustmentRow(
+        adjustment_id=2,
+        window_id=1,
+        session=later,
+        kind=kind,
+        explanation_json=explanation,
+        known_at=stamp,
+        ingested_at=stamp,
+    )
+    with pytest.raises(reconcile_run.StatedBeforeTrueUp, match=f"^{what} is stated for {later}"):
+        reconcile_run._refuse_before_a_true_up([row], S)
+    reconcile_run._refuse_before_a_true_up([row], later)
+    reconcile_run._refuse_before_a_true_up([replace(row, kind="dividend")], S)

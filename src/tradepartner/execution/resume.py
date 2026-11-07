@@ -8,7 +8,7 @@ The only way the kill switch is released. In the req 5 order:
    book the outcome is `no_window`: no broker call, no write. Another book's
    window, switch and lock are never read or touched (B.5).
 2. Journal the `resume_invocations` row first, so a refused resume is still
-   on record and its fill cursor has a writer id.
+   on record and its fill cursor has a writer id and a book (#2490).
 3. Close every unfinished run of the window `crashed`.
 4. Settle every `pending` order of the window (req 4). `get_order` found: an
    `accepted` event with the broker's order id, which acknowledges it, and
@@ -51,7 +51,9 @@ The only way the kill switch is released. In the req 5 order:
      residual fill and its terminal event; one the broker still holds open
      refuses, since it may yet fill.
 6. `reconcile_now` (T61) for the clock's session, its journal cut (`as_of`)
-   a clock reading taken after every row steps 1 to 5 wrote. A mismatch refuses (the
+   a clock reading taken after every row steps 1 to 5 wrote. A ledger stated
+   before a true-up's session (only a clock gone back) refuses with the reason
+   and engages nothing (#3018). A mismatch refuses (the
    mismatch row is written, the switch stays engaged, and is engaged with
    source `fault` if nothing had engaged it). Any other status but `ok` or
    `breaks` refuses too: `switch.release` takes only those, so a lag inside
@@ -163,6 +165,7 @@ from tradepartner.execution.lock import resolve_book, run_lock
 from tradepartner.execution.planning import reference_prices
 from tradepartner.execution.reconcile import BREAKS, OK
 from tradepartner.execution.reconcile_run import (
+    StatedBeforeTrueUp,
     command_session,
     frozen_risk,
     reconcile_now,
@@ -303,6 +306,7 @@ def _window_id(window: PaperWindowRow) -> int:
 def _start(
     connect: Connect,
     window_id: int,
+    book: str,
     now: datetime,
     reason: str,
     accept_broker_fills: bool,
@@ -320,6 +324,7 @@ def _start(
                 reason=reason,
                 accept_broker_fills=accept_broker_fills,
                 accept_rejections=accept_rejections,
+                book_id=book,
                 known_at=now,
                 ingested_at=now,
             ),
@@ -685,6 +690,7 @@ def resume(
         resume_id, seen, crashed, pending = _start(
             connect,
             window_id,
+            book,
             now,
             reason,
             accept_broker_fills,
@@ -837,6 +843,11 @@ def resume(
                 frozen=frozen,
                 as_of=as_of,
             )
+        except StatedBeforeTrueUp as exc:
+            # A ledger stated before a true-up's session (#3018): refused before
+            # any broker read or write, so nothing is a fault to engage on. Only
+            # a clock that went back past a true-up reaches it here.
+            return outcome(REFUSED, f"reconciliation refused: {exc}")
         except ReconciliationError as exc:
             # A fault found here engages the switch when nothing has (a resume
             # with no engagement to release), as `paper reconcile` does.

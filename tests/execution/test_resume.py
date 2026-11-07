@@ -22,7 +22,7 @@ from tradepartner.execution import reconcile_run, switch
 from tradepartner.execution import resume as resume_module
 from tradepartner.execution.collect import collect
 from tradepartner.execution.lock import LockHeld, run_lock
-from tradepartner.execution.reconcile_run import reconcile_now
+from tradepartner.execution.reconcile_run import StatedBeforeTrueUp, reconcile_now
 from tradepartner.execution.resume import NO_WINDOW, REFUSED, RELEASED, resume
 from tradepartner.store import registry
 from tradepartner.store.db import open_for_write, open_read_only
@@ -2581,6 +2581,12 @@ def test_b_s_resume_releases_b_alone_under_its_own_lock(
         (reconciliation,) = reconciliations_for(conn, b_id)
         assert reconciliations_for(conn, window.window_id) == []  # type: ignore[arg-type]
     assert reconciliation.book_id == "b"
+    with open_read_only(journal_settings) as conn:
+        # #2490: the invocation names its book, so its fill cursor is b's alone.
+        (invocation,) = resume_invocations(conn)
+        (cursor,) = fill_cursors(conn)
+    assert invocation.book_id == "b"
+    assert (cursor.writer_kind, cursor.writer_id) == ("resume", invocation.resume_id)
 
 
 def test_resume_for_a_book_with_no_window_is_no_window_beside_main(
@@ -2590,3 +2596,34 @@ def test_resume_for_a_book_with_no_window_is_no_window_beside_main(
     assert outcome.status == NO_WINDOW
     assert fake.calls == ()
     assert _count(journal_settings, "resume_invocations") == 0
+
+
+def test_a_resume_stated_before_a_true_up_refuses_with_the_reason(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3018: `reconcile_now` refuses a ledger stated before a true-up's
+    session. A resume states `command_session(now)`, so this needs a clock that
+    went back past a true-up; it then reports REFUSED with the reason (not a
+    traceback or a halt), writes no reconciliation and leaves the switch engaged."""
+    _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+
+    def refuse(*args: object, **kwargs: object) -> object:
+        raise StatedBeforeTrueUp(
+            "a true-up is stated for 2026-10-02, after 2026-10-01: reconcile 2026-10-02 or later"
+        )
+
+    monkeypatch.setattr(resume_module, "reconcile_now", refuse)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert outcome.reasons == (
+        "reconciliation refused: a true-up is stated for 2026-10-02, after 2026-10-01: "
+        "reconcile 2026-10-02 or later",
+    )
+    assert outcome.reconciliation_id is None and outcome.released_event_id is None
+    assert _engaged(journal_settings, window)

@@ -822,3 +822,175 @@ def test_a_held_name_the_broker_does_not_know_still_halts_when_it_is_not_ambiguo
         _execute(_gate(env, alerter_conn), env, [_decision(env, A, "sell", notional=300.0)])
 
     assert _submits(env.fake) == []
+
+
+# --- a held chained predecessor (#3031) -----------------------------------------------
+
+#: A's chain successor (#821) and the new ticker it trades under from S-1.
+SUCC = "SEC_DUAL_A_SUCC"
+SUCC_TICKER = "DUALN"
+
+
+@pytest.fixture
+def chained_prices(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The store's chained read (#821) keys A's bars to `SUCC`, so the order
+    path's reference-price read has no bar for the held predecessor (a separate
+    gap, filed from #3031). These cases test the symbol map only, so the read
+    prices A at `PRICE` and every other name as before."""
+    real = wrapper.reference_prices
+
+    def priced(conn: Any, session: Any, names: Any, actions: Any) -> dict[str, float]:
+        rest = sorted(set(names) - {A})
+        found = real(conn, session, rest, actions) if rest else {}
+        return {**found, **({A: PRICE} if A in names else {})}
+
+    monkeypatch.setattr(wrapper, "reference_prices", priced)
+
+
+def _chain(env: Env, *, recorded: bool, delisted: bool = False) -> None:
+    """A 1:1 chain A -> `SUCC` (#821) known a minute before close(S-1), the
+    successor trading as `DUALN` from S-1 and, when `delisted`, A's Form 25.
+    When `recorded`, the broker re-booked A's position under `DUALN` and the
+    window's reconciliation on S recorded the chain's mapping `DUALA -> DUALN`
+    (reconcile_run `_symbols`, #3024)."""
+    known = CUT - timedelta(minutes=1)
+    common = {"known_at": known, "ingested_at": known, "source": "edgar", "provenance": "filing"}
+    with open_for_write(env.settings) as conn:
+        (row,) = conn.execute(
+            "SELECT exchange, class_title FROM listings WHERE security_id = ? "
+            "ORDER BY valid_from DESC LIMIT 1",
+            [A],
+        ).fetchall()
+        insert_row(
+            conn,
+            "securities",
+            {"security_id": SUCC, "cik": "CIK0009003031", "name": "Dual A Successor", **common},
+        )
+        insert_row(
+            conn,
+            "listings",
+            {
+                "security_id": SUCC,
+                "ticker": SUCC_TICKER,
+                "exchange": row[0],
+                "class_title": row[1],
+                "valid_from": PREV,
+                **common,
+            },
+        )
+        insert_row(
+            conn,
+            "successor_chains",
+            {
+                "predecessor_id": A,
+                "successor_id": SUCC,
+                "evidence_accession": "SEC-26-003031",
+                "evidence_form": "8-K12B",
+                "retracted": False,
+                "withdrawn_known_at": None,
+                **common,
+            },
+        )
+        if delisted:
+            insert_row(
+                conn,
+                "delistings",
+                {
+                    "security_id": A,
+                    "form": "25",
+                    "class_title": row[1],
+                    "exchange": row[0],
+                    "filed_at": known,
+                    "effective_on": PREV + timedelta(days=10),
+                    **common,
+                },
+            )
+    if not recorded:
+        return
+    env.fake.set_asset(SUCC_TICKER, Asset(True, True, "active", None))
+    env.prices[SUCC_TICKER] = PRICE
+    held = env.fake._net_quantity.pop(SYMBOLS[A], None)
+    if held is not None:
+        env.fake._net_quantity[SUCC_TICKER] = held
+    change = {"security_id": A, "old_symbol": SYMBOLS[A], "new_symbol": SUCC_TICKER}
+    at = env.clock.now - timedelta(minutes=1)
+    with open_for_write(env.settings) as conn:
+        append(
+            conn,
+            ReconciliationRow(
+                window_id=env.window.window_id,  # type: ignore[arg-type]
+                run_id=env.run.run_id,
+                at=at,
+                status="ok",
+                broker_cash=100_000.0,
+                mismatches_json=json.dumps({"symbol_changes": [change]}),
+                known_at=at,
+                ingested_at=at,
+            ),
+        )
+
+
+@pytest.mark.parametrize("decision", ["trade", "forced_exit"])
+def test_a_held_chained_predecessor_is_sold_under_its_successors_symbol(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, decision: str, chained_prices: None
+) -> None:
+    """#3031: hold A; a chain to `SUCC` (trading as `DUALN`) known at close(S-1);
+    the broker re-booked the position under `DUALN` and the reconciliation on S
+    mapped it. A trim, or the forced exit of the delisted predecessor (whose
+    successor's later listing is no reused ticker), goes out under `DUALN`,
+    never under `DUALA`, which the broker no longer holds."""
+    _hold(env, A, 10.0)
+    _chain(env, recorded=True, delisted=decision == "forced_exit")
+    if decision == "forced_exit":
+        sell = _decision(env, A, "sell", quantity=10.0, decision="forced_exit", reason="delisted")
+        outcome = _execute(_gate(env, alerter_conn), env, [], (sell,))
+    else:
+        trim = _decision(env, A, "sell", notional=300.0)
+        outcome = _execute(_gate(env, alerter_conn), env, [trim])
+
+    assert outcome.status == "ok"
+    (sent,) = _submits(env.fake)
+    assert sent.symbol == SUCC_TICKER
+    assert sent.client_order_id.startswith("tp-")
+    assert SYMBOLS[A] not in _assets_asked(env)
+
+
+def test_a_chained_predecessor_whose_successor_is_also_planned_is_skipped_not_guessed(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, chained_prices: None
+) -> None:
+    """#3031 (fail closed): the reconciliation on S mapped A to `DUALN`, but the
+    plan also buys `SUCC`, so two ids would claim one broker symbol and the map
+    cannot follow the chain. A's trim is `skip_asset_unknown` with a note, never
+    sent under `DUALA` or a guessed `DUALN`; the other names still trade."""
+    _hold(env, A, 10.0)
+    _hold(env, B, 10.0)
+    _chain(env, recorded=True)
+    trim_a = _decision(env, A, "sell", notional=300.0)
+    trim_b = _decision(env, B, "sell", notional=300.0)
+    notes: list[str] = []
+
+    outcome = _gate(env, alerter_conn).execute(
+        env.run, [trim_a, trim_b, _decision(env, SUCC, "buy", notional=300.0)], (), notes=notes
+    )
+
+    assert outcome.status == "ok"
+    sent = [r.symbol for r in _submits(env.fake)]
+    assert SYMBOLS[A] not in sent
+    assert SYMBOLS[B] in sent
+    assert (trim_a.decision_id, "skipped", "skip_asset_unknown") in _decision_events(env.settings)
+    assert any(f"DUALA -> {SUCC_TICKER}" in n for n in notes)
+
+
+def test_an_unrecorded_chain_keeps_the_predecessors_own_symbol(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, chained_prices: None
+) -> None:
+    """#3031: the chain is known but the broker still holds `DUALA`, so the
+    reconciliation recorded no mapping: the trim goes out under `DUALA`, the
+    symbol the broker holds, and nothing is sent under `DUALN`."""
+    _hold(env, A, 10.0)
+    _chain(env, recorded=False)
+
+    outcome = _execute(_gate(env, alerter_conn), env, [_decision(env, A, "sell", notional=300.0)])
+
+    assert outcome.status == "ok"
+    assert [r.symbol for r in _submits(env.fake)] == [SYMBOLS[A]]
