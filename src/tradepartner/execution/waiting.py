@@ -17,7 +17,9 @@ clears it, the command the owner types (text only: nothing here runs it).
    engages it. Command: `paper resume`.
 2. `reconcile_break` (#2266 item 12; T284): one per open break of the window
    (`alerts.latest_open_breaks`), named by id, kinds, name, size, age, cause and
-   whether it restricts the name. `since` is the break's `opened` event's
+   whether it restricts the name (`restricts`: a material break with a
+   `security_id`; an `unknown_symbol` break has none, so it restricts nothing).
+   `since` is the break's `opened` event's
    `known_at`; `aged` is True once it is older than the frozen
    `risk.break_max_age_sessions` at the command's session (`alerts.is_aged`).
    Command: `paper true-up`, the reason left for the owner. A break never
@@ -173,7 +175,8 @@ class WaitingItem:
     text the owner types to clear it, None where no command does; `line` is the
     shakedown line a `shakedown_failing` item is about (None otherwise, and for
     an unreadable shakedown); `aged` is True only for a `reconcile_break` item
-    past the frozen `risk.break_max_age_sessions`."""
+    past the frozen `risk.break_max_age_sessions`, and `restricts` only for one
+    that restricts its name (no buys or adds)."""
 
     book_id: str
     kind: WaitingKind
@@ -182,6 +185,7 @@ class WaitingItem:
     command: str | None
     line: str | None = None
     aged: bool = False
+    restricts: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -327,6 +331,7 @@ def _break_items(book_id: str, facts: BreakFacts) -> list[WaitingItem]:
         aged = is_aged(event, facts.session, facts.max_age_sessions)
         size = "unpriced" if event.dollar_size is None else f"${event.dollar_size:,.2f}"
         age = break_age(event.first_seen_session, facts.session)
+        restricts = event.material and event.security_id is not None
         items.append(
             WaitingItem(
                 book_id=book_id,
@@ -338,15 +343,12 @@ def _break_items(book_id: str, facts: BreakFacts) -> list[WaitingItem]:
                     f"{age} session(s) old"
                     + (f" (aged past {facts.max_age_sessions})" if aged else "")
                     + f", cause {event.cause or 'unknown'}, "
-                    + (
-                        "restricted (no buys or adds)"
-                        if event.material and event.security_id is not None
-                        else "not restricted"
-                    )
+                    + ("restricted (no buys or adds)" if restricts else "not restricted")
                     + "; check Alpaca, then true it up"
                 ),
                 command=true_up_command(book_id, event.break_id),
                 aged=aged,
+                restricts=restricts,
             )
         )
     return items
