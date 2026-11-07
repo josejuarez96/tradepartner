@@ -943,6 +943,7 @@ def download_filing_file(
     *,
     settings: Settings | None = None,
     client: httpx.Client | None = None,
+    max_bytes: int | None = None,
 ) -> Path:
     """Download one file from a filing's index into `edgar.cache_dir`; return its path.
 
@@ -951,17 +952,64 @@ def download_filing_file(
     `accession` and `filename` are validated first (`cached_filing_path`),
     before anything else, so a file already sitting at an unsafe target is
     never returned. A file already present is returned without a request (a
-    filing never changes); a new one is written atomically.
+    filing never changes); a new one is written atomically. When `max_bytes`
+    is set, both cached and streamed documents must fit the limit.
     """
     settings = settings or get_settings()
     dest = cached_filing_path(cik, accession, filename, settings=settings)
     if dest.is_file():
+        if max_bytes is not None and dest.stat().st_size > max_bytes:
+            raise FilingTooLargeError(f"filing document exceeds {max_bytes} bytes")
         return dest
     accession_nodash = accession.replace("-", "")
     url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_nodash}/{filename}"
-    response = _get(url, settings=settings, client=client)
-    write_atomic(dest, response.content)
+    if max_bytes is None:
+        response = _get(url, settings=settings, client=client)
+        body = response.content
+    else:
+        body = _bounded_get(url, max_bytes=max_bytes, settings=settings, client=client)
+    write_atomic(dest, body)
     return dest
+
+
+class FilingTooLargeError(ValueError):
+    """A filing document exceeded its configured byte limit."""
+
+
+def _bounded_get(
+    url: str, *, max_bytes: int, settings: Settings, client: httpx.Client | None
+) -> bytes:
+    """Stream one filing through the normal EDGAR retry policy and byte cap."""
+    headers = {"User-Agent": _user_agent(settings)}
+    http_client = (
+        client if client is not None else _default_client(settings.edgar.request_timeout_seconds)
+    )
+    policy = _RetryPolicy(settings)
+    while True:
+        _LIMITER.wait(1.0 / settings.edgar.requests_per_second)
+        try:
+            with http_client.stream(
+                "GET", url, headers=headers, timeout=settings.edgar.request_timeout_seconds
+            ) as response:
+                if policy.retry_after_response(response):
+                    continue
+                content_length = response.headers.get("Content-Length")
+                if (
+                    content_length is not None
+                    and content_length.isdecimal()
+                    and int(content_length) > max_bytes
+                ):
+                    raise FilingTooLargeError(f"filing document exceeds {max_bytes} bytes")
+                body = bytearray()
+                for chunk in response.iter_bytes():
+                    if len(body) + len(chunk) > max_bytes:
+                        raise FilingTooLargeError(f"filing document exceeds {max_bytes} bytes")
+                    body.extend(chunk)
+                return bytes(body)
+        except httpx.TransportError:
+            if policy.retry_after_transport_error():
+                continue
+            raise
 
 
 def _stream_to(url: str, dest: Path, *, settings: Settings, client: httpx.Client | None) -> Path:
