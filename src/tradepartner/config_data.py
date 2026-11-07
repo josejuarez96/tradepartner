@@ -236,6 +236,14 @@ class UniverseConfig(_ClosedConfig):
     # accepted fact, still subject to `max_shares_age_days`. `health` lists them all.
     max_shares_ratio: float = Field(default=100, gt=1, allow_inf_nan=False)
     accepted_shares_facts: list[str] = Field(default_factory=list)
+    # Split dating (#3055), part of rule 7: a fact dated before a split's ex-date but
+    # accepted on or after it, whose value over the last accepted fact (split-moved to its
+    # own date) is closer to that split's ratio than to 1, already carries the split (SHW
+    # 2021-03-31, TJX 2018-11-03). On, its value is divided by the ratio at its own
+    # `as_of_date`, so rule 8's move gives back the filed count instead of applying the
+    # split twice. Frozen at `false` (`backtest/frozen.py`), today's rule, so no stored
+    # fingerprint moves; the flip repins the twin hashes and lands with the data sitting.
+    shares_split_dating: bool = False
     top_n_by_cap: int = 1000
     # Rule 8's ranking (ADR 0023 D4, T212): `cap` is ADR 0006's market-cap rank (needs
     # rule 7's shares fact); `dollar_volume` ranks by median dollar volume from bars alone
@@ -307,6 +315,13 @@ class HealthConfig(_ClosedConfig):
     # well above `ingest.min_free_disk_gb` and `paper.min_free_disk_gb` so there is time
     # to act. 0 turns the warning off.
     warn_free_disk_gb: float = Field(default=15.0, ge=0)
+    # #3055: the shares cap-jump review list (`universe.shares_cap_jumps`). A shares
+    # fact's implied cap (its value x the raw close of the last traded bar at most
+    # `shares_cap_close_days` before its `as_of_date`) out of line with both its
+    # neighbours' by more than `shares_cap_jump_ratio` either way, or with the one
+    # before it when it is the latest, is listed. Report only.
+    shares_cap_jump_ratio: float = Field(default=2.0, gt=1, allow_inf_nan=False)
+    shares_cap_close_days: int = Field(default=10, ge=0)
 
 
 class BorrowConfig(_ClosedConfig):

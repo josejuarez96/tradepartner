@@ -934,6 +934,14 @@ def _print_report(report: HealthReport) -> None:
             f"as of {row['baseline_as_of']}"
         )
         echo(f"  {row['security_id']}@{row['as_of_date']} {row['value']:.0f} ({why})")
+    cap_jumps = report.shares_cap_jumps
+    shown = "" if cap_jumps.before is None else f" before {cap_jumps.before.isoformat()}"
+    echo(f"shares cap jumps{shown}: {cap_jumps.frame.height} to review")
+    for row in cap_jumps.frame.iter_rows(named=True):
+        echo(
+            f"  {row['security_id']}@{row['as_of_date']} {row['value']:.0f} "
+            f"(cap x{row['cap'] / row['prev_cap']:.3g} over {row['prev_as_of']})"
+        )
     pairs = report.accepted_same_day_pairs.frame
     echo(f"accepted same-day pairs: {pairs.height}")
     for row in pairs.iter_rows(named=True):
