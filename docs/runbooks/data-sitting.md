@@ -164,7 +164,7 @@ Purpose: load FRED DTB3 history, then land the already reviewed default flip. It
 
 Purpose: move the job checkout from the pinned `1fe51c9f` to origin/main once, so every later step runs the merged repairs. No release: this step writes nothing to the store.
 
-- [ ] The pull is **all of origin/main**, not a T198-only diff. On 2026-11-06 that was 54+ commits. They include T198's flip and FSN/COVER bumps (#2975), the schema 47 fill cursor (#3029), and ingest behaviour changes #3073, #3064, #3068, #3090, #3086 and #3095. `BUILD_RULES_VERSION` is 6 (#3064, then #3095), so step 9's first `ingest --source edgar` is a full master rebuild. #2975's bumps make it re-extract every FSN period too. Read its census with that in mind (step 9).
+- [ ] The pull is **all of origin/main**, not a T198-only diff. On 2026-11-06 that was 54+ commits. They include T198's flip and FSN/COVER bumps (#2975), the schema 47 fill cursor (#3029), and ingest behaviour changes #3073, #3064, #3068, #3090, #3086 and #3095. `BUILD_RULES_VERSION` is 8 (#3064, #3095, #3091, #3192), so step 9's first `ingest --source edgar` is a full master rebuild. #2975's bumps make it re-extract every FSN period too. Read its census with that in mind (step 9).
 - [ ] Record what is pulled. Only what is merged at this moment is in the sitting; nothing merged later is pulled mid-sitting.
   - **Open on 2026-11-06:** #3071 (shares split dating), the #3070 flip that follows it and #3091 (issuer-class tags, schema 48). Steps 9 and 17 depend on whether each is in. The #3116 exposure-backfill tool will not come (#3133 closed). Step 16 needs only #3176's kill-line copy, `docs/research/2026-10-31-candidate-5-kill-line.md`, to be in the pull.
   - **T214 (PR #1968):** closed without merging, so there is nothing to merge. D8's lapse needs its dated strike note in the data-foundation plan, outside this sheet.
@@ -595,6 +595,7 @@ Purpose: give each book a survivorship-gap sign-off computed on the post-sitting
   ```
 
   A refused start stops restart; leave jobs stopped and follow the [paper scheduling runbook](scheduling.md). Paste old/new window ids, final stop/abandon reconciliations, broker flatness or matched residues, account-id checks, final health and coverage, all release ids, and job restart evidence on the sitting PRs. The new windows start a new span; the earlier T162 pass remains the gate for *this* sitting.
+- [ ] **Then, after the sitting.** Four owner runs whose code is merged are not part of this sheet: T246, T248f, T164e and T324. Run them in the order and with the checks in [after the sitting](after-the-sitting.md). Read its entry point **before** `paper start` above: its T164e step is a named release, which rule 5 of [named data releases](data-releases.md) keeps out of an open paper window, so the owner chooses whether its first steps run before that start.
 
 ## Restore and gaps
 
