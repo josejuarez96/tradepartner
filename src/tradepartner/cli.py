@@ -1201,6 +1201,13 @@ def _scrubbed(text: str, settings: Settings) -> str:
     return scrub_text(text, secrets=_configured_secrets(settings))[0]
 
 
+def _input_fail(message: str, settings: Callable[[], Settings]) -> typer.Exit:
+    """A usage error (exit 2) whose message echoes the caller's own raw input, printed
+    through the `cli_record` scrub so a pasted secret is not echoed (#3191). Settings
+    are read only on this error path, so a bad value is still refused before any."""
+    return _fail(_scrubbed(message, settings()), USAGE_ERROR)
+
+
 def _fmt(value: Any) -> str:
     if value is None:
         return "n/a"
@@ -1215,13 +1222,13 @@ def _bps(level: float) -> str:
     return f"{level:g} bps"
 
 
-def _parse_day(flag: str, value: str | None) -> date | None:
+def _parse_day(flag: str, value: str | None, settings: Callable[[], Settings]) -> date | None:
     if value is None:
         return None
     try:
         return date.fromisoformat(value)
     except ValueError:
-        raise _fail(f"{flag} must be YYYY-MM-DD, got {value!r}", USAGE_ERROR) from None
+        raise _input_fail(f"{flag} must be YYYY-MM-DD, got {value!r}", settings) from None
 
 
 def _filing_headers(settings: Settings, client: httpx.Client | None) -> HeaderLookup:
@@ -1470,28 +1477,28 @@ def _refusal(exc: BaseException, settings: Settings) -> typer.Exit:
     return _fail(_scrubbed(f"refused: {exc}", settings), USAGE_ERROR)
 
 
-def _parse_aware(flag: str, value: str) -> datetime:
+def _parse_aware(flag: str, value: str, settings: Callable[[], Settings]) -> datetime:
     """An ISO datetime that carries its UTC offset, returned in UTC; a naive one is a
     usage error (exit 2) before anything is written."""
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
-        raise _fail(f"{flag} {value!r} is not an ISO datetime", USAGE_ERROR) from None
+        raise _input_fail(f"{flag} {value!r} is not an ISO datetime", settings) from None
     if parsed.tzinfo is None:
-        raise _fail(
+        raise _input_fail(
             f"{flag} {value!r} has no UTC offset; give one, e.g. 2026-10-31T20:00:00+00:00",
-            USAGE_ERROR,
+            settings,
         )
     return parsed.astimezone(UTC)
 
 
-def _exposure_pins(values: Sequence[str]) -> dict[str, str]:
+def _exposure_pins(values: Sequence[str], settings: Callable[[], Settings]) -> dict[str, str]:
     """`--pin name=value` pairs; one without an `=` or a name is a usage error."""
     pins: dict[str, str] = {}
     for item in values:
         name, sep, value = item.partition("=")
         if not sep or not name.strip():
-            raise _fail(f"--pin {item!r} must be <name>=<value>", USAGE_ERROR)
+            raise _input_fail(f"--pin {item!r} must be <name>=<value>", settings)
         pins[name.strip()] = value
     return pins
 
@@ -1519,7 +1526,9 @@ def _read_config(path: Path, settings: Settings) -> dict[str, Any]:
     return config
 
 
-def _sealed_periods(extra: Sequence[str]) -> list[tuple[date, date]]:
+def _sealed_periods(
+    extra: Sequence[str], settings: Callable[[], Settings]
+) -> list[tuple[date, date]]:
     """The `--sealed-period <start> <end>` pairs from the command's extra
     arguments (Typer cannot declare a repeated two-value option). Any other
     extra argument, such as an unknown flag, is a usage error."""
@@ -1528,11 +1537,11 @@ def _sealed_periods(extra: Sequence[str]) -> list[tuple[date, date]]:
     while rest:
         flag = rest.pop(0)
         if flag != "--sealed-period":
-            raise _fail(f"no such option or argument: {flag}", USAGE_ERROR)
+            raise _input_fail(f"no such option or argument: {flag}", settings)
         if len(rest) < 2 or any(v.startswith("--") for v in rest[:2]):
             raise _fail("--sealed-period takes two dates, <start> <end>", USAGE_ERROR)
-        start = _parse_day("--sealed-period", rest.pop(0))
-        end = _parse_day("--sealed-period", rest.pop(0))
+        start = _parse_day("--sealed-period", rest.pop(0), settings)
+        end = _parse_day("--sealed-period", rest.pop(0), settings)
         assert start is not None and end is not None
         if end < start:
             raise _fail(f"--sealed-period end {end} is before its start {start}", USAGE_ERROR)
@@ -1806,16 +1815,16 @@ def _code_version_text() -> str:
     return f"{commit}+dirty" if dirty else commit
 
 
-def _parse_as_of(value: str) -> datetime:
+def _parse_as_of(value: str, settings: Callable[[], Settings]) -> datetime:
     """`--as-of`: an ISO datetime carrying its UTC offset, returned in UTC."""
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
-        raise _fail(f"--as-of {value!r} is not an ISO datetime", USAGE_ERROR) from None
+        raise _input_fail(f"--as-of {value!r} is not an ISO datetime", settings) from None
     if parsed.tzinfo is None:
-        raise _fail(
+        raise _input_fail(
             f"--as-of {value!r} has no UTC offset; give one, e.g. 2026-10-09T00:00:00+00:00",
-            USAGE_ERROR,
+            settings,
         )
     return parsed.astimezone(UTC)
 
@@ -2762,10 +2771,10 @@ def make_app(
     ) -> None:
         """Bring the store up to the expected session, or backfill it."""
         if source not in ("all", *SOURCES, ASSETS_SOURCE, "openfigi"):
-            raise _fail(
+            raise _input_fail(
                 "--source must be all, "
                 f"{' or '.join((*SOURCES, ASSETS_SOURCE, 'openfigi'))}; got {source!r}",
-                USAGE_ERROR,
+                settings,
             )
         if census_sec_forms:
             _census_sec_forms(
@@ -2889,19 +2898,21 @@ def make_app(
                 raise _fail("--security needs --fill-holes", USAGE_ERROR)
             named = [part.strip() for value in security for part in value.split(",")]
             if not all(named):
-                raise _fail(f"--security takes non-blank ids, got {security!r}", USAGE_ERROR)
+                raise _input_fail(f"--security takes non-blank ids, got {security!r}", settings)
         start: date | None = None
         if since is not None:
             try:
                 start = date.fromisoformat(since)
             except ValueError:
-                raise _fail(f"--since must be YYYY-MM-DD, got {since!r}", USAGE_ERROR) from None
+                raise _input_fail(f"--since must be YYYY-MM-DD, got {since!r}", settings) from None
         through_date: date | None = None
         if through is not None:
             try:
                 through_date = date.fromisoformat(through)
             except ValueError:
-                raise _fail(f"--through must be YYYY-MM-DD, got {through!r}", USAGE_ERROR) from None
+                raise _input_fail(
+                    f"--through must be YYYY-MM-DD, got {through!r}", settings
+                ) from None
         base = settings()  # the edges get the caller's own Settings; only the store wait differs
         s = _writer_settings(base)
         scheduled_ingest = (
@@ -3124,7 +3135,7 @@ def make_app(
         exchange: Annotated[str | None, typer.Option(help="listing exchange, to seed it")] = None,
     ) -> None:
         """Seed (if missing) and backfill one configured benchmark's bars (#840)."""
-        start = _parse_day("--since", since) or date.min
+        start = _parse_day("--since", since, settings) or date.min
         given = [cik, name, exchange]
         if any(v is not None for v in given) and not all(v is not None for v in given):
             raise _fail("--cik, --name and --exchange go together", USAGE_ERROR)
@@ -3209,8 +3220,8 @@ def make_app(
         ] = None,
     ) -> None:
         """Delete one security's Alpaca bars and actions, every revision, on a session range."""
-        first = _parse_day("--from", from_)
-        last = _parse_day("--to", to)
+        first = _parse_day("--from", from_, settings)
+        last = _parse_day("--to", to, settings)
         assert first is not None and last is not None
         expect = _repair_expect(dry_run, expect_bar_rows, expect_action_rows, release)
         s = settings()
@@ -3404,7 +3415,7 @@ def make_app(
         ] = None,
     ) -> None:
         """Delete the reviewed list's duplicate cash dividend rows (#1613)."""
-        last = _parse_day("--to", to)
+        last = _parse_day("--to", to, settings)
         expect: int | None = None
         if not dry_run:
             if expect_action_rows is None:
@@ -3461,8 +3472,8 @@ def make_app(
     ) -> None:
         """Ask Alpaca again for the splits and dividends of committed months (#3054),
         or, with --span, of named securities over the whole range at once (#3074)."""
-        start = _parse_day("--since", since)
-        last = _parse_day("--through", through)
+        start = _parse_day("--since", since, settings)
+        last = _parse_day("--through", through, settings)
         assert start is not None and last is not None
         if last < start:
             raise _fail("--through must be on or after --since", USAGE_ERROR)
@@ -3573,8 +3584,8 @@ def make_app(
         ] = False,
     ) -> None:
         """Ask Alpaca for spin-offs per symbol before the actions floor (#3058)."""
-        start = _parse_day("--since", since)
-        last = _parse_day("--through", through)
+        start = _parse_day("--since", since, settings)
+        last = _parse_day("--through", through, settings)
         assert start is not None
         if not dry_run and _blank_text(release):
             raise _fail(
@@ -3726,11 +3737,13 @@ def make_app(
             try:
                 expected = datetime.fromisoformat(expect_known_at)
             except ValueError:
-                raise _fail(
-                    f"--expect-known-at {expect_known_at!r} is not an ISO datetime", USAGE_ERROR
+                raise _input_fail(
+                    f"--expect-known-at {expect_known_at!r} is not an ISO datetime", settings
                 ) from None
             if expected.tzinfo is None:
-                raise _fail(f"--expect-known-at {expect_known_at!r} has no UTC offset", USAGE_ERROR)
+                raise _input_fail(
+                    f"--expect-known-at {expect_known_at!r} has no UTC offset", settings
+                )
         s = settings()
         if (missing := _store_missing(s)) is not None:
             raise missing
@@ -3918,7 +3931,7 @@ def make_app(
         ] = None,
     ) -> None:
         """Print the data-health report."""
-        cutoff = _parse_day("--jumps-before", jumps_before)
+        cutoff = _parse_day("--jumps-before", jumps_before, settings)
         s = settings()
         if check and coverage is False and s.coverage.computed_by_default:
             raise _fail(
@@ -4060,7 +4073,7 @@ def make_app(
         ] = None,
     ) -> None:
         """Run a registered hypothesis as one trial on the store."""
-        first, last = _parse_day("--start", start), _parse_day("--end", end)
+        first, last = _parse_day("--start", start, settings), _parse_day("--end", end, settings)
         if spend_holdout and _blank_text(holdout_reason):
             raise _fail("--spend-holdout needs --holdout-reason", USAGE_ERROR)
         if holdout_reason is not None and not spend_holdout:
@@ -4321,8 +4334,8 @@ def make_app(
         """Close the open release: write its `after` row with the sessions touched."""
         if reason is not None and not reason.strip():
             raise _fail("--reason must not be blank", USAGE_ERROR)
-        first = _parse_day("--from", from_)
-        last = _parse_day("--to", to)
+        first = _parse_day("--from", from_, settings)
+        last = _parse_day("--to", to, settings)
         assert first is not None and last is not None
         s = settings()
         if (missing := _store_missing(s)) is not None:
@@ -4398,7 +4411,7 @@ def make_app(
         """Set the development boundary: a new row, never an edit (ADR 0016)."""
         if not reason.strip():
             raise _fail("--reason must not be blank", USAGE_ERROR)
-        day = _parse_day("--date", date_)
+        day = _parse_day("--date", date_, settings)
         assert day is not None
         s = settings()
         if (missing := _store_missing(s)) is not None:
@@ -4893,16 +4906,18 @@ def make_app(
         s = settings()
         if probe_unavailable != (reason is not None):
             raise _fail("--probe-unavailable and --reason go together", USAGE_ERROR)
-        start = _parse_day("--window-start", window_start)
-        end = _parse_day("--window-end", window_end)
+        start = _parse_day("--window-start", window_start, settings)
+        end = _parse_day("--window-end", window_end, settings)
         assert start is not None and end is not None
         spec = research.ExposureInput(
             candidate_ref=candidate,
             source=source,
             kill_line_url=kill_line_url,
             kill_line_file=kill_line_file,
-            kill_line_posted_at=_parse_aware("--kill-line-posted-at", kill_line_posted_at),
-            read_at=_parse_aware("--read-at", read_at),
+            kill_line_posted_at=_parse_aware(
+                "--kill-line-posted-at", kill_line_posted_at, settings
+            ),
+            read_at=_parse_aware("--read-at", read_at, settings),
             window_start=start,
             window_end=end,
             n_configurations=configurations,
@@ -4913,7 +4928,7 @@ def make_app(
             probe_sha256=probe_sha256,
             probe_unavailable_reason=reason if probe_unavailable else None,
             inputs=tuple(input_files or ()),
-            pins=_exposure_pins(pin or ()),
+            pins=_exposure_pins(pin or (), settings),
             audit_url=audit_url,
             holdout_reason=holdout_reason,
             note=note,
@@ -4943,7 +4958,7 @@ def make_app(
         s = settings()
         if candidates != (since is not None):
             raise _fail("--candidates and --since go together", USAGE_ERROR)
-        since_day = _parse_day("--since", since)
+        since_day = _parse_day("--since", since, settings)
         if (missing := _store_missing(s)) is not None:
             raise missing
         try:
@@ -5123,7 +5138,7 @@ def make_app(
         try:
             days = [date.fromisoformat(d) for d in file_date or ()]
         except ValueError as exc:
-            raise _fail(f"rederive refused: --file-date {exc}", 2) from None
+            raise _fail(_scrubbed(f"rederive refused: --file-date {exc}", s), 2) from None
         try:
             lines = archive_cmd.rederive(
                 s,
@@ -5171,9 +5186,9 @@ def make_app(
     ) -> None:
         """Register a dataset version. `--sealed-period <start> <end>` (repeatable)
         seals a period of source events."""
-        periods = _sealed_periods(ctx.args)
-        start = _parse_day("--event-start", event_start)
-        end = _parse_day("--event-end", event_end)
+        periods = _sealed_periods(ctx.args, settings)
+        start = _parse_day("--event-start", event_start, settings)
+        end = _parse_day("--event-end", event_end, settings)
         assert start is not None and end is not None
         s = settings()
         explicit_sealed = tuple(sealed or ())
@@ -5297,9 +5312,9 @@ def make_app(
         ] = departure_fetch.DEFAULT_MAX_REQUESTS,
     ) -> None:
         """Fetch the departure-reason corpus (Form 25s, notices, one 8-K each)."""
-        start = _parse_day("--since", since)
+        start = _parse_day("--since", since, settings)
         assert start is not None
-        end = _parse_day("--until", until)
+        end = _parse_day("--until", until, settings)
         if limit is not None and limit < 1:
             raise _fail("--limit must be at least 1", USAGE_ERROR)
         if max_requests < 0:
@@ -5307,7 +5322,7 @@ def make_app(
         ciks = tuple(c.strip() for c in cik or ())
         bad = [c for c in ciks if not (c.isascii() and c.isdigit())]
         if bad:
-            raise _fail(f"--cik must be digits: {', '.join(bad)}", USAGE_ERROR)
+            raise _input_fail(f"--cik must be digits: {', '.join(bad)}", settings)
         s = settings()
         missing = _missing_secrets(s, "edgar")
         if missing:
@@ -5354,7 +5369,7 @@ def make_app(
         ] = False,
     ) -> None:
         """Build the departure-reason frame: the rule answer of every listing end at t."""
-        t = _parse_as_of(as_of)
+        t = _parse_as_of(as_of, settings)
         s = settings()
         if t > ensure_tz_aware_utc(clock(), field_name="clock()"):
             raise _fail(f"--as-of {t.isoformat()} is in the future", USAGE_ERROR)
@@ -5584,8 +5599,8 @@ def make_app(
         holdout_reason: Annotated[str | None, typer.Option(help="why the period is spent")] = None,
     ) -> None:
         """Label one batch with the pinned model (or, with --dry-run, estimate it)."""
-        start = _parse_day("--accepted-from", accepted_from)
-        end = _parse_day("--accepted-to", accepted_to)
+        start = _parse_day("--accepted-from", accepted_from, settings)
+        end = _parse_day("--accepted-to", accepted_to, settings)
         if limit is not None and limit < 1:
             raise _fail("--limit must be at least 1", USAGE_ERROR)
         if configurations < 1:
@@ -6180,7 +6195,7 @@ def make_app(
         """The book's measured per-side cost against the open, from its own orders and
         fills (paper spec amendment 2026-11-07 #3118 item 3); read-only."""
         chosen = _checked_book(book)
-        last = _parse_day("--through", through)
+        last = _parse_day("--through", through, settings)
         if last is not None and not _is_session(last):
             raise _fail(f"--through must be an XNYS session, got {through}", USAGE_ERROR)
         s = paper_settings()
@@ -6452,7 +6467,7 @@ def make_app(
     ) -> None:
         """Append an override to the book's window through the override page's
         writer (spec req 9)."""
-        day = _parse_day("--session", session)
+        day = _parse_day("--session", session, settings)
         chosen = _checked_book(book)
         s = paper_settings(reason)
         if kind != "engage_kill_switch":
