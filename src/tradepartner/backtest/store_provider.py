@@ -145,6 +145,7 @@ from tradepartner.store.asof import (
     adjusted_prices_as_of,
     dropped_dividends_as_of,
     listings_as_of,
+    live_actions_as_of,
     live_chains,
     marking_changed_ids_as_of,
     mergers_as_of,
@@ -172,6 +173,28 @@ _LATE_SPLIT_SCHEMA: Final = dict(
 #: Two split factors this close are one: `r1 * r2 / r1 / r2` on one ex-date is 1 up to
 #: rounding, never a re-base.
 _SAME_FACTOR: Final = 1e-12
+
+
+def _rekeyed_splits(
+    actions: pl.DataFrame, successor: Mapping[str, str], session: date
+) -> list[tuple[tuple[str, date], float]]:
+    """`((security_id, ex_date), ratio)` of the live splits in `actions` with an ex-date
+    on or before `session`, each re-keyed to its successor, one per action identity
+    (#108: the source's id, else the ex-date): when a predecessor and its successor
+    both carry one identity, the successor's own row is kept, the rule
+    `live_actions_as_of` applies under a chain (#821)."""
+    kept: dict[tuple[str, str, date | None], tuple[bool, date, float]] = {}
+    for row in actions.iter_rows(named=True):
+        if row["action_type"] != "split" or row["ex_date"] > session:
+            continue
+        sid = row["security_id"]
+        key = successor.get(sid, sid)
+        source_id = row["source_action_id"] or ""
+        identity = (key, source_id, None if source_id else row["ex_date"])
+        own = key == sid
+        if identity not in kept or (own and not kept[identity][0]):
+            kept[identity] = (own, row["ex_date"], row["ratio_or_amount"])
+    return [((key, ex_date), ratio) for (key, _, _), (_, ex_date, ratio) in kept.items()]
 
 
 def _successors(chains: Sequence[tuple[str, str]]) -> dict[str, str]:
@@ -420,7 +443,9 @@ class StoreProvider:
         splits (latest revision per identity, a cancelled one dropped, #108), the list
         the marking frame's adjustment applies. A predecessor's splits read at `t_prev`
         are keyed by its successor in the chains known at `t` (#821), as `t`'s read
-        keys them, so a chain first known in the window moves no factor."""
+        keys them, one row per action identity with the successor's own row winning a
+        shared one (`_rekeyed_splits`), so a chain first known in the window moves no
+        factor, even for a split the vendor stored on both ids."""
         t, t_prev, wanted = check_t(t), check_t(t_prev, name="t_prev"), _ids(ids)
         if t_prev >= t:
             raise ValueError(f"t_prev {t_prev.isoformat()} is not before t {t.isoformat()}")
@@ -433,10 +458,10 @@ class StoreProvider:
         for sid, splits in _split_factors(conn, t, wanted, prev_session).items():
             for ex_date, ratio in splits:
                 factors[(sid, ex_date)] = factors.get((sid, ex_date), 1.0) * ratio
-        for sid, splits in _split_factors(conn, t_prev, before_ids, prev_session).items():
-            for ex_date, ratio in splits:
-                key = (successor.get(sid, sid), ex_date)
-                factors[key] = factors.get(key, 1.0) / ratio
+        for (sid, ex_date), ratio in _rekeyed_splits(
+            live_actions_as_of(conn, t_prev, before_ids), successor, prev_session
+        ):
+            factors[(sid, ex_date)] = factors.get((sid, ex_date), 1.0) / ratio
         rows = [
             (sid, ex_date, factor)
             for (sid, ex_date), factor in sorted(factors.items())

@@ -765,9 +765,12 @@ def _rebase_late_splits(book: _Book, late: pl.DataFrame, signed: bool) -> int:
     prices it from that mark, so only the count moves. Otherwise a fill or an exit has
     already traded on the unrepaired value (or, in a signed book, a drift-cover test has
     weighed it), no re-base can make the book tradable, and the trial is refused with a
-    `ValueError` naming the split. A benchmark has no fill after F_0, so its value is
-    re-based whenever its mark crossed an ex-date after F_0; it adds nothing to the
-    count, which is the strategy's."""
+    `ValueError` naming the split. A name no longer held is refused even when its exit
+    was at a mark before the ex-date (a stale exit that booked nothing): the book keeps
+    no history to tell, so it fails closed. At `daily` cadence the last fill is T_i, at
+    or after every such ex-date, so every booked late split refuses. A benchmark has
+    no fill after F_0, so its value is re-based whenever its mark crossed an ex-date
+    after F_0; it adds nothing to the count, which is the strategy's."""
     fills = [row.fill_session for row in book.rebalances]
     n_late = 0
     for sid, ex, ratio in late.select("security_id", "ex_date", "ratio").iter_rows():

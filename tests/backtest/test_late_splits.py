@@ -19,14 +19,17 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
+from types import SimpleNamespace
+from typing import Any, cast
 
 import polars as pl
 import pytest
 
 from backtest.fake_provider import FakeProvider
+from tradepartner.backtest import engine
 from tradepartner.backtest.engine import BacktestResult, run
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
-from tradepartner.calendar import all_sessions, session_close
+from tradepartner.calendar import all_sessions, previous_session, session_close
 from tradepartner.config import Settings
 from tradepartner.store import registry
 
@@ -42,6 +45,8 @@ TOO_LATE = datetime(2024, 4, 2, 21, 30, tzinfo=UTC)
 ON_TIME = datetime(2024, 2, 14, 21, 30, tzinfo=UTC)
 
 Split = tuple[str, str, date, float, datetime]  # security, action id, ex-date, ratio, known_at
+#: A `Split` revision with this ratio cancels the action (`cancelled` on the fake's row).
+CANCEL = 0.0
 
 
 def _handle() -> registry.TrialHandle:
@@ -78,7 +83,10 @@ def _frame(
     jump date, and each adjusted revision divides a bar before a live split's ex-date by
     its ratio, the store's rule."""
     rows = pl.DataFrame(
-        [(sid, action, ex, ratio, False, known) for sid, action, ex, ratio, known in splits],
+        [
+            (sid, action, ex, ratio, ratio == CANCEL, known)
+            for sid, action, ex, ratio, known in splits
+        ],
         schema={
             "security_id": pl.Utf8,
             "action_id": pl.Utf8,
@@ -96,7 +104,7 @@ def _frame(
         for sid, action, ex, ratio, known in splits:
             if known <= at and ((sid, action) not in latest or latest[(sid, action)][0] < known):
                 latest[(sid, action)] = (known, ex, ratio)
-        return [(sid, ex, ratio) for (sid, _), (_, ex, ratio) in latest.items()]
+        return [(sid, ex, ratio) for (sid, _), (_, ex, ratio) in latest.items() if ratio != CANCEL]
 
     adjusted, raw = [], []
     for sid in sorted(jumps):
@@ -238,3 +246,91 @@ def test_no_look_ahead_the_step_before_the_split_is_known_never_sees_it() -> Non
     reads = [call for call in probe.calls if call.method == "late_splits"]
     assert reads and all(call.t_prev is not None and call.t_prev < call.t for call in reads)
     assert probe.read_times() <= {read_time(t) for t in rebalance_sessions(T0, T2)}
+
+
+def test_a_split_cancelled_after_its_ex_date_is_undone() -> None:
+    """A 2:1 known in time for 02-15 that never happened (the price never moves),
+    cancelled 03-04: step 0 booked a fake +100% on A; step 1 multiplies by 1/2 before
+    its fill, so the book equals one that never knew the split."""
+    jumps = {"A": (EX, 100.0, 100.0), "B": (EX, 5.0, 5.0)}
+    cancelled = [("A", "a", EX, 2.0, ON_TIME), ("A", "a", EX, CANCEL, LATE)]
+    got = _run(_provider(jumps, cancelled), T2)
+    want = _run(_provider(jumps, []), T2)
+    e_got, e_want = _equity(got), _equity(want)
+    for session in e_got:
+        if session >= F1:
+            assert e_got[session] == pytest.approx(e_want[session], rel=1e-12), session
+    assert e_got[T1] > 1.4 * e_want[T1]
+    assert _late_counts(got)[T1] == 1
+
+
+def _book(
+    positions: dict[str, float],
+    marked: dict[str, date],
+    held: dict[str, set[date]],
+    fills: Sequence[date],
+) -> engine._Book:
+    book = engine._Book(level=LEVEL, cash=0.0, positions=dict(positions))
+    book.marked_at, book.held_on = dict(marked), {sid: set(days) for sid, days in held.items()}
+    book.rebalances = cast(Any, [SimpleNamespace(fill_session=day) for day in fills])
+    return book
+
+
+def _late(*rows: tuple[str, date, float]) -> pl.DataFrame:
+    return pl.DataFrame(
+        list(rows),
+        schema={"security_id": pl.Utf8, "ex_date": pl.Date, "ratio": pl.Float64},
+        orient="row",
+    )
+
+
+HELD = {previous_session(EX), EX, T1}
+
+
+class TestRebaseBranches:
+    """`_rebase_late_splits`' branches one by one (quant-auditor, #3112)."""
+
+    def test_held_across_with_no_fill_since_is_multiplied(self) -> None:
+        book = _book({"A": 500.0}, {"A": T1}, {"A": HELD}, [F0])
+        assert engine._rebase_late_splits(book, _late(("A", EX, 2.0)), signed=False) == 1
+        assert book.positions == {"A": 1000.0}
+
+    def test_a_mark_before_the_ex_date_is_counted_not_rebased(self) -> None:
+        """A halted name last marked before the ex-date booked nothing: this step's
+        frame prices it from that mark, so a re-base would apply the split twice."""
+        halted = date(2024, 2, 12)
+        book = _book({"A": 500.0}, {"A": halted}, {"A": HELD}, [F0])
+        assert engine._rebase_late_splits(book, _late(("A", EX, 2.0)), signed=False) == 1
+        assert book.positions == {"A": 500.0}
+
+    def test_a_name_not_held_before_the_ex_date_is_left_alone(self) -> None:
+        book = _book({"A": 500.0}, {"A": T1}, {"A": {EX, T1}}, [F0])
+        assert engine._rebase_late_splits(book, _late(("A", EX, 2.0)), signed=False) == 0
+        assert book.positions == {"A": 500.0}
+
+    @pytest.mark.parametrize(
+        ("positions", "fills", "signed"),
+        [
+            ({}, [F0], False),  # sold or exited since the ex-date: the jump is in cash
+            ({"A": 500.0}, [F0, date(2024, 2, 16)], False),  # a fill since sized from it
+            ({"A": 500.0}, [F0], True),  # a signed book's cover tests weighed it
+        ],
+        ids=["exited", "filled-since", "long-short"],
+    )
+    def test_an_unrepairable_late_split_refuses_the_trial(
+        self, positions: dict[str, float], fills: list[date], signed: bool
+    ) -> None:
+        book = _book(positions, {"A": T1}, {"A": HELD}, fills)
+        with pytest.raises(ValueError, match=r"late split on A ex 2024-02-15"):
+            engine._rebase_late_splits(book, _late(("A", EX, 2.0)), signed=signed)
+
+    def test_a_benchmark_is_rebased_only_after_its_buy(self) -> None:
+        book = _book({}, {}, {}, [F0])
+        book.benchmarks = {
+            "SPY": engine._Holding("S", cash=0.0, value=500.0, marked_at=T1),
+            "MTUM": engine._Holding("M", cash=0.0, value=500.0, marked_at=T1),
+        }
+        late = _late(("S", EX, 2.0), ("M", F0, 2.0))
+        assert engine._rebase_late_splits(book, late, signed=False) == 0
+        assert book.benchmarks["SPY"].value == 1000.0  # marked across 02-15 after F0
+        assert book.benchmarks["MTUM"].value == 500.0  # bought on the ex-date: no jump
