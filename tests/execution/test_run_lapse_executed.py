@@ -59,3 +59,5 @@ def test_a_traded_rebalance_with_open_remainders_lapses_executed_not_missed(
     assert later.status == "ok", env.result(later.run_id)
     assert env.rebalance_events() == [(T_0, "executed", None, later.run_id)]
     assert env.alerts("missed_rebalance") == []
+    message = env.result(later.run_id)[2] or ""
+    assert "executed at its lapse" in message and "SEC_TRANSFER" in message

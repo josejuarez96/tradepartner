@@ -260,6 +260,7 @@ from tradepartner.execution.outcomes import write_outcomes_and_lots
 from tradepartner.execution.plan import (
     DecisionState,
     RebalanceState,
+    State,
     decision_state,
     rebalance_state,
     residue,
@@ -2279,15 +2280,16 @@ class _Run:
         with open_read_only(self.settings, retry=True) as conn:
             inputs = window_journal_inputs(conn, self.window_id)
         prices = self._pending_prices(actions)
-        traded = {
-            lapse.rebalance_session
-            for lapse in missed
-            if traded_at_lapse(
-                self._decision_states(lapse.rebalance_session, inputs, actions, prices),
-                inputs.orders,
-                inputs.fills,
-            )
-        }
+        left: dict[date, list[tuple[str | None, str, float]]] = {}
+        for lapse in missed:
+            states = self._decision_states(lapse.rebalance_session, inputs, actions, prices)
+            if traded_at_lapse(states, inputs.orders, inputs.order_events, inputs.fills):
+                left[lapse.rebalance_session] = [
+                    (d.side, d.security_id, s.remainder.notional)
+                    for d, s in states
+                    if s.state is State.OPEN and s.remainder is not None
+                ]
+        traded = set(left)
         missed = [lapse for lapse in missed if lapse.rebalance_session not in traded]
         stamp = self.gate.read_clock()
         with self.connect() as conn:
@@ -2315,10 +2317,14 @@ class _Run:
                     ),
                 )
         for t_i in sorted(traded):
+            total = sum(notional for _, _, notional in left[t_i])
             self.notes.append(
-                f"rebalance {t_i.isoformat()} executed at its lapse: every decision was sent "
-                "and filled; its small open remainders are not traded further"
+                f"rebalance {t_i.isoformat()} executed at its lapse: every order filled; "
+                f"open remainders not traded further ({total:.2f} in all): "
+                + ", ".join(f"{side} {sid} {notional:.2f}" for side, sid, notional in left[t_i])
             )
+        # Idle cash of a rebalance executed here is judged like any other executed one.
+        self._unspent_cash(sorted(traded))
         if not missed:
             return
         self._alert(

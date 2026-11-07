@@ -977,10 +977,13 @@ def test_a_rebalance_whose_every_decision_was_sent_and_filled_traded_at_lapse() 
         (sell, DecisionState(State.SETTLED)),
         (skip, DecisionState(State.CLOSED, "skip_below_minimum")),
     ]
-    assert traded_at_lapse(states, [o_buy, o_sell], fills)
+    events = [_event(o_buy, "filled"), _event(o_sell, "filled")]
+    assert traded_at_lapse(states, [o_buy, o_sell], events, fills)
 
 
-@pytest.mark.parametrize("case", ["never_sent", "sent_never_filled", "in_flight", "empty"])
+@pytest.mark.parametrize(
+    "case", ["never_sent", "sent_never_filled", "partly_filled_expired", "in_flight", "empty"]
+)
 def test_a_rebalance_with_an_unsent_unfilled_or_in_flight_decision_did_not_trade(
     case: str,
 ) -> None:
@@ -988,11 +991,14 @@ def test_a_rebalance_with_an_unsent_unfilled_or_in_flight_decision_did_not_trade
     order = _order(buy, T0, notional=500.0, sells_in_flight=True)
     open_state = DecisionState(State.OPEN, remainder=Remainder(10.0, 500.0))
     if case == "never_sent":  # a halt before the buys (the 10-28 case)
-        assert not traded_at_lapse([(buy, open_state)], [], [])
+        assert not traded_at_lapse([(buy, open_state)], [], [], [])
     elif case == "sent_never_filled":
-        assert not traded_at_lapse([(buy, open_state)], [order], [])
+        assert not traded_at_lapse([(buy, open_state)], [order], [_event(order, "expired")], [])
+    elif case == "partly_filled_expired":  # review on #3145: 1% filled is not traded
+        events = [_event(order, "expired")]
+        assert not traded_at_lapse([(buy, open_state)], [order], events, [_fill(order, 0.1, PRICE)])
     elif case == "in_flight":
         state = DecisionState(State.IN_FLIGHT)
-        assert not traded_at_lapse([(buy, state)], [order], [_fill(order, 1.0, PRICE)])
+        assert not traded_at_lapse([(buy, state)], [order], [], [_fill(order, 1.0, PRICE)])
     else:
-        assert not traded_at_lapse([], [], [])
+        assert not traded_at_lapse([], [], [], [])
