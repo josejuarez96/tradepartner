@@ -3689,6 +3689,7 @@ def test_filename_fetch_workers_defaults_to_four_and_refuses_zero() -> None:
         Settings(_env_file=None, edgar={"filename_fetch_workers": 0})
 
 
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize("workers", [2, 4, 8])
 def test_filename_pool_answer_is_byte_identical_to_the_sequential_fetch(
     tmp_path: Path, workers: int
@@ -3704,6 +3705,44 @@ def test_filename_pool_answer_is_byte_identical_to_the_sequential_fetch(
     seq_router = _fn_router()
     _fn_run(tmp_path / "again", seq_router, 1)
     assert sorted(router.urls) == sorted(seq_router.urls)
+
+
+@pytest.mark.timeout(60)
+def test_filename_pool_finishes_after_a_leaked_limiter_stamp(tmp_path: Path) -> None:
+    """#3039: the CI hang. Another test's fake clock left the process-wide
+    limiter's stamp far ahead of the real `time.monotonic()`; the pool's
+    first request slept the whole gap under the limiter lock and every
+    worker queued behind it. Each wait is now at most one interval."""
+    edgar_raw._LIMITER._last_request_monotonic = time.monotonic() + 100_000.0
+    started = time.monotonic()
+    result = _fn_run(tmp_path, _fn_router(), 2)
+    assert time.monotonic() - started < 30.0
+    assert [e.accession for e in result["listings"]] == [_FN_A, _FN_B, _FN_25_NASDAQ, _FN_COVER]
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("workers", [2, 4])
+def test_filename_pool_job_started_after_its_turn_still_answers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workers: int
+) -> None:
+    """#3039: the second CI hang. The caller takes each prefetched future in
+    order, removing it from the dict it was handed; a job a worker picked up
+    only after its turn came found no future, died in the pool unseen, and
+    the caller waited on that future forever. Here every job starts late, so
+    every turn comes first: the answer is still the sequential one."""
+    real_pool = edgar_source_module.ThreadPoolExecutor
+
+    class LateStart(real_pool):  # type: ignore[misc, valid-type]
+        def map(self, fn: Any, *iterables: Any, **kwargs: Any) -> Any:
+            def late(*args: Any) -> Any:
+                time.sleep(0.2)  # the caller reaches its turn first
+                return fn(*args)
+
+            return super().map(late, *iterables, **kwargs)
+
+    sequential = _fn_run(tmp_path / "one", _fn_router(), 1)
+    monkeypatch.setattr(edgar_source_module, "ThreadPoolExecutor", LateStart)
+    assert _fn_run(tmp_path / "pool", _fn_router(), workers) == sequential
 
 
 def test_filename_pool_of_one_is_todays_sequential_path(
