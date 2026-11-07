@@ -25,17 +25,24 @@ from tradepartner.adapters.fixture_filings import FixtureFilingSource
 from tradepartner.config import Settings
 from tradepartner.store.classify import (
     _EDGAR,
+    BDC_ELECTION_FORMS,
+    BDC_WITHDRAWAL_FORMS,
+    CLOSED_END_REPORT_FORMS,
     COMMON,
     DOMESTIC_FORMS,
     F6_FORMS,
     FOREIGN_FORMS,
     FUND_FORMS,
+    N2_FORM,
+    PERIODIC_FORMS,
     SPAC_SIC,
     UNCLASSIFIABLE,
     ClassificationBuild,
     _base_form,
     _title_type,
     build_classifications,
+    is_partnership_name,
+    is_partnership_title,
     ticker_suffix_type,
 )
 from tradepartner.store.master import MasterBuild
@@ -54,6 +61,7 @@ EPOCH = datetime(2000, 1, 3, 21, 0, tzinfo=UTC)
 class _RefEvidence:
     forms: tuple[tuple[datetime, str], ...]
     sics: tuple[tuple[datetime, int], ...]
+    names: tuple[tuple[datetime, str], ...] = ()
 
 
 def _reference_classify(
@@ -79,8 +87,12 @@ def _reference_classify(
         return "spac", "sic_6770", sic, "filing"
     known = [row for row in listings if row["known_at"] <= t]
     titled = [row for row in known if row["class_title"] is not None]
+    # #3076: no `common` before a header SIC or a periodic report.
+    waiting = sic is None and not any(form in PERIODIC_FORMS for form in forms)
     if titled:
         security_type, rule = _title_type(titled[-1]["class_title"])
+        if security_type == COMMON and waiting:
+            return UNCLASSIFIABLE, "no_sic_or_periodic", sic, "filing"
         return security_type, rule, sic, "filing"
     if known:
         suffix_type = ticker_suffix_type(known[-1]["ticker"])
@@ -95,25 +107,56 @@ def _reference_classify(
                 "filing_name" if provenance == "filing_name" else "snapshot_static",
             )
     if domestic:
+        if waiting:
+            return UNCLASSIFIABLE, "no_sic_or_periodic", sic, "filing"
         return COMMON, "common_default", sic, "filing"
     return UNCLASSIFIABLE, "no_rule_matched", sic, "filing"
+
+
+def _reference_tag(t: datetime, evidence: _RefEvidence, listings: Sequence[Row]) -> str | None:
+    """#3076's `issuer_class`, recomputed from every piece of evidence known at `t`."""
+    forms = [form for known_at, form in evidence.forms if known_at <= t]
+    sics = [sic for known_at, sic in evidence.sics if known_at <= t]
+    names = [name for known_at, name in evidence.names if known_at <= t]
+    if sics and sics[-1] == SPAC_SIC:
+        return "spac"
+    elections = [form for form in forms if form in BDC_ELECTION_FORMS | BDC_WITHDRAWAL_FORMS]
+    status = [form for form in forms if form in DOMESTIC_FORMS | FOREIGN_FORMS]
+    domestic = status[-1] in DOMESTIC_FORMS if status else None
+    elected = bool(elections) and elections[-1] in BDC_ELECTION_FORMS
+    n2 = N2_FORM in forms
+    closed_end = any(form in CLOSED_END_REPORT_FORMS for form in forms)
+    if elected or (n2 and domestic is True and not closed_end):
+        return "bdc"
+    titled = [r for r in listings if r["known_at"] <= t and r["class_title"] is not None]
+    if (names and is_partnership_name(names[-1])) or (
+        titled and is_partnership_title(titled[-1]["class_title"])
+    ):
+        return "mlp"
+    if domestic is False:
+        return "foreign"
+    return None
 
 
 def _reference_evidence(
     source: FixtureFilingSource, ciks: Iterable[str], settings: Settings
 ) -> dict[str, _RefEvidence]:
     wanted = set(ciks)
-    forms: dict[str, list[tuple[datetime, str, str]]] = defaultdict(list)
+    forms: dict[str, list[tuple[datetime, str, str, str]]] = defaultdict(list)
     for entry in source.filing_index():
         if entry.cik in wanted:
-            forms[entry.cik].append((entry.accepted_at, entry.accession, _base_form(entry.form)))
+            forms[entry.cik].append(
+                (entry.accepted_at, entry.accession, _base_form(entry.form), entry.company_name)
+            )
     out: dict[str, _RefEvidence] = {}
     for cik in wanted:
         headers = source.filing_headers(cik, settings.edgar.header_forms)
         sics = sorted((h.accepted_at, h.accession, h.sic) for h in headers if h.sic is not None)
+        ordered = sorted(forms[cik])
         out[cik] = _RefEvidence(
-            forms=tuple((stamp, form) for stamp, _, form in sorted(forms[cik])),
+            forms=tuple((stamp, form) for stamp, _, form, _ in ordered),
             sics=tuple((stamp, sic) for stamp, _, sic in sics),
+            names=tuple((stamp, name) for stamp, _, _, name in ordered),
         )
     return out
 
@@ -149,20 +192,22 @@ def _reference_build_classifications(
                 f"ingested_at {ingested_at.isoformat()}"
             )
         start = security["known_at"]
-        previous: tuple[str, str, int | None] | None = None
+        previous: tuple[str, str, int | None, str | None] | None = None
         for t in sorted({start} | {stamp for stamp in stamps if stamp > start}):
             security_type, rule, sic, provenance = _reference_classify(
                 t, facts, listings[security_id], benchmark
             )
-            if (security_type, rule, sic) == previous:
+            tag = None if benchmark is not None else _reference_tag(t, facts, listings[security_id])
+            if (security_type, rule, sic, tag) == previous:
                 continue
-            previous = (security_type, rule, sic)
+            previous = (security_type, rule, sic, tag)
             rows.append(
                 {
                     "security_id": security_id,
                     "sic": sic,
                     "security_type": security_type,
                     "rule": rule,
+                    "issuer_class": tag,
                     "known_at": t,
                     "ingested_at": ingested_at,
                     "source": security["source"] if benchmark is not None else _EDGAR,
@@ -180,6 +225,7 @@ _FORMS = (
     *sorted(FOREIGN_FORMS),
     *sorted(FUND_FORMS),
     *sorted(F6_FORMS),
+    *sorted(BDC_ELECTION_FORMS | BDC_WITHDRAWAL_FORMS | CLOSED_END_REPORT_FORMS),
     "10-K/A",
     "20-F/A",
     "6-K/A",
@@ -203,7 +249,10 @@ _TITLES = (
     "American Depositary Shares",
     "5.25% Senior Notes due 2030",
     "Shares of Beneficial Interest",
+    "Common Units representing limited partner interests",
 )
+#: Filing-index names, partnership and not (#3076).
+_NAMES = ("Co", "Co", "Co Inc", "Midstream Partners L.P.", "Fund LP /DE/", "Holdings LLC")
 _TICKERS = ("ABC", "ABC-WS", "ABCDW", "ABCDU", "ABC.U", "ABC-PA", "ABCDY", "BRK.B", "ABCDE")
 #: The provenances a `listings` row may carry (schema.TABLE_PROVENANCE_VALUES),
 #: drawn per scenario listing row so rule 7's written provenance varies: the
@@ -244,7 +293,7 @@ def _scenario(seed: int, companies: int) -> tuple[FixtureFilingSource, MasterBui
             acc = f"{cik}-{accession:08d}"
             at = stamp()
             form = rng.choice(_FORMS)
-            index.append(FilingIndexEntry(cik, "Co", form, acc, at))
+            index.append(FilingIndexEntry(cik, rng.choice(_NAMES), form, acc, at))
             if rng.random() < 0.6:
                 header_form = form if rng.random() < 0.5 else rng.choice(header_forms)
                 headers.append(FilingHeader(cik, acc, header_form, rng.choice(_SICS), at))

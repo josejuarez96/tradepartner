@@ -592,7 +592,8 @@ _TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ("security_id", "ticker", "exchange", "valid_from"),
         ("class_title", "retracted"),
     ),
-    "classifications": (("security_id",), ("sic", "security_type", "rule")),
+    # `issuer_class` (#3076, schema 48): a tag change alone is a new row.
+    "classifications": (("security_id",), ("sic", "security_type", "rule", "issuer_class")),
     "delistings": (
         ("security_id", "form", "class_title", "exchange", "filed_at"),
         ("effective_on",),
@@ -604,7 +605,7 @@ _TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 #: What makes an action row a new revision of its identity (`CorporateAction.same_values`).
 #: A value column a builder row may leave out, and what it means then: a
 #: master row is live unless a retraction says otherwise (#859).
-_VALUE_DEFAULTS: dict[str, Any] = {"retracted": False}
+_VALUE_DEFAULTS: dict[str, Any] = {"retracted": False, "issuer_class": None}
 
 _ACTION_VALUES: tuple[str, ...] = ("action_type", "ex_date", "ratio_or_amount", "cancelled")
 
