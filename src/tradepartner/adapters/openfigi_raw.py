@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -12,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from pydantic import SecretStr
 
 from tradepartner.cli_record import SCRUBBED, scrub_json
 from tradepartner.config import OpenfigiConfig
@@ -26,24 +26,26 @@ def _utc_clock(clock: Callable[[], datetime]) -> datetime:
     return value
 
 
-def _api_key() -> str:
-    """The key sent on the wire, from the process environment only."""
-    return os.environ.get("OPENFIGI_API_KEY", "").strip()
+def _api_key(api_key: SecretStr | None) -> str:
+    """The key sent on the wire: `Settings.openfigi_api_key`, stripped, or "" (#3153)."""
+    return "" if api_key is None else api_key.get_secret_value().strip()
 
 
 def map_tickers(
     tickers: Sequence[str],
     config: OpenfigiConfig,
     *,
+    api_key: SecretStr | None = None,
     client: httpx.Client | None = None,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> list[tuple[list[Any], datetime, datetime]]:
-    """Return (response, sent, received) for each batch in request order."""
+    """Return (response, sent, received) for each batch in request order. `api_key` is
+    `Settings.openfigi_api_key` (shell or `.env`); without one the keyless limits apply."""
     if not config.enabled:
         raise ValueError("OpenFIGI client is disabled")
-    key = _api_key()
+    key = _api_key(api_key)
     requests, window, jobs = config.limits(keyed=bool(key))
     headers = {"Content-Type": "application/json"}
     if key:
@@ -91,10 +93,17 @@ def map_tickers(
     return batches
 
 
-def record_mapping_fixture(path: Path, tickers: Sequence[str], responses: list[Any]) -> None:
-    """Write a scrubbed mapping fixture; never serialize the environment key."""
-    raw_key = os.environ.get("OPENFIGI_API_KEY", "")
-    key = _api_key()
+def record_mapping_fixture(
+    path: Path,
+    tickers: Sequence[str],
+    responses: list[Any],
+    *,
+    api_key: SecretStr | None = None,
+) -> None:
+    """Write a scrubbed mapping fixture; never serialize the key (`api_key`, as
+    `map_tickers` takes it)."""
+    raw_key = "" if api_key is None else api_key.get_secret_value()
+    key = _api_key(api_key)
     document = {
         "tickers": list(tickers),
         "responses": responses,
