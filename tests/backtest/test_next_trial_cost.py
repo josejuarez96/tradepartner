@@ -146,10 +146,18 @@ class _Clock:
         raise AssertionError("the close must not wait")
 
 
+@pytest.mark.parametrize("undefined", [False, True], ids=["defined-v", "undefined-v"])
 def test_sr_star_now_equals_what_the_real_sweep_close_stores_at_todays_n(
-    lab_store: duckdb.DuckDBPyConnection, settings: Settings, monkeypatch: pytest.MonkeyPatch
+    lab_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    undefined: bool,
 ) -> None:
+    """The preview equals the close; with V undefined (#3127) both use
+    `family_v_floor`, the preview through `undefined_floor`."""
     _family(lab_store, settings, [0.5, 0.52, 0.51])
+    if undefined:
+        monkeypatch.setattr(registry.FamilySharpes, "variance", lambda _self, _basis: None)
     first = lab_store.execute("SELECT MIN(hypothesis_id) FROM hypotheses").fetchone()[0]  # type: ignore[index]
     rules = lab_registry.write_family_rules(
         lab_store,
@@ -207,12 +215,18 @@ def test_sr_star_now_equals_what_the_real_sweep_close_stores_at_todays_n(
         [run_id],
     ).fetchall()
     cost = results.next_trial_cost(
-        lab_store, "momentum", basis="excess_spy", floor=rules.min_sharpe_variance_annual
+        lab_store,
+        "momentum",
+        basis="excess_spy",
+        floor=rules.min_sharpe_variance_annual,
+        undefined_floor=lab_registry.family_v_floor(rules),
     )
     assert n_end == cost.n_now == 3
     assert cost.floored is True
     assert stored > 0
     assert cost.sr_star_now == pytest.approx(stored)
+    if undefined:
+        assert cost.variance_used == pytest.approx(lab_registry.family_v_floor(rules))
 
 
 def test_unknown_v_without_a_floor_is_zero_and_says_so(
