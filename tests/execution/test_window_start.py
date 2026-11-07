@@ -915,6 +915,42 @@ def test_accepts_start_once_the_data_release_is_closed(
     assert result.window.window_id is not None
 
 
+class _ReleaseOpeningFake(CallCountingFake):
+    """A data release opens while `start` reads the broker (#3188)."""
+
+    def __init__(self, settings: Settings, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.settings = settings
+
+    def account(self) -> Account:
+        if not self.broker_calls:
+            with open_for_write(self.settings) as conn:
+                registry.open_data_release(
+                    conn, conn, name="repair-race", backup_path="data/x.duckdb", reason="#1 fix"
+                )
+        return super().account()
+
+
+def test_a_release_opened_after_the_read_is_refused_under_the_write(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """#3188: a release opened between the read chunk and the write is refused
+    (`release_open`) by the re-check under the write, and no window is added."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(conn, journal_settings, "h1", HOLDOUT_END_PAST)
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+    broker = _ReleaseOpeningFake(
+        journal_settings, clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, auto_fill=False
+    )
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, _connect(journal_settings), broker, fixed_clock, "h1")
+    assert exc.value.reason == "release_open"
+    assert "repair-race" in str(exc.value)
+    assert "account" in broker.broker_calls
+    with _connect(journal_settings)() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM paper_windows").fetchone() == (0,)
+
+
 def test_refuses_incomplete_holdout_end(
     journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
 ) -> None:

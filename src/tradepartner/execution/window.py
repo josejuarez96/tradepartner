@@ -16,9 +16,9 @@ session below, and picks the frozen `paper.min_rebalances`. Then, in order, it
 refuses, before any write:
 
 0. **A data release is open** (`release_open`, #3188; spec amendment
-   2026-11-07): `registry.open_release` finds a `before` row with no `after`
-   of its name, so a repair is still changing the store. Checked again in the
-   write chunk.
+   2026-11-07; after the sweep and family refusals above):
+   `registry.open_release` finds a `before` row with no `after` of its name,
+   so a repair is still changing the store. Checked again in the write chunk.
 1. **No `gap_signoff`.** `owner_decisions` must hold a row of kind
    `gap_signoff` for the hypothesis, referencing a trial that is `ok`,
    non-synthetic and `kind = in_sample` (ADR 0009 point 3). The decision
