@@ -114,7 +114,7 @@ from tradepartner.store.asof import (
     symbol_changes_as_of,
 )
 from tradepartner.store.db import insert_row, open_for_write, utc_now
-from tradepartner.store.delistings import listing_ends_as_of
+from tradepartner.store.delistings import delistings_as_of, listing_ends_as_of
 from tradepartner.store.dividend_reviews import DUPLICATE, ReviewedGroup, reviewed_groups
 from tradepartner.store.master import (
     RenameRefusal,
@@ -163,6 +163,7 @@ def store_resolver(
         quiet_after_days=settings.alpaca.registrant_quiet_days,
         transfer_window_sessions=settings.master.transfer_window_sessions,
         class_symbols=settings.alpaca.class_symbols,
+        filed_bars=filed_bars(conn, at),
     )
     return ListingResolver(
         listings_as_of(conn, at).iter_rows(named=True),
@@ -178,6 +179,45 @@ def store_resolver(
         symbol_changes=_symbol_changes(conn, at),
         chains=live_chains(conn, at),
     )
+
+
+def filed_bars(conn: duckdb.DuckDBPyConnection, at: datetime) -> dict[tuple[str, date], date]:
+    """Per `(security_id, New York day of a Form 25 acceptance)` of the
+    `delistings` known at `at`, the session of that security's last traded
+    Alpaca bar on or before that day known at `at` (#3056, rule 7's
+    stopped-before-filing cut): per session the latest revision known at
+    `at`, from an Alpaca source, with volume above zero, as `last_bar`
+    reads one. One query for every Form 25; a security with no such bar
+    is left out."""
+    at = ensure_tz_aware_utc(at, field_name="at")
+    filed = delistings_as_of(conn, at)
+    if filed.is_empty():
+        return {}
+    days = (
+        filed.select(
+            pl.col("security_id"),
+            pl.col("filed_at").dt.convert_time_zone("America/New_York").dt.date().alias("filed_on"),
+        )
+        .unique()
+        .sort("security_id", "filed_on")
+    )
+    conn.register("_filed_days", days)
+    try:
+        rows = conn.execute(
+            "SELECT d.security_id, d.filed_on, max(b.session) FROM _filed_days d"
+            " JOIN ("
+            "  SELECT security_id, session, volume FROM prices_daily"
+            "  WHERE known_at <= ? AND list_contains(?, source)"
+            "  AND security_id IN (SELECT security_id FROM _filed_days)"
+            "  QUALIFY row_number() OVER"
+            "    (PARTITION BY security_id, session ORDER BY known_at DESC) = 1"
+            " ) b ON b.security_id = d.security_id AND b.session <= d.filed_on"
+            " WHERE b.volume > 0 GROUP BY 1, 2",
+            [at, sorted(BAR_SOURCES)],
+        ).fetchall()
+    finally:
+        conn.unregister("_filed_days")
+    return {(str(sid), day): last for sid, day, last in rows}
 
 
 def _symbol_changes(conn: duckdb.DuckDBPyConnection, at: datetime) -> list[dict[str, Any]]:

@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import duckdb
@@ -5023,3 +5024,105 @@ def test_filing_index_naive_timestamp_fails(
     insert_row(loose_store, "filing_index", _fi_first())
     failed = _fi_failed(loose_store, settings)
     assert failed["filing_index_timestamps_aware"]["column"].to_list() == [column]
+
+
+# --- spliced_series (#3056) ---------------------------------------------------
+
+_SPLICED_RUN = datetime(2026, 10, 4, 18, tzinfo=UTC)
+
+
+def _splice_bar(sid: str, session: date, close: float) -> dict[str, Any]:
+    from tradepartner.calendar import session_close
+
+    return {
+        "security_id": sid,
+        "session": session,
+        "open": close,
+        "high": close,
+        "low": close,
+        "close": close,
+        "volume": 1_000,
+        "known_at": session_close(session),
+        "ingested_at": _SPLICED_RUN,
+        "source": "alpaca_sip",
+        "provenance": "bar",
+    }
+
+
+@pytest.fixture
+def splice_settings(tmp_path: Path) -> Settings:
+    """`_settings()` on a fresh tmp store file."""
+    return _settings().model_copy(
+        update={"store": _settings().store.model_copy(update={"path": str(tmp_path / "s.duckdb")})}
+    )
+
+
+@pytest.fixture
+def spliced_store(splice_settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
+    """GPOR's shape: the old common's last prints 2020-11-24/25, then the
+    new equity's 72.95 on 2021-05-18 under the same id; a quiet name with a
+    long gap and a small move; a big one-day move with no gap."""
+    from tradepartner.store.schema import init_schema
+
+    conn = duckdb.connect(splice_settings.store.path)
+    configure_connection(conn)
+    init_schema(conn)
+    for row in (
+        _splice_bar("GPOR", date(2020, 11, 24), 0.145),
+        _splice_bar("GPOR", date(2020, 11, 25), 0.1383),
+        _splice_bar("GPOR", date(2021, 5, 18), 72.95),
+        _splice_bar("GPOR", date(2021, 5, 19), 68.01),
+        _splice_bar("QUIET", date(2021, 1, 4), 10.0),
+        _splice_bar("QUIET", date(2021, 3, 1), 12.0),
+        _splice_bar("JUMP", date(2021, 1, 4), 1.0),
+        _splice_bar("JUMP", date(2021, 1, 5), 9.0),
+    ):
+        insert_row(conn, "prices_daily", row)
+    yield conn
+    conn.close()
+
+
+def test_a_jump_across_a_bar_gap_is_listed_as_spliced(
+    spliced_store: duckdb.DuckDBPyConnection, splice_settings: Settings
+) -> None:
+    found = health.spliced_series(spliced_store, _SPLICED_RUN, splice_settings)
+    assert found.frame.select("security_id", "prev_session", "session").rows() == [
+        ("GPOR", date(2020, 11, 25), date(2021, 5, 18))
+    ]
+    row = found.frame.row(0, named=True)
+    assert row["ratio"] == pytest.approx(72.95 / 0.1383)
+    assert row["gap_sessions"] > splice_settings.master.transfer_window_sessions
+
+
+def test_the_splice_bound_comes_from_config(
+    spliced_store: duckdb.DuckDBPyConnection, splice_settings: Settings
+) -> None:
+    loose = splice_settings.model_copy(
+        update={"health": splice_settings.health.model_copy(update={"splice_max_price_ratio": 1.1})}
+    )
+    found = health.spliced_series(spliced_store, _SPLICED_RUN, loose)
+    assert found.frame["security_id"].to_list() == ["GPOR", "QUIET"]
+
+
+def test_spliced_series_reads_only_bars_known_at_t(
+    spliced_store: duckdb.DuckDBPyConnection, splice_settings: Settings
+) -> None:
+    # No look-ahead: before the new equity's first bar is known, no gap.
+    from tradepartner.calendar import session_close
+
+    before = session_close(date(2021, 5, 18)) - PROBE_EPSILON
+    assert health.spliced_series(spliced_store, before, splice_settings).count == 0
+    assert (
+        health.spliced_series(
+            spliced_store, session_close(date(2021, 5, 18)), splice_settings
+        ).count
+        == 1
+    )
+
+
+def test_the_health_report_carries_the_spliced_block(
+    spliced_store: duckdb.DuckDBPyConnection, splice_settings: Settings
+) -> None:
+    report = health.health_report(spliced_store, _SPLICED_RUN, splice_settings)
+    assert report.spliced.count == 1
+    assert report.ok or "spliced_series" not in report.failures
