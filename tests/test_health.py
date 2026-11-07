@@ -46,6 +46,7 @@ from tradepartner.health import (
     CHAIN_IDS_DISTINCT_CIKS,
     CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS,
     CHAIN_KNOWN_AT_LE_INGESTED_AT,
+    CHAIN_NOT_REVIEWED,
     CHAIN_PREDECESSOR_NO_BAR_AFTER_HANDOVER,
     CHAIN_PRICE_BREAK,
     CHAIN_SUCCESSOR_LISTED_UNDER_PREDECESSOR_TICKER,
@@ -3993,6 +3994,59 @@ def test_the_figi_block_reads_the_latest_observation_known_at_t(
 
 
 CHAIN_IDS = ("0001000010", "0001000011")
+
+
+def test_empty_successor_chain_table_passes_review_rule(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    assert _chain_rule(fixture_store, CHAIN_NOT_REVIEWED) == []
+
+
+def test_missing_successor_chain_table_fails_closed(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    fixture_store.execute("DROP TABLE successor_chains")
+    assert "missing table" in _chain_rule(fixture_store, CHAIN_NOT_REVIEWED)[0]["predecessor_id"]
+
+
+def test_unlisted_successor_chain_fails_and_names_row(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    report = health_report(chain_fixture_store, T_END, _settings())
+    assert CHAIN_NOT_REVIEWED in report.failures
+    rows = next(c.violations.to_dicts() for c in report.integrity if c.rule == CHAIN_NOT_REVIEWED)
+    assert any(
+        row["predecessor_id"] == CHAIN_IDS[0] and row["successor_id"] == CHAIN_IDS[1]
+        for row in rows
+    )
+
+
+def test_listed_successor_chain_passes_review_rule(
+    chain_fixture_store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store import successor_reviews
+
+    rows = health.successor_chains(chain_fixture_store, T_END, _settings()).frame.to_dicts()
+    reviewed = "predecessor_id,successor_id,effective_session,reason,issue\n" + "".join(
+        f"{row['predecessor_id']},{row['successor_id']},{row['handover']},fixture,#3142\n"
+        for row in rows
+    )
+    monkeypatch.setattr(
+        health, "reviewed_chains", lambda: successor_reviews.parse_reviews(reviewed)
+    )
+    assert _chain_rule(chain_fixture_store, CHAIN_NOT_REVIEWED) == []
+
+
+def test_malformed_successor_allowlist_fails_closed(
+    fixture_store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store import successor_reviews
+
+    monkeypatch.setattr(
+        health, "reviewed_chains", lambda: successor_reviews.parse_reviews("wrong,header\n")
+    )
+    with pytest.raises(ValueError, match=r"successor_reviews\.csv"):
+        health_report(fixture_store, T_END, _settings())
 
 
 def _live_chain(
