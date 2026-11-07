@@ -453,7 +453,14 @@ from tradepartner.adapters.prices import (
 )
 from tradepartner.adapters.rates import RateSource
 from tradepartner.adapters.stamp_repair import ManifestRow
-from tradepartner.backfill import BenchmarkSeed, HoleFill, backfill, backfill_benchmark, fill_holes
+from tradepartner.backfill import (
+    BenchmarkSeed,
+    HoleFill,
+    backfill,
+    backfill_benchmark,
+    fill_holes,
+    refetch_actions,
+)
 from tradepartner.backtest import index_check as ic
 from tradepartner.backtest import index_check_store as idx
 from tradepartner.backtest import lab, promotion, sweep_report
@@ -2575,6 +2582,14 @@ def make_app(
             bool,
             typer.Option("--actions-backfill", help="scan spin-offs and name changes by month"),
         ] = False,
+        name_changes_only: Annotated[
+            bool,
+            typer.Option(
+                "--name-changes-only",
+                help="with --actions-backfill: name changes only, from "
+                "alpaca.name_change_backfill_floor (#3054)",
+            ),
+        ] = False,
         through: Annotated[
             str | None, typer.Option("--through", help="last actions process date, YYYY-MM-DD")
         ] = None,
@@ -2742,6 +2757,8 @@ def make_app(
                 )
             if since is None:
                 raise _fail("--actions-backfill needs --since", USAGE_ERROR)
+        elif name_changes_only:
+            raise _fail("--name-changes-only needs --actions-backfill", USAGE_ERROR)
         elif backfill_ != (since is not None):
             raise _fail("--backfill and --since go together", USAGE_ERROR)
         if through is not None and not actions_backfill:
@@ -2853,10 +2870,14 @@ def make_app(
             raise _fail("--source openfigi needs openfigi.enabled=true", USAGE_ERROR)
         if actions_backfill:
             assert start is not None
-            if start < s.alpaca.actions_backfill_floor:
+            floor_name, floor = (
+                ("name_change_backfill_floor", s.alpaca.name_change_backfill_floor)
+                if name_changes_only
+                else ("actions_backfill_floor", s.alpaca.actions_backfill_floor)
+            )
+            if start < floor:
                 raise _fail(
-                    f"--since before alpaca.actions_backfill_floor "
-                    f"{s.alpaca.actions_backfill_floor} is refused",
+                    f"--since before alpaca.{floor_name} {floor} is refused",
                     USAGE_ERROR,
                 )
             if through_date is not None and through_date < start:
@@ -2926,7 +2947,12 @@ def make_app(
         if actions_backfill:
             assert start is not None
             result = ingest_actions_backfill(
-                s, since=start, through=through_date, clock=clock, dry_run=dry_run
+                s,
+                since=start,
+                through=through_date,
+                clock=clock,
+                dry_run=dry_run,
+                name_changes_only=name_changes_only,
             )
             _print_result(result)
             raise typer.Exit(result.exit_code)
@@ -3355,6 +3381,60 @@ def make_app(
             raise _fail(
                 f"{len(result.stale)} stale list entries: re-review them before a real run", 1
             )
+
+    @app.command("refetch-actions")
+    def refetch_actions_cmd(
+        since: Annotated[str, typer.Option(help="first month's first day, YYYY-MM-DD")],
+        through: Annotated[str, typer.Option(help="last ex-date to cover, YYYY-MM-DD")],
+        release: Annotated[str, typer.Option(help="the open data release (checked on a real run)")],
+        security: Annotated[
+            list[str] | None,
+            typer.Option(help="only this security_id (repeatable, or ID,ID)"),
+        ] = None,
+        dry_run: Annotated[
+            bool, typer.Option(help="fetch and count, then roll every write back")
+        ] = False,
+    ) -> None:
+        """Ask Alpaca again for the splits and dividends of committed months (#3054)."""
+        start = _parse_day("--since", since)
+        last = _parse_day("--through", through)
+        assert start is not None and last is not None
+        if last < start:
+            raise _fail("--through must be on or after --since", USAGE_ERROR)
+        if _blank_text(release):
+            raise _fail(
+                "a refetch writes only inside a data release: pass --release <name>",
+                USAGE_ERROR,
+            )
+        parts = {part.strip() for item in security or () for part in item.split(",")}
+        named = sorted(parts - {""}) or None
+        s = settings()
+        if (missing_store := _store_missing(s)) is not None:
+            raise missing_store
+        if missing := _missing_secrets(s, "alpaca"):
+            raise _fail(
+                f"missing required secret(s): {', '.join(missing)}. "
+                "Set them in .env (see .env.example).",
+                USAGE_ERROR,
+            )
+        prices = price_source(s) if price_source else StorePriceSource(s, clock=clock)
+        try:
+            result = refetch_actions(
+                s,
+                prices=prices,
+                since=start,
+                through=last,
+                release=release,
+                clock=clock,
+                dry_run=dry_run,
+                securities=named,
+            )
+        except ValueError as exc:
+            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+        for run in result.runs:
+            typer.echo(f"{run.status} {run.chunk_cursor}: {run.message}")
+        typer.echo(result.summary())
+        raise typer.Exit(0 if result.ok else 1)
 
     @app.command("repair-spinoff-splits")
     def repair_spinoff_splits(

@@ -141,6 +141,27 @@ Purpose: attach `data.release_id` to new registrations at the release boundary.
 
 - [ ] Read the latest PR #1968 review and #1958/#1970 resolution. No store command or dry run exists for a merge. Merge and pull **only inside this sitting** after T198's release is closed and its fingerprint evidence can be compared. A pre-release registration must retain its stored hash; a new release registration names a **closed** release and keeps `gap.*` and `adjust.*` frozen under the 2026-10-19 spec decision. Record the re-recorded fixture fingerprints beside the release's. If the PR is not ready, **do not merge**: D8 lapses and the plan needs its dated strike note. Paste the decision and fingerprint comparison on PR #1968/T198.
 
+## 7. #3054: `actions-3054` (missing splits and dividends)
+
+Purpose: store the pre-2020 name changes, then ask Alpaca again for the splits and dividends of committed months, so a renamed security's pre-rename symbol carries its actions (`ListingResolver.action_alias`). Also retract the STX 2021-05-11 duplicate, which is now on the reviewed list.
+
+- [ ] Census first: dry-run both steps and read the counts before writing. The measurement (#3053, 11-02 store) put 307 missing dividends and 61 missing splits under an old symbol the master never lists. That is the most this can recover. Rows with no rename (SPY 2016-03-18, 2018-06-15) are expected to stay missing unless Alpaca serves them now.
+
+  ```bash
+  uv run tradepartner store backup
+  uv run tradepartner decision data-release open --name actions-3054 --backup <actions-copy> --reason "#3054 name changes 2016-2020 and actions refetch"
+  uv run tradepartner ingest --source alpaca --actions-backfill --name-changes-only --since 2016-01-01 --through 2020-05-31 --dry-run
+  uv run tradepartner ingest --source alpaca --actions-backfill --name-changes-only --since 2016-01-01 --through 2020-05-31
+  uv run tradepartner refetch-actions --since 2016-01-04 --through <last committed backfill day> --release actions-3054 --dry-run
+  uv run tradepartner refetch-actions --since 2016-01-04 --through <last committed backfill day> --release actions-3054
+  uv run tradepartner repair-dividends --release actions-3054 --dry-run
+  uv run tradepartner repair-dividends --release actions-3054 --expect-action-rows <dry-run-row-count>
+  uv run tradepartner health --check
+  uv run tradepartner decision data-release close --name actions-3054 --from 2016-01-04 --to <last touched ex-date> --reason "#3054 added actions by type, STX retract"
+  ```
+
+- [ ] Name-change step: read `symbol_change_backdated` and `actions_unresolved` on each month's run row. Refetch step: the dry run's last line names the rows per type (`would add N dividend, M split`). Stop when splits outnumber the census's 61 + 26, or when an added split lands on a name with no matching raw price gap. Paste both summaries, the repair count and `health --check` on #3054. `repair-dividends` expects exactly STX's one row plus any duplicates the list already holds and the store still has.
+
 ## Restart and close
 
 - [ ] Confirm every opened release has an `after` row, `uv run tradepartner health --check` exits 0, and `uv run tradepartner health --coverage` has the reviewed final buckets. List every stale trial and replay only H1 and a kill-ladder rung-4 survivor per ADR 0023. Record delete-only affected sweep decisions under [named data releases](data-releases.md); each rerun counts in N.
