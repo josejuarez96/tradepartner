@@ -549,3 +549,31 @@ def test_refusals_carry_a_reason() -> None:
     with pytest.raises(ExamLedgerRefused) as caught:
         load_ledger("x")
     assert caught.value.reason == EXAM_LEDGER_INVALID
+
+
+def test_a_retried_start_after_not_started_is_append_only() -> None:
+    first = _pending(1) | {"outcome": "not_started"}
+    retry = _pending(2)
+    old = _text(first, retry)
+    _ok(old, old)
+    _ok(old, _text(first, retry | {"outcome": "running", "window_id": 7}))
+
+
+def test_swapping_a_retried_pair_is_still_refused() -> None:
+    first = _pending(1) | {"outcome": "not_started"}
+    retry = _pending(2)
+    _bad(_text(first, retry), _text(retry | {"seq": 1}, first | {"seq": 2}))
+
+
+def test_a_whitespace_only_string_is_invalid() -> None:
+    with _refused(EXAM_LEDGER_INVALID):
+        load_ledger(_text(_entry(1, book_id="  ")))
+
+
+@pytest.mark.parametrize("outcome", ["failed", "unexamined"])
+def test_a_terminal_outcome_on_before_start_date_is_invalid(outcome: str) -> None:
+    entry = _ran(1, 7, outcome, 4) | {"outcome_on": dt.date(2027, 1, 3), "kill_line": "none"}
+    if outcome != "unexamined":
+        entry["kill_line"] = _URL
+    with _refused(EXAM_LEDGER_INVALID):
+        load_ledger(_text(entry))

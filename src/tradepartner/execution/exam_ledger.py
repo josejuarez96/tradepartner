@@ -165,7 +165,7 @@ def _entry(index: int, raw: object) -> ExamEntry:
     if unknown := sorted(keys - _ENTRY_FIELDS):
         raise _invalid(f"{where} has unknown field(s) {', '.join(unknown)}")
     for name in _STR_FIELDS:
-        if not isinstance(raw[name], str) or not raw[name]:
+        if not isinstance(raw[name], str) or not raw[name].strip():
             raise _invalid(f"{where}: {name} must be a non-empty string")
     for name in _INT_FIELDS:
         if not _is_int(raw[name]):
@@ -196,6 +196,8 @@ def _check_entry(where: str, entry: ExamEntry) -> None:
         raise _invalid(f"{where}: campaign_k {entry.campaign_k} is below -1")
     if entry.outcome in (PENDING, RUNNING) and entry.outcome_on != entry.start_date:
         raise _invalid(f"{where}: a {entry.outcome} entry's outcome_on must be its start_date")
+    if entry.outcome in TERMINAL | {UNEXAMINED} and entry.outcome_on < entry.start_date:
+        raise _invalid(f"{where}: a {entry.outcome} entry's outcome_on is before its start_date")
 
 
 def load_ledger(text: str) -> ExamLedger:
@@ -334,10 +336,18 @@ def check_append_only(old_text: str, new_text: str) -> None:
         raise _not_append_only(f"budget changed {old.budget} -> {new.budget} without budget_adr")
     if len(new.entries) < len(old.entries):
         raise _not_append_only(f"{len(old.entries) - len(new.entries)} entry(ies) removed")
-    old_seq = {_identity(e): e.seq for e in old.entries}
+    old_seq: dict[tuple[object, ...], int] = {}
+    for entry in old.entries:
+        old_seq.setdefault(_identity(entry), entry.seq)
     for old_entry, new_entry in zip(old.entries, new.entries, strict=False):
-        moved = old_seq.get(_identity(new_entry))
-        if moved is not None and moved != old_entry.seq:
+        # A retried start repeats an entry's identity (a `not_started` one, then a
+        # fresh `pending` one), so "moved" is read only where the identity changed.
+        moved = (
+            None
+            if _identity(new_entry) == _identity(old_entry)
+            else old_seq.get(_identity(new_entry))
+        )
+        if moved is not None:
             raise _not_append_only(f"entry seq {moved} was moved to seq {new_entry.seq}")
         _check_kept(old_entry, new_entry)
     for entry in new.entries[len(old.entries) :]:
