@@ -429,7 +429,8 @@ DELISTING_VERSION = 1
 #: The issuer HTML Form 25s `parse_delisting_html` read and found no class or
 #: exchange in (`delisting_html_unread/v1/`, #3084): bump when that parser reads
 #: more, so they are fetched again. A successful read goes to the
-#: `DELISTING_VERSION` cache like an XML one.
+#: `DELISTING_VERSION` cache like an XML one, so only a `DELISTING_VERSION`
+#: bump re-reads those (a parser change that alters successful readings needs it).
 DELISTING_HTML_VERSION = 1
 #: The per-document `parse_form25_evidence` cache (`delisting_evidence/v1/`, T327,
 #: #2670): the provision only, beside (never inside) the `DELISTING_VERSION` cache.

@@ -85,6 +85,24 @@ def test_another_class_is_never_read_as_common(listing: str) -> None:
     assert _form25_classes("Common Stock", {"other": [listing]}) == ()
 
 
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Series A Preference Shares, convertible into Common Stock",
+        "Exchangeable Shares, exchangeable for common stock",
+        "Subscription Receipts, each exchangeable for one common share",
+        "American Depository Shares, each representing one ordinary share",
+        "Shares, each convertible into common stock",
+        "Warrants, each exercisable for one share of Common Stock",
+    ],
+)
+def test_a_filing_for_another_class_never_ends_the_only_common_class(title: str) -> None:
+    """quant-auditor on #3095: a description after the comma is never read
+    as the class, so the issuer's one plain-common class stays listed."""
+    assert _form25_title(title) == title
+    assert _form25_classes(title, {"common": ["Common Stock, par value $0.01"]}) == ()
+
+
 def test_community_in_a_name_is_no_unit() -> None:
     """The not-common words count at a word start, so a bank's name reads past."""
     listing = "First Community Bancorp, Inc., common stock, par value $1"

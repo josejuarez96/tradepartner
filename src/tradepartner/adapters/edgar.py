@@ -1481,8 +1481,8 @@ def parse_delisting_html(
 
     Nothing is guessed (#609 D1): a document missing the issuer, address or
     class label, an issuer block naming no known exchange or two different
-    ones, or an empty or overlong class description raises `ValueError`, and
-    the notice stays a failure for the owner to accept."""
+    ones, or an empty or overlong class description raises `ValueError`: no
+    row is written (the source counts and remembers it as unread, #3084)."""
     if form not in HTML_DELISTING_FORMS:
         raise ValueError(f"{accession}: not an issuer Form 25: {form!r}")
     accepted_at = ensure_tz_aware_utc(accepted_at, field_name="accepted_at")

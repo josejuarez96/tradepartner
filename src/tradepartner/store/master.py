@@ -593,8 +593,43 @@ _UNIT_COMPONENT = re.compile(
 )
 
 
-#: `_NOT_COMMON_WORDS` at a word start, so "Community Bancorp" names no unit.
-_OTHER_CLASS_WORD = re.compile(r"\b(?:" + "|".join(_NOT_COMMON_WORDS) + ")", re.IGNORECASE)
+#: `_NOT_COMMON_WORDS` at a word start ("Community Bancorp" names no unit),
+#: plus the words of other classes that describe themselves against common
+#: stock ("Preference Shares, convertible into Common Stock", "Subscription
+#: Receipts, each exchangeable for one common share", EDGAR's "Depository").
+#: Read by `_form25_title` only; `_NOT_COMMON_WORDS` is unchanged.
+_OTHER_CLASS_WORD = re.compile(
+    r"\b(?:"
+    + "|".join(
+        (
+            *_NOT_COMMON_WORDS,
+            "preference",
+            "depository",
+            "exchangeable",
+            "convertible",
+            "receipt",
+            "subscription",
+            "option",
+            "bond",
+            "trust",
+            "interest",
+        )
+    )
+    + ")",
+    re.IGNORECASE,
+)
+#: A title that is a company name or par value, then a class name:
+#: "HD Supply Holdings, Inc. common stock, par value ...", "ShockWave Medical
+#: Inc., common stock ...", "$.01 Par Value, Common Stock". The head holds at
+#: most one comma and ends in a legal suffix or a par value; `rest` starts
+#: with the class name itself.
+_NAME_THEN_CLASS = re.compile(
+    r"\A(?P<head>[^,]*?(?:,[^,]*?)?\b(?:inc|incorporated|corp|corporation|co|company|"
+    r"ltd|limited|llc|plc|holdings|group|bancorp|par\s+value|no\s+par)\.?)\s*,?\s+"
+    r"(?P<rest>(?:(?:class|series)\s+[a-z0-9]{1,2}\s+)?(?:common|ordinary|capital\s+stock)"
+    r"\b.*)\Z",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _form25_title(title: str) -> str:
@@ -603,22 +638,18 @@ def _form25_title(title: str) -> str:
 
     - a unit-component tail is dropped ("Class A common stock included as
       part of the units" reads "Class A common stock");
-    - a title naming no warrant, unit, right, preferred, depositary or debt
-      class whose head before the first comma names no common equity (a
-      company name, "HD Supply Holdings, Inc. common stock, par value ...",
-      or a par value, "$.01 Par Value, Common Stock") reads from the first
-      comma part that does.
+    - a title naming no other class (`_OTHER_CLASS_WORD`) whose head before
+      the first comma names no common equity reads from its class name only
+      when the head is a company name or a par value (`_NAME_THEN_CLASS`).
+      A description after a comma ("Shares, convertible into Common Stock")
+      is never read as the class.
 
     Anything else is returned as it is."""
     cut = _UNIT_COMPONENT.sub("", title)
     if _is_common(cut) or _OTHER_CLASS_WORD.search(cut):
         return cut
-    parts = cut.split(",")
-    for index in range(1, len(parts)):
-        rest = ",".join(parts[index:]).strip()
-        if _is_common(rest):
-            return rest
-    return cut
+    match = _NAME_THEN_CLASS.match(cut.strip())
+    return match.group("rest") if match else cut
 
 
 def _form25_classes[K](title: str, classes: Mapping[K, Collection[str | None]]) -> tuple[K, ...]:
