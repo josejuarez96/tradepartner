@@ -1833,6 +1833,87 @@ def test_reversed_true_up_has_no_paper_check_residue_effect() -> None:
     assert check([carried, booked, reversed_row]) == check([carried])
 
 
+def test_reversed_true_up_beside_a_period_fill_matches_history_without_it() -> None:
+    """A fully reversed true-up in a period with a fill is not a quantity row (#3210)."""
+    marks = [
+        _position_mark(T0, A, 10.3, 20, cash=99_794),
+        _position_mark(T1, A, 15.3, 21, cash=99_694),
+    ]
+    carried = AdjustmentRow(
+        adjustment_id=31,
+        window_id=WINDOW_ID,
+        session=T0,
+        kind="carried_residue",
+        origin="dust",
+        security_id=A,
+        quantity=0.3,
+        known_at=_utc(T0),
+        ingested_at=_utc(T0),
+    )
+    booked = AdjustmentRow(
+        adjustment_id=32,
+        window_id=WINDOW_ID,
+        session=T1,
+        kind="owner_true_up",
+        security_id=A,
+        quantity=1,
+        explanation_json=json.dumps({"broker_quantity": 16.3}),
+        known_at=_utc(T1) - timedelta(seconds=2),
+        ingested_at=_utc(T1) - timedelta(seconds=2),
+    )
+    reversed_row = AdjustmentRow(
+        adjustment_id=33,
+        window_id=WINDOW_ID,
+        session=T1,
+        kind="owner_true_up",
+        security_id=A,
+        quantity=-1,
+        explanation_json=json.dumps({"reversed_adjustment_id": 32}),
+        known_at=_utc(T1) - timedelta(seconds=1),
+        ingested_at=_utc(T1) - timedelta(seconds=1),
+    )
+    orders = [
+        OrderRow(
+            client_order_id=label,
+            decision_id=1,
+            run_id=1,
+            session=day,
+            attempt=1,
+            phase="buy",
+            security_id=A,
+            symbol=A,
+            side="buy",
+            quantity=quantity,
+            sells_in_flight_at_submit=False,
+            known_at=_utc(day),
+            ingested_at=_utc(day),
+        )
+        for label, day, quantity in (("fill", T1, 5), ("opening", T0, 10))
+    ]
+
+    def check(rows: list[AdjustmentRow]) -> tuple[float, tuple[str, ...]]:
+        result = compare_periods(
+            _window(),
+            _trial({T0: 100_000, T1: 100_000}, {T0: 0}),
+            _journal(
+                positions_daily=marks,
+                adjustments=rows,
+                fills=[
+                    _fill("opening", "buy", A, _utc(T0), 10, 20),
+                    _fill("fill", "buy", A, _utc(T1), 5, 20),
+                ],
+                orders=orders,
+            ),
+            _no_actions(),
+            _prices({(A, T0): 20, (A, T1): 20}),
+            None,
+        )
+        return result.periods[0].residue_term, result.periods[0].residue_trued_up
+
+    assert check([carried, booked, reversed_row]) == check([carried])
+    assert check([carried])[1] == ()
+
+
 def test_later_period_reversal_labels_the_residue_change() -> None:
     marks = [
         _position_mark(T0, A, 5, 20, cash=99_900),
