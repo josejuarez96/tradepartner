@@ -3944,13 +3944,34 @@ class TestClassSymbols:
             (date(2019, 8, 28), "BF.B", date(2024, 6, 4)),
         )
 
-    def test_the_default_config_names_the_four_known_pairs(self) -> None:
+    def test_the_default_config_names_the_five_known_pairs(self) -> None:
         assert _settings().alpaca.class_symbols == {
             "BFA": "BF.A",
             "BFB": "BF.B",
+            "BIOB": "BIO.B",
             "HVTA": "HVT.A",
             "WSOB": "WSO.B",
         }
+
+    def test_bio_rads_lower_case_class_letter_asks_bio_b(self) -> None:
+        """#3082: Bio-Rad's cover pages wrote class B as `BIOb` (NYSE) from
+        2019-08-06 to 2024-02-16; folded it is `BIOB`, no Alpaca symbol, so
+        the class had no bars on that span. The default map asks `BIO.B`."""
+        bio_b = "0000012208:class-b-common-stock"
+        row = _listing(bio_b, "BIOb", date(2019, 8, 6), "Class B Common Stock")
+        row["exchange"] = "NYSE"
+        resolver = ListingResolver([row], class_symbols=_settings().alpaca.class_symbols)
+        assert resolver.symbols(bio_b, date(2020, 1, 2), date(2020, 1, 3)) == ["BIO.B"]
+        assert resolver.resolve("BIO.B", date(2020, 1, 2)) == bio_b
+        assert resolver.resolve("BIOB", date(2020, 1, 2)) is None
+
+    def test_semileds_trailing_lower_case_is_no_class_letter(self) -> None:
+        """`LEDs` (SemiLEDs, Nasdaq `LEDS`) is the store's other trailing
+        lower-case ticker: no spelling rule, so it keeps its own symbol."""
+        row = _listing("0001333822", "LEDs", date(2019, 11, 20), "Common Stock")
+        row["exchange"] = "NASDAQ"
+        resolver = ListingResolver([row], class_symbols=_settings().alpaca.class_symbols)
+        assert resolver.symbols("0001333822", date(2020, 1, 2), date(2020, 1, 3)) == ["LEDS"]
 
 
 class TestAsofPerSpan:

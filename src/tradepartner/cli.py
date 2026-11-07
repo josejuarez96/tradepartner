@@ -4884,6 +4884,58 @@ def make_app(
         typer.echo(f"manifest: {result.manifest_path}")
         typer.echo(f"code commit {result.git_commit}, schema version {result.schema_version}")
 
+    @store_app.command("bank-filers")
+    def store_bank_filers(
+        assets: Annotated[
+            Path | None,
+            typer.Option(
+                "--assets",
+                help="an Alpaca GET /v2/assets file (the recorder's .json.gz, or a plain "
+                "JSON list) to read for bank-level names no listing row carries",
+            ),
+        ] = None,
+    ) -> None:
+        """Read-only census of the banks that file with their regulator instead of
+        EDGAR (#3078): per reviewed bank, the master rows, bars and delistings the
+        store holds and any other company on its ticker. Writes nothing."""
+        from tradepartner.store import bank_filers
+
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        listed = None
+        if assets is not None:
+            try:
+                listed = bank_filers.read_assets_file(assets)
+            except (OSError, ValueError) as exc:
+                raise _fail(f"--assets {assets}: {exc}", 1) from None
+        filers = bank_filers.load_bank_filers()
+        try:
+            with open_read_only(s) as conn:
+                rows = bank_filers.census(conn, filers)
+                held = bank_filers.held_tickers(conn) if listed is not None else frozenset()
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        for r in rows:
+            f = r.filer
+            exit_ = f"{f.exit_kind} closed {f.closed_on} last {f.last_exchange_session}"
+            typer.echo(
+                f"{f.ticker:<6} {r.status:<8} cik {f.edgar_cik or '-'} master "
+                f"{','.join(r.master_ids) or '-'} bars {r.bars} last {r.last_bar or '-'} "
+                f"delistings {r.delistings} | {f.regulator} {f.exchange} "
+                f"{exit_ if f.exit_kind else 'listed'}"
+            )
+            for h in r.other_holders:
+                typer.echo(
+                    f"       ticker held by {h.security_id} ({h.name}) {h.exchange} "
+                    f"from {h.valid_from}: another company"
+                )
+        if listed is not None:
+            leads = bank_filers.candidates(listed, held)
+            typer.echo(f"candidates (bank-level names, no listing row): {len(leads)}")
+            for c in leads:
+                typer.echo(f"  {c.symbol:<6} {c.exchange:<6} {c.status:<8} {c.name}")
+
     archive_app = typer.Typer(
         no_args_is_help=True, help="Move the old EDGAR cache into the archive."
     )
