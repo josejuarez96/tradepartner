@@ -832,7 +832,8 @@ def test_lab_view_over_ten_thousand_trials_recomputes_with_one_query_per_basis(
     elapsed = time.perf_counter() - began
 
     [card] = view.families
-    assert card.n == results.family_n(conn, "momentum") == 10_000
+    # Same pairs, vintage and code, but Sharpes vary by i % 97: 5 x 97 distinct series (#3127).
+    assert card.n == results.family_n(conn, "momentum") == 485
     [sweep] = view.sweeps
     assert sweep.report.complete
     # `lab status`'s row tally of every registry table counts `trial_metrics` once; it
@@ -847,9 +848,12 @@ def test_lab_view_over_ten_thousand_trials_recomputes_with_one_query_per_basis(
     )
     # One set-based query per basis per `family_sharpes` read: the card's (through
     # `lab_status`) and the sweep report's; plus the report's one read of its counted
-    # trials' metrics. Independent of the 10,000 trials.
+    # trials' metrics; plus one outcome-digest read per N count (#3127). Independent of
+    # the 10,000 trials.
     assert by_basis == {"sharpe_period": 2, "sharpe_period_excess_spy": 2}
-    assert len(metric_reads) == 5
+    digests = [sql for sql, _p in metric_reads if "string_agg" in sql]
+    assert len(metric_reads) - len(digests) == 5
+    assert 1 <= len(digests) <= 4
     assert elapsed < RENDER_SECONDS_LIMIT
 
 
