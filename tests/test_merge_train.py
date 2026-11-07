@@ -202,6 +202,20 @@ def test_a_family_registry_change_is_class_b_although_under_src(
     assert _eligible(_pr(labels=("owner-ok",), fragment_texts=(FRAGMENT,)), paths=paths) is None
 
 
+def test_an_exam_ledger_change_is_class_b_although_under_docs_research(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3147 (ADR 0016 amendment 2026-11-07, rule 3): any change to the exam ledger,
+    its `budget` and `budget_adr` fields included, lands only on the owner's word."""
+    monkeypatch.setattr(mt.ready_pr, "required_reviews", lambda _paths: ())
+    paths = ("docs/research/exam-ledger.toml", "changelog.d/12-thing.md")
+    refusal = _eligible(_pr(fragment_texts=(FRAGMENT,)), paths=paths)
+    assert refusal is not None and "class B (docs/research/exam-ledger.toml)" in refusal
+    assert _eligible(_pr(labels=("owner-ok",), fragment_texts=(FRAGMENT,)), paths=paths) is None
+    other = ("docs/research/some-report.md", "changelog.d/12-thing.md")
+    assert _eligible(_pr(fragment_texts=(FRAGMENT,)), paths=other) is None
+
+
 # --- AC3: order --------------------------------------------------------------------------
 
 

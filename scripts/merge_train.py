@@ -48,11 +48,13 @@ CLASS_A_PREFIXES = (
     "docs/runbooks/",
     "changelog.d/",
 )
-#: Files under a class-A prefix that are class B anyway: the family registry
-#: (`FAMILIES`, `FAMILY_PARENTS`), whose root-or-child call for a new family is the
-#: owner's (strategy-lab spec open question 11; #3126). CLAUDE.md rule 1 is to be
-#: amended by the owner to match.
-CLASS_B_PATHS = ("src/tradepartner/config_backtest.py",)
+#: Files under a class-A prefix that are class B anyway, checked before the prefixes:
+#: the family registry (`FAMILIES`, `FAMILY_PARENTS`), whose root-or-child call for a
+#: new family is the owner's (strategy-lab spec open question 11; #3126), and the exam
+#: ledger, whose entries and `budget` / `budget_adr` are the owner's word (ADR 0016
+#: amendment 2026-11-07, rule 3; #3147). CLAUDE.md rule 1 is to be amended by the owner
+#: to match.
+CLASS_B_PATHS = ("src/tradepartner/config_backtest.py", ready_pr.EXAM_LEDGER)
 #: Every train comment's first line starts with this.
 COMMENT_PREFIX = "merge-train:"
 OUTCOMES = (
@@ -254,7 +256,7 @@ def eligibility(
     if pr.unresolved_threads:
         plural = "" if pr.unresolved_threads == 1 else "s"
         return f"(j) {pr.unresolved_threads} unresolved review thread{plural}"
-    class_b = [p for p in diff_paths if not p.startswith(CLASS_A_PREFIXES) or p in CLASS_B_PATHS]
+    class_b = [p for p in diff_paths if p in CLASS_B_PATHS or not p.startswith(CLASS_A_PREFIXES)]
     if class_b and "owner-ok" not in labels:
         return f"(k) class B ({class_b[0]}): needs the owner-ok label (the owner's word)"
     return None

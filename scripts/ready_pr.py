@@ -21,7 +21,9 @@ Steps, in order (each one stops the run with a reason on failure):
    Other STATUS sections ("Blocked", "Decisions needed") may be edited freely. The PR
    ticks no plan box in ``docs/plans/`` (a fold may), and when the branch's issue carries
    a ``task:Tn`` label its fragment holds ``task: Tn (PR #<this PR>)``: the fold ticks and
-   collapses the line after merge (#2280).
+   collapses the line after merge (#2280). A PR touching ``docs/research/exam-ledger.toml``
+   passes T381b's ``check_append_only`` against ``origin/main``'s copy, whatever the flags
+   (#3147).
 4. Local checks: ruff check, ruff format --check, mypy, the fragment check and
    ``tests/test_docs_budget.py`` always, plus the whole-tree static invariant tests
    (``STATIC_INVARIANT_TESTS``, ``-n 2``, ~25 s, #2367). No other local pytest by default:
@@ -99,6 +101,10 @@ STATUS_LIST = "## Recently done"
 CHANGELOG_LIST = "## [Unreleased]"
 FRAGMENT_DIRS = ("docs/status.d/", "changelog.d/")
 PLANS_PREFIX = "docs/plans/"
+#: The exam ledger (ADR 0016 amendment 2026-11-07, rule 3): class B whatever its path
+#: (`merge_train.CLASS_B_PATHS`), and every PR touching it passes T381b's
+#: `check_append_only` against `origin/main`'s copy (#3147).
+EXAM_LEDGER = "docs/research/exam-ledger.toml"
 # A fragment's plan-task line (#2280), the shape scripts/fragments.py writes (TASK_LINE_RE).
 FRAGMENT_TASK_RE = re.compile(r"^task: (?P<id>T\d+[a-z]?\d?) \(PR #(?P<pr>\d+)\)$")
 PLAN_BOX_RE = re.compile(r"^- \[(?P<done>[ x])\] \*\*(?P<id>T\d+[a-z]?\d?)[ :]")
@@ -698,6 +704,43 @@ def lacks_changelog_bullets(branch: str, fragment_texts: Sequence[str]) -> bool:
     return True
 
 
+def exam_ledger_refusal(main_text: str | None, branch_text: str | None) -> str | None:
+    """Why a PR's copy of the exam ledger (`branch_text`, None when the PR deletes it)
+    may not replace `origin/main`'s (`main_text`, None when main has none), or None.
+
+    T381b's `check_append_only` is the rule; a new ledger is checked as appended to an
+    empty one with its own `budget` and `budget_adr` (#3147)."""
+    from tradepartner.execution import exam_ledger
+
+    if branch_text is None:
+        return f"this PR deletes {EXAM_LEDGER}; the ledger is append-only"
+    try:
+        if main_text is None:
+            ledger = exam_ledger.load_ledger(branch_text)
+            main_text = f"budget = {ledger.budget}\nbudget_adr = {json.dumps(ledger.budget_adr)}\n"
+        exam_ledger.check_append_only(main_text, branch_text)
+    except exam_ledger.ExamLedgerRefused as exc:
+        return str(exc)
+    return None
+
+
+def exam_ledger_budget_change(main_text: str | None, branch_text: str) -> str | None:
+    """The `budget` / `budget_adr` change a PR's ledger copy makes, worded for the
+    owner, or None. `check_append_only` lets `budget` move with any new `budget_adr`,
+    so only the class-B rule (the owner's word) guards that pair (#3147)."""
+    from tradepartner.execution import exam_ledger
+
+    if main_text is None:
+        return None
+    old, new = exam_ledger.load_ledger(main_text), exam_ledger.load_ledger(branch_text)
+    parts = []
+    if old.budget != new.budget:
+        parts.append(f"budget {old.budget} -> {new.budget}")
+    if old.budget_adr != new.budget_adr:
+        parts.append(f"budget_adr {old.budget_adr!r} -> {new.budget_adr!r}")
+    return "; ".join(parts) or None
+
+
 def tests_needed(paths: Sequence[str]) -> bool:
     """Whether the diff can make pytest fail: it touches code, tests, scripts or deps."""
     return any(p.startswith(TEST_TRIGGER_PREFIXES) or p in TEST_TRIGGER_FILES for p in paths)
@@ -868,6 +911,23 @@ def ready(
                 "(or the line `task: Tn (PR #n)` first in it); the fold ticks and collapses "
                 "the plan line after merge (#2280)"
             )
+    # #3147: the exam ledger is append-only (T381b's check) and class B; outside the
+    # --allow-shared-files block, so no flag skips it.
+    if EXAM_LEDGER in touched:
+        ledger_main = (
+            r.git("show", f"{main_ref}:{EXAM_LEDGER}")
+            if r.git_ok("cat-file", "-e", f"{main_ref}:{EXAM_LEDGER}")
+            else None
+        )
+        ledger_branch = None if EXAM_LEDGER in deleted else r.read(EXAM_LEDGER)
+        if refusal := exam_ledger_refusal(ledger_main, ledger_branch):
+            raise ReadyError(f"{EXAM_LEDGER}: {refusal} (ADR 0016 rule 3, #3147)")
+        assert ledger_branch is not None  # a deletion is refused above
+        budget = exam_ledger_budget_change(ledger_main, ledger_branch)
+        say(
+            f"{EXAM_LEDGER}: append-only check passed; class B, the owner's word lands it"
+            + (f" (changes {budget})" if budget else "")
+        )
     # #2280: every `task:` line the diff adds names this PR, sits in this issue's fragment
     # and is one of the issue's `task:` labels; a labelled issue's fragment has its line.
     # Outside the --allow-shared-files block: a merged task line marks a task done for claims.
