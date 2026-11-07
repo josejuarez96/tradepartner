@@ -2391,6 +2391,12 @@ class _Run:
         return stop_session(min(s.at for s in requested_rows)), flat
 
     def _due(self) -> planning.RebalanceKind | None:
+        """The planning kind now, None unless the run was journaled `rebalance` or
+        `catch_up` at lock time: a fill this run's own step 3 first journals can
+        make a pending T_i part-executed (#3131), and a run journaled `mark` must
+        never trade on that; the next run reads the fill at lock time."""
+        if self.kind not in ("rebalance", "catch_up"):
+            return None
         with open_read_only(self.settings, retry=True) as conn:
             run_rows = [r.run for r in runs_for(conn, self.window_id)]
             events = rebalance_events_for(conn, self.window_id)

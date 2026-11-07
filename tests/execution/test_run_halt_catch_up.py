@@ -149,3 +149,32 @@ def test_rebalances_with_fills_names_only_rebalances_with_a_live_fill(
     with open_for_write(env.settings) as conn:
         assert rebalances_with_fills(conn, window.window_id) == frozenset({T_0, T_1})
         assert rebalances_with_fills(conn, window.window_id + 1) == frozenset()
+
+
+def test_a_run_journaled_mark_never_trades_a_rebalance_its_own_collection_started(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Safety review on #3136: the kind is read at lock time, before step 3 collects.
+    A fill first journaled by this run's own collection must not turn a `mark` run
+    into a catch-up that submits; the next run, which reads the fill at lock time,
+    catches up instead. Simulated by hiding the fills from the lock-time read only."""
+    from tradepartner.execution import run as run_module
+
+    _halt_after_the_sells(env, window, monkeypatch)
+    _release(env, at(date(2019, 6, 6), 22, 0))
+    real = run_module.rebalances_with_fills
+    calls = {"n": 0}
+
+    def first_call_sees_nothing(conn: Any, window_id: int) -> frozenset[date]:
+        calls["n"] += 1
+        return frozenset() if calls["n"] == 1 else real(conn, window_id)
+
+    monkeypatch.setattr(run_module, "rebalances_with_fills", first_call_sees_nothing)
+    before = env.count("orders")
+    late = env.run(at(LATE))
+    assert (late.kind, late.status) == ("mark", "ok"), env.result(late.run_id)
+    assert env.count("orders") == before
+    assert not [e for e in env.rebalance_events() if e[0] == T_1]  # not lapsed either
+    monkeypatch.setattr(run_module, "rebalances_with_fills", real)
+    nxt = env.run(at(date(2019, 6, 10)))
+    assert (nxt.kind, nxt.status) == ("catch_up", "ok"), env.result(nxt.run_id)
