@@ -22,7 +22,14 @@ refuses, before any write:
    referenced trial's kind or synthetic flag, so this is re-checked here,
    against the trial as it is *now* (a trial could in principle be amended
    only by a fresh row, never updated, but the check is cheap and the gate
-   matters).
+   matters). Once the store holds a closed data release (a command-written
+   `after` row, `registry.vintage_releases`), the trial must also have run on
+   the released store (#3178; spec amendment 2026-11-07): its recorded
+   `data_vintage` at or after the `made_at` of the newest release reaching its
+   `data_cutoff` (`registry.latest_release_reaching`, the release
+   `data_vintage` itself counts). A trial with no recorded `data_cutoff` or
+   `data_vintage` then fails closed; a release whose touched sessions all start
+   after the trial's cutoff did not change what it read and does not refuse it.
 2. **`holdout.end` not a completed rebalance session.** The hypothesis's
    frozen `holdout_end` must be a rebalance session at its cadence (at
    `month_end`, the last XNYS session of its calendar month), and its close
@@ -568,12 +575,20 @@ def _frozen_params(
     return params
 
 
-def _gap_signoff_ok(conn: duckdb.DuckDBPyConnection, hypothesis_id: int) -> bool:
-    """A `gap_signoff` row for `hypothesis_id` referencing an `ok`,
-    non-synthetic, `in_sample` trial of that hypothesis (ADR 0009 point 3)."""
-    row = conn.execute(
+def _gap_signoff_refusal(
+    conn: duckdb.DuckDBPyConnection, hypothesis_id: int, slug: str
+) -> str | None:
+    """Why no `gap_signoff` row for `hypothesis_id` passes, or None when one does
+    (module docstring, step 1). A row passes when it references an `ok`,
+    non-synthetic, `in_sample` trial of that hypothesis (ADR 0009 point 3) that,
+    once the store holds a closed data release (`registry.vintage_releases`),
+    ran on the released store (#3178): the trial's recorded `data_vintage` is at
+    or after the `made_at` of the newest release reaching its `data_cutoff`
+    (`registry.latest_release_reaching`). A trial missing either stamp fails
+    closed then."""
+    rows = conn.execute(
         """
-        SELECT COUNT(*) FROM owner_decisions od
+        SELECT t.trial_id, t.data_cutoff, t.data_vintage FROM owner_decisions od
         JOIN trials t ON t.trial_id = od.trial_id
         JOIN trial_results r ON r.trial_id = t.trial_id
         WHERE od.kind = ?
@@ -582,10 +597,37 @@ def _gap_signoff_ok(conn: duckdb.DuckDBPyConnection, hypothesis_id: int) -> bool
           AND r.status = 'ok'
           AND NOT t.synthetic
           AND t.kind = 'in_sample'
+        ORDER BY t.trial_id DESC
         """,
         [_GAP_SIGNOFF, hypothesis_id, hypothesis_id],
-    ).fetchone()
-    return row is not None and bool(row[0])
+    ).fetchall()
+    if not rows:
+        return (
+            f"no gap_signoff for {slug!r} references an ok, non-synthetic, "
+            "in_sample trial of this hypothesis"
+        )
+    releases = registry.vintage_releases(conn)
+    if not releases:
+        return None
+    blocking: list[str] = []
+    for trial_id, cutoff, vintage in rows:
+        if cutoff is None or vintage is None:
+            blocking.append(
+                f"trial {trial_id} has no recorded data_cutoff or data_vintage, so it "
+                f"cannot show it read the store after release {releases[0].name!r}"
+            )
+            continue
+        release = registry.latest_release_reaching(conn, cutoff)
+        if release is None or vintage >= release.made_at:
+            return None
+        blocking.append(
+            f"trial {trial_id} (data_vintage {vintage.isoformat()}) predates release "
+            f"{release.name!r} (closed {release.made_at.isoformat()})"
+        )
+    return (
+        f"no gap_signoff for {slug!r} references a trial run on the current data "
+        "release; rerun the in-sample trial and sign off its gap again: " + "; ".join(blocking)
+    )
 
 
 def _previous_stop(conn: duckdb.DuckDBPyConnection, previous: PaperWindowRow | None) -> Any:
@@ -813,12 +855,8 @@ def start(
                 )
             registered = frozen_values(hyp)
             cadence = _cadence_of(registered, f"hypothesis {slug!r}")
-            if not _gap_signoff_ok(conn, hyp.hypothesis_id):
-                raise StartRefusedError(
-                    "gap_signoff",
-                    f"no gap_signoff for {slug!r} references an ok, non-synthetic, "
-                    "in_sample trial of this hypothesis",
-                )
+            if (gap_refusal := _gap_signoff_refusal(conn, hyp.hypothesis_id, slug)) is not None:
+                raise StartRefusedError("gap_signoff", gap_refusal)
             reading = _read_clock(clock)
             forward = _forward(conn, hyp)
             if forward:

@@ -1822,17 +1822,34 @@ def _release_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datet
     trials were rerun by hand under the runbook's rule before T140b, and counting
     it now would stale every trial opened since its `made_at`, which read the
     repaired store, and rerun them into N (#1321 pass-2 follow-up)."""
+    found = latest_release_reaching(conn, cutoff)
+    return found.made_at if found is not None else None
+
+
+def vintage_releases(conn: duckdb.DuckDBPyConnection) -> list[DataRelease]:
+    """The closed releases that move a data vintage: every command-written `after`
+    row (an imported one, `IMPORTED_AT_KEY`, moves none; `_release_vintage`),
+    newest first as `data_releases` orders them."""
+    return [r for r in data_releases(conn) if r.stage == "after" and r.imported_at is None]
+
+
+def latest_release_reaching(
+    conn: duckdb.DuckDBPyConnection, cutoff: datetime
+) -> DataRelease | None:
+    """The newest of `vintage_releases` whose `sessions_from` is on or before
+    `cutoff`'s UTC date, or None: the release whose `made_at` is
+    `_release_vintage(conn, cutoff)`. A trial at `cutoff` whose recorded
+    `data_vintage` is earlier than that `made_at` was opened before this release
+    closed, so it read the store the release repaired (#3178)."""
     day = cutoff.astimezone(UTC).date()
-    latest: datetime | None = None
-    for release in data_releases(conn):
+    latest: DataRelease | None = None
+    for release in vintage_releases(conn):
         if (
-            release.stage == "after"
-            and release.imported_at is None
-            and release.sessions_from is not None
+            release.sessions_from is not None
             and release.sessions_from <= day
-            and (latest is None or release.made_at > latest)
+            and (latest is None or release.made_at > latest.made_at)
         ):
-            latest = release.made_at
+            latest = release
     return latest
 
 
