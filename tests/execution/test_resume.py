@@ -250,6 +250,7 @@ def _resume(
     *,
     accept: bool = False,
     accept_rejections: bool = False,
+    accept_fill_band: bool = False,
     book_id: str | None = None,
 ) -> Any:
     # A real clock moves between reads; the release must be stamped after the
@@ -263,6 +264,7 @@ def _resume(
         "owner checked",
         accept,
         accept_rejections=accept_rejections,
+        accept_fill_band=accept_fill_band,
         book_id=book_id,
     )
 
@@ -437,6 +439,62 @@ def test_resume_judges_a_new_fill_and_reports_its_price(
         assert _engaged(journal_settings, window)
 
 
+def test_accept_fill_band_releases_a_checked_bad_fill_and_journals_it(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3130: the owner checks the print and resumes with `accept_fill_band`. The
+    resume that first journals the bad fill still refuses (the owner has not seen
+    it); a later one with the flag releases, records the accepted fault in its
+    `resume_acceptances` row, and a later band fault refuses again."""
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _order(journal_settings, fake, crashed, "tp-bad", 2.0, DAY1 - timedelta(hours=1))
+    fake.apply("tp-bad", FillAt(200.0))
+    _engage(journal_settings, window, fixed_clock)
+    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
+    first = _resume(journal_settings, fake, fixed_clock, accept_fill_band=True)
+    assert first.status == REFUSED
+    assert any("fill_price_outside_band" in r for r in first.reasons)
+    plain = _resume(journal_settings, fake, fixed_clock)
+    assert plain.status == REFUSED
+    assert any("prior fill_price_outside_band" in r for r in plain.reasons)
+    accepted = _resume(journal_settings, fake, fixed_clock, accept_fill_band=True)
+    assert accepted.status == RELEASED, accepted.reasons
+    assert not _engaged(journal_settings, window)
+    with open_read_only(journal_settings) as conn:
+        (row,) = conn.execute(
+            "SELECT accepted_json FROM resume_acceptances WHERE resume_id = ?",
+            [accepted.resume_id],
+        ).fetchall()
+    entries = json.loads(row[0])
+    # The engagement and the crashed run's rejudged fill: both accepted, both named.
+    assert entries and {e["kind"] for e in entries} == {"fill_band"}
+    assert all("fill_price_outside_band" in e["message"] for e in entries)
+    assert any("tp-bad" in e["message"] for e in entries)
+    # A new band fault after that release refuses a plain resume again.
+    switch.engage(
+        journal_settings,
+        fixed_clock,
+        window_id=window.window_id,  # type: ignore[arg-type]
+        source="fault",
+        fault_type="SystemFaultError",
+        reason="SystemFaultError: fill_price_outside_band: tp-y 400 vs 100",
+    )
+    later = _resume(journal_settings, fake, fixed_clock)
+    assert later.status == REFUSED
+    assert any("tp-y" in r for r in later.reasons) and not any("tp-bad" in r for r in later.reasons)
+
+
+def test_accept_fill_band_must_be_a_bool(
+    journal_settings: Settings, fake: SkewedFake, fixed_clock: FixedClock
+) -> None:
+    with pytest.raises(TypeError, match="accept_fill_band"):
+        _resume(journal_settings, fake, fixed_clock, accept_fill_band=1)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize("initially_engaged", [False, True])
 def test_bad_fill_stays_refused_if_fault_engagement_write_fails(
     journal_settings: Settings,
@@ -506,6 +564,49 @@ def test_clock_step_back_rechecks_an_earlier_refused_invocation(
         assert not any(
             event.state == "released" for event in kill_switch_events_for(conn, window.window_id)
         )
+
+
+def test_accept_fill_band_never_accepts_a_rejudged_fill_nobody_has_seen(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review on #3140: a halt read's bad fill whose engagement write failed (#3027)
+    has no band engagement, so no output ever showed it. Even with the flag, the
+    resume that first rejudges it refuses (engaging and naming it); the next
+    flagged resume, after the owner has seen it, accepts it."""
+    started = DAY1 - timedelta(hours=1)
+    run_id = _run(journal_settings, window, started, finished=False)
+    order = _order(journal_settings, fake, run_id, "tp-unseen", 2.0, started)
+    fake.apply("tp-unseen", FillAt(200.0))
+    collect(
+        fake,
+        lambda: open_for_write(journal_settings),
+        [order],
+        fixed_clock,
+        "run",
+        run_id,
+        FROZEN,
+        journal_settings,
+    )
+    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
+    first = _resume(journal_settings, fake, fixed_clock, accept_fill_band=True)
+    assert first.status == REFUSED, first.reasons
+    assert any("tp-unseen" in r for r in first.reasons)
+    assert _engaged(journal_settings, window)
+    second = _resume(journal_settings, fake, fixed_clock, accept_fill_band=True)
+    assert second.status == RELEASED, second.reasons
+    assert any("tp-unseen" in a for a in second.accepted_fill_band)
+
+
+def test_a_shown_later_attempt_does_not_mark_an_earlier_attempt_seen() -> None:
+    """Review on #3140: `tp-x-1` is a prefix of `tp-x-12`; seen means `"<id> ("`."""
+    shown = ["SystemFaultError: fill_price_outside_band: tp-x-12 (SEC_SPY): fill price 400"]
+    seen = resume_module._band_fault_seen
+    assert seen("tp-x-12 (SEC_SPY): fill price 400 is outside 50%", shown)
+    assert not seen("tp-x-1 (SEC_SPY): fill price 400 is outside 50%", shown)
 
 
 @pytest.mark.parametrize("price, expected", [(200.0, REFUSED), (100.0, RELEASED)])
