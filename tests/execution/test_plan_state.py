@@ -29,6 +29,7 @@ from tradepartner.execution.plan import (
     is_full_exit,
     remainder,
     target_notional,
+    traded_at_lapse,
 )
 from tradepartner.store import schema
 from tradepartner.store.journal import (
@@ -957,3 +958,41 @@ def test_a_whole_cover_state_open_then_settled() -> None:
 def test_a_long_buy_without_a_target_still_raises() -> None:
     with pytest.raises(ValueError, match="no target_notional"):
         _remainder(_decision(side="buy", planned_quantity=4.0), [], [])
+
+
+# --- traded_at_lapse (#3141) ---------------------------------------------------------
+
+
+def test_a_rebalance_whose_every_decision_was_sent_and_filled_traded_at_lapse() -> None:
+    """#3141: an open remainder left by a filled order (submitted with a sell in
+    flight, so never written off) does not make a traded rebalance `missed`."""
+    buy = _decision(side="buy", target=500.0, decision_id=1)
+    sell = _decision(side="sell", decision_id=2, security_id="SEC_B")
+    skip = _decision(side=None, decision="skip_below_minimum", decision_id=3)
+    o_buy = _order(buy, T0, notional=490.0, sells_in_flight=True)
+    o_sell = _order(sell, T0, quantity=1.0)
+    fills = [_fill(o_buy, 9.8, PRICE), _fill(o_sell, 1.0, PRICE)]
+    states = [
+        (buy, DecisionState(State.OPEN, remainder=Remainder(0.2, 10.0))),
+        (sell, DecisionState(State.SETTLED)),
+        (skip, DecisionState(State.CLOSED, "skip_below_minimum")),
+    ]
+    assert traded_at_lapse(states, [o_buy, o_sell], fills)
+
+
+@pytest.mark.parametrize("case", ["never_sent", "sent_never_filled", "in_flight", "empty"])
+def test_a_rebalance_with_an_unsent_unfilled_or_in_flight_decision_did_not_trade(
+    case: str,
+) -> None:
+    buy = _decision(side="buy", target=500.0, decision_id=1)
+    order = _order(buy, T0, notional=500.0, sells_in_flight=True)
+    open_state = DecisionState(State.OPEN, remainder=Remainder(10.0, 500.0))
+    if case == "never_sent":  # a halt before the buys (the 10-28 case)
+        assert not traded_at_lapse([(buy, open_state)], [], [])
+    elif case == "sent_never_filled":
+        assert not traded_at_lapse([(buy, open_state)], [order], [])
+    elif case == "in_flight":
+        state = DecisionState(State.IN_FLIGHT)
+        assert not traded_at_lapse([(buy, state)], [order], [_fill(order, 1.0, PRICE)])
+    else:
+        assert not traded_at_lapse([], [], [])
