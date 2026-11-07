@@ -50,8 +50,11 @@ def test_every_listed_setting_changes_hash(key: str) -> None:
 # Pinned from main (before #2826 added `edgar.statement_fact_units`), then
 # re-pinned for #2929's `BUILD_RULES_VERSION` 3, then #2941's 4, then T198's
 # flip of `edgar.cover_split_contexts` and `edgar.class_member_link` with
-# `FSN_VERSION` and `COVER_VERSION` 7, then #3056's `BUILD_RULES_VERSION` 5.
-MAIN_DEFAULT_HASH = "a3abc2519fdb0bab9176fa02700e0f548a50529fd88afaa94ddd1d0a207da072"
+# `FSN_VERSION` and `COVER_VERSION` 7, then #2490's `CURRENT_SCHEMA_VERSION` 47
+# (`resume_invocations.book_id`; at 46 the hash is still da136ce7...785df1), then
+# #3012's move of the two Form 4 routing keys out of the hash (before T324 seeds
+# the real store), then #3056's `BUILD_RULES_VERSION` 5.
+MAIN_DEFAULT_HASH = "aac8cee3e9f15fe577b6871a82557bfd5a3100052aab3c1808330d07830d6dc4"
 
 
 def test_hash_at_defaults_equals_the_hex_pinned_from_main() -> None:
@@ -152,15 +155,30 @@ def test_every_master_and_edgar_key_is_classified() -> None:
     }
 
 
-def test_form4_compare_keys_do_not_move_the_build_hash() -> None:
-    """#2994: the rule 5 keys are classified as excluded, so setting them leaves the
-    incremental EDGAR build's hash (and so its cache) as it was."""
+@pytest.mark.parametrize(
+    "update",
+    (
+        {"form4_compare_threshold": Decimal("0.5"), "form4_multi_owner_xml": False},
+        {"form4_xml_price_below": Decimal("2.00")},
+        {"form4_zero_price_xml_codes": ["TEST"]},
+    ),
+)
+def test_form4_keys_do_not_move_the_build_hash(update: dict[str, Any]) -> None:
+    """#2994, #3012: every Form 4 writer key is classified as excluded, so setting one
+    leaves the incremental EDGAR build's hash (and so its gate) as it was."""
     base = Settings(_env_file=None)
-    events = base.events.model_copy(
-        update={"form4_compare_threshold": Decimal("0.5"), "form4_multi_owner_xml": False}
-    )
-    changed = base.model_copy(update={"events": events})
+    changed = base.model_copy(update={"events": base.events.model_copy(update=update)})
     assert module.build_fingerprint(changed).hash == module.build_fingerprint(base).hash
+
+
+def test_no_form4_key_is_hashed() -> None:
+    form4 = {
+        k
+        for k in (*module.HASHED_SETTINGS_KEYS, *module.EXCLUDED_SETTINGS_KEYS)
+        if k.startswith("events.form4_")
+    }
+    assert form4
+    assert form4 <= set(module.EXCLUDED_SETTINGS_KEYS)
 
 
 # --- additive_statement_change (T365a, #2826) ---------------------------------
