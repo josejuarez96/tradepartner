@@ -1196,6 +1196,7 @@ class TestRefusals:
                     "adjust.apply_spin_offs",
                     "strategy.hold_top_fraction",
                     "backtest.delisting_failure_return",
+                    "universe.shares_split_dating",
                     "portfolio.",
                     "costs.borrow",
                 )
