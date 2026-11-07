@@ -1670,7 +1670,11 @@ def test_an_open_basis_operations_file_of_h1_registers_as_a_pre_lab_parent(ops: 
         "SELECT trial_id FROM trials WHERE hypothesis_id = ?", [h1.hypothesis_id]
     ).fetchone()
     n_before = results.family_n(ops.conn, "momentum")
+    v_before = registry.family_sharpes(ops.conn, "momentum").variance("excess_spy")
+    trials_before = _ops_counts(ops.conn)["trials"]
     outcome = _ops_register(ops, _open_file(ops, "h1-open", 0.5), "h1")
+    assert _ops_counts(ops.conn)["trials"] == trials_before
+    assert registry.family_sharpes(ops.conn, "momentum").variance("excess_spy") == v_before
     values = outcome.values
     assert outcome.variant == h1
     assert (values["sweep_id"], values["sweep_slug"], values["variant_index"]) == (None,) * 3
@@ -1729,7 +1733,7 @@ def test_the_fill_price_exemption_is_an_operations_files_only(ops: Any) -> None:
     assert "execution.fill_price" in hypothesis._rule_differences(parsed, params, rules)
     assert hypothesis._rule_differences(parsed, params, rules, operations=True) == []
     before = _ops_counts(ops.conn)
-    with pytest.raises(LabRegistrationError):
+    with pytest.raises(LabRegistrationError, match="fingerprint differs from variant"):
         hypothesis.register(
             ops.conn,
             path,

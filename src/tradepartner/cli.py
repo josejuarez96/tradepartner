@@ -164,7 +164,9 @@ Phase 3 (T42):
   full frozen set and its hash (spec req 10). With `--operations-book-of
   <variant-slug> --reason` (both or neither; strategy-lab spec req 1, amendment
   2026-10-10, paper plan T160b) it registers an operations file of that sweep
-  variant through `hypothesis.register_operations_book` and also prints the
+  variant or pre-lab hypothesis (differing only in `execution.fill_price` and a
+  higher `costs.per_side_bps`, #3118 item 2) through
+  `hypothesis.register_operations_book` and also prints the
   `operations_book` decision's id; it is never a promotion.
 - `tradepartner trials [--hypothesis] [--include-synthetic]` lists trials newest
   first, `unfinished`, failed and refused ones with their message; synthetic

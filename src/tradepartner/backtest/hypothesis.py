@@ -71,8 +71,9 @@ registered, the variant's `ok` in-sample trial counted in N, current or stale
 (`sweep_report.variant_standing`), its
 family in `PAPER_FAMILIES`, the family's holdout **not forward** (`holdout.is_forward`
 with `registry.family_registered_on`; ADR 0016 point 4) and no `promotion` or
-`operations_book` row naming the variant already. The registration, its
-`hypothesis_fingerprints` row (the variant's fingerprint) and the `operations_book`
+`operations_book` row naming the variant already (for the same differences, below).
+The registration, its `hypothesis_fingerprints` row (the file's own fingerprint, the
+variant's when nothing differs) and the `operations_book`
 decision are one transaction. It is not a promotion: `lab_registry.promotion_for` stays
 None, so `holdout.decide` refuses any spend by it (req 5(b)); it writes no trial, so N
 and V are unchanged.
@@ -1129,10 +1130,12 @@ def register_operations_book(
 ) -> OperationsBookOutcome:
     """`hypothesis register <path> --operations-book-of <variant_slug> --reason
     <reason>` (module docstring, "Operations files"): register `path` with
-    `operations_of` the variant's id, write its `hypothesis_fingerprints` row
-    (the variant's fingerprint) and append the `operations_book` decision (sweep,
-    variant, registered id, the variant's base-level in-sample statistics; the
-    owner's reason), in one transaction (the caller's if open). Writes no trial.
+    `operations_of` the parent's id (a sweep variant or a pre-lab hypothesis), write
+    its `hypothesis_fingerprints` row (its own fingerprint) and append the
+    `operations_book` decision (sweep and variant index, null for a pre-lab parent;
+    the parent and registered ids; the parent trial's base-level in-sample statistics;
+    `parent_fingerprint` and `differing_keys`; the owner's reason), in one
+    transaction (the caller's if open). Writes no trial.
 
     Raises `LabNotInitialised` on a store without the lab tables, `ValueError` for a
     blank reason, `UnknownHypothesis` for an unknown variant slug and
