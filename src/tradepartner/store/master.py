@@ -1160,7 +1160,7 @@ def derive_rename_listings(
         if not on_exchange:
             refused.append(RenameRefusal(sid, old, new, RENAME_EXCHANGE_DIFFERS))
             continue
-        if any(holder != sid and ex == current["exchange"] for holder, ex in change.held_by):
+        if any(holder != sid for holder, _ex in change.held_by):  # on any exchange
             refused.append(RenameRefusal(sid, old, new, RENAME_HELD))
             continue
         known_at = max(min(at for at, _ in on_exchange), change.known_at)
