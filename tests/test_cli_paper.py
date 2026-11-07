@@ -504,6 +504,7 @@ NO_WINDOW = cli.PAPER_REFUSAL_EXIT["no_window"]
 #: Every `paper` command's exact options (spec req 16: no endpoint, run-session,
 #: store-path or bypass flag; `override --session` is the override's rebalance session).
 PAPER_OPTIONS = {
+    "cost": {"--book", "--window", "--through"},
     "start": {"--hypothesis", "--book", "--now"},
     "stop": {"--reason", "--book"},
     "run": {"--book"},
@@ -3135,3 +3136,115 @@ def test_status_all_hides_phase_notes_but_keeps_other_run_notes() -> None:
     row.last_run_message = "paper_phase started=1"
     assert "check fill" not in cli._summary_lines((row,), SESSION_CLOCK)[0]
     assert "paper_phase" not in cli._summary_lines((row,), SESSION_CLOCK)[0]
+
+
+# --- paper cost (T383, #3118 item 3) --------------------------------------------------
+
+_COST = paper_slippage.MeasuredCost(
+    slippage=paper_slippage.Slippage(
+        buy=paper_slippage.SideSlippage(944, 49.5, 36.3, 120.0),
+        sell=paper_slippage.SideSlippage(900, 91.3, 14.4, 200.0),
+        overall=paper_slippage.SideSlippage(1844, 61.4, 10.5, 150.0),
+        no_bar=2,
+        off_session=1,
+        pending=3,
+    ),
+    month_end=paper_slippage.SideSlippage(190, 70.0, 5.0, 100.0),
+    stop_run=142,
+    after_stop=4,
+    stop_session=date(2026, 11, 5),
+    figure_bp=60.0,
+)
+
+
+def _seed_books() -> None:
+    """Windows 1 (`daily`), 2 (`main`) and 3 (`daily`, the latest)."""
+    with open_for_write(_settings()) as conn:
+        init_schema(conn)
+        for book in ("daily", "main", "daily"):
+            journal.append(conn, replace(_window(None, WINDOW_START), book_id=book))
+
+
+@pytest.fixture
+def cost_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, datetime]]:
+    calls: list[tuple[int, datetime]] = []
+
+    def fake(_conn: object, window_id: int, cutoff: datetime) -> paper_slippage.MeasuredCost:
+        calls.append((window_id, cutoff))
+        return _COST
+
+    monkeypatch.setattr(paper_slippage, "window_cost", fake)
+    return calls
+
+
+def test_paper_cost_prints_the_sides_the_counts_and_the_figure_for_the_latest_window(
+    cost_calls: list[tuple[int, datetime]], clock: _Clock, factory: _Factory
+) -> None:
+    _seed_books()
+    out = _paper(clock, factory, "cost", "--book", "daily")
+    assert out.exit_code == 0, out.output
+    assert cost_calls == [(3, SESSION_CLOCK)]
+    assert "book daily, window 3" in out.stdout
+    assert "buys n=944 +49.5; sells n=900 +91.3; pooled n=1844 +61.4" in out.stdout
+    assert "left out: 142 orders of stop runs, 4 on or after the stop (stop session " in (
+        out.stdout
+    )
+    assert "counted apart: no bar 2, off session 1, pending 3" in out.stdout
+    assert "on sessions a month-end book also traded (in the pool) n=190 +70.0" in out.stdout
+    assert "figure to freeze: 60 bp per side (pooled, rounded to 5 bp)" in out.stdout
+    assert factory.clocks == []  # no broker is built
+
+
+def test_paper_cost_window_selects_the_window_and_through_bounds_the_read(
+    cost_calls: list[tuple[int, datetime]], clock: _Clock, factory: _Factory
+) -> None:
+    _seed_books()
+    clock.now = datetime(2026, 11, 7, 14, tzinfo=UTC)
+    out = _paper(
+        clock, factory, "cost", "--book", "daily", "--window", "1", "--through", "2026-11-04"
+    )
+    assert out.exit_code == 0, out.output
+    assert cost_calls == [(1, datetime(2026, 11, 4, 21, tzinfo=UTC))]  # close(11-04)
+
+
+def test_paper_cost_refuses_another_books_window_a_missing_one_and_a_bad_through(
+    cost_calls: list[tuple[int, datetime]], clock: _Clock, factory: _Factory
+) -> None:
+    _seed_books()
+    other = _paper(clock, factory, "cost", "--book", "daily", "--window", "2")
+    missing = _paper(clock, factory, "cost", "--book", "daily", "--window", "9")
+    no_book = _paper(clock, factory, "cost", "--book", "nobook")
+    weekend = _paper(clock, factory, "cost", "--book", "daily", "--through", "2026-11-07")
+    assert other.exit_code == cli.PAPER_REFUSAL_EXIT["refused"]
+    assert "window 2 is book 'main', not 'daily'" in other.output
+    assert (missing.exit_code, no_book.exit_code) == (cli.PAPER_REFUSAL_EXIT["no_window"],) * 2
+    assert weekend.exit_code == cli.USAGE_ERROR
+    assert cost_calls == []
+
+
+def test_paper_cost_opens_the_store_read_only_and_writes_nothing(
+    cost_calls: list[tuple[int, datetime]],
+    clock: _Clock,
+    factory: _Factory,
+    live: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_books()
+    before = _sha256(live)
+    opened: list[str] = []
+    real = cli.open_read_only
+
+    def read_only(settings: Settings) -> Any:
+        opened.append("read_only")
+        return real(settings)
+
+    def for_write(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("paper cost opened the store for writing")
+
+    monkeypatch.setattr(cli, "open_read_only", read_only)
+    monkeypatch.setattr(cli, "open_for_write", for_write)
+    monkeypatch.setattr(cli.store_migrate, "migrate", for_write)
+    out = _paper(clock, factory, "cost", "--book", "daily")
+    assert out.exit_code == 0, out.output
+    assert opened == ["read_only", "read_only"]  # the schema check, then the read
+    assert _sha256(live) == before
