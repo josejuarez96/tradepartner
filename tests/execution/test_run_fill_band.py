@@ -41,11 +41,14 @@ def _fill_victim_at(env: Env, factor: float) -> str:
     return victim
 
 
-def test_the_default_band_is_a_quarter_of_the_reference_price() -> None:
-    assert PaperConfig().max_fill_price_deviation == 0.25
+def test_the_default_band_is_half_the_reference_price() -> None:
+    """#3130: real overnight gaps of 25% or more (about 8.6e-4 per name-session,
+    Audit C; INTC 10-30 at -29.3%) ended windows at 0.25. The band is for bad prints
+    and unit errors."""
+    assert PaperConfig().max_fill_price_deviation == 0.5
 
 
-@pytest.mark.parametrize("factor", [100.0, 0.01])
+@pytest.mark.parametrize("factor", [100.0, 0.01, 2.0, 1.55, 0.45])
 def test_a_fill_far_outside_the_band_halts_with_a_named_alert(
     env: Env, window: PaperWindowRow, factor: float
 ) -> None:
@@ -60,7 +63,7 @@ def test_a_fill_far_outside_the_band_halts_with_a_named_alert(
     assert env.query("SELECT run_id FROM kill_switch")[-1][0] == run_id
 
 
-@pytest.mark.parametrize("factor", [1.2, 0.8, 1.0])
+@pytest.mark.parametrize("factor", [1.2, 0.8, 1.0, 0.707, 1.45, 0.55])
 def test_a_normal_fill_and_a_large_real_gap_inside_the_band_pass(
     env: Env, window: PaperWindowRow, factor: float
 ) -> None:
