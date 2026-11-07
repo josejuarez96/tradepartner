@@ -3538,7 +3538,12 @@ def test_filename_evidence_is_fetched_before_freeze_only_when_enabled(
 
     h1 = Path(__file__).resolve().parents[1] / "docs/hypotheses/h1-momentum-12-1.md"
     parsed = hypothesis.parse_file(h1)
-    pinned = Settings(_env_file=None, universe={"exclude_sic_ranges": [[4900, 4999]]})
+    # H1's stored record: the old universe, before #1540's live default and before
+    # #3076's key (which it reads at its table default `[]`).
+    pinned = Settings(
+        _env_file=None,
+        universe={"exclude_sic_ranges": [[4900, 4999]], "exclude_issuer_classes": []},
+    )
     params = hypothesis.frozen_params(parsed, pinned)
     assert frozen.fingerprint("momentum", params, parsed.in_sample_start) == (
         "534917a58a4f8c5dfe17330b3e2d06faf38111de553fd467886a06c147f609a4"

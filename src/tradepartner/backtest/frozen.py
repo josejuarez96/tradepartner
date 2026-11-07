@@ -121,6 +121,12 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     # #3055: rule 7's split dating (a post-split count dated before the ex-date). `false`
     # is today's rule, so no stored canonical set or fingerprint moves.
     ("universe.shares_split_dating", False, 46),
+    # #3076 (#3053 item 6): rule 1's issuer-class exclusion. `[]` is the rule before it,
+    # so no stored canonical set or fingerprint moves; the live default excludes BDCs,
+    # MLPs and foreign filers, so a new registration that leaves the key out freezes that
+    # and is a new fingerprint. A universe key, so a family's rules fix it (`[]` for a
+    # family registered before it).
+    ("universe.exclude_issuer_classes", [], 48),
 )
 
 #: Keys added to a family's own listed section **after** that family's first

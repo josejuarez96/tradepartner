@@ -664,6 +664,7 @@ def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path:
             "strategy.hold_top_fraction",
             "backtest.delisting_failure_return",
             "universe.shares_split_dating",
+            "universe.exclude_issuer_classes",
             "portfolio.",
             "costs.borrow",
         ),
@@ -678,6 +679,11 @@ def test_h1_twin_registered_before_t85_still_loads_and_verifies(
     section's live values, `frozen_hash_matches` (what `record_results` checks) holds,
     and `hypothesis register` on the unchanged file writes nothing new."""
     parsed = hypothesis.parse_file(FIXTURE)
+    # #3076: a registration from before these entries predates the issuer-class key
+    # too, so it reads the key's table default `[]` (the live default excludes).
+    settings = settings.model_copy(
+        update={"universe": settings.universe.model_copy(update={"exclude_issuer_classes": []})}
+    )
     params = {
         k: v
         for k, v in hypothesis.frozen_params(parsed, settings).items()
@@ -1332,6 +1338,11 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
     """H1's case: stored without the key. `frozen_hash_matches` holds on its loaded
     settings, and `hypothesis register` on the unchanged file writes nothing."""
     parsed = hypothesis.parse_file(FIXTURE)
+    # #3076: a registration from before these entries predates the issuer-class key
+    # too, so it reads the key's table default `[]` (the live default excludes).
+    settings = settings.model_copy(
+        update={"universe": settings.universe.model_copy(update={"exclude_issuer_classes": []})}
+    )
     later = (
         TURNOVER_KEY,
         "metrics.risk_free_source",
@@ -1355,6 +1366,7 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
         "strategy.hold_top_fraction",
         "backtest.delisting_failure_return",
         "universe.shares_split_dating",
+        "universe.exclude_issuer_classes",
         "portfolio.side",
         "portfolio.gross_exposure",
         "portfolio.net_exposure",
@@ -1732,6 +1744,11 @@ def test_h1s_unchanged_file_registered_before_the_terms_writes_nothing(
     returns that record (the three are a suffix of the table at their defaults; a
     registration from before them also predates T187's later chain keys)."""
     parsed = hypothesis.parse_file(H1_FILE)
+    # #3076: a registration from before these entries predates the issuer-class key
+    # too, so it reads the key's table default `[]` (the live default excludes).
+    settings = settings.model_copy(
+        update={"universe": settings.universe.model_copy(update={"exclude_issuer_classes": []})}
+    )
     later = {
         *COST_TERMS,
         *(k for k in hypothesis.frozen_keys() if k.startswith("master.chain")),
@@ -1740,6 +1757,7 @@ def test_h1s_unchanged_file_registered_before_the_terms_writes_nothing(
         "strategy.hold_top_fraction",
         "backtest.delisting_failure_return",
         "universe.shares_split_dating",
+        "universe.exclude_issuer_classes",
     }
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     stored = registry.register_hypothesis(

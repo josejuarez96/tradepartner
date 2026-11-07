@@ -5,7 +5,10 @@
 reported once, under the first rule it fails:
 
 1. `security_type`: the latest classification known at `t` is in
-   `universe.security_types`. No classification row is `unclassified`.
+   `universe.security_types`. No classification row is `unclassified`. Then
+   its `issuer_class` (#3076: `spac`, `bdc`, `mlp`, `foreign`) is not in
+   `universe.exclude_issuer_classes` (reason `issuer:<class>`); a store before
+   schema 48, or a row with no tag, passes this part.
 2. `exchange`: the security's current listing at T's session is live and
    on one of `universe.exchanges`. The current listing is the one with the
    latest `valid_from` on or before the session (a ticker change or a
@@ -1074,19 +1077,18 @@ def universe_as_of(
         alive = [sid for sid in alive if not reasons.get(sid)]
 
     classes = {r["security_id"]: r for r in classifications_as_of(conn, t).iter_rows(named=True)}
-    apply(
-        "security_type",
-        {
-            sid: (
-                "unclassified"
-                if sid not in classes
-                else ""
-                if classes[sid]["security_type"] in cfg.security_types
-                else classes[sid]["security_type"]
-            )
-            for sid in alive
-        },
-    )
+    excluded_classes = frozenset(cfg.exclude_issuer_classes)
+
+    def security_type(sid: str) -> str:
+        if sid not in classes:
+            return "unclassified"
+        row = classes[sid]
+        if row["security_type"] not in cfg.security_types:
+            return str(row["security_type"])
+        tag = row.get("issuer_class")  # absent on a schema-47 store (#3076)
+        return f"issuer:{tag}" if tag in excluded_classes else ""
+
+    apply("security_type", {sid: security_type(sid) for sid in alive})
 
     listings = _current_listings(conn, t, session, settings)
     apply(
