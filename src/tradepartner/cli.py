@@ -6161,6 +6161,7 @@ def make_app(
                 )
                 for m in comparison.periods
             ),
+            *(result.fidelity.report_lines if result.fidelity is not None else ()),
             *(
                 f"  target {t.rebalance_session} {t.security_id}: paper "
                 f"{_fmt(t.paper_weight)} trial {_fmt(t.trial_weight)} ({t.difference})"
