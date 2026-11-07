@@ -724,12 +724,17 @@ def _exit_book(context: StepContext) -> _ExitBook:
             if held
             else {}
         )
-        tickers, ambiguous = _current_symbols(conn, session, held, context.settings, window_id)
+        mapped = order_symbols(conn, session, held, context.settings, window_id)
+        tickers = {sid: symbol for sid, symbol in mapped.symbols.items() if symbol is not None}
+        ambiguous = dict(mapped.ambiguous)
         delisted = frozenset(sid for sid, row in ends.items() if row["status"] == DELISTED)
         if delisted:
             current = planning.current_listings(
                 listings_as_of(conn, cut, sorted(delisted)), session
             )
+            # A held predecessor's chain successor is no later issuer of the
+            # successor symbol the map sends it under (#3031, #3051), as in the
+            # wrapper's `_listings`.
             reused = _refuse_reused_tickers(
                 conn,
                 cut,
@@ -738,6 +743,7 @@ def _exit_book(context: StepContext) -> _ExitBook:
                 delisted,
                 tickers,
                 context.settings.alpaca.class_symbols,
+                mapped.chained,
             )
             for sid, note in reused.items():
                 ambiguous[sid] = f"{ambiguous[sid]}; {note}" if sid in ambiguous else note

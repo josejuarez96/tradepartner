@@ -1270,3 +1270,84 @@ def test_a_stop_run_with_an_ambiguous_held_residue_still_exits_the_other_names(
     assert exited == {"SEC_SPLIT_FUTURE": "window_stop", "SEC_TRANSFER": "window_stop"}
     assert message is not None and "DUALB -> DUALBX" in message
     assert "DUALB" in env.held()
+
+
+# --- a held chained predecessor (#3051) ----------------------------------------------
+
+
+def chain(env: Env, security_id: str, successor: str, ticker: str, known_at: datetime) -> None:
+    """A 1:1 successor chain (#821) `security_id -> successor` known at
+    `known_at`, the successor listed as `ticker` on the predecessor's exchange
+    from that session, and the broker's re-booking of the position under it."""
+    (row,) = env.query(
+        "SELECT exchange, class_title FROM listings WHERE security_id = ? "
+        "ORDER BY valid_from DESC LIMIT 1",
+        [security_id],
+    )
+    stamp = {"known_at": known_at, "ingested_at": known_at, "source": "edgar"}
+    env.insert(
+        "securities",
+        {
+            "security_id": successor,
+            "cik": "CIK0009003051",
+            "name": "Successor",
+            **stamp,
+            "provenance": "filing",
+        },
+    )
+    env.insert(
+        "listings",
+        {
+            "security_id": successor,
+            "ticker": ticker,
+            "exchange": row[0],
+            "class_title": row[1],
+            "valid_from": known_at.date(),
+            "provenance": "filing",
+            **stamp,
+        },
+    )
+    env.insert(
+        "successor_chains",
+        {
+            "predecessor_id": security_id,
+            "successor_id": successor,
+            "evidence_accession": "SEC-26-003051",
+            "evidence_form": "8-K12B",
+            "retracted": False,
+            "withdrawn_known_at": None,
+            "provenance": "filing",
+            **stamp,
+        },
+    )
+    env.fake.set_asset(ticker, Asset(True, True, "active", None))
+    env.fake._net_quantity[ticker] = env.fake._net_quantity.pop(SYMBOLS[security_id])
+
+
+def test_a_held_chained_predecessor_is_marked_and_exited_under_its_successor(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """#3051 end to end: DUALB is held; its Form 25 and a chain to a successor
+    trading as `DUALN` are known at close(F_0), so the store files DUALB's bars
+    under the successor (#821), and the broker re-booked the position under
+    `DUALN`. The run on F_0 + 1 reconciles under `DUALN` (#3024), marks the held
+    predecessor at its successor's bars instead of raising `no price for
+    SEC_DUAL_B`, and sends the forced exit under `DUALN` (#3031)."""
+    bought(env)
+    held = env.held()["DUALB"]
+    close = env.prices["DUALB"]
+    delist(env, "SEC_DUAL_B", at(F_0, 19, 0))
+    chain(env, "SEC_DUAL_B", "SEC_DUAL_B_SUCC", "DUALN", at(F_0, 19, 0))
+    sent_before = len(env.submits())
+
+    outcome = env.run(at(F_0_PLUS_1), prices={"DUALN": close})
+
+    assert outcome.status == "ok", env.result(env.latest_run())
+    marked = env.query(
+        "SELECT mark_price FROM positions_daily WHERE security_id = 'SEC_DUAL_B' AND session = ?",
+        [F_0],
+    )
+    assert marked and marked[0][0] is not None and marked[0][0] > 0
+    (sell,) = env.submits()[sent_before:]
+    assert sell.symbol == "DUALN"
+    assert sell.quantity == pytest.approx(held)
