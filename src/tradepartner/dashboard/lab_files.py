@@ -33,7 +33,7 @@ from __future__ import annotations
 import re
 import subprocess
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
@@ -44,6 +44,7 @@ from tradepartner.backtest import hypothesis, results, sweep
 from tradepartner.backtest.holdout import Frozen, is_forward
 from tradepartner.config import Settings, secret_values
 from tradepartner.store import lab_registry, lab_schema, registry
+from tradepartner.store.db import utc_now
 
 #: A file name the Lab accepts; no separator, no dot-dot, lower-case.
 NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]*\.md")
@@ -341,9 +342,9 @@ def preview(
     """What the sweep file at `path` declares and what registering it would do.
 
     Raises `LabFileRefused` (scrubbed message) for a file the sweep parser or
-    `expand_grid` refuses. Reads the store; writes nothing. `today` (default the UTC
-    day) is the registration day of a family with no hypothesis yet, which decides
-    whether its holdout is forward (ADR 0016 point 4).
+    `expand_grid` refuses. Reads the store; writes nothing. `today` (default the New
+    York day, `registry.registration_day`) is the registration day of a family with no
+    hypothesis yet, which decides whether its holdout is forward (ADR 0016 point 4).
     """
     _check_sweep_path(path)
     try:
@@ -354,7 +355,7 @@ def preview(
     lab = lab_schema.is_lab_initialised(conn)
     registered_on = registry.family_registered_on(conn, parsed.family)
     if registered_on is None:
-        registered_on = today if today is not None else datetime.now(UTC).date()
+        registered_on = today if today is not None else registry.registration_day(utc_now())
     forward = is_forward(
         Frozen(
             hypothesis_id=0,
