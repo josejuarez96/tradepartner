@@ -190,6 +190,9 @@ class AlpacaConfig(BaseModel):
     opg_cutoff_minutes_before_open: int = Field(default=3, ge=2)
     actions_process_lag_days: int = Field(default=90, ge=0)
     actions_backfill_floor: date = date(2020, 6, 1)
+    #: #3054: `ingest --actions-backfill --name-changes-only` starts no earlier
+    #: (the store's bars start 2016-01-04).
+    name_change_backfill_floor: date = date(2016, 1, 1)
     registrant_quiet_days: int = Field(default=180, ge=1)
     # #843: how far before a rename's first cover-page row the new ticker may fill the
     # renamed company's bar hole (`ListingResolver.lead`). The 2016-2026 store's longest

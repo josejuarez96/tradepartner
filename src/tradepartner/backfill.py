@@ -1271,3 +1271,159 @@ def _benchmark_chunk(
         return outcome(LOCKED, 0, str(exc))
     except Exception as exc:  # any source or parse failure halts the run
         return outcome(FAILED, 0, _with_frames(f"{type(exc).__name__}: {exc}", exc, settings))
+
+
+#: `refetch_actions`' run mode (#3054); its committed months are `filled`, never `ok`.
+ACTIONS_REFETCH = "actions_refetch"
+
+
+class RefetchRefused(RuntimeError):
+    """`refetch_actions` may not write: no open data release of that name."""
+
+
+@dataclass(frozen=True)
+class ActionsRefetch:
+    """What `refetch_actions` added (or, dry, would add) per month."""
+
+    runs: tuple[SourceRun, ...]
+    dry_run: bool
+    #: Rows added (would be added) by action type, over every month run.
+    added: tuple[tuple[str, int], ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        """True when every month ran to its end (`filled`)."""
+        return all(run.status == FILLED for run in self.runs)
+
+    def summary(self) -> str:
+        """One line for the terminal."""
+        verb = "would add" if self.dry_run else "added"
+        counts = ", ".join(f"{n} {kind}" for kind, n in self.added) or "nothing"
+        return f"actions refetch over {len(self.runs)} month(s): {verb} {counts}"
+
+
+def refetch_actions(
+    settings: Settings,
+    *,
+    prices: PriceSource,
+    since: date,
+    through: date,
+    release: str,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+    securities: Collection[str] | None = None,
+) -> ActionsRefetch:
+    """Ask the source again for the splits and dividends of the committed
+    months `since..through` (#3054), with no bars: a month the backfill
+    resumed past keeps the actions its first fetch got, so an action the
+    resolver of the day missed (a pre-rename symbol it never asked, before
+    the alias) never arrives.
+
+    Per calendar month: the store's resolver and the window names at the
+    clock (`_window_names`, the backfill's own fetch list; only `securities`
+    of them when given), `prices.corporate_actions` with no store connection
+    open, and `ingest._add_actions` in one write transaction, so an
+    identity already stored adds nothing and every row keeps the source's
+    timing rule (a first-seen row its first-seen proxy, a revision the
+    clock). A real run writes only inside the open data release `release`
+    (`repair.release_refusal`) and records one `ingestion_runs` row per
+    month, mode `ACTIONS_REFETCH`, status `filled` (never `ok`); a dry run
+    fetches the same and rolls every write and its run row back, so its
+    counts are the run's. Halts at the first month that is not `filled`."""
+    if isinstance(since, datetime) or not isinstance(since, date):
+        raise TypeError(f"since must be a date, got {since!r}")
+    if isinstance(through, datetime) or not isinstance(through, date) or through < since:
+        raise ValueError("through must be a date on or after since")
+    if isinstance(securities, str):
+        raise TypeError("securities must be a collection of ids, not one string")
+    only = None if securities is None else frozenset(securities)
+    if only is not None and not only:
+        raise ValueError("securities, when given, must name at least one id")
+    totals: Counter[str] = Counter()
+    runs: list[SourceRun] = []
+    for window in month_windows(since, through):
+        run = _refetch_month(settings, prices, since, window, release, clock, dry_run, only, totals)
+        runs.append(run)
+        if run.status != FILLED:
+            break
+    return ActionsRefetch(tuple(runs), dry_run, tuple(sorted(totals.items())))
+
+
+def _refetch_month(
+    settings: Settings,
+    prices: PriceSource,
+    since: date,
+    window: tuple[date, date],
+    release: str,
+    clock: Callable[[], datetime],
+    dry_run: bool,
+    only: frozenset[str] | None,
+    totals: Counter[str],
+) -> SourceRun:
+    """One month of `refetch_actions`; adds the rows it moved to `totals`."""
+    from tradepartner.repair import release_refusal
+
+    prepared: dict[str, Any] = {}
+    started = ensure_tz_aware_utc(clock(), field_name="clock()")
+
+    def prepare() -> None:
+        with _read(settings) as conn:
+            # Refused before any fetch; checked again under the write lock.
+            if not dry_run and (why := release_refusal(conn, release)) is not None:
+                raise RefetchRefused(why)
+            resolver = store_resolver(conn, started, settings)
+            ids = _window_names(conn, started, window, settings, resolver)[0]
+        wanted = sorted(set(ids) & only) if only is not None else sorted(ids)
+        fetched = prices.corporate_actions(wanted, *window) if wanted else []
+        # Splits and dividends only: spin-offs keep their own path (#3053 item 2).
+        actions = [a for a in fetched if a.action_type in (ActionType.SPLIT, ActionType.DIVIDEND)]
+        with _read(settings) as conn:
+            plan = _replay_plan(conn, actions, window)
+        prepared["actions"], prepared["covered"] = _replay_actions(prices, actions, window, plan)
+        prepared["names"] = len(wanted)
+
+    def write(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
+        if not dry_run and (why := release_refusal(conn, release)) is not None:
+            raise RefetchRefused(why)
+        before = _action_counts(conn)
+        stats: dict[str, int] = {}
+        stamp = ensure_tz_aware_utc(clock(), field_name="clock()")
+        added = _add_actions(
+            conn,
+            prepared["actions"],
+            window,
+            ingested_at=stamp,
+            covered=prepared["covered"],
+            stats=stats,
+        )
+        moved = _action_counts(conn) - before
+        totals.update(moved)
+        by_type = ", ".join(f"{kind}={n}" for kind, n in sorted(moved.items())) or "none"
+        extra = "".join(f"; {key}={value}" for key, value in sorted(stats.items()))
+        message = (
+            f"{window[0]}..{window[1]}: {len(prepared['actions'])} action(s) for "
+            f"{prepared['names']} names; added {by_type}; release {release}{extra}"
+        )
+        if resolution := prices.resolution_summary():
+            message += f"; {resolution}"
+        return added, message
+
+    return _run_source(
+        "alpaca",
+        write,
+        settings,
+        started,
+        clock,
+        f"{ACTIONS_REFETCH};since={since};through={window[1]}",
+        dry_run,
+        mode=ACTIONS_REFETCH,
+        prepare=prepare,
+        success_status=FILLED,
+    )
+
+
+def _action_counts(conn: duckdb.DuckDBPyConnection) -> Counter[str]:
+    rows = conn.execute(
+        "SELECT action_type, count(*) FROM corporate_actions GROUP BY action_type"
+    ).fetchall()
+    return Counter({str(kind): int(n) for kind, n in rows})
