@@ -51,7 +51,7 @@ security_id,ex_date,amount,verdict,retract_source_action_id,ticker,evidence
 0001058057,2021-04-08,0.06,duplicate,ca889417-b74a-4464-9340-51dab337123d,MRVL,raw records differ by cusip only
 0001847398,2021-04-08,0.03,duplicate,40d4b6bb-5527-437a-9339-73feef13604d,NECB,raw records differ by cusip only
 0001040971,2021-04-29,0.3033,duplicate,ea19186f-3794-46a8-a592-8ef093ca41cf,SLG,raw records differ by cusip only
-0001137789,2021-05-11,0.67,unresolved,,STX,Alpaca no longer returns either id; only the issuer record settles it (#1613 Q25)
+0001137789,2021-05-11,0.67,duplicate,d08ea098-e6bd-4775-9bb6-abda5545428d,STX,an independent dividend history has one 0.67 entitlement on this ex-date (2026-11-03 store measurement); the owner-side raw export pairs the two ids (#3054)
 0001413898,2021-05-13,0.04,duplicate,b48977ca-6659-414b-8992-91ef07b714a4,AHC,raw records differ by cusip only
 0001372807,2021-05-18,0.06,unresolved,,,"no listing at the ex-date (#1597 listing gap), so no raw pair"
 0001040971,2021-05-27,0.3033,duplicate,8dfac438-2df5-4d5f-b816-88398a9fdd49,SLG,raw records differ by cusip only
