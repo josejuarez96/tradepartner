@@ -291,6 +291,8 @@ class _Book:
     values: list[pl.DataFrame] = field(default_factory=list)
     keep_detail: bool = True
     chained_positions: int = 0  # #821: positions renamed by a successor chain this step
+    refused_chains: int = 0  # #3097: held predecessors of a refused chain this step
+    refused_seen: set[str] = field(default_factory=set)  # #3097: counted once per name
     series: str = STRATEGY_SERIES
     borrow_bps: float | None = None
     pending_covers: set[str] = field(default_factory=set)
@@ -1261,12 +1263,18 @@ def _step(
 def _rebalance_counts(plan: Plan, book: _Book) -> Mapping[str, int]:
     """The rebalance row's counts: the plan's, plus `n_chained_positions` (#821,
     T187b) on the one step whose read saw the chain and renamed `book`'s
-    positions (0 in every other step, so no extra count row is written)."""
-    if not book.chained_positions:
+    positions, and `n_refused_chains` (#3097) on the one step whose read refused
+    a chain naming a held predecessor (0 in every other step, so no extra count
+    row is written)."""
+    if not book.chained_positions and not book.refused_chains:
         return plan.counts
     counts = dict(plan.counts)
-    counts["n_chained_positions"] = book.chained_positions
+    if book.chained_positions:
+        counts["n_chained_positions"] = book.chained_positions
+    if book.refused_chains:
+        counts["n_refused_chains"] = book.refused_chains
     book.chained_positions = 0
+    book.refused_chains = 0
     return counts
 
 
@@ -1522,6 +1530,9 @@ class _SharedReads:
     def chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
         return self._once(("chains", t), lambda: self._provider.chains(t))
 
+    def refused_chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        return self._once(("refused_chains", t), lambda: self._provider.refused_chains(t))
+
     def adjusted_prices(
         self,
         t: datetime,
@@ -1633,6 +1644,9 @@ class _Requests:
         # Not a keyed read: the engine reads it once per step itself, never a
         # signal reader (T187b).
         return self.view.chains(t)
+
+    def refused_chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        return self.view.refused_chains(t)
 
     def adjusted_prices(
         self,
@@ -2009,6 +2023,13 @@ def _run_group(
         if chains:
             for variant in group:
                 _rename_chained(variant, chains)
+        # #3097: a stored chain the reads refuse renames nothing (`chains` leaves it
+        # out, and no read re-keys its predecessor); a held predecessor exits by the
+        # normal delisting path and is counted on the step's rebalance row.
+        refused = view.refused_chains(t)
+        if refused:
+            for variant in group:
+                _count_refused(variant, refused)
         own = [_marking_ids(variant, benchmarks) for variant in group]
         t_prev = read_time(cast(Plan, group[0].plan).session, cadence)
         view.share(
@@ -2075,6 +2096,17 @@ def _cash_accruals(
     )
     yields = {s: to_yield(rate, metrics.risk_free_basis) for s, rate in published.items()}
     return session_accruals(every, yields, series=series)
+
+
+def _count_refused(variant: _Variant, refused: Sequence[tuple[str, str]]) -> None:
+    """Count, per book, the held predecessors of the refused chains (#3097), each
+    name once per run: the predecessor keeps its own id, so the step's listing-end
+    read exits it like any other delisted name."""
+    for book in variant.books:
+        for predecessor, _ in refused:
+            if predecessor in book.positions and predecessor not in book.refused_seen:
+                book.refused_seen.add(predecessor)
+                book.refused_chains += 1
 
 
 def _rename_chained(variant: _Variant, chains: Sequence[tuple[str, str]]) -> None:

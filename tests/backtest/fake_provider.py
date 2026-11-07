@@ -223,6 +223,7 @@ class FakeProvider:
         default_factory=lambda: pl.DataFrame(schema=_MERGER_EXIT_SCHEMA)
     )
     chain_pairs: tuple[tuple[str, str], ...] = ()
+    refused_pairs: tuple[tuple[str, str], ...] = ()
     n_assets_intersected: int = 0
     assets_intersection_skipped: bool = False
     calls: list[Call] = field(default_factory=list)
@@ -244,6 +245,10 @@ class FakeProvider:
     def chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
         self._record("chains", t)
         return self.chain_pairs
+
+    def refused_chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        self._record("refused_chains", t)
+        return self.refused_pairs
 
     def universe(self, t: datetime) -> Universe:
         t = self._record("universe", t)

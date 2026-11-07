@@ -154,6 +154,14 @@ class DataProvider(Protocol):
         built, so a chained predecessor becomes its successor at one point."""
         ...
 
+    def refused_chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        """The stored successor chains known at `t` that `chains(t)` leaves out
+        (#3097, `store.asof.refused_chains`), as `(predecessor_id, successor_id)`
+        pairs: a failed predecessor or a hand-over outside the chain window. The
+        engine renames nothing through them (a held predecessor exits by the normal
+        delisting path) and counts each held one as `n_refused_chains`."""
+        ...
+
     def adjusted_prices(
         self,
         t: datetime,

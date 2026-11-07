@@ -142,6 +142,7 @@ from tradepartner.store.asof import (
     mergers_as_of,
     prices_as_of,
     rates_as_of,
+    refused_chains,
     statement_facts_as_of,
     unvalued_spin_offs_as_of,
 )
@@ -304,6 +305,12 @@ class StoreProvider:
         through before building the step's marking ids."""
         t = check_t(t)
         return live_chains(self._at(t), t)
+
+    def refused_chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        """The stored chains known at `t` that `chains(t)` refuses (#3097)."""
+        t = check_t(t)
+        found = refused_chains(self._at(t), t)
+        return tuple((r.predecessor_id, r.successor_id) for r in found)
 
     def adjusted_prices(
         self,

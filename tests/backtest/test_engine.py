@@ -1792,6 +1792,7 @@ def test_the_twin_pin_fails_if_the_screen_reads_or_runs_at_the_default(
 TWIN_CALL_METHODS = {
     "universe",
     "chains",
+    "refused_chains",
     "adjusted_prices",
     "raw_prices",
     "static_listing_count",
@@ -1801,8 +1802,8 @@ TWIN_CALL_METHODS = {
     "dropped_dividends",
     "late_dividends",
 }
-TWIN_N_CALLS = 41
-TWIN_CALL_LOG_SHA256 = "84941e2098cbff6122a610b8b2a0b2b63f13a7a8c6a23378fb25116ac867f25a"
+TWIN_N_CALLS = 45  # #3097: one `refused_chains` read per step
+TWIN_CALL_LOG_SHA256 = "5aa38bbe36f7f42b22e6cfa7744218dbea693afe8962e3be5001c11c83672bbf"
 #: Per cost level: a SHA-256 over the equity, rebalance (counts included), weight and
 #: target rows, floats rounded to nine places.
 TWIN_RUN_DIGESTS = {
@@ -1880,6 +1881,21 @@ class TestSuccessorChains:
         engine._rename_chained(variant, (("PRE", "POST"),))
         assert variant.books[0].positions == {"POST": 1234.0}
         assert variant.books[0].chained_positions == 1  # not counted twice
+
+    def test_a_refused_chain_renames_nothing_and_is_counted_once(self) -> None:
+        """#3097: a refused chain is never passed to `_rename_chained`; the held
+        predecessor keeps its id (so the listing-end read exits it) and lands once as
+        `n_refused_chains` on the step's rebalance row, not again on later steps."""
+        variant = self._variant()
+        book = variant.books[0]
+        engine._count_refused(variant, (("PRE", "POST"), ("OTHER", "ELSE")))
+        assert book.positions == {"PRE": 1234.0}
+        plan = cast(engine.Plan, variant.plan)
+        counts = engine._rebalance_counts(plan, book)
+        assert counts["n_refused_chains"] == 1  # OTHER is not held
+        assert "n_chained_positions" not in counts
+        engine._count_refused(variant, (("PRE", "POST"),))
+        assert engine._rebalance_counts(plan, book) is plan.counts
 
     def test_a_collision_sums_the_values(self) -> None:
         variant = self._variant()

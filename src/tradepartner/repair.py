@@ -110,7 +110,7 @@ from tradepartner.store.asof import (
     facts_as_of,
     listings_as_of,
     live_actions_as_of,
-    live_chains,
+    stored_chains,
     symbol_changes_as_of,
 )
 from tradepartner.store.db import open_for_write, utc_now
@@ -146,7 +146,7 @@ def store_resolver(
     first session (`first_sessions`); the `symbol_changes` known at
     `at` (#1696, `symbol_changes_as_of`), followed where the listings lag
     them; and the live successor chains known at `at` (#821, T187b,
-    `asof.live_chains`), whose rule 9 gives a successor the sessions between
+    `asof.stored_chains`), whose rule 9 gives a successor the sessions between
     its predecessor's span end and its first listing row."""
     at = ensure_tz_aware_utc(at, field_name="at")
     evidence = registrant_evidence(
@@ -170,7 +170,7 @@ def store_resolver(
         last_bar=functools.partial(last_bar, conn, at),
         handover_sessions=settings.master.transfer_window_sessions,
         symbol_changes=_symbol_changes(conn, at),
-        chains=live_chains(conn, at),
+        chains=stored_chains(conn, at),
     )
 
 
@@ -382,7 +382,7 @@ def _chain_lines(conn: duckdb.DuckDBPyConnection, at: datetime) -> tuple[ChainLi
     T187b): the successor's first close over the predecessor's last close, read
     from `prices_daily` known at `at` (`None` when either has no bar)."""
     lines = []
-    for predecessor, successor in live_chains(conn, at):
+    for predecessor, successor in stored_chains(conn, at):
 
         def edge(security_id: str, order: str) -> float | None:
             row = conn.execute(

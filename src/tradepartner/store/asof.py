@@ -271,6 +271,7 @@ multiplies `open`/`high`/`low`/`close` by that factor directly in SQL.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -452,14 +453,75 @@ def _has_table(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
     return table in {name for (name,) in rows}
 
 
+#: The delisting reasons (`store.delisting_reasons`) that refuse a chain whose
+#: predecessor's latest Form 25 episode carries one at `t` (#3097): the predecessor
+#: failed, so its equity did not become the successor's one share for one share.
+#: `merger_acquisition` and `voluntary_other` (a rename, a holding-company
+#: reorganisation, a transfer) and no reason row (`unknown`) do not refuse.
+CHAIN_REFUSING_REASONS: Final[frozenset[str]] = frozenset({"bankruptcy", "performance_failure"})
+
+
+@dataclass(frozen=True)
+class RefusedChain:
+    """A stored chain the chain-aware reads refuse at `t` (#3097, `refused_chains`).
+    `why` is `predecessor_reason:<reason>` or `hand_over_window:<sessions>`."""
+
+    predecessor_id: str
+    successor_id: str
+    why: str
+
+
 def live_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[tuple[str, str], ...]:
     """The `(predecessor_id, successor_id)` pairs whose live chain is known
-    at `t` (#821, T187b): sorted by successor. The live chain is the
-    successor's unretracted `successor_chains` row with the greatest
-    `ingested_at`, unless a later row (a retraction) was written after it
-    (`schema.successor_chains`); only rows with `known_at <= t` are read, so
-    a chain reads absent at every `t` before its evidence stamp. A store
-    below schema 31 has no `successor_chains` table and no chain.
+    at `t` (#821, T187b), sorted by successor: `stored_chains(t)` less the
+    chains `refused_chains(t)` refuses (#3097). Every chain-aware read (the
+    price, action and fact re-keying, `chained_read_ids`, the backtest
+    provider's `chains`) goes through here, so a refused chain re-keys
+    nothing anywhere: its predecessor's rows stay its own and a held
+    predecessor exits by the normal delisting path.
+
+    `t` must be tz-aware (a bare date raises `TypeError`)."""
+    pairs = stored_chains(conn, t)
+    if not pairs:
+        return ()
+    refused = {(r.predecessor_id, r.successor_id) for r in _refused(conn, t, pairs)}
+    return tuple(pair for pair in pairs if pair not in refused)
+
+
+def refused_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[RefusedChain, ...]:
+    """The stored chains known at `t` that `live_chains(t)` leaves out (#3097),
+    sorted by successor. A chain is refused, from rows known at `t` only, when
+
+    - its predecessor's latest Form 25 episode (`delistings`, greatest
+      `filed_at`) has a latest reason revision in `CHAIN_REFUSING_REASONS`
+      (Audit A s10b: a bankrupt equity chained to the post-reorganisation
+      one); or
+    - its hand-over day (the successor's first listing row under the
+      predecessor's last ticker and exchange, else the successor's first
+      listing row) comes more than `master.chain_window_sessions` sessions
+      after the predecessor's last bar, the bound `build_chains`'s
+      candidates obey (#821).
+
+    No evidence passes: a predecessor with no reason row (absence reads as
+    `unknown`, as XOM's Form 25 does), no bar or a successor with no listing
+    row known at `t` is not refused on that count. The window is read from
+    `get_settings()` only when a gap is to be judged.
+
+    `t` must be tz-aware (a bare date raises `TypeError`)."""
+    pairs = stored_chains(conn, t)
+    return _refused(conn, t, pairs) if pairs else ()
+
+
+def stored_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[tuple[str, str], ...]:
+    """The `(predecessor_id, successor_id)` pairs whose stored chain row is
+    live at `t` (#821, T187b), before `refused_chains`' checks: sorted by
+    successor. The live row is the successor's unretracted `successor_chains`
+    row with the greatest `ingested_at`, unless a later row (a retraction)
+    was written after it (`schema.successor_chains`); only rows with
+    `known_at <= t` are read, so a chain reads absent at every `t` before its
+    evidence stamp. A store below schema 31 has no `successor_chains` table
+    and no chain. The ingest's bar routing and health's hand-over ratio read
+    this, so they see every stored chain.
 
     `t` must be tz-aware (a bare date raises `TypeError`)."""
     t = _validate_t(t)
@@ -478,6 +540,88 @@ def live_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[tuple[str
         [t],
     ).fetchall()
     return tuple((str(predecessor), str(successor)) for predecessor, successor in rows)
+
+
+def _refused(
+    conn: duckdb.DuckDBPyConnection, t: datetime, pairs: Sequence[tuple[str, str]]
+) -> tuple[RefusedChain, ...]:
+    """`refused_chains` over `pairs` (the stored chains at `t`)."""
+    # Local imports: both modules import this one.
+    from tradepartner.store.delisting_reasons import delisting_reasons_as_of
+    from tradepartner.store.delistings import delistings_as_of
+
+    t = _validate_t(t)
+    predecessors = sorted({predecessor for predecessor, _ in pairs})
+    reasons: dict[str, str] = {}
+    if _has_table(conn, "delistings") and _has_table(conn, "delisting_reasons"):
+        episodes = delistings_as_of(conn, t, predecessors)
+        latest: dict[str, datetime] = {}
+        for security_id, filed_at in episodes.select("security_id", "filed_at").iter_rows():
+            latest[security_id] = max(filed_at, latest.get(security_id, filed_at))
+        found = delisting_reasons_as_of(conn, t, predecessors)
+        for security_id, filed_at, reason in found.select(
+            "security_id", "delisting_filed_at", "reason"
+        ).iter_rows():
+            if latest.get(security_id) == filed_at:
+                reasons[security_id] = reason
+    last_bars = dict(
+        conn.execute(
+            "SELECT security_id, MAX(session) FROM prices_daily "
+            "WHERE known_at <= ? AND security_id IN (SELECT unnest(?)) GROUP BY security_id",
+            [t, predecessors],
+        ).fetchall()
+    )
+    hand_overs = _hand_overs(conn, t, pairs, first_row=True)
+    window: int | None = None
+    refused: list[RefusedChain] = []
+    for predecessor, successor in pairs:
+        reason = reasons.get(predecessor)
+        if reason in CHAIN_REFUSING_REASONS:
+            refused.append(RefusedChain(predecessor, successor, f"predecessor_reason:{reason}"))
+            continue
+        last, hand_over = last_bars.get(predecessor), hand_overs.get(successor)
+        if last is None or hand_over is None or hand_over <= last:
+            continue
+        days = all_sessions()
+        gap = bisect_right(days, hand_over) - bisect_right(days, last)
+        if window is None:
+            window = get_settings().master.chain_window_sessions
+        if gap > window:
+            refused.append(RefusedChain(predecessor, successor, f"hand_over_window:{gap}"))
+    return tuple(refused)
+
+
+def _hand_overs(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    pairs: Sequence[tuple[str, str]],
+    *,
+    first_row: bool = False,
+) -> dict[str, date]:
+    """Each successor's hand-over day from the listings known at `t`: its
+    earliest row under the predecessor's last listing row's ticker and
+    exchange (as `store.master.build_chains`). With `first_row`, a successor
+    with no such row falls back to its earliest listing row; a successor
+    with no row known at `t` is absent."""
+    listings = listings_as_of(conn, t).select("security_id", "ticker", "exchange", "valid_from")
+    by_security: dict[str, list[tuple[str, str, date]]] = {}
+    for security_id, ticker, exchange, valid_from in listings.iter_rows():
+        by_security.setdefault(security_id, []).append((ticker, exchange, valid_from))
+    hand_overs: dict[str, date] = {}
+    for predecessor, successor in pairs:
+        predecessor_rows = by_security.get(predecessor, [])
+        successor_rows = by_security.get(successor, [])
+        if not successor_rows:
+            continue
+        matches: list[date] = []
+        if predecessor_rows:
+            last = max(predecessor_rows, key=lambda row: row[2])
+            matches = [row[2] for row in successor_rows if row[0] == last[0] and row[1] == last[1]]
+        if matches:
+            hand_overs[successor] = min(matches)
+        elif first_row:
+            hand_overs[successor] = min(row[2] for row in successor_rows)
+    return hand_overs
 
 
 def chained_read_ids(
@@ -672,21 +816,7 @@ def _live_chains_at(conn: duckdb.DuckDBPyConnection, t: datetime) -> LiveChains:
     pairs = live_chains(conn, t)
     if not pairs:
         return _NO_CHAINS
-    listings = listings_as_of(conn, t).select("security_id", "ticker", "exchange", "valid_from")
-    by_security: dict[str, list[tuple[str, str, date]]] = {}
-    for security_id, ticker, exchange, valid_from in listings.iter_rows():
-        by_security.setdefault(security_id, []).append((ticker, exchange, valid_from))
-    handovers: dict[str, date] = {}
-    for predecessor, successor in pairs:
-        predecessor_rows = by_security.get(predecessor, [])
-        successor_rows = by_security.get(successor, [])
-        if not predecessor_rows or not successor_rows:
-            continue
-        last = max(predecessor_rows, key=lambda row: row[2])
-        matches = [row[2] for row in successor_rows if row[0] == last[0] and row[1] == last[1]]
-        if matches:
-            handovers[successor] = min(matches)
-    return LiveChains(dict(pairs), handovers)
+    return LiveChains(dict(pairs), _hand_overs(conn, t, pairs))
 
 
 def _spin_off_actions_filter(
