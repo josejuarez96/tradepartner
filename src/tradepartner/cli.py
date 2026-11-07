@@ -1006,6 +1006,9 @@ def _print_report(report: HealthReport) -> None:
         ):
             verdict += f" ({len(report.duplicate_dividends.pending)} pending repair)"
         echo(f"  {check.rule}: {verdict}")
+        if check.rule == "chain_not_reviewed":
+            for row in check.violations.iter_rows(named=True):
+                echo(f"    {row['predecessor_id']} -> {row['successor_id']}: {row['detail']}")
     echo(f"  {COVERAGE_REFERENCE_NAMES}: {_coverage_verdict(report.coverage_reference)}")
     echo(f"  {INDEX_MEMBERS_MISSING}: {_index_verdict(report.coverage_reference)}")
     echo(f"  {FIGI_TYPES_DISAGREEMENTS}: {report.figi_types.verdict}")
