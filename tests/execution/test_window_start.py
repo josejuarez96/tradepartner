@@ -873,6 +873,48 @@ def test_refuses_a_signoff_trial_missing_its_stamp_once_a_release_exists(
     assert "repair-monday" in str(exc.value)
 
 
+def test_refuses_start_while_a_data_release_is_open(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """#3188: a `before` row with no `after` means a repair is still changing the
+    store, so `paper start` is refused (`release_open`), naming the release, before
+    any broker call or write."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(conn, journal_settings, "h1", HOLDOUT_END_PAST)
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+        registry.open_data_release(
+            conn, conn, name="repair-open", backup_path="data/x.duckdb", reason="#1 fix"
+        )
+    broker = CallCountingFake(
+        clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, auto_fill=False
+    )
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, _connect(journal_settings), broker, fixed_clock, "h1")
+    assert exc.value.reason == "release_open"
+    assert "repair-open" in str(exc.value)
+    assert broker.broker_calls == []
+    with _connect(journal_settings)() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM paper_windows").fetchone() == (0,)
+
+
+def test_accepts_start_once_the_data_release_is_closed(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """#3188: the same release, closed, no longer refuses the start (its sessions
+    start after the trial's cutoff, so the #3178 rule passes too)."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(conn, journal_settings, "h1", HOLDOUT_END_PAST)
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+        _close_release(
+            conn, "repair-open", sessions_from=date(2026, 10, 1), sessions_to=date(2026, 10, 2)
+        )
+        assert registry.open_release(conn) is None
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    assert result.window.window_id is not None
+
+
 def test_refuses_incomplete_holdout_end(
     journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
 ) -> None:

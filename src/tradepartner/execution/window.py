@@ -15,6 +15,10 @@ is the cadence of the holdout-end check, of T_0 and of the forward first
 session below, and picks the frozen `paper.min_rebalances`. Then, in order, it
 refuses, before any write:
 
+0. **A data release is open** (`release_open`, #3188; spec amendment
+   2026-11-07): `registry.open_release` finds a `before` row with no `after`
+   of its name, so a repair is still changing the store. Checked again in the
+   write chunk.
 1. **No `gap_signoff`.** `owner_decisions` must hold a row of kind
    `gap_signoff` for the hypothesis, referencing a trial that is `ok`,
    non-synthetic and `kind = in_sample` (ADR 0009 point 3). The decision
@@ -383,6 +387,8 @@ _SPINOFF = "spinoff"
 _GAP_SIGNOFF = "gap_signoff"
 #: `StartRefusedError.reason` when the account is another book's (ADR 0017 B.4).
 ACCOUNT_IN_USE = "account_in_use"
+#: `StartRefusedError.reason` while a data release is open (#3188).
+RELEASE_OPEN = "release_open"
 
 
 class StartRefusedError(RuntimeError):
@@ -1173,6 +1179,19 @@ def _refuse_account_in_use(account_id: str, other_accounts: Mapping[str, str]) -
         )
 
 
+def _refuse_open_release(conn: duckdb.DuckDBPyConnection) -> None:
+    """`release_open` while a data release is open (#3188; spec amendment
+    2026-11-07): a `before` row with no `after` of its name
+    (`registry.open_release`) means a repair is still changing the store, so no
+    window starts on it. Checked in the read chunk and again under the write."""
+    current = registry.open_release(conn)
+    if current is not None:
+        raise StartRefusedError(
+            RELEASE_OPEN,
+            f"data release {current.name!r} is open: close it before starting a window",
+        )
+
+
 def start(
     settings: Settings,
     connect: Connect,
@@ -1207,6 +1226,7 @@ def start(
                     f"{slug!r} is in family {hyp.family!r}, which paper trading cannot run "
                     f"yet (paper families: {', '.join(PAPER_FAMILIES)})",
                 )
+            _refuse_open_release(conn)
             registered = frozen_values(hyp)
             cadence = _cadence_of(registered, f"hypothesis {slug!r}")
             if (gap_refusal := _gap_signoff_refusal(conn, hyp.hypothesis_id, slug)) is not None:
@@ -1339,6 +1359,7 @@ def start(
 
         with open_for_write(settings) as write_conn:
             init_schema(write_conn)
+            _refuse_open_release(write_conn)
             if open_window(write_conn, book) is not None:
                 raise StartRefusedError("window_open", "a paper window is already open")
             _refuse_account_in_use(account.account_id, _other_books_accounts(write_conn, book))
