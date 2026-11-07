@@ -734,6 +734,29 @@ def test_calendar_differing_from_the_live_one_refused(store: Store) -> None:
         StoreProvider(store.connect, store.handle, frozen)
 
 
+@pytest.mark.parametrize(
+    ("key", "value", "env"),
+    [
+        ("chain_window_sessions", 66, "66"),
+        ("chain_max_price_ratio", 1.2, "1.2"),
+        ("transfer_window_sessions", 6, "6"),
+    ],
+)
+def test_a_chain_check_key_differing_from_the_live_one_refused(
+    store: Store, monkeypatch: pytest.MonkeyPatch, key: str, value: object, env: str
+) -> None:
+    """#3097, #3108: the chain-aware store reads use the live chain-check keys, so a
+    frozen value that differs refuses the run and names the key; equal values (here both
+    non-default, the live one from the environment) construct."""
+    frozen = Settings(_env_file=None, store={"path": str(store.path)}, master={key: value})
+    with pytest.raises(ValueError, match=f"master.{key}"):
+        StoreProvider(store.connect, store.handle, frozen)
+    monkeypatch.setenv(f"MASTER__{key.upper()}", env)
+    with pytest.raises(ValueError, match=f"master.{key}"):
+        StoreProvider(store.connect, store.handle, store.settings)
+    StoreProvider(store.connect, store.handle, frozen).close()
+
+
 def test_handle_check_retries_under_a_write_lock(store: Store) -> None:
     attempts: list[str] = []
 

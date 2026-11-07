@@ -465,7 +465,8 @@ CHAIN_REFUSING_REASONS: Final[frozenset[str]] = frozenset({"bankruptcy", "perfor
 @dataclass(frozen=True)
 class RefusedChain:
     """A stored chain the chain-aware reads refuse at `t` (#3097, `refused_chains`).
-    `why` is `predecessor_reason:<reason>` or `hand_over_window:<sessions>`."""
+    `why` is `predecessor_reason:<reason>`, `hand_over_window:<sessions>` or
+    `hand_over_price:<ratio>` (#3108)."""
 
     predecessor_id: str
     successor_id: str
@@ -475,7 +476,8 @@ class RefusedChain:
 def live_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[tuple[str, str], ...]:
     """The `(predecessor_id, successor_id)` pairs whose live chain is known
     at `t` (#821, T187b), sorted by successor: `stored_chains(t)` less the
-    chains `refused_chains(t)` refuses (#3097). Every chain-aware read (the
+    chains `refused_chains(t)` refuses (#3097, #3108) and the pending ones whose
+    successor has no bar known at `t` yet (`_judged`). Every chain-aware read (the
     price, action and fact re-keying, `chained_read_ids`, the backtest
     provider's `chains`) goes through here, so a refused chain re-keys
     nothing anywhere: its predecessor's rows stay its own and a held
