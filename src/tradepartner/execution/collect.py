@@ -60,7 +60,8 @@ path's read, `paper resume`'s settlement). In order:
      when the broker's `filled_quantity` exceeds its journaled fills by more
      than that tolerance, and **`excess`** when its journaled fills exceed
      the broker's (a feed ahead of `get_order`, or a fill re-issued under a
-     new id); reconciliation sees either;
+     new id); reconciliation sees either, an `excess` reading as a
+     `bad_reading` mismatch naming the order (#3152);
    - the rejection verdicts (below);
    - one `fill_cursors` row for this invocation, whatever it found. Its
      `collected_through` is the latest `filled_at` seen, never earlier than

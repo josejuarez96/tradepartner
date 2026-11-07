@@ -120,6 +120,7 @@ from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Final, Literal
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pyarrow as pa
@@ -834,7 +835,9 @@ def register_hypothesis(
     real store. With a development boundary in force (ADR 0016 point 2), refuses
     (`BoundaryRefused`) an `in_sample_start` on or after it, or one with no
     rebalance session at the frozen cadence on or before it, so no
-    registration's default window is ever empty.
+    registration's default window is ever empty, and a non-oracle
+    `holdout_start` on or before it (points 3 and 8, #3151), so no exam month
+    is a development month.
     """
     settings = settings if settings is not None else get_settings()
     if family not in settings.hypotheses.families:
@@ -868,6 +871,11 @@ def register_hypothesis(
             raise BoundaryRefused(
                 f"{slug!r}: in_sample_start {in_sample_start} leaves no {cadence} rebalance "
                 f"session on or before the development boundary {boundary}"
+            )
+        if family != ORACLE_FAMILY and holdout_start <= boundary:
+            raise BoundaryRefused(
+                f"{slug!r}: holdout.start {holdout_start} is on or before the development "
+                f"boundary {boundary}: exam months never become development months"
             )
     families = conn.execute(
         "SELECT DISTINCT family FROM hypotheses WHERE slug = ?", [slug]
@@ -1781,15 +1789,27 @@ def write_development_boundary(
     )
 
 
+#: The exchange calendar's zone, in which `holdout.start` dates are written.
+_NEW_YORK: Final = ZoneInfo("America/New_York")
+
+
+def registration_day(at: datetime) -> date:
+    """The New York calendar day of a registration stamp `at` (tz-aware): the day
+    `holdout.start` is compared with (ADR 0016 point 4, #3154)."""
+    return at.astimezone(_NEW_YORK).date()
+
+
 def family_registered_on(conn: duckdb.DuckDBPyConnection, family: str) -> date | None:
-    """The UTC day `family` was first registered (its earliest `hypotheses` row), or
-    None for a family with no registration: the day a holdout is forward from (ADR
-    0016 point 4, `holdout.Frozen.registered_on`)."""
+    """The New York day `family` was first registered (its earliest `hypotheses`
+    row), or None for a family with no registration: the day a holdout is forward
+    from (ADR 0016 point 4, `holdout.Frozen.registered_on`). New York's, not UTC's,
+    because `holdout.start` is a New York calendar date (#3154): a registration at
+    21:00 ET is on that day, so a `holdout.start` the next day is forward."""
     row = conn.execute(
         "SELECT MIN(registered_at) FROM hypotheses WHERE family = ?", [family]
     ).fetchone()
     first = row[0] if row is not None else None
-    return None if first is None else first.astimezone(UTC).date()
+    return None if first is None else registration_day(first)
 
 
 def _release_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime | None:
