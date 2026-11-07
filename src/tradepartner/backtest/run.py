@@ -23,7 +23,14 @@
 4. **Run** the engine over a `StoreProvider` whose factory opens one short-lived
    read-only connection per step, at the base level and every
    `costs.sensitivity_per_side_bps` level, from the frozen `Settings`.
-5. **Write** through `results.write_results` in one chunk; it records `failed`
+5. **Exit coverage** (plan T329, spec amendment #2670): while the results are in
+   memory, `exit_coverage` reads `DataProvider.delisting_reasons` at the trial's data
+   cutoff for the base level's `delisting_exits` and `with_exit_coverage` adds the
+   `EXIT_COVERAGE_COUNTS` to that level's last rebalance row, under every policy
+   (`none` included), so they are written as `trial_rebalance_counts` rows at the
+   trial's last rebalance session. They sit beside the engine output, not in it: the
+   engine result, the trial's vintage and every pinned digest are unchanged.
+6. **Write** through `results.write_results` in one chunk; it records `failed`
    (`store changed during run`) when the data vintage at the trial's cutoff
    moved since the open (`registry.write_result`, #1232).
 
@@ -95,17 +102,18 @@ from __future__ import annotations
 
 import math
 import traceback
-from collections.abc import Mapping
-from dataclasses import dataclass
-from datetime import date
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
+from datetime import date, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Final, Literal, cast
 
 import duckdb
+import polars as pl
 
 from tradepartner.backtest import engine, placebo
-from tradepartner.backtest.engine import BacktestResult
+from tradepartner.backtest.engine import BacktestResult, DelistingExit
 from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.holdout import (
     Decision,
@@ -119,6 +127,7 @@ from tradepartner.backtest.holdout import (
     gap_sessions,
 )
 from tradepartner.backtest.hypothesis import load_frozen
+from tradepartner.backtest.provider import DataProvider
 from tradepartner.backtest.results import write_results
 from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.store_provider import StoreProvider
@@ -147,6 +156,77 @@ class RunOutcome:
     status: Status
     results: Results | None = None
     error: str | None = None
+
+
+#: The per-trial delisting exit coverage counts (plan T329), written on the base cost
+#: level's last rebalance row under every policy: the booked delisting exits, those
+#: with no single matching classified reason at the cutoff, and those whose matching
+#: classified reason was first known after the exit's deciding read but by the cutoff
+#: (informational: under the owner's 2026-10-31 rule such a reason applies).
+EXIT_COVERAGE_COUNTS: Final = (
+    "n_exit_coverage_exits",
+    "n_exit_coverage_unknown",
+    "n_exit_coverage_after_read",
+)
+_UNKNOWN_REASON: Final = "unknown"
+
+
+def exit_coverage_counts(exits: Sequence[DelistingExit], reasons: pl.DataFrame) -> dict[str, int]:
+    """`EXIT_COVERAGE_COUNTS` for `exits` from `reasons`, a `delisting_reasons` read at
+    the trial's cutoff (every row `known_at <= cutoff`). An exit's reason is matched as
+    the engine matches it (plan T328c): the single row whose `delisting_form` and
+    `delisting_filed_at` equal the exit's and whose `delisting_exchange` is the exit's
+    listing exchange. None, two or more, or an `unknown` row counts as unknown; a
+    classified match with `known_at` after the exit's `read_time` counts as after-read.
+    Pure."""
+    by_id: dict[str, list[dict[str, Any]]] = {}
+    for row in reasons.iter_rows(named=True):
+        by_id.setdefault(row["security_id"], []).append(row)
+    unknown = after_read = 0
+    for e in exits:
+        key = (e.delisting_form, e.delisting_filed_at, e.exchange)
+        matched = [
+            row
+            for row in by_id.get(e.security_id, ())
+            if None not in key
+            and (row["delisting_form"], row["delisting_filed_at"], row["delisting_exchange"]) == key
+        ]
+        if len(matched) != 1 or matched[0]["reason"] == _UNKNOWN_REASON:
+            unknown += 1
+        elif matched[0]["known_at"] > e.read_time:
+            after_read += 1
+    return {
+        "n_exit_coverage_exits": len(exits),
+        "n_exit_coverage_unknown": unknown,
+        "n_exit_coverage_after_read": after_read,
+    }
+
+
+def exit_coverage(
+    provider: DataProvider, cutoff: datetime, exits: Sequence[DelistingExit]
+) -> dict[str, int]:
+    """`exit_coverage_counts` for `exits` over `provider.delisting_reasons(cutoff, ids)`
+    for the exits' security ids; no read when there is no exit."""
+    ids = sorted({e.security_id for e in exits})
+    if not ids:
+        return exit_coverage_counts((), pl.DataFrame())
+    return exit_coverage_counts(exits, provider.delisting_reasons(cutoff, ids))
+
+
+def with_exit_coverage(
+    results: Mapping[float, BacktestResult], base_level: float, counts: Mapping[str, int]
+) -> dict[float, BacktestResult]:
+    """`results` with `counts` added to the base level's last rebalance row's counts
+    (module docstring, step 5); unchanged when that level has no rebalance row. Every
+    other field and level is the engine's, untouched."""
+    out = dict(results)
+    base = out[base_level]
+    if not base.rebalances:
+        return out
+    last = base.rebalances[-1]
+    row = replace(last, counts={**last.counts, **counts})
+    out[base_level] = replace(base, rebalances=(*base.rebalances[:-1], row))
+    return out
 
 
 def _on_store(live: Settings, store_path: Path | str | None) -> Settings:
@@ -382,6 +462,7 @@ def run_hypothesis(
                 "a placebo file runs in sample only, never on the holdout or as a tracking run"
             )
         sessions = gap_sessions(window, cadence)
+        cutoff = read_time(sessions[-1], cadence) if sessions else None
         refused = decision.outcome not in ("run", "needs_gap")
         holdout = decision.kind == "holdout" and not refused
         # A refusal is always recorded `in_sample` (it spent nothing), whatever
@@ -403,7 +484,7 @@ def run_hypothesis(
             kind=trial_kind,
             start_session=window.start,
             end_session=window.end,
-            data_cutoff=read_time(sessions[-1], cadence) if sessions else None,
+            data_cutoff=cutoff,
             synthetic=synthetic,
             run_by=run_by,
             holdout_repeat=holdout and decision.holdout_repeat,
@@ -472,6 +553,10 @@ def run_hypothesis(
                 family=hypothesis.family,
                 keep_marking_frames=keep_marking_frames,
             )
+            base_level = params.costs.per_side_bps
+            if cutoff is not None:
+                counts = exit_coverage(provider, cutoff, results[base_level].delisting_exits)
+                results = with_exit_coverage(results, base_level, counts)
         with open_for_write(store) as conn:
             status = write_results(conn, handle, results, params)
     except Exception as exc:

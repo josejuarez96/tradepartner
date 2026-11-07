@@ -992,3 +992,53 @@ def test_lab_status_lists_an_operations_book_as_not_promoted(
         f"{pre_lab.decision_id}): operations book of h1 (pre-lab), not promoted\n"
     ) in text()
     assert sweep_report.pre_lab_standing(lab_store, 999, code_vintage=CODE) is None
+
+
+# --- delisting exit coverage (plan T329, #2670) ----------------------------------------
+
+
+def test_each_grid_row_shows_its_unknown_delisting_exits_and_share(
+    world: tuple[Store, registry.HypothesisRecord], settings: Settings
+) -> None:
+    """The unknown count and `unknown / exits` beside every grid row, from the shown
+    trial's coverage counts; blank at 0 exits and for a trial without them."""
+    store, _twin = world
+    conn = store.conn
+    _sweep_record, records = _sweep(conn, settings, [0.15, 0.2, 0.25, 0.3])
+    coverage = [(4, 1), (0, 0), None]
+    for record, counts in zip(records, coverage, strict=False):
+        trial_id = store.trial(
+            record.hypothesis_id, metrics=_metrics(excess_cagr=0.01, sharpe_annual_excess=0.4)
+        )
+        if counts is None:
+            continue
+        exits, unknown = counts
+        for session, name, value in (
+            (date(2019, 4, 30), "n_exit_coverage_exits", exits),
+            (date(2019, 4, 30), "n_exit_coverage_unknown", unknown),
+            (date(2019, 4, 30), "n_exit_coverage_after_read", 0),
+            (date(2019, 3, 29), "n_excluded_no_history", 7),
+        ):
+            conn.execute(
+                "INSERT INTO trial_rebalance_counts VALUES (?, ?, ?, ?)",
+                [trial_id, session, name, value],
+            )
+
+    report = sweep_report.sweep_report(conn, "mom-grid", code_vintage=CODE)
+
+    rows = report.rows
+    assert [(r.exit_coverage_unknown, r.exit_coverage_exits) for r in rows] == [
+        (1, 4),
+        (0, 0),
+        (None, None),
+        (None, None),
+    ]
+    assert [r.exit_coverage_unknown_share for r in rows] == [0.25, None, None, None]
+    lines = sweep_report.format_report(report).splitlines()
+    header = next(line for line in lines if line.startswith("idx  slug"))
+    assert header.endswith("red_flag  delisting_unknown  delisting_unknown_share")
+    by_slug = {r.slug: next(line for line in lines if f"  {r.slug}  " in line) for r in rows}
+    assert by_slug[records[0].slug].endswith("  1/4  25.00%")
+    assert by_slug[records[1].slug].endswith("  0/0  -")
+    assert by_slug[records[2].slug].endswith("  -  -")
+    assert by_slug[records[3].slug].endswith("  -  -")
