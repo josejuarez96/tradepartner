@@ -291,6 +291,25 @@ def counted_trial(
     return _counted_trial(conn, hypothesis_id, window, code_tree_sha256(), {})
 
 
+def latest_ok_trial(
+    conn: duckdb.DuckDBPyConnection, hypothesis_id: int, *, code_vintage: str | None
+) -> tuple[TrialRow, bool] | None:
+    """A pre-lab hypothesis's latest `ok`, non-synthetic, `in_sample` trial, over any
+    window (each such trial is counted in N), with whether it is current at
+    `code_vintage`; or None. What an operations file of a pre-lab parent reads in place
+    of a variant's counted trial (paper spec amendment 2026-11-07 #3118 item 2)."""
+    require_lab(conn)
+    row = conn.execute(
+        _TRIAL_SELECT + "WHERE t.hypothesis_id = ? AND t.kind = 'in_sample' "
+        "AND NOT t.synthetic AND r.status = 'ok' ORDER BY t.trial_id DESC LIMIT 1",
+        [hypothesis_id],
+    ).fetchone()
+    if row is None:
+        return None
+    trial = TrialRow(*row)
+    return trial, _is_current(conn, trial, code_vintage, {})
+
+
 def is_current(conn: duckdb.DuckDBPyConnection, trial: TrialRow) -> bool:
     """Whether `trial` is current (spec, Definitions "Vintage"): its data vintage
     equals the data vintage computed now at its own cutoff, and its code vintage

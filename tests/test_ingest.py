@@ -28,6 +28,7 @@ from typing import Any
 import duckdb
 import httpx
 import pytest
+from pydantic import SecretStr
 
 from tradepartner import ingest as ingest_module
 from tradepartner.adapters.alpaca_raw import AssetsFetch
@@ -381,11 +382,13 @@ def test_openfigi_history_window_anchors_to_last_completed_session(settings: Set
         )
 
     seen: list[list[str]] = []
+    keys: list[object] = []
 
     def fake_mapping(
-        tickers: list[str], _config: object, **_kwargs: object
+        tickers: list[str], _config: object, **kwargs: object
     ) -> list[tuple[list[object], datetime, datetime]]:
         seen.append(tickers)
+        keys.append(kwargs.get("api_key"))
         sent = datetime(2026, 10, 28, 1, tzinfo=UTC)
         return [
             (
@@ -396,7 +399,11 @@ def test_openfigi_history_window_anchors_to_last_completed_session(settings: Set
             for i in range(len(tickers))
         ]
 
+    # #3153: the key is the one `Settings` read (shell or `.env`), passed through.
+    key = SecretStr("figi-synthetic-key")
+    enabled = enabled.model_copy(update={"openfigi_api_key": key})
     result = ingest_module.ingest_openfigi(enabled, clock=lambda: now, mapping=fake_mapping)
+    assert keys == [key]
     # Both securities should be mapped because the history window correctly starts
     # at 2025-10-27 (last completed session - 12 months), which includes S_BOUNDARY's bar.
     assert seen == [["BOUND", "LATER"]]
@@ -3538,7 +3545,12 @@ def test_filename_evidence_is_fetched_before_freeze_only_when_enabled(
 
     h1 = Path(__file__).resolve().parents[1] / "docs/hypotheses/h1-momentum-12-1.md"
     parsed = hypothesis.parse_file(h1)
-    pinned = Settings(_env_file=None, universe={"exclude_sic_ranges": [[4900, 4999]]})
+    # H1's stored record: the old universe, before #1540's live default and before
+    # #3076's key (which it reads at its table default `[]`).
+    pinned = Settings(
+        _env_file=None,
+        universe={"exclude_sic_ranges": [[4900, 4999]], "exclude_issuer_classes": []},
+    )
     params = hypothesis.frozen_params(parsed, pinned)
     assert frozen.fingerprint("momentum", params, parsed.in_sample_start) == (
         "534917a58a4f8c5dfe17330b3e2d06faf38111de553fd467886a06c147f609a4"

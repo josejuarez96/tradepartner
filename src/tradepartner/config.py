@@ -1358,6 +1358,11 @@ class Settings(BaseSettings):
     # and `secret_values` redacts it from every stored message. Read and checked only
     # by `store/raw_archive_config.py`, never validated here (#1093).
     tradepartner_raw_archive: SecretStr | None = Field(default=None)
+    # #3153: the optional owner-held OpenFIGI key, env `OPENFIGI_API_KEY`, set in `.env`
+    # (`.env.example`; data-foundation spec). Read here, like every other secret, so the
+    # `.env` value is used and `secret_values` redacts it; `ingest_openfigi` passes it to
+    # `openfigi_raw.map_tickers`, which never reads the environment itself.
+    openfigi_api_key: SecretStr | None = Field(default=None)
 
     def __init__(self, **kwargs: Any) -> None:
         # A per-instance default (not a class-level `model_config` value) so

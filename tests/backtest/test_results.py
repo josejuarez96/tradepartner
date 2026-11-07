@@ -1197,6 +1197,7 @@ class TestRefusals:
                     "strategy.hold_top_fraction",
                     "backtest.delisting_failure_return",
                     "universe.shares_split_dating",
+                    "universe.exclude_issuer_classes",
                     "portfolio.",
                     "costs.borrow",
                 )

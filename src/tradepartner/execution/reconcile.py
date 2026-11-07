@@ -41,7 +41,9 @@ unjournaled notional (`filled_quantity` x `filled_avg_price` less the journaled
 notional, the spec's synthetic-fill residual). A reading that cannot bound this
 (a non-finite `filled_quantity`, one above a quantity order's size, a filled
 value above a notional order's notional x (1 + `risk.whole_share_price_buffer`),
-a missing or non-positive `filled_avg_price`) is `bad_reading`. While any
+a missing or non-positive `filled_avg_price`) is `bad_reading`, as is an
+`excess` reading, journaled fills above its `filled_quantity` by more than the
+quantity tolerance (#3152). While any
 order is `pending`, the status
 is `pending_unresolved` whatever the differences; a pending order allows its
 symbol to differ in its direction by up to its quantity (a notional order's at
@@ -1676,9 +1678,35 @@ def _lag(
     it is not lagging, or a `bad_reading` mismatch when the reading cannot
     bound the lag: more shares than a quantity order asked for, or more
     filled value than a notional order's notional x (1 + `buffer`), beyond the
-    cash tolerance (#398)."""
+    cash tolerance (#398). An `excess` reading, one whose `filled_quantity`
+    (none counting as 0) is below the journaled fills by more than the
+    quantity tolerance, is also `bad_reading` (#3152): the collector withholds
+    its terminal event, so without this nothing names the order and its
+    decision stays in flight. A non-finite `filled_quantity` is `bad_reading`
+    before either test (#3162)."""
     reading, order = item.reading, item.order
-    if reading is None or reading.filled_quantity is None:
+    if reading is None:
+        return None
+    if reading.filled_quantity is not None and not math.isfinite(reading.filled_quantity):
+        # Before any comparison: NaN compares false both ways, so it would
+        # otherwise pass as "not lagging" (#3162).
+        return Mismatch(
+            "bad_reading",
+            f"broker filled_quantity {reading.filled_quantity} is not a finite number "
+            f"({reading.status.value})",
+            security_id=order.security_id,
+            client_order_id=order.client_order_id,
+        )
+    if item.journaled_quantity - (reading.filled_quantity or 0.0) > tolerance:
+        return Mismatch(
+            "bad_reading",
+            f"journaled {item.journaled_quantity} filled, broker reads "
+            f"{reading.filled_quantity} ({reading.status.value}): fills in the journal "
+            "the broker does not report",
+            security_id=order.security_id,
+            client_order_id=order.client_order_id,
+        )
+    if reading.filled_quantity is None:
         return None
     filled = reading.filled_quantity
     unjournaled = filled - item.journaled_quantity
@@ -1687,8 +1715,7 @@ def _lag(
     too_many = order.quantity is not None and filled > order.quantity + tolerance
     price = reading.filled_avg_price
     if (
-        not math.isfinite(filled)
-        or too_many
+        too_many
         or price is None
         or not math.isfinite(price)
         or price <= 0

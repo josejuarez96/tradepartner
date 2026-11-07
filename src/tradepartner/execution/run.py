@@ -260,10 +260,12 @@ from tradepartner.execution.outcomes import write_outcomes_and_lots
 from tradepartner.execution.plan import (
     DecisionState,
     RebalanceState,
+    State,
     decision_state,
     rebalance_state,
     residue,
     stop_session,
+    traded_at_lapse,
 )
 from tradepartner.execution.reconcile import (
     BREAKS,
@@ -1623,7 +1625,7 @@ class _Run:
         ledger = self._ledger_at(self.session, actions)
         self.assets_read(list(self._symbols(sorted(ledger.positions)).values()))
         self._mark(actions)
-        self._lapses()
+        self._lapses(actions)
         self._outcomes(actions)
         if self.engaged:
             return self._skipped()
@@ -1907,30 +1909,9 @@ class _Run:
         for t_i in rebalance_sessions(first, self.session, self.cadence):
             if fill_session(t_i, self.cadence) > self.session or t_i in settled:
                 continue
-            mine = [
-                d
-                for d in inputs.decisions
-                if d.decision.rebalance_session == t_i and d.decision.decision != _FORCED_EXIT
-            ]
-            if not mine:
+            states = self._decision_states(t_i, inputs, actions, prices)
+            if not states:
                 continue
-            states = [
-                (
-                    d.decision,
-                    decision_state(
-                        d.decision,
-                        list(d.events),
-                        inputs.orders,
-                        inputs.order_events,
-                        inputs.fills,
-                        actions,
-                        prices.__getitem__,
-                        self.frozen,
-                        session=self.session,
-                    ),
-                )
-                for d in mine
-            ]
             verdict = rebalance_state(
                 t_i,
                 self.window,
@@ -2247,8 +2228,39 @@ class _Run:
         self.engaged = True
         self._alert(_DRAWDOWN, crossing.reason)
 
-    def _lapses(self) -> None:
-        """The lapse rows from `marks.lapses`, with one `missed_rebalance` alert."""
+    def _decision_states(
+        self,
+        t_i: date,
+        inputs: WindowJournalInputs,
+        actions: pl.DataFrame,
+        prices: Mapping[str, float],
+    ) -> list[tuple[DecisionRow, DecisionState]]:
+        """Every decision of rebalance `t_i` (forced exits aside) with its state on S."""
+        return [
+            (
+                d.decision,
+                decision_state(
+                    d.decision,
+                    list(d.events),
+                    inputs.orders,
+                    inputs.order_events,
+                    inputs.fills,
+                    actions,
+                    prices.__getitem__,
+                    self.frozen,
+                    session=self.session,
+                ),
+            )
+            for d in inputs.decisions
+            if d.decision.rebalance_session == t_i and d.decision.decision != _FORCED_EXIT
+        ]
+
+    def _lapses(self, actions: pl.DataFrame) -> None:
+        """The lapse rows from `marks.lapses`, with one `missed_rebalance` alert. A
+        lapsing rebalance that traded (`plan.traded_at_lapse`: every order of every
+        open decision filled, #3141) is journaled `executed` instead, with a note
+        naming its open remainders, and goes through the unspent-cash check; only the
+        others are `missed`."""
         with open_read_only(self.settings, retry=True) as conn:
             runs = runs_for(conn, self.window_id)
             events = rebalance_events_for(conn, self.window_id)
@@ -2266,8 +2278,33 @@ class _Run:
         )
         if not missed:
             return
+        with open_read_only(self.settings, retry=True) as conn:
+            inputs = window_journal_inputs(conn, self.window_id)
+        prices = self._pending_prices(actions)
+        left: dict[date, list[tuple[str | None, str, float]]] = {}
+        for lapse in missed:
+            states = self._decision_states(lapse.rebalance_session, inputs, actions, prices)
+            if traded_at_lapse(states, inputs.orders, inputs.order_events, inputs.fills):
+                left[lapse.rebalance_session] = [
+                    (d.side, d.security_id, s.remainder.notional)
+                    for d, s in states
+                    if s.state is State.OPEN and s.remainder is not None
+                ]
+        traded = set(left)
+        missed = [lapse for lapse in missed if lapse.rebalance_session not in traded]
         stamp = self.gate.read_clock()
         with self.connect() as conn:
+            for t_i in sorted(traded):
+                append(
+                    conn,
+                    RebalanceEventRow(
+                        rebalance_session=t_i,
+                        run_id=self.run_id,
+                        status=_EXECUTED,
+                        known_at=stamp,
+                        ingested_at=stamp,
+                    ),
+                )
             for lapse in missed:
                 append(
                     conn,
@@ -2280,12 +2317,26 @@ class _Run:
                         ingested_at=stamp,
                     ),
                 )
-        self._alert(
-            "missed_rebalance",
-            "; ".join(
-                f"rebalance {m.rebalance_session.isoformat()} missed ({m.reason})" for m in missed
-            ),
-        )
+        for t_i in sorted(traded):
+            total = sum(notional for _, _, notional in left[t_i])
+            self.notes.append(
+                f"rebalance {t_i.isoformat()} executed at its lapse: every order filled; "
+                f"open remainders not traded further ({total:.2f} in all): "
+                + ", ".join(
+                    f"{side or 'no side'} {sid} {notional:.2f}" for side, sid, notional in left[t_i]
+                )
+            )
+        if missed:
+            self._alert(
+                "missed_rebalance",
+                "; ".join(
+                    f"rebalance {m.rebalance_session.isoformat()} missed ({m.reason})"
+                    for m in missed
+                ),
+            )
+        # After the missed alert, so a halting broker read here never swallows it. Idle
+        # cash of a rebalance executed here is judged like any other executed one.
+        self._unspent_cash(sorted(traded))
 
     def _outcomes(self, actions: pl.DataFrame) -> None:
         """The due outcomes and the lot-ledger write (T62). A lot-ledger error is

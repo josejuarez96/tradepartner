@@ -313,14 +313,17 @@ class VariantStanding:
 @dataclass(frozen=True)
 class OperationsBookLine:
     """An `operations_book` decision in `lab status` (strategy-lab spec req 1,
-    amendment 2026-10-10): the registered file, the sweep and variant index it runs."""
+    amendment 2026-10-10): the registered file, the sweep and variant index it runs,
+    or, for a pre-lab parent (paper spec amendment 2026-11-07 #3118 item 2), none."""
 
     hypothesis_id: int
     slug: str
     family: str
     decision_id: int
-    sweep_slug: str
-    variant_index: int
+    #: None for a pre-lab parent (#3118 item 2), whose slug is `parent_slug`.
+    sweep_slug: str | None
+    variant_index: int | None
+    parent_slug: str | None = None
 
 
 @dataclass(frozen=True)
@@ -659,18 +662,78 @@ def variant_standing(
 
 def _operations_books(conn: duckdb.DuckDBPyConnection) -> tuple[OperationsBookLine, ...]:
     """Every `operations_book` decision, oldest first, with the variant index it
-    names (from `sweep_variants`, never from the stored values alone)."""
+    names (from `sweep_variants`, never from the stored values alone), or, for a
+    pre-lab parent, none and the parent's slug (#3118 item 2)."""
     rows = conn.execute(
-        "SELECT d.hypothesis_id, h.slug, h.family, d.decision_id, s.slug, v.variant_index "
-        "FROM owner_decisions d JOIN hypotheses h USING (hypothesis_id) "
-        "JOIN sweep_variants v ON v.hypothesis_id = TRY_CAST(json_extract_string("
+        "SELECT d.hypothesis_id, h.slug, h.family, d.decision_id, s.slug, v.variant_index, "
+        "p.slug FROM owner_decisions d JOIN hypotheses h USING (hypothesis_id) "
+        "LEFT JOIN hypotheses p ON p.hypothesis_id = TRY_CAST(json_extract_string("
         "d.values_json, '$.variant_hypothesis_id') AS BIGINT) "
-        "JOIN sweeps s ON s.sweep_id = v.sweep_id "
+        "LEFT JOIN sweep_variants v ON v.hypothesis_id = p.hypothesis_id "
+        "LEFT JOIN sweeps s ON s.sweep_id = v.sweep_id "
         "WHERE d.kind = 'operations_book' ORDER BY d.decision_id"
     ).fetchall()
     return tuple(
-        OperationsBookLine(int(h), str(slug), str(family), int(d), str(sweep), int(index))
-        for h, slug, family, d, sweep, index in rows
+        OperationsBookLine(
+            int(h),
+            str(slug),
+            str(family),
+            int(d),
+            None if sweep is None else str(sweep),
+            None if index is None else int(index),
+            None if parent is None else str(parent),
+        )
+        for h, slug, family, d, sweep, index, parent in rows
+    )
+
+
+@dataclass(frozen=True)
+class PreLabStanding:
+    """A pre-lab parent's standing for an operations file (#3118 item 2): its latest
+    `ok`, non-synthetic, in-sample trial, whether it is current, and that trial's
+    base-level statistics, `dsr_excess` at today's N and V (as a variant row's)."""
+
+    trial_id: int
+    current: bool
+    excess_cagr_spy: float | None
+    sharpe_annual_excess_spy: float | None
+    dsr_excess: float | None
+    cost_drag: float | None
+    turnover_annual: float | None
+    max_drawdown: float | None
+
+
+def pre_lab_standing(
+    conn: duckdb.DuckDBPyConnection, hypothesis_id: int, *, code_vintage: str | None = None
+) -> PreLabStanding | None:
+    """The standing of pre-lab hypothesis `hypothesis_id` (`PreLabStanding`), or None
+    with no such trial. `ValueError` when the trial lacks a finite base-level metric
+    the DSR needs, as `variant_standing`."""
+    require_lab(conn)
+    vintage = code_vintage if code_vintage is not None else registry.code_tree_sha256()
+    found = lab_queries.latest_ok_trial(conn, hypothesis_id, code_vintage=vintage)
+    if found is None:
+        return None
+    trial, current = found
+    record = registry.get_hypothesis_by_id(conn, hypothesis_id)
+    base = float(frozen_values(record)[BASE_COST_KEY])
+    metrics = _metrics(conn, [(trial.trial_id, base)])[trial.trial_id]
+    dsr = deflated_sharpe(
+        metrics,
+        "excess_spy",
+        n_trials=results.family_n(conn, record.family),
+        pair_sharpes=registry.family_sharpes(conn, record.family).excess_spy,
+        periods_per_year=int(_number(metrics, "periods_per_year", trial.trial_id)),
+    ).dsr
+    return PreLabStanding(
+        trial_id=trial.trial_id,
+        current=current,
+        excess_cagr_spy=metrics.get("excess_cagr_spy"),
+        sharpe_annual_excess_spy=metrics.get("sharpe_annual_excess_spy"),
+        dsr_excess=dsr,
+        cost_drag=metrics.get("cost_drag"),
+        turnover_annual=metrics.get("turnover_annual"),
+        max_drawdown=metrics.get("max_drawdown"),
     )
 
 
@@ -1028,7 +1091,11 @@ def format_lab_status(status: LabStatus) -> str:
     lines.append("operations books:")
     lines += [
         f"  {o.slug} ({o.family}, id {o.hypothesis_id}, decision {o.decision_id}): "
-        f"operations book of {o.sweep_slug} v{o.variant_index}, not promoted"
+        + (
+            f"operations book of {o.parent_slug} (pre-lab), not promoted"
+            if o.sweep_slug is None
+            else f"operations book of {o.sweep_slug} v{o.variant_index}, not promoted"
+        )
         for o in status.operations_books
     ] or ["  none"]
     lines.append("open sweeps:")

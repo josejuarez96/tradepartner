@@ -971,3 +971,24 @@ def test_lab_status_lists_an_operations_book_as_not_promoted(
         f"operations books:\n  ops-book (momentum, id {record.hypothesis_id}, decision "
         f"{outcome.decision_id}): operations book of {sweep.slug} v2, not promoted\n"
     ) in text()
+    # T382 (#3118 item 2): a pre-lab parent's book has no sweep_variants row, so it is
+    # listed by its parent's slug instead of dropping out of the join
+    path = lab.file("h1-open", 0.5, cost=60.0)
+    marker = "[gap]\ncount_share_threshold = 0.05\n"
+    path.write_text(
+        path.read_text().replace(marker, marker + '\n[execution]\nfill_price = "open"\n', 1)
+    )
+    pre_lab = hypothesis.register_operations_book(
+        lab_store,
+        path,
+        "h1",
+        "the open-basis restart",
+        registered_by="owner",
+        settings=settings,
+        code_vintage=CODE,
+    )
+    assert (
+        f"  h1-open (momentum, id {pre_lab.registered.hypothesis_id}, decision "
+        f"{pre_lab.decision_id}): operations book of h1 (pre-lab), not promoted\n"
+    ) in text()
+    assert sweep_report.pre_lab_standing(lab_store, 999, code_vintage=CODE) is None

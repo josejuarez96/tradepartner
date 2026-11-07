@@ -1448,6 +1448,72 @@ def test_a_notional_reading_past_its_buffered_notional_is_a_bad_reading() -> Non
     assert "bad_reading" in _kinds(result)
 
 
+def _excess_sell(journaled: float, status: OrderStatus, filled: float | None) -> JournalOpenOrder:
+    row = _order_row("tp-20261007-SEC_A-sell-1", "SEC_A", "sell", quantity=10.0)
+    return JournalOpenOrder(
+        row,
+        pending=False,
+        journaled_quantity=journaled,
+        journaled_notional=journaled * 50.0,
+        reading=_reading(row, status, filled=filled, avg=50.0 if filled else None),
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "filled"), [(OrderStatus.EXPIRED, None), (OrderStatus.CANCELLED, 4.0)]
+)
+def test_an_excess_reading_is_a_bad_reading_naming_the_order(
+    status: OrderStatus, filled: float | None
+) -> None:
+    """#3152: the journal holds 10 shares sold; the broker's terminal reading says
+    fewer (none, or 4) filled. Collect withholds the terminal event, so the order
+    stays in flight; with positions agreeing nothing else would name it."""
+    result = _run(
+        _ledger(1_500.0, SEC_A=0.0),
+        {},
+        1_500.0,
+        journal_open=[_excess_sell(10.0, status, filled)],
+    )
+
+    assert result.status == "mismatch"
+    (mismatch,) = [m for m in result.mismatches if m.kind == "bad_reading"]
+    assert mismatch.client_order_id == "tp-20261007-SEC_A-sell-1"
+    assert mismatch.security_id == "SEC_A"
+    assert "journaled 10.0" in mismatch.detail
+    assert result.lagging_ids == ()
+
+
+def test_an_excess_within_the_quantity_tolerance_is_not_a_mismatch() -> None:
+    """#3152: a journaled surplus inside `risk.reconcile_quantity_tolerance` is noise."""
+    result = _run(
+        _ledger(1_500.0, SEC_A=0.0),
+        {},
+        1_500.0,
+        journal_open=[_excess_sell(10.0, OrderStatus.FILLED, 10.0 - 1e-9)],
+    )
+
+    assert "bad_reading" not in _kinds(result)
+
+
+@pytest.mark.parametrize(
+    ("journaled", "bad"),
+    [(0.0, float("nan")), (10.0, float("nan")), (0.0, float("-inf")), (0.0, float("inf"))],
+)
+def test_a_non_finite_filled_quantity_is_a_bad_reading(journaled: float, bad: float) -> None:
+    """#3162: `Order` refuses a non-finite `filled_quantity`, but a reading that
+    slips past it (NaN compares false both ways) must not pass as "not lagging"."""
+    item = _excess_sell(journaled, OrderStatus.FILLED, 10.0)
+    assert item.reading is not None
+    object.__setattr__(item.reading, "filled_quantity", bad)  # bypass Order's validator
+    result = _run(_ledger(1_500.0, SEC_A=0.0), {}, 1_500.0, journal_open=[item])
+
+    assert result.status == "mismatch"
+    (mismatch,) = [m for m in result.mismatches if m.kind == "bad_reading"]
+    assert mismatch.client_order_id == "tp-20261007-SEC_A-sell-1"
+    assert "not a finite" in mismatch.detail
+    assert result.lagging_ids == ()
+
+
 def test_a_credited_dividend_while_a_buy_lags_is_allowed_and_deferred() -> None:
     """#399: the broker filled 5 (journal 2) and credited $4.50 on SEC_B."""
     result = _run(
