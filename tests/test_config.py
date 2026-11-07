@@ -235,6 +235,13 @@ def test_edgar_defaults() -> None:
     assert s.edgar.retry_max_attempts == 5
     assert s.edgar.retry_backoff_cap_seconds == pytest.approx(60.0)
     assert s.edgar.rate_limit_wait_seconds == pytest.approx(600.0)
+    assert s.edgar.form25_html_max_bytes == 2_000_000
+
+
+@pytest.mark.parametrize("max_bytes", [0, -1])
+def test_edgar_form25_html_max_bytes_is_positive(max_bytes: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, edgar={"form25_html_max_bytes": max_bytes})
 
 
 def test_edgar_filing_source_defaults() -> None:
