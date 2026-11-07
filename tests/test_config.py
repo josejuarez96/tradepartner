@@ -2634,6 +2634,24 @@ def test_a_books_pair_loads_from_the_environment_and_the_env_file(
     assert c.api_secret is None
 
 
+def test_the_openfigi_key_loads_from_the_env_file_and_is_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3153: `OPENFIGI_API_KEY` set in `.env` (spec data-foundation, `.env.example`)
+    reaches `Settings`, is in `secret_values` and never in repr/str."""
+    monkeypatch.delenv("OPENFIGI_API_KEY", raising=False)
+    env_file = tmp_path / "figi.env"
+    env_file.write_text("OPENFIGI_API_KEY=figi-synthetic-4242\n", encoding="utf-8")
+    s = Settings(_env_file=env_file)
+    assert s.openfigi_api_key is not None
+    assert s.openfigi_api_key.get_secret_value() == "figi-synthetic-4242"
+    assert "figi-synthetic-4242" in secret_values(s)
+    assert "figi-synthetic-4242" not in repr(s) and "figi-synthetic-4242" not in str(s)
+    assert Settings(_env_file=None).openfigi_api_key is None
+    example = (Path(__file__).resolve().parents[1] / ".env.example").read_text(encoding="utf-8")
+    assert "# OPENFIGI_API_KEY=" in example
+
+
 def test_book_pairs_default_empty_and_never_fall_back(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ALPACA_PAPER_API_KEY", "pk-main-111")
     monkeypatch.setenv("ALPACA_API_KEY", "sk-data-abc123")

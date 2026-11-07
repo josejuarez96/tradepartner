@@ -1441,6 +1441,36 @@ def test_journaled_fills_above_the_brokers_quantity_keep_the_order_in_flight(
     assert _statuses(journal_settings, "tp-a") == ["pending", "accepted"]
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_a_non_finite_filled_quantity_keeps_the_order_in_flight(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+    bad: float,
+) -> None:
+    """#3162: a terminal reading whose `filled_quantity` slipped past `Order`'s
+    validator as NaN/inf journals no terminal event (NaN gaps compare false)."""
+    run_id = _run(journal_settings, open_window, fixed_clock())
+    order = _order(journal_settings, scripted_fake, fixed_clock, run_id, "tp-a", quantity=10.0)
+    scripted_fake.apply("tp-a", FillAt(50.0))
+    fixed_clock.advance(minutes=1)
+    real = scripted_fake.get_order
+
+    def tampered(client_order_id: str) -> Any:
+        reading = real(client_order_id)
+        object.__setattr__(reading, "filled_quantity", bad)  # bypass Order's validator
+        return reading
+
+    monkeypatch.setattr(scripted_fake, "get_order", tampered)
+    (reading,) = _collect(
+        journal_settings, scripted_fake, fixed_clock, [order], writer_id=run_id
+    ).readings
+    assert not reading.terminal_written
+    assert _statuses(journal_settings, "tp-a") == ["pending", "accepted"]
+
+
 def test_rejections_a_resume_journaled_are_judged_by_the_next_run(
     journal_settings: Settings,
     open_window: PaperWindowRow,

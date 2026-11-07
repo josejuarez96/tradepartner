@@ -2459,6 +2459,38 @@ def test_family_registered_on_is_the_first_registration_day(
     assert registry.family_registered_on(conn, "momentum") == date(2026, 9, 1)
 
 
+def test_registration_day_is_the_new_york_calendar_day() -> None:
+    """#3154: DST ends 2026-11-01; both sides of it map to New York's day."""
+    assert registry.registration_day(datetime(2026, 11, 1, 3, 59, tzinfo=UTC)) == date(2026, 10, 31)
+    assert registry.registration_day(datetime(2026, 11, 2, 4, 59, tzinfo=UTC)) == date(2026, 11, 1)
+    assert registry.registration_day(datetime(2026, 11, 2, 5, 0, tzinfo=UTC)) == date(2026, 11, 2)
+
+
+@pytest.mark.parametrize(
+    ("registered_at", "day"),
+    [
+        # 21:00 EDT on 10-31 is 01:00 UTC on 11-01 (the B4 next-day pattern, #1441).
+        (datetime(2026, 11, 1, 1, 0, tzinfo=UTC), date(2026, 10, 31)),
+        # 19:30 EST on 11-30 is 00:30 UTC on 12-01.
+        (datetime(2026, 12, 1, 0, 30, tzinfo=UTC), date(2026, 11, 30)),
+        # 00:30 EDT on 09-02 is 04:30 UTC: the New York day has turned.
+        (datetime(2026, 9, 2, 4, 30, tzinfo=UTC), date(2026, 9, 2)),
+    ],
+)
+def test_family_registered_on_is_the_new_york_day(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, registered_at: datetime, day: date
+) -> None:
+    """#3154, ADR 0016 point 4: the registration day is New York's, the calendar a
+    holdout.start is written in, so an evening registration with holdout.start the
+    next day is forward."""
+    first = _register(conn, settings)
+    conn.execute(
+        "UPDATE hypotheses SET registered_at = ? WHERE hypothesis_id = ?",
+        [registered_at, first.hypothesis_id],
+    )
+    assert registry.family_registered_on(conn, "momentum") == day
+
+
 def test_a_boundary_leaving_no_rebalance_session_is_refused(
     conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
