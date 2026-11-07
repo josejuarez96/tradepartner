@@ -23,7 +23,7 @@ from typing import Any
 import duckdb
 import pytest
 from conftest import version_4_store
-from dashboard_nav import NavCall, nav_calls_fixture, nav_titles  # noqa: F401
+from dashboard_nav import NavCall, app_test, nav_calls_fixture, nav_titles  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.backtest.hypothesis import frozen_params_of
@@ -288,7 +288,7 @@ def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path, now: datetime = _NOW
     # slow shard whose wall clock crosses a session boundary between import and
     # render cannot advance the required session past the fixture's run (#1263).
     monkeypatch.setattr(ops_page, "utc_now", lambda: now)
-    at = AppTest.from_file(_APP_PATH)
+    at = app_test(_APP_PATH)
     at.run()
     monkeypatch.setenv("DASHBOARD_TEST_PAGE", _PAGE)
     at.run()
@@ -941,7 +941,7 @@ def test_two_books_list_two_summary_rows_and_the_selector_switches_the_sections(
     alerts = _dataframe_with_columns(at, "kind", "message")
     assert alerts["message"].to_list() == ["SPY has no bar for S"]
 
-    selector.set_value("b").run(timeout=30)
+    selector.set_value("b").run()
     assert not at.exception
     assert {m.label: str(m.value) for m in at.metric}["Positions"] == "2"
     assert "No alerts in this window." in _text(at)
@@ -985,7 +985,7 @@ def test_waiting_card_covers_every_book_after_selection_and_writes_nothing(
     assert re.search(r":orange-badge\[[^\]]*b: unreadable", text)
     assert any("tradepartner paper resume --book main" in code.value for code in at.code)
     [selector] = [sb for sb in at.selectbox if sb.key == ops_page.BOOK_KEY]
-    selector.set_value("b").run(timeout=30)
+    selector.set_value("b").run()
     assert not at.exception
     assert "main: kill_switch_engaged" in _text(at)
     assert "b: unreadable" in _text(at)
