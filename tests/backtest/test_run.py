@@ -17,11 +17,13 @@ import json
 import shutil
 from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime
+from functools import partial
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
 import duckdb
+import polars as pl
 import pytest
 from conftest import load_universe_fixtures, mark_pre_lab
 
@@ -33,9 +35,16 @@ from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.backtest.run import run_hypothesis
 from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.store_provider import StoreProvider
+from tradepartner.calendar import session_close
 from tradepartner.config import FORBIDDEN_AXIS_PREFIXES, Settings
 from tradepartner.store import lab_registry, lab_schema, registry, schema
-from tradepartner.store.db import configure_connection, insert_row, open_for_write, utc_now
+from tradepartner.store.db import (
+    configure_connection,
+    insert_row,
+    open_for_write,
+    open_read_only,
+    utc_now,
+)
 
 SLUG = "h-run"
 IN_SAMPLE_START = date(2018, 1, 31)
@@ -1513,3 +1522,234 @@ def test_a_delayed_file_is_not_refused_a_holdout_or_tracking_run(
     assert outcome.status == "ok"
     trial = _row(read(), "trials", outcome.trial_id)
     assert (trial["kind"], trial["note"]) == ("holdout", "signal_delay=1")
+
+
+# --- delisting exit coverage (plan T329, #2670) ----------------------------------------
+
+#: The fixture's one booked delisting exit over the default window: SEC_TRANSFER's
+#: Form 25 (NYSE, accepted 2018-10-23), decided by the 2018-10-31 read.
+EXIT_ID = "SEC_TRANSFER"
+EXIT_FILED_AT = datetime(2018, 10, 23, 20, 30, tzinfo=UTC)
+EXIT_READ = read_time(date(2018, 10, 31))
+COVERAGE = ("n_exit_coverage_exits", "n_exit_coverage_unknown", "n_exit_coverage_after_read")
+
+
+def _reason(
+    known_at: datetime,
+    reason: str = "bankruptcy",
+    *,
+    security_id: str = EXIT_ID,
+    filed_at: datetime = EXIT_FILED_AT,
+    class_title: str = "Common Stock",
+) -> dict[str, Any]:
+    return {
+        "security_id": security_id,
+        "delisting_form": "25",
+        "delisting_class_title": class_title,
+        "delisting_exchange": "NYSE",
+        "delisting_filed_at": filed_at,
+        "reason": reason,
+        "reason_evidence_form": "8-K",
+        "reason_evidence_accession": f"acc-{reason}-{known_at.date()}",
+        "reason_source": "eightk_item",
+        "reason_known_at": known_at,
+        "known_at": known_at,
+    }
+
+
+def _exit(
+    security_id: str = EXIT_ID, filed_at: datetime | None = EXIT_FILED_AT
+) -> engine.DelistingExit:
+    return engine.DelistingExit(
+        security_id=security_id,
+        read_time=EXIT_READ,
+        end_session=date(2018, 10, 31),
+        exchange="NYSE",
+        delisting_form="25",
+        delisting_filed_at=filed_at,
+    )
+
+
+def _insert_reason(path: Path, row: dict[str, Any]) -> None:
+    with open_for_write(_store(path)) as conn:
+        insert_row(
+            conn,
+            "delisting_reasons",
+            row | {"ingested_at": utc_now(), "source": "edgar", "provenance": "filing"},
+        )
+
+
+def _coverage(conn: duckdb.DuckDBPyConnection, trial_id: int) -> dict[date, dict[str, int]]:
+    found: dict[date, dict[str, int]] = {}
+    for session, name, value in conn.execute(
+        "SELECT session, name, value FROM trial_rebalance_counts "
+        "WHERE trial_id = ? AND name LIKE 'n_exit_coverage%'",
+        [trial_id],
+    ).fetchall():
+        found.setdefault(session, {})[name] = value
+    return found
+
+
+def test_exit_coverage_counts_match_the_reason_as_the_engine_does() -> None:
+    """A single classified row for the exit's (form, filed_at, exchange) covers it; a row
+    known after the deciding read is after-read; none, two, an `unknown` row or another
+    episode's row leave it unknown."""
+    early, late = EXIT_READ.replace(day=25), EXIT_READ.replace(month=12)
+    frame = pl.DataFrame(
+        [
+            _reason(early, security_id="A"),
+            _reason(late, "merger_acquisition", security_id="B"),
+            _reason(early, "unknown", security_id="C"),
+            _reason(early, security_id="D"),
+            _reason(early, "merger_acquisition", security_id="D", class_title="Class B"),
+            _reason(early, security_id="E", filed_at=EXIT_FILED_AT.replace(day=1)),
+        ]
+    )
+    exits = [_exit(sid) for sid in "ABCDEF"] + [_exit("A", filed_at=None)]
+    assert run_module.exit_coverage_counts(exits, frame) == {
+        "n_exit_coverage_exits": 7,
+        "n_exit_coverage_unknown": 5,  # C, D, E, F and the exit without its filing
+        "n_exit_coverage_after_read": 1,  # B
+    }
+    assert run_module.exit_coverage_counts([], pl.DataFrame()) == dict.fromkeys(COVERAGE, 0)
+
+
+@pytest.mark.parametrize("reason", ["bankruptcy", "merger_acquisition"])
+def test_evidence_after_the_cutoff_is_not_counted_and_before_it_is_after_read(
+    store: Path, reason: str
+) -> None:
+    """Through the store's own read at the cutoff: a reason known after the cutoff leaves
+    the exit unknown; one known after the deciding read but by the cutoff covers it and
+    counts in `n_exit_coverage_after_read`."""
+    cutoff = read_time(DEFAULT_END)
+    after_cutoff = session_close(date(2019, 6, 3))
+    _insert_reason(store, _reason(after_cutoff, reason))
+    with open_for_write(_store(store)) as conn:
+        handle = registry.open_trial(
+            conn,
+            hypothesis_id=registry.get_hypothesis(conn, SLUG).hypothesis_id,
+            kind="in_sample",
+            start_session=IN_SAMPLE_START,
+            end_session=DEFAULT_END,
+            data_cutoff=cutoff,
+            synthetic=True,
+            run_by="test",
+            settings=_frozen(),
+        )
+    with StoreProvider(partial(open_read_only, _store(store)), handle, _frozen()) as provider:
+        assert run_module.exit_coverage(provider, cutoff, [_exit()]) == {
+            "n_exit_coverage_exits": 1,
+            "n_exit_coverage_unknown": 1,
+            "n_exit_coverage_after_read": 0,
+        }
+    _insert_reason(store, _reason(read_time(date(2019, 1, 31)), reason))
+    with StoreProvider(partial(open_read_only, _store(store)), handle, _frozen()) as provider:
+        assert run_module.exit_coverage(provider, cutoff, [_exit()]) == {
+            "n_exit_coverage_exits": 1,
+            "n_exit_coverage_unknown": 0,
+            "n_exit_coverage_after_read": 1,
+        }
+
+
+def _without_coverage(results: dict[float, engine.BacktestResult]) -> list[Any]:
+    """Every level's rebalance rows with the coverage counts dropped, its equity and
+    weights: what the engine produced."""
+    out: list[Any] = []
+    for level in sorted(results):
+        result = results[level]
+        rows = [
+            (row.columns(), {k: v for k, v in row.counts.items() if k not in COVERAGE})
+            for row in result.rebalances
+        ]
+        out.append((level, rows, result.equity, result.weights, result.delisting_exits))
+    return out
+
+
+def test_a_none_trial_writes_its_coverage_and_reason_rows_change_nothing_else(
+    store: Path, read: Read
+) -> None:
+    """Under `none` the counts are written at the trial's last rebalance session; a reason
+    row known by the cutoff changes them only: the engine's rows, the metrics and the
+    trial's data vintage are the same with and without it."""
+    first = run_hypothesis(SLUG, None, None, Flags(), synthetic=True, store_path=store)
+    _insert_reason(store, _reason(read_time(date(2019, 1, 31))))
+    second = run_hypothesis(SLUG, None, None, Flags(), synthetic=True, store_path=store)
+
+    assert (first.status, second.status) == ("ok", "ok")
+    assert first.results is not None and second.results is not None
+    last = first.results[15.0].rebalances[-1].session
+    conn = read()
+    assert _coverage(conn, first.trial_id) == {
+        last: {
+            "n_exit_coverage_exits": 1,
+            "n_exit_coverage_unknown": 1,
+            "n_exit_coverage_after_read": 0,
+        }
+    }
+    assert _coverage(conn, second.trial_id) == {
+        last: {
+            "n_exit_coverage_exits": 1,
+            "n_exit_coverage_unknown": 0,
+            "n_exit_coverage_after_read": 1,
+        }
+    }
+    assert _without_coverage(first.results) == _without_coverage(second.results)
+    metrics = (
+        "SELECT series, cost_per_side_bps, metric, value FROM trial_metrics WHERE trial_id = ?"
+    )
+    assert sorted(conn.execute(metrics, [first.trial_id]).fetchall()) == sorted(
+        conn.execute(metrics, [second.trial_id]).fetchall()
+    )
+    vintage = "SELECT data_vintage FROM trials WHERE trial_id = ?"
+    assert (
+        conn.execute(vintage, [first.trial_id]).fetchone()
+        == conn.execute(vintage, [second.trial_id]).fetchone()
+    )
+    # Only the base level's last row carries them.
+    for level, result in first.results.items():
+        for row in result.rebalances:
+            carries = level == 15.0 and row.session == last
+            assert (set(COVERAGE) <= set(row.counts)) == carries
+
+
+def test_a_severe_unknown_shock_and_its_coverage_are_both_counted(
+    fixture_store_path: Path, read: Read
+) -> None:
+    """Under `severe_v1` the fixture's unknown exit is shocked (`n_failure_shocks`, the
+    engine's) and counted unknown in the coverage."""
+    frozen = Settings(
+        _env_file=None,
+        strategy={"top_fraction": 0.5},
+        holdout={"start": HOLDOUT[0], "end": HOLDOUT[1]},
+        gap={"count_share_threshold": 0.05},
+        backtest={"delisting_failure_return": "severe_v1"},
+    )
+    with open_for_write(_store(fixture_store_path)) as conn:
+        registry.register_hypothesis(
+            conn,
+            slug="h-severe",
+            family="momentum",
+            title="severe",
+            doc_path="docs/hypotheses/h-severe.md",
+            doc_sha256="0" * 64,
+            params=frozen_params_of(frozen, family="momentum"),
+            in_sample_start=IN_SAMPLE_START,
+            holdout_start=HOLDOUT[0],
+            holdout_end=HOLDOUT[1],
+            registered_by="test",
+            settings=frozen,
+        )
+    outcome = run_hypothesis(
+        "h-severe", None, None, Flags(), synthetic=True, store_path=fixture_store_path
+    )
+    assert (outcome.status, outcome.error) == ("ok", None)
+    conn = read()
+    counts = registry.rebalance_counts(conn, outcome.trial_id)
+    assert sum(c.get("n_failure_shocks", 0) for c in counts.values()) == 1
+    assert sum(c.get("n_unknown_exits", 0) for c in counts.values()) == 1
+    (coverage,) = _coverage(conn, outcome.trial_id).values()
+    assert coverage == {
+        "n_exit_coverage_exits": 1,
+        "n_exit_coverage_unknown": 1,
+        "n_exit_coverage_after_read": 0,
+    }

@@ -21,7 +21,13 @@ from typing import Any
 
 import duckdb
 import pytest
-from dashboard_nav import NavCall, nav_calls_fixture, nav_titles  # noqa: F401
+from dashboard_nav import (  # noqa: F401
+    APPTEST_TIMEOUT_S,
+    NavCall,
+    app_test,
+    nav_calls_fixture,
+    nav_titles,
+)
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.backtest.hypothesis import frozen_params_of
@@ -97,7 +103,7 @@ def store(tmp_path: Path) -> Path:
 def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> AppTest:
     monkeypatch.setenv("STORE__PATH", str(store_path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
-    at = AppTest.from_file(_APP_PATH, default_timeout=30)
+    at = app_test(_APP_PATH)
     at.run()
     monkeypatch.setenv("DASHBOARD_TEST_PAGE", _PAGE)
     at.run()
@@ -494,7 +500,7 @@ def test_the_page_writes_to_the_shells_settings_not_the_environments(
 
         render_app(Settings(_env_file=None, store={"path": path}))
 
-    at = AppTest.from_function(_script, args=(str(store),), default_timeout=30)
+    at = AppTest.from_function(_script, args=(str(store),), default_timeout=APPTEST_TIMEOUT_S)
     at.run()
     monkeypatch.setenv("DASHBOARD_TEST_PAGE", _PAGE)
     at.run()

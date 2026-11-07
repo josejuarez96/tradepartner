@@ -1764,6 +1764,54 @@ def test_h1_twin_run_on_the_fake_provider_is_pinned() -> None:
     assert finals == pytest.approx(TWIN_FINAL_EQUITY, rel=1e-12)
 
 
+def test_the_twin_pin_carries_no_delisting_exit_record() -> None:
+    """Plan T328c: the `none` twin (no listing ends) records no delisting exit in memory;
+    the record is outside the digest either way."""
+    settings = _twin_settings()
+    assert settings.backtest.delisting_failure_return == "none"
+    results = run(settings, _provider(), T0, T4, _handle(), (0.0,), family="momentum")
+    assert results[0.0].delisting_exits == ()
+    assert _run_digest(results[0.0]) == TWIN_RUN_DIGESTS[0.0]
+
+
+@pytest.mark.parametrize("policy", ["failure_v1", "severe_v1"])
+def test_a_policy_twin_without_exits_reads_nothing_new_and_adds_only_zero_counts(
+    policy: str,
+) -> None:
+    """Plan T328c: with no delisting exit a policy run makes no evidence read (its call
+    log is the pinned one) and its rows differ from the pin only by the policy counts,
+    all zero, which a policy other than `none` writes on every row."""
+    import hashlib
+    import json
+
+    settings = _twin_settings().model_copy(
+        update={
+            "backtest": _twin_settings().backtest.model_copy(
+                update={"delisting_failure_return": policy}
+            )
+        }
+    )
+    provider = _provider()
+    levels = tuple(settings.costs.sensitivity_per_side_bps)
+    results = run(settings, provider, T0, T4, _handle(), levels, family="momentum")
+    log = _call_log(provider)
+    assert hashlib.sha256(json.dumps(log).encode()).hexdigest() == TWIN_CALL_LOG_SHA256
+    policy_counts = set(engine.POLICY_COUNT_NAMES)
+    stripped = {}
+    for level, result in results.items():
+        for row in result.rebalances:
+            assert {k: row.counts[k] for k in policy_counts} == dict.fromkeys(policy_counts, 0)
+        rows = tuple(
+            dataclasses.replace(
+                row, counts={k: v for k, v in row.counts.items() if k not in policy_counts}
+            )
+            for row in result.rebalances
+        )
+        stripped[level] = _run_digest(dataclasses.replace(result, rebalances=rows))
+    assert stripped == TWIN_RUN_DIGESTS
+    assert _run_digest(results[0.0]) != TWIN_RUN_DIGESTS[0.0]
+
+
 def test_the_twin_pin_fails_if_the_screen_reads_or_runs_at_the_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -56,8 +56,9 @@ def test_every_listed_setting_changes_hash(key: str) -> None:
 # the real store), then #3056's `BUILD_RULES_VERSION` 5, then #3084's
 # `BUILD_RULES_VERSION` 6 with `DELISTING_HTML_VERSION` in the cache names, then
 # #3076's `BUILD_RULES_VERSION` 7 and `CURRENT_SCHEMA_VERSION` 48 (`classifications.issuer_class`),
-# then #3106's Form 25 cap (hashed setting only; no rules or cache version bump).
-MAIN_DEFAULT_HASH = "d55d74106ad56850adce779cf42944a6f1928bad70945312e63280b87dec8145"
+# then #3106's Form 25 cap (hashed setting only; no rules or cache version bump),
+# then #3190's `BUILD_RULES_VERSION` 8 (at 7 the hash is d55d7410...dec8145).
+MAIN_DEFAULT_HASH = "5c00edf75ffcc3c2d1f0406c50c2b175e3c2935bc9ee6be8d1d4befec0e07e1b"
 
 
 def test_hash_at_defaults_equals_the_hex_pinned_from_main() -> None:

@@ -167,6 +167,18 @@ here is this module's and is stated once:
   acquirer, never the acquiree) and `mergers_unique` (one row per identity
   and stamp) run over every stored row.
 
+- **Delisting reasons** (`delisting_reasons`, spec amendment #2670, plan
+  T329): the latest reason revision of each Form 25 episode known at `t`
+  counted by reason and evidence source, the episodes with no or an `unknown`
+  reason, the ended-listing keys more than one revision answers (conflicted,
+  read `unknown` by the engine), the reason 8-K items no episode window or
+  reason corroborates, and the `merger_acquisition` episodes without usable
+  consideration (`DelistingReasonsHealth`). Report-only; the integrity rule
+  `delisting_reasons_known_at_from_acceptance` (no revision known before its
+  supporting acceptance) runs over every stored row. A backtest trial's own
+  coverage counts are its run-time snapshot (`backtest.run.EXIT_COVERAGE_COUNTS`);
+  this block is the current view.
+
 - **Coverage against a named reference** (`coverage_reference`, #1541,
   T180): the one check that compares the store with a list outside its own
   derivation, `coverage.reference_names` (`CIK:TICKER[:FROM[:TO]]`, the
@@ -466,6 +478,7 @@ from tradepartner.adapters.alpaca_prices import (
     is_same_day_typo,
     same_alpaca_symbol,
 )
+from tradepartner.adapters.edgar import REASON_8K_ITEMS, eightk_item_codes
 from tradepartner.adapters.prices import announcement_date_known_at, spinoff_known_at_floor
 from tradepartner.adapters.rates import rate_known_at
 from tradepartner.backfill import BACKFILL
@@ -484,6 +497,7 @@ from tradepartner.config import (
     get_settings,
     parse_accepted_same_day_pair,
 )
+from tradepartner.config_backtest import DELISTING_POLICIES
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
 from tradepartner.ingest import ASSETS_IMPORT_MODE, DERIVED_FACTS, MODE, OK, SOURCES
 from tradepartner.store.asof import (
@@ -494,21 +508,30 @@ from tradepartner.store.asof import (
     _traded,
     _validate_t,
     borrow_status_as_of,
+    filing_events_as_of,
     form4_date_plausibility_sql,
     listings_as_of,
     live_actions_as_of,
+    live_chains,
     mergers_as_of,
     price_jumps_as_of,
     prices_as_of,
     statement_facts_as_of,
 )
 from tradepartner.store.classify import EQUITY, UNCLASSIFIABLE, classifications_as_of, listing_kind
+from tradepartner.store.delisting_reasons import (
+    MERGER,
+    UNKNOWN,
+    ReasonWindows,
+    delisting_reasons_as_of,
+)
 from tradepartner.store.delistings import (
     DELISTED,
     LISTED,
     TRANSFERRED,
     _filing_session,
     _window,
+    delistings_as_of,
     listing_ends_as_of,
 )
 from tradepartner.store.dividend_reviews import (
@@ -614,6 +637,12 @@ MERGER_KNOWN_AT = "mergers_known_at_from_process_date"
 MERGER_RATES_MATCH_KIND = "mergers_rates_match_kind"
 MERGER_ACQUIRER = "mergers_acquirer"
 MERGER_UNIQUE = "mergers_unique"
+#: The delisting-reason stamp rule (spec amendment #2670, plan T329): no stored
+#: reason revision is known before its supporting acceptance (the Form 25's for a
+#: `form25_*` source, the cited 8-K's `filing_events.accepted_at` for `eightk_item`).
+#: An 8-K-supported revision may precede its Form 25 (T327's item windows reach back);
+#: the reason read shows it only once that episode is known.
+DELISTING_REASON_KNOWN_AT_FROM_ACCEPTANCE = "delisting_reasons_known_at_from_acceptance"
 #: The duplicate-dividends rule (#1613, T186b): `duplicate_dividends`.
 DUPLICATE_DIVIDENDS = "duplicate_dividends"
 #: The borrow-status key rule (#1506, T171e): `borrow_status_unique`.
@@ -679,6 +708,7 @@ INTEGRITY_RULES: tuple[str, ...] = (
     MERGER_RATES_MATCH_KIND,
     MERGER_ACQUIRER,
     MERGER_UNIQUE,
+    DELISTING_REASON_KNOWN_AT_FROM_ACCEPTANCE,
     DUPLICATE_DIVIDENDS,
     BORROW_STATUS_UNIQUE,
     CHAIN_NOT_REVIEWED,
@@ -1375,6 +1405,271 @@ def _mergers_report(
         conflicts.select(list(_MERGER_CONFLICT_SCHEMA)).cast(pl.Schema(_MERGER_CONFLICT_SCHEMA)),
         pl.DataFrame(after, schema=_MERGER_AFTER_SCHEMA).sort("security_id", "effective_date"),
     )
+
+
+_EPISODE_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "delisting_form": pl.Utf8,
+    "delisting_class_title": pl.Utf8,
+    "delisting_exchange": pl.Utf8,
+    "delisting_filed_at": pl.Datetime("us", "UTC"),
+}
+_CONFLICT_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "delisting_form": pl.Utf8,
+    "delisting_exchange": pl.Utf8,
+    "delisting_filed_at": pl.Datetime("us", "UTC"),
+    "reasons": pl.List(pl.Utf8),
+}
+_CONSIDERATION_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "delisting_form": pl.Utf8,
+    "delisting_filed_at": pl.Datetime("us", "UTC"),
+    "end_session": pl.Date,
+    "detail": pl.Utf8,
+}
+_REASON_STAMP_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "delisting_form": pl.Utf8,
+    "delisting_filed_at": pl.Datetime("us", "UTC"),
+    "reason_source": pl.Utf8,
+    "reason_evidence_accession": pl.Utf8,
+    "known_at": pl.Datetime("us", "UTC"),
+    "accepted_at": pl.Datetime("us", "UTC"),
+}
+#: The engine's merger match window (plan T328c): the widest version's, the same
+#: (10 trading sessions after `end_session`) in every version so far.
+_MERGER_WINDOW_SESSIONS = max(p.merger_window_sessions for p in DELISTING_POLICIES.values())
+
+
+@dataclass(frozen=True, eq=False)
+class DelistingReasonsHealth:
+    """The delisting-reason block at `t` (spec amendment #2670, "Health and
+    acceptance"; plan T329): report only, nothing here fails `--check` (the stamp
+    rule `delisting_reasons_known_at_from_acceptance` is an integrity rule).
+
+    `by_reason_source` counts the latest reason revision of each Form 25 episode
+    known at `t` by `(reason, reason_source)`. `unknown` lists the episodes with no
+    revision or an `unknown` one. `conflicted` lists the ended-listing keys the
+    engine matches on (`security_id`, `delisting_form`, `delisting_exchange`,
+    `delisting_filed_at`) that more than one revision answers, which the engine
+    reads as `unknown` (`n_reason_conflicts`). `unmatched_items` counts, per reason
+    8-K item, each `(security, 8-K)` of a security with an episode whose item falls
+    outside every episode's `ReasonWindows`, or, for Item 2.01, inside one whose
+    reason is not `merger_acquisition` (uncorroborated). `missing_consideration`
+    lists each `merger_acquisition` episode the engine would value at the last
+    close (a transferred listing is never an exit and is skipped): no delisted
+    listing end, not exactly one acquiree `mergers` row in
+    [`end_session`, `end_session` + the window], or a stock component without the
+    acquirer's raw traded close on `effective_date`."""
+
+    by_reason_source: dict[tuple[str, str], int]
+    unknown: pl.DataFrame
+    conflicted: pl.DataFrame
+    unmatched_items: dict[str, int]
+    missing_consideration: pl.DataFrame
+
+    def lines(self) -> list[str]:
+        """The block as text lines."""
+        counts = ", ".join(
+            f"{reason}/{source} {n}"
+            for (reason, source), n in sorted(self.by_reason_source.items())
+        )
+        items = ", ".join(f"{item} {n}" for item, n in self.unmatched_items.items())
+        return [
+            f"delisting reasons: {counts or 'none'}",
+            f"  unknown episodes: {self.unknown.height}; conflicted: {self.conflicted.height}",
+            f"  unmatched 8-K items: {items}",
+            f"  missing merger consideration: {self.missing_consideration.height}",
+        ]
+
+
+def delisting_reasons_report(
+    conn: duckdb.DuckDBPyConnection, t: datetime, listings: pl.DataFrame
+) -> DelistingReasonsHealth:
+    """The delisting-reason block at `t` (`DelistingReasonsHealth`); `listings` is
+    `listing_ends_as_of(conn, t, settings)`."""
+    t = _validate_t(t)
+    tables = _present_tables(conn)
+    unmatched = dict.fromkeys(REASON_8K_ITEMS, 0)
+    if "delisting_reasons" not in tables:
+        return DelistingReasonsHealth(
+            {},
+            pl.DataFrame(schema=_EPISODE_SCHEMA),
+            pl.DataFrame(schema=_CONFLICT_SCHEMA),
+            unmatched,
+            pl.DataFrame(schema=_CONSIDERATION_SCHEMA),
+        )
+    reasons = delisting_reasons_as_of(conn, t)
+    by_reason_source = dict(
+        Counter(zip(reasons["reason"].to_list(), reasons["reason_source"].to_list(), strict=True))
+    )
+    episodes = (
+        delistings_as_of(conn, t)
+        .rename(
+            {
+                "form": "delisting_form",
+                "class_title": "delisting_class_title",
+                "exchange": "delisting_exchange",
+                "filed_at": "delisting_filed_at",
+            }
+        )
+        .select(list(_EPISODE_SCHEMA))
+        .unique()
+    )
+    known = reasons.filter(pl.col("reason") != UNKNOWN).select(list(_EPISODE_SCHEMA))
+    unknown = episodes.join(known, on=list(_EPISODE_SCHEMA), how="anti").sort(
+        "security_id", "delisting_filed_at"
+    )
+    engine_key = ["security_id", "delisting_form", "delisting_exchange", "delisting_filed_at"]
+    conflicted = (
+        reasons.group_by(engine_key)
+        .agg(pl.col("reason").sort().alias("reasons"))
+        .filter(pl.col("reasons").list.len() > 1)
+        .sort(engine_key)
+    )
+    return DelistingReasonsHealth(
+        by_reason_source,
+        unknown.cast(pl.Schema(_EPISODE_SCHEMA)),
+        conflicted.select(list(_CONFLICT_SCHEMA)).cast(pl.Schema(_CONFLICT_SCHEMA)),
+        _unmatched_items(conn, t, episodes, reasons, unmatched),
+        _missing_consideration(conn, t, reasons, listings),
+    )
+
+
+def _unmatched_items(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    episodes: pl.DataFrame,
+    reasons: pl.DataFrame,
+    unmatched: dict[str, int],
+) -> dict[str, int]:
+    """`DelistingReasonsHealth.unmatched_items`, filling `unmatched` (every item at 0)."""
+    if "filing_events" not in _present_tables(conn) or episodes.is_empty():
+        return unmatched
+    merger_reason = {
+        (row["security_id"], row["delisting_form"], row["delisting_filed_at"])
+        for row in reasons.filter(pl.col("reason") == MERGER).iter_rows(named=True)
+    }
+    by_security: dict[str, list[tuple[str, datetime]]] = defaultdict(list)
+    for row in episodes.iter_rows(named=True):
+        by_security[row["security_id"]].append((row["delisting_form"], row["delisting_filed_at"]))
+    windows = ReasonWindows()
+    events = filing_events_as_of(conn, t, ("8-K", "8-K/A"), REASON_8K_ITEMS)
+    for row in events.iter_rows(named=True):
+        own = by_security.get(row["security_id"])
+        if not own:
+            continue
+        codes = eightk_item_codes(row["items"])
+        for item in REASON_8K_ITEMS:
+            if item not in codes:
+                continue
+            near = [e for e in own if windows.holds(item, e[1], row["accepted_at"])]
+            if item == "2.01":
+                near = [e for e in near if (row["security_id"], *e) in merger_reason]
+            unmatched[item] += not near
+    return unmatched
+
+
+def _missing_consideration(
+    conn: duckdb.DuckDBPyConnection, t: datetime, reasons: pl.DataFrame, listings: pl.DataFrame
+) -> pl.DataFrame:
+    """`DelistingReasonsHealth.missing_consideration` (its docstring)."""
+    mergers_wanted = reasons.filter(pl.col("reason") == MERGER)
+    if mergers_wanted.is_empty():
+        return pl.DataFrame(schema=_CONSIDERATION_SCHEMA)
+    ends: dict[tuple[str, str, datetime, str], tuple[str, date | None]] = {
+        (row["security_id"], row["delisting_form"], row["delisting_filed_at"], row["exchange"]): (
+            row["status"],
+            row["end_session"],
+        )
+        for row in listings.filter(pl.col("delisting_form").is_not_null()).iter_rows(named=True)
+    }
+    ids = sorted(set(mergers_wanted["security_id"].to_list()))
+    rows = (
+        mergers_as_of(conn, t, ids).filter(pl.col("security_id").is_in(ids))
+        if "mergers" in _present_tables(conn)
+        else pl.DataFrame()
+    )
+    chains = dict(live_chains(conn, t))
+    out: list[dict[str, Any]] = []
+    for reason in mergers_wanted.iter_rows(named=True):
+        sid = reason["security_id"]
+        key = (sid, reason["delisting_form"], reason["delisting_filed_at"])
+        status, end = ends.get((*key, reason["delisting_exchange"]), (None, None))
+        if status == TRANSFERRED:
+            continue  # a transfer is never an exit: nothing is valued
+        detail: str | None = None
+        if status != DELISTED or end is None:
+            detail = "no delisted listing end"
+        else:
+            every = all_sessions()
+            last = every[min(bisect_left(every, end) + _MERGER_WINDOW_SESSIONS, len(every) - 1)]
+            found = (
+                []
+                if rows.is_empty()
+                else [
+                    r
+                    for r in rows.filter(pl.col("security_id") == sid).iter_rows(named=True)
+                    if end <= r["effective_date"] <= last
+                ]
+            )
+            if len(found) != 1:
+                detail = f"{len(found)} merger rows in the window"
+            elif found[0]["share_ratio"] is not None:
+                acquirer = found[0]["acquirer_security_id"]
+                bars = (
+                    prices_as_of(
+                        conn,
+                        t,
+                        [chains.get(acquirer, acquirer)],
+                        traded_only=True,
+                        sessions_from=found[0]["effective_date"],
+                    )
+                    if acquirer is not None
+                    else pl.DataFrame()
+                )
+                if bars.is_empty() or found[0]["effective_date"] not in bars["session"].to_list():
+                    detail = "no acquirer raw close on the effective date"
+        if detail is not None:
+            out.append(
+                {
+                    "security_id": sid,
+                    "delisting_form": key[1],
+                    "delisting_filed_at": key[2],
+                    "end_session": end,
+                    "detail": detail,
+                }
+            )
+    return pl.DataFrame(out, schema=_CONSIDERATION_SCHEMA)
+
+
+def _reason_stamps(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
+    """`delisting_reasons_known_at_from_acceptance` over every stored revision."""
+    tables = _present_tables(conn)
+    if "delisting_reasons" not in tables:
+        return pl.DataFrame(schema=_REASON_STAMP_SCHEMA)
+    eightk = (
+        "(SELECT max(f.accepted_at) FROM filing_events f "
+        "WHERE f.accession = r.reason_evidence_accession)"
+        if "filing_events" in tables
+        else "NULL"
+    )
+    rows = conn.execute(
+        f"""
+        SELECT security_id, delisting_form, delisting_filed_at, reason_source,
+            reason_evidence_accession, known_at,
+            CASE WHEN reason_source = 'eightk_item' THEN {eightk}
+                ELSE delisting_filed_at END AS accepted_at
+        FROM delisting_reasons r
+        """
+    ).fetchall()
+    found = [
+        dict(zip(_REASON_STAMP_SCHEMA, row, strict=True))
+        for row in rows
+        if row[6] is not None and row[5] < row[6]
+    ]
+    return pl.DataFrame(found, schema=_REASON_STAMP_SCHEMA)
 
 
 _FIGI_DISAGREEMENT_SCHEMA: dict[str, Any] = {
@@ -2108,6 +2403,8 @@ class HealthReport:
     spliced: SplicedSeries = field(
         default_factory=lambda: SplicedSeries(pl.DataFrame([], schema=_SPLICED_SCHEMA))
     )
+    #: Delisting reasons and their evidence (plan T329); report-only.
+    delisting_reasons: DelistingReasonsHealth | None = None
 
     @property
     def failures(self) -> tuple[str, ...]:
@@ -2266,6 +2563,7 @@ def health_report(
         rates=_rates_report(conn, t, settings),
         borrow=_borrow_report(conn, t, session, settings),
         mergers=_mergers_report(conn, t, ingests),
+        delisting_reasons=delisting_reasons_report(conn, t, listings),
         figi_types=_figi_types_report(conn, t, session, settings, current, classes),
         duplicate_dividends=dividends,
         implausible_form4_dates=int(
@@ -3406,6 +3704,7 @@ def _integrity_checks(
         **_rate_rules(conn),
         **_new_action_stamp_rules(conn),
         **_merger_rules(conn),
+        DELISTING_REASON_KNOWN_AT_FROM_ACCEPTANCE: _reason_stamps(conn),
         DUPLICATE_DIVIDENDS: dividends.violations,
         BORROW_STATUS_UNIQUE: _borrow_duplicates(conn),
         CHAIN_NOT_REVIEWED: _unreviewed_chains(conn),

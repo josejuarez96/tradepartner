@@ -2,15 +2,17 @@
 criterion; plan task T108).
 
 `sweep_report(conn, slug)` reads a sweep's latest registration and its family in a
-number of reads that grows with the variants, never with the trials: the `sweeps`
-row and the family rules (`lab_registry`), every variant of every sweep in the
-family (one `sweep_variants` read), their registrations (one `hypotheses` read),
-their in-sample trials with results (one `trials` read), the variant states
+number of reads that grows with the variants, never with the trials: the `sweeps` row
+and the family rules (`lab_registry`), every variant of every sweep in the family (one
+`sweep_variants` read), their registrations (one `hypotheses` read), their in-sample
+trials with results (one `trials` read), the variant states
 (`lab_queries.variant_states`, a few reads per variant), the counted trials'
-base-level metrics (one `trial_metrics` read), **one** `registry.family_sharpes`
-call (itself one `trial_metrics` query per basis) and **one** `results.family_n`
-call (plus the parent family's N when the rules name a parent). Everything after
-the reads is pure over those rows.
+base-level metrics (one `trial_metrics` read), the shown trials' delisting exit
+coverage counts (one `trial_rebalance_counts` read; plan T329: each grid row shows its
+unknown exits over its exits and that share, blank at 0 exits), **one**
+`registry.family_sharpes` call (itself one `trial_metrics` query per basis) and
+**one** `results.family_n` call (plus the parent family's N when the rules name a
+parent). Everything after the reads is pure over those rows.
 
 **Variant states** (spec, Definitions "Selection statistic", "Complete sweep"; req 2;
 #1221). There is one classifier: `store.lab_queries.variant_states`, which the sweep
@@ -186,6 +188,19 @@ class VariantRow:
     max_drawdown: float | None
     red_flag: bool | None
     message: str | None
+    #: The shown trial's delisting exit coverage (plan T329): its booked delisting
+    #: exits and those with no single classified reason at its cutoff, from its
+    #: `trial_rebalance_counts`; None for a trial written before T329 or no trial.
+    exit_coverage_exits: int | None = None
+    exit_coverage_unknown: int | None = None
+
+    @property
+    def exit_coverage_unknown_share(self) -> float | None:
+        """`unknown / exits`; None (blank) at 0 exits or with no counts."""
+        exits, unknown = self.exit_coverage_exits, self.exit_coverage_unknown
+        if not exits or unknown is None:
+            return None
+        return unknown / exits
 
 
 @dataclass(frozen=True)
@@ -440,6 +455,29 @@ def _metrics(
     return found
 
 
+_COVERAGE_NAMES: Final = ("n_exit_coverage_exits", "n_exit_coverage_unknown")
+
+
+def _exit_coverage(
+    conn: duckdb.DuckDBPyConnection, trial_ids: Iterable[int]
+) -> dict[int, dict[str, int]]:
+    """Each trial's delisting exit coverage counts (plan T329), in one
+    `trial_rebalance_counts` read; a trial with none is absent."""
+    wanted = sorted(set(trial_ids))
+    found: dict[int, dict[str, int]] = {}
+    if not wanted:
+        return found
+    rows = conn.execute(
+        "SELECT trial_id, name, sum(value) FROM trial_rebalance_counts "
+        "WHERE list_contains($ids::BIGINT[], trial_id) "
+        "AND list_contains($names::VARCHAR[], name) GROUP BY trial_id, name",
+        {"ids": wanted, "names": list(_COVERAGE_NAMES)},
+    ).fetchall()
+    for trial_id, name, value in rows:
+        found.setdefault(trial_id, {})[name] = int(value)
+    return found
+
+
 # --- variant states (pure) ---------------------------------------------------------
 
 
@@ -530,8 +568,10 @@ def _row(
     *,
     family_n: int,
     pair_sharpes: Sequence[float],
+    coverage: Mapping[str, int] | None = None,
 ) -> VariantRow:
     values = frozen_values(state.record)
+    coverage = coverage or {}
     trial = state.trial
     dsr: float | None = None
     if trial is not None and metrics is not None:
@@ -560,6 +600,8 @@ def _row(
         max_drawdown=shown.get("max_drawdown"),
         red_flag=trial.red_flag if trial is not None else None,
         message=state.message,
+        exit_coverage_exits=coverage.get("n_exit_coverage_exits"),
+        exit_coverage_unknown=coverage.get("n_exit_coverage_unknown"),
     )
 
 
@@ -758,6 +800,7 @@ def sweep_report(
         if s.trial is not None
     ]
     metrics = _metrics(conn, shown)
+    coverage = _exit_coverage(conn, (trial_id for trial_id, _ in shown))
     sharpes = registry.family_sharpes(conn, sweep.family)
     family_n = results.family_n(conn, sweep.family)
     rows = tuple(
@@ -766,6 +809,7 @@ def sweep_report(
             metrics[s.trial.trial_id] if s.trial is not None else None,
             family_n=family_n,
             pair_sharpes=sharpes.excess_spy,
+            coverage=coverage.get(s.trial.trial_id) if s.trial is not None else None,
         )
         for s in states
     )
@@ -856,6 +900,13 @@ def _pct(value: float | None) -> str:
     return "-" if value is None else f"{value * _PERCENT_POINTS:.2f}%"
 
 
+def _coverage(row: VariantRow) -> str:
+    """`unknown/exits` of the row's delisting exits, `-` without counts."""
+    if row.exit_coverage_exits is None or row.exit_coverage_unknown is None:
+        return "-"
+    return f"{row.exit_coverage_unknown}/{row.exit_coverage_exits}"
+
+
 def _varied(values: Mapping[str, Any]) -> str:
     return ", ".join(f"{key}={json.dumps(value)}" for key, value in sorted(values.items()))
 
@@ -884,7 +935,7 @@ def format_report(report: SweepReport) -> str:
     lines.append(
         "idx  slug  varied  cadence  anchor  status  excess_cagr_spy  "
         "sharpe_annual_excess_spy  dsr_excess  cost_drag  turnover_annual  "
-        "max_drawdown  red_flag"
+        "max_drawdown  red_flag  delisting_unknown  delisting_unknown_share"
     )
     for row in report.rows:
         lines.append(
@@ -893,7 +944,8 @@ def format_report(report: SweepReport) -> str:
             + (f" ({row.message})" if row.message else "")
             + f"  {_pct(row.excess_cagr_spy)}  {_fmt(row.sharpe_annual_excess_spy)}  "
             f"{_fmt(row.dsr_excess)}  {_pct(row.cost_drag)}  {_fmt(row.turnover_annual)}  "
-            f"{_pct(row.max_drawdown)}  {'-' if row.red_flag is None else row.red_flag}"
+            f"{_pct(row.max_drawdown)}  {'-' if row.red_flag is None else row.red_flag}  "
+            f"{_coverage(row)}  {_pct(row.exit_coverage_unknown_share)}"
         )
     d = report.distribution
     lines.append(
