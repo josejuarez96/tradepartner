@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -114,3 +114,109 @@ def test_tracking_progress() -> None:
     assert not bs.tracking_progress(None, 4).enough
     with pytest.raises(ValueError):
         bs.tracking_progress(1, 0)
+
+
+# --- the forward return exam's inputs (plan T381a) -----------------------------------
+
+#: The first rebalance session of a fixture exam window and the month-ends after it.
+EXAM_T0 = date(2026, 10, 30)
+EXAM_ENDS = [date(2026, 10, 30), date(2026, 11, 30), date(2026, 12, 31), date(2027, 1, 29)]
+
+
+def _exam_inputs(
+    ends: list[date],
+) -> tuple[dict[date, float], dict[date, float], dict[date, float]]:
+    """Equity, benchmark and accruals on every session from the base to `ends[-1]`:
+    equity grows 2% a month-end step, the benchmark 1%, each session accrues 0.0001."""
+    sessions = [ends[0], *bs.sessions_between(ends[0], ends[-1])]
+    equity: dict[date, float] = {}
+    bench: dict[date, float] = {}
+    level_e, level_b = 100.0, 50.0
+    for s in sessions:
+        if s in ends[1:]:
+            level_e *= 1.02
+            level_b *= 1.01
+        equity[s] = level_e
+        bench[s] = level_b
+    accruals = {s: 0.0001 for s in sessions[1:]}
+    return equity, bench, accruals
+
+
+def test_exam_series_hand_values() -> None:
+    equity, bench, accruals = _exam_inputs(EXAM_ENDS)
+    series = bs.exam_series(equity, bench, accruals, EXAM_T0, EXAM_ENDS[-1])
+    assert series.month_ends == tuple(EXAM_ENDS)
+    assert series.months == 3
+    assert series.net_excess == pytest.approx([0.01, 0.01, 0.01])
+    november = len(bs.sessions_between(EXAM_ENDS[0], EXAM_ENDS[1]))
+    assert series.bench_over_cash[0] == pytest.approx(0.01 - (1.0001**november - 1.0))
+
+
+def test_exam_series_starts_at_the_first_month_end_on_or_after_t0() -> None:
+    """A mid-month T_0: the stub to the first month-end is not a month."""
+    equity, bench, accruals = _exam_inputs(EXAM_ENDS)
+    series = bs.exam_series(equity, bench, accruals, date(2026, 10, 15), EXAM_ENDS[-1])
+    assert series.month_ends[0] == EXAM_ENDS[0]
+    assert series.months == 3
+    assert bs.exam_series({}, bench, accruals, EXAM_T0, EXAM_ENDS[-1]).months == 0
+
+
+def test_exam_series_has_no_look_ahead() -> None:
+    """The series up to month k is unchanged when later sessions are added or moved."""
+    equity, bench, accruals = _exam_inputs(EXAM_ENDS)
+    short = bs.exam_series(equity, bench, accruals, EXAM_T0, EXAM_ENDS[2])
+    longer = bs.exam_series(equity, bench, accruals, EXAM_T0, EXAM_ENDS[-1])
+    assert longer.net_excess[: short.months] == short.net_excess
+    altered = {s: (v * 3.0 if s > EXAM_ENDS[2] else v) for s, v in equity.items()}
+    cut = bs.exam_series(altered, bench, accruals, EXAM_T0, EXAM_ENDS[2])
+    assert cut == short
+    # as_of past the last mark reads only the marked month-ends
+    marked_to_dec = {s: v for s, v in equity.items() if s <= EXAM_ENDS[2]}
+    assert bs.exam_series(marked_to_dec, bench, accruals, EXAM_T0, EXAM_ENDS[-1]) == short
+
+
+def test_exam_series_refuses_a_missing_mark_benchmark_or_accrual() -> None:
+    equity, bench, accruals = _exam_inputs(EXAM_ENDS)
+    gap = {s: v for s, v in equity.items() if s != EXAM_ENDS[1]}
+    with pytest.raises(ValueError, match="equity mark at month-end 2026-11-30"):
+        bs.exam_series(gap, bench, accruals, EXAM_T0, EXAM_ENDS[-1])
+    with pytest.raises(ValueError, match="benchmark level"):
+        bs.exam_series(equity, {EXAM_ENDS[0]: 1.0}, accruals, EXAM_T0, EXAM_ENDS[-1])
+    with pytest.raises(ValueError, match="T-bill accrual"):
+        bs.exam_series(equity, bench, {}, EXAM_T0, EXAM_ENDS[-1])
+
+
+def test_window_ended_only_after_the_stop() -> None:
+    stop = datetime(2027, 1, 4, 15, 0, tzinfo=UTC)
+    assert not bs.window_ended(None, stop)
+    assert not bs.window_ended(stop, stop - timedelta(seconds=1))
+    assert bs.window_ended(stop, stop)
+    assert bs.window_ended(stop, stop + timedelta(days=1))
+
+
+def test_minimums_met_by_counts_fills_and_rebalances_by_each_look_s_month_end() -> None:
+    """False at a look whose fills by its month-end are below the minimum, true once
+    they reach it; an unreached look and a window without the frozen key are unmet."""
+    ends = [date(2026, 10, 30), date(2026, 11, 30), date(2026, 12, 31)]
+    rebalances = [date(2026, 10, 30), date(2026, 11, 30), date(2026, 12, 31)]
+    fills = [date(2026, 11, 2)] * 3 + [date(2026, 12, 1)] * 2
+    met = bs.minimums_met_by((1, 2, 3), ends, rebalances, fills, min_rebalances=2, min_exam_fills=5)
+    assert met == {1: False, 2: True, 3: False}
+    fewer = bs.minimums_met_by((1, 2), ends, rebalances, fills, min_rebalances=3, min_exam_fills=5)
+    assert fewer == {1: False, 2: True}
+    unfrozen = bs.minimums_met_by(
+        (1, 2), ends, rebalances, fills, min_rebalances=1, min_exam_fills=None
+    )
+    assert unfrozen == {1: False, 2: False}
+
+
+def test_minimums_met_by_needs_each_minimum_on_its_own() -> None:
+    """Unmet rebalances with enough fills, and unmet fills with enough rebalances, are
+    each unmet (T381 folds both into one flag, so each is tested here)."""
+    ends = [date(2026, 10, 30), date(2026, 11, 30)]
+    rebalances = [date(2026, 10, 30), date(2026, 11, 30)]
+    fills = [date(2026, 11, 2)] * 10
+    kwargs = {"min_rebalances": 2, "min_exam_fills": 10}
+    assert bs.minimums_met_by((1,), ends, rebalances, fills, **kwargs) == {1: True}
+    assert bs.minimums_met_by((1,), ends, rebalances[:1], fills, **kwargs) == {1: False}
+    assert bs.minimums_met_by((1,), ends, rebalances, fills[:9], **kwargs) == {1: False}

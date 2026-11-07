@@ -69,6 +69,21 @@ SET_STAMP = datetime(2026, 12, 31, 22, tzinfo=UTC)
 CUSIP = "98422D105"
 
 
+#: The reviewed exam ledger `paper status` reads in these tests: empty, budget 4
+#: (the committed file's values), whatever the checkout's git state.
+EMPTY_LEDGER = 'budget = 4\nbudget_adr = "docs/decisions/0016.md#rule-5"\n'
+
+
+@pytest.fixture(autouse=True)
+def reviewed_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`paper status` reads `origin/main`'s ledger copy; pin it (plan T381a)."""
+    monkeypatch.setattr(
+        window,
+        "read_ledger_texts",
+        lambda root=None, *, fetch=True: window.LedgerTexts(EMPTY_LEDGER, EMPTY_LEDGER),
+    )
+
+
 @pytest.fixture(autouse=True)
 def live(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fixture_store_path: Path) -> Path:
     """The live store is the fixture copy; secrets are set so a leak is detectable."""
@@ -1946,6 +1961,8 @@ STATUS_MAIN = (
     "with an arrival price): buy n=0; sell n=0; all n=0; no arrival price 0\n"
     "no successful EDGAR ingest yet; run `tradepartner ingest`\n"
     "alerts (0):\n"
+    "exam: tracking window; machine pass, edge unjudged\n"
+    "exam budget 0 of 4 (ledger), 0 exam windows in the store\n"
 )
 CHECK_MAIN = (
     "FAIL rebalance_count: 0 of 6 rebalance sessions done so far, about 6 months to go\n"
@@ -2055,6 +2072,9 @@ def test_status_all_prints_one_summary_line_per_book(
         f"last run n/a; {nxt}"
         f"book main: window 1 open; positions 0; open orders 0; kill switch released; "
         f"last run n/a; {nxt}"
+        "book b; exam: tracking window; machine pass, edge unjudged\n"
+        "book main; exam: tracking window; machine pass, edge unjudged\n"
+        "exam budget 0 of 4 (ledger), 0 exam windows in the store\n"
     )
 
 
@@ -2317,7 +2337,10 @@ def test_status_all_lists_two_waiting_items_byte_for_byte(
         f"book b: window {b_window} open; positions 0; open orders 0; kill switch engaged; "
         f"last run n/a; {nxt}"
         f"book main: window 1 open; positions 0; open orders 0; kill switch engaged; "
-        f"last run n/a; {nxt}",
+        f"last run n/a; {nxt}"
+        "book b; exam: tracking window; machine pass, edge unjudged\n"
+        "book main; exam: tracking window; machine pass, edge unjudged\n"
+        "exam budget 0 of 4 (ledger), 0 exam windows in the store\n",
     )
     assert _sha256(live) == before
 
@@ -3318,3 +3341,143 @@ def test_paper_cost_opens_the_store_read_only_and_writes_nothing(
     assert out.exit_code == 0, out.output
     assert opened == ["read_only", "read_only"]  # the schema check, then the read
     assert _sha256(live) == before
+
+
+# --- the exam line and the budget line (plan T381a; ADR 0016 decision 1, #3146) -------
+
+_EXAM_FROZEN = {
+    "exam_class": "exam",
+    "paper.exam_looks_months": [12, 24, 36],
+    "paper.exam_bounds": [4.762, 3.367, 2.75],
+    "paper.exam_futility_months": 6,
+}
+
+
+def _make_exam_window(frozen: dict[str, Any]) -> None:
+    with open_for_write(_settings()) as conn:
+        current = json.loads(
+            conn.execute("SELECT frozen_json FROM paper_windows WHERE window_id = 1").fetchone()[0]
+        )
+        current.pop("exam_class", None)
+        conn.execute(
+            "UPDATE paper_windows SET frozen_json = ? WHERE window_id = 1",
+            [json.dumps({**current, **frozen})],
+        )
+
+
+def _ledger_with(outcome: str) -> str:
+    on = "2026-10-30" if outcome == "running" else "2027-10-29"
+    return EMPTY_LEDGER + (
+        '\n[[exam]]\nseq = 1\nhypothesis = "h1"\nhypothesis_fingerprint = "fp"\n'
+        'family = "momentum"\nbook_id = "main"\nwindow_id = 1\nstart_date = 2026-10-30\n'
+        'kill_line = "https://github.com/x/y/issues/1#issuecomment-1"\ncampaign_k = -1\n'
+        f'outcome = "{outcome}"\noutcome_on = {on}\n'
+    )
+
+
+def _verdict(state: str, month: int | None, next_look: int | None, read: int) -> Any:
+    from tradepartner.execution.exam import ExamVerdict
+
+    return ExamVerdict(state, month, next_look, read, ())  # type: ignore[arg-type]
+
+
+@pytest.mark.usefixtures("started")
+@pytest.mark.parametrize(
+    ("verdict", "outcome", "line"),
+    [
+        (
+            ("running", None, 12, 3),
+            "running",
+            "exam: forward return exam running, month 3, next look at month 12; "
+            "machine pass, edge unjudged",
+        ),
+        (
+            ("passed", 12, None, 12),
+            "running",
+            "exam: forward return exam passed by T381, not yet recorded in the ledger; "
+            "machine pass, edge unjudged",
+        ),
+        (("passed", 12, None, 12), "passed", "exam: forward return exam passed at month 12"),
+        (
+            ("failed_futility", 6, None, 6),
+            "failed_futility",
+            "exam: forward return exam failed (futility) at month 6; machine pass, edge unjudged",
+        ),
+        (
+            ("failed_void", None, None, 20),
+            "failed_void",
+            "exam: forward return exam failed (void); machine pass, edge unjudged",
+        ),
+    ],
+)
+def test_status_prints_an_exam_window_s_verdict_and_reads_a_pass_only_from_the_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+    clock: _Clock,
+    factory: _Factory,
+    verdict: tuple[str, int | None, int | None, int],
+    outcome: str,
+    line: str,
+) -> None:
+    from tradepartner.execution import book_stats
+
+    _make_exam_window(_EXAM_FROZEN)
+    monkeypatch.setattr(book_stats, "exam_verdict_of", lambda *a, **k: _verdict(*verdict))
+    text = _ledger_with(outcome)
+    monkeypatch.setattr(
+        window, "read_ledger_texts", lambda root=None, *, fetch=True: window.LedgerTexts(text, text)
+    )
+    out = _paper(clock, factory, "status")
+    assert out.exit_code == 0, out.output
+    tail = out.output.splitlines()[-2:]
+    assert tail == [line, "exam budget 1 of 4 (ledger), 1 exam windows in the store"]
+
+
+@pytest.mark.usefixtures("started")
+def test_status_never_prints_a_pass_without_a_reviewed_ledger(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    """A passed verdict with `origin/main`'s copy unreadable is not "passed"; the
+    budget line says the ledger cannot be read."""
+    from tradepartner.execution import book_stats
+
+    _make_exam_window(_EXAM_FROZEN)
+    monkeypatch.setattr(
+        book_stats, "exam_verdict_of", lambda *a, **k: _verdict("passed", 12, None, 12)
+    )
+    monkeypatch.setattr(
+        window,
+        "read_ledger_texts",
+        lambda root=None, *, fetch=True: window.LedgerTexts(_ledger_with("passed"), None),
+    )
+    tail = _paper(clock, factory, "status").output.splitlines()[-2:]
+    assert tail == [
+        "exam: forward return exam passed by T381, not yet recorded in the ledger; "
+        "machine pass, edge unjudged",
+        "exam budget unreadable (no reviewed ledger), 1 exam windows in the store",
+    ]
+
+
+@pytest.mark.usefixtures("started")
+def test_status_labels_a_pre_t381a_exam_window_unexamined_counted(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    monkeypatch.setattr(window, "_forward", lambda _conn, _hyp: True)
+    _make_exam_window({})
+    tail = _paper(clock, factory, "status").output.splitlines()[-2:]
+    assert tail == [
+        "exam: exam window, unexamined, counted; machine pass, edge unjudged",
+        "exam budget 0 of 4 (ledger), 1 exam windows in the store",
+    ]
+
+
+@pytest.mark.usefixtures("started")
+def test_status_reports_an_unreadable_exam_series_as_edge_unjudged(
+    clock: _Clock, factory: _Factory
+) -> None:
+    """The window has no marks, SPY or rates for a month yet: not a crash, not a pass."""
+    _make_exam_window(_EXAM_FROZEN)
+    out = _paper(clock, factory, "status")
+    assert out.exit_code == 0, out.output
+    exam = out.output.splitlines()[-2]
+    assert exam.startswith("exam: forward return exam ")
+    assert exam.endswith("machine pass, edge unjudged")

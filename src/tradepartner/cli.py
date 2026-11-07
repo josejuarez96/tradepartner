@@ -493,9 +493,8 @@ from tradepartner.close_gap import close_gaps
 from tradepartner.config import Settings, clean_message, get_settings
 from tradepartner.corpus import departure_fetch
 from tradepartner.diskfloor import ingest_floor_refusal, low_disk_warning
-from tradepartner.execution import check as paper_check
-from tradepartner.execution import lock as paper_lock
 from tradepartner.execution import (
+    book_stats,
     lots_reconcile,
     ops,
     paper_message,
@@ -504,6 +503,8 @@ from tradepartner.execution import (
     waiting,
     window,
 )
+from tradepartner.execution import check as paper_check
+from tradepartner.execution import lock as paper_lock
 from tradepartner.execution import report as paper_report
 from tradepartner.execution import resume as paper_resume
 from tradepartner.execution import run as paper_run
@@ -2222,6 +2223,23 @@ def _break_lines(data: ops.OpsData) -> list[str]:
             f"{b.first_seen_session}; age {b.age}; cause {b.cause or '-'}; {b.state}"
             + ("; restricted" if b.restricted else "")
         )
+    return lines
+
+
+def _exam_status_lines(
+    s: Settings, windows: Sequence[journal.PaperWindowRow], now: datetime, *, per_book: bool
+) -> list[str]:
+    """`paper status`'s exam lines (plan T381a; ADR 0016 decision 1, #3146): one per
+    book's latest window, then the budget line. A pass is read only from
+    `origin/main`'s copy of the ledger, as git last fetched it (no fetch here)."""
+    ledger = window.committed_ledger(window.read_ledger_texts(fetch=False))
+    with open_read_only(s) as conn:
+        lines = [
+            (f"book {w.book_id}; " if per_book else "")
+            + book_stats.exam_line(conn, s, w, ledger, now=now)
+            for w in windows
+        ]
+        lines.append(book_stats.exam_budget_line(conn, ledger))
     return lines
 
 
@@ -4692,7 +4710,12 @@ def make_app(
         try:
             with open_read_only(s) as conn:
                 schema.init_schema(conn)  # read-only: checks the version, never migrates
-                status = sweep_report.lab_status(conn, s, now=clock())
+                status = sweep_report.lab_status(
+                    conn,
+                    s,
+                    now=clock(),
+                    ledger=window.committed_ledger(window.read_ledger_texts(fetch=False)),
+                )
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
         except schema.SchemaVersionError as exc:
@@ -6379,6 +6402,12 @@ def make_app(
                 ):
                     _echo_scrubbed(line, s)
                 return
+            exam_lines = _paper_call(
+                s,
+                lambda: _exam_status_lines(
+                    s, [row.window for row in summaries], now, per_book=True
+                ),
+            )
             for line in (
                 *_book_first_lines(summaries, items, now, overdue),
                 *_waiting_lines(items),
@@ -6386,6 +6415,7 @@ def make_app(
                 *overdue_lines,
                 *edgar_lines,
                 *_summary_lines(summaries, now),
+                *exam_lines,
             ):
                 _echo_scrubbed(line, s)
             return
@@ -6436,6 +6466,15 @@ def make_app(
         values = _paper_call(s, short_values)
         for line in _status_lines(data, chosen, fill_slippage, values):
             _echo_scrubbed(line, s)
+        if data.window is not None and data.journal_outdated is None:
+            shown = data.window
+            for line in _paper_call(
+                s,
+                lambda: _exam_status_lines(
+                    s, [shown], ensure_tz_aware_utc(clock(), field_name="clock()"), per_book=False
+                ),
+            ):
+                _echo_scrubbed(line, s)
         if data.journal_outdated is not None:
             raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
 

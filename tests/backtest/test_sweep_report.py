@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 import re
 import time
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ from tradepartner.backtest.metrics import (
     probabilistic_sharpe,
 )
 from tradepartner.config import Settings
+from tradepartner.execution import exam_ledger
 from tradepartner.store import lab_queries, lab_registry, registry
 from tradepartner.store.db import insert_row, utc_now
 from tradepartner.store.lab_schema import LabNotInitialised
@@ -992,3 +994,67 @@ def test_lab_status_lists_an_operations_book_as_not_promoted(
         f"{pre_lab.decision_id}): operations book of h1 (pre-lab), not promoted\n"
     ) in text()
     assert sweep_report.pre_lab_standing(lab_store, 999, code_vintage=CODE) is None
+
+
+# --- the exam diagnostics in `lab status` (plan T381a; ADR 0016 decision 1, #3146) ----
+
+_LEDGER_HEAD = 'budget = 4\nbudget_adr = "docs/decisions/0016.md#rule-5"\n'
+
+
+def _entry(seq: int, family: str, *, campaign_k: int, outcome: str = "running") -> str:
+    on = "2026-10-30" if outcome == "running" else "2029-10-31"
+    return (
+        f'\n[[exam]]\nseq = {seq}\nhypothesis = "x{seq}"\nhypothesis_fingerprint = "fp{seq}"\n'
+        f'family = "{family}"\nbook_id = "b{seq}"\nwindow_id = {seq}\nstart_date = 2026-10-30\n'
+        'kill_line = "https://github.com/x/y/issues/1#issuecomment-1"\n'
+        f'campaign_k = {campaign_k}\noutcome = "{outcome}"\noutcome_on = {on}\n'
+    )
+
+
+def _family_line(text: str, family: str) -> str:
+    (line,) = [ln for ln in text.splitlines() if ln.startswith(f"  {family}: N ")]
+    return line
+
+
+def test_lab_status_prints_campaign_k_and_the_edge_label_without_changing_n_or_dsr(
+    world: tuple[Store, registry.HypothesisRecord], settings: Settings
+) -> None:
+    """ "campaign k 7" from the family's latest entry, "not recorded" with none or -1;
+    "machine pass, edge unjudged" for every family without a `passed` entry. The
+    family's numbers are the same with or without a ledger (a diagnostic only)."""
+
+    def status(ledger: exam_ledger.ExamLedger | None) -> sweep_report.LabStatus:
+        return sweep_report.lab_status(
+            world[0].conn,
+            settings,
+            now=datetime(2026, 10, 7, tzinfo=UTC),
+            system_tz=ZoneInfo("America/New_York"),
+            code_vintage=CODE,
+            ledger=ledger,
+        )
+
+    first = "momentum"
+    without = status(None)
+    text = sweep_report.format_lab_status(without)
+    assert _family_line(text, first).endswith(
+        "; campaign k not recorded; machine pass, edge unjudged"
+    )
+    ledger = exam_ledger.load_ledger(
+        _LEDGER_HEAD + _entry(1, first, campaign_k=3) + _entry(2, first, campaign_k=7)
+    )
+    with_k = status(ledger)
+    line = _family_line(sweep_report.format_lab_status(with_k), first)
+    assert line.endswith("; campaign k 7; machine pass, edge unjudged")
+    assert line.split("; campaign k")[0] == _family_line(text, first).split("; campaign k")[0]
+    strip = [replace(f, campaign_k=None, exam_passed=False) for f in with_k.families]
+    assert strip == list(without.families)
+    minus_one = exam_ledger.load_ledger(_LEDGER_HEAD + _entry(1, first, campaign_k=-1))
+    assert "campaign k not recorded" in _family_line(
+        sweep_report.format_lab_status(status(minus_one)), first
+    )
+    passed = exam_ledger.load_ledger(
+        _LEDGER_HEAD + _entry(1, first, campaign_k=7, outcome="passed")
+    )
+    assert _family_line(sweep_report.format_lab_status(status(passed)), first).endswith(
+        "; campaign k 7; forward return exam passed"
+    )

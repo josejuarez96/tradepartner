@@ -70,6 +70,7 @@ from tradepartner.backtest.metrics import (
 )
 from tradepartner.backtest.quiet import system_timezone_matches
 from tradepartner.config import Settings
+from tradepartner.execution.exam_ledger import PASSED, ExamLedger
 from tradepartner.store import lab_queries, lab_registry, registry
 from tradepartner.store.db import utc_now
 from tradepartner.store.lab_registry import (
@@ -265,6 +266,11 @@ class FamilyStatus:
     declared_count: int
     rules: FamilyRules | None
     forward: bool = False
+    #: The family has a ledger entry marked `passed` (ADR 0016 #3146 rule 2(b)).
+    exam_passed: bool = False
+    #: The family's latest ledger entry's `campaign_k`; None when it has none or it
+    #: is -1. A diagnostic only: no refusal, gate or verdict reads it (#3146).
+    campaign_k: int | None = None
 
 
 @dataclass(frozen=True)
@@ -967,10 +973,13 @@ def lab_status(
     now: datetime | None = None,
     system_tz: tzinfo | None = None,
     code_vintage: str | None = None,
+    ledger: ExamLedger | None = None,
 ) -> LabStatus:
     """`lab status` (module docstring). `now`, `system_tz` and `code_vintage` stand in
     for the clock, the machine's zone and the checkout's code vintage (a test passes
-    them). Raises `LabNotInitialised` on a store without the lab tables."""
+    them). `ledger` is `origin/main`'s copy of the exam ledger (None when it cannot
+    be read): a family's pass and campaign k are read from it only (plan T381a).
+    Raises `LabNotInitialised` on a store without the lab tables."""
     require_lab(conn)
     vintage = code_vintage if code_vintage is not None else registry.code_tree_sha256()
     families = [
@@ -1002,6 +1011,8 @@ def lab_status(
                 declared_count=len(states.declared),
                 rules=rules,
                 forward=rules is not None and first is not None and rules.holdout_start > first,
+                exam_passed=_family_passed(ledger, family),
+                campaign_k=_campaign_k(ledger, family),
             )
         )
         for sweep_id, variant_states in sorted(states.by_sweep.items()):
@@ -1045,6 +1056,28 @@ def lab_status(
     )
 
 
+def _family_passed(ledger: ExamLedger | None, family: str) -> bool:
+    """Whether `family` has a ledger entry marked `passed`."""
+    return ledger is not None and any(
+        e.family == family and e.outcome == PASSED for e in ledger.entries
+    )
+
+
+def _campaign_k(ledger: ExamLedger | None, family: str) -> int | None:
+    """The family's latest ledger entry's `campaign_k`, None when none or -1."""
+    entries = [e for e in (ledger.entries if ledger is not None else ()) if e.family == family]
+    if not entries or entries[-1].campaign_k == -1:
+        return None
+    return entries[-1].campaign_k
+
+
+def _exam_text(f: FamilyStatus) -> str:
+    """The family line's exam diagnostics (ADR 0016 decision 1; #3146 "Display")."""
+    k = "campaign k not recorded" if f.campaign_k is None else f"campaign k {f.campaign_k}"
+    label = "forward return exam passed" if f.exam_passed else "machine pass, edge unjudged"
+    return f"; {k}; {label}"
+
+
 def _rules_text(rules: FamilyRules, forward: bool = False) -> str:
     return (
         f"rules: parent {rules.parent_family or 'none (root)'}; in_sample_start "
@@ -1074,6 +1107,7 @@ def format_lab_status(status: LabStatus) -> str:
         lines.append(
             f"  {f.family}: N {f.n}; V raw {_fmt(f.sharpe_variance_annual_raw)}; V excess "
             f"{_fmt(f.sharpe_variance_annual_excess)}; declared count {f.declared_count}"
+            + _exam_text(f)
         )
         lines.append(
             "    " + (_rules_text(f.rules, f.forward) if f.rules is not None else "rules: none")

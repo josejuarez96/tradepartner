@@ -5,6 +5,7 @@ and stop"; ADR 0009 point 3; plan T64).
 from __future__ import annotations
 
 import json
+import subprocess
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import replace
@@ -28,10 +29,11 @@ from tradepartner.adapters.broker import (
 )
 from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.adapters.prices import announcement_date_known_at
-from tradepartner.backtest.schedule import fill_session
+from tradepartner.backtest.schedule import fill_session, rebalance_sessions
 from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import FROZEN_COSTS_KEYS, FROZEN_EXECUTION_KEYS, Settings
-from tradepartner.execution import lock, report, window
+from tradepartner.execution import exam as exam_rules
+from tradepartner.execution import exam_ledger, lock, report, window
 from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import LockHeld, run_lock
 from tradepartner.execution.reconcile_run import frozen_risk
@@ -1932,6 +1934,7 @@ def _register_forward(
     family: str = "momentum",
     params: dict[str, Any] | None = None,
     sign_off: bool = True,
+    excess: tuple[float, ...] = (0.01, -0.005, 0.02, -0.01, 0.0, 0.015),
 ) -> registry.HypothesisRecord:
     """Register `h1` with a holdout of [`holdout_start`, `FORWARD_END`] and date the
     family's every registration at `first_registered` (`registered_at` is the wall
@@ -1948,11 +1951,100 @@ def _register_forward(
         )
         if sign_off:
             _sign_off(conn, settings, hyp, tmp_path)
+            _write_insample_equity(conn, hyp, excess)
         conn.execute(
             "UPDATE hypotheses SET registered_at = ? WHERE family = ?", [first_registered, family]
         )
         assert registry.family_registered_on(conn, family) == first_registered.date()
     return hyp
+
+
+#: The in-sample trial's span (`_sign_off`) and the SPY series's monthly return.
+_INSAMPLE_SPAN = (date(2018, 1, 31), date(2022, 12, 30))
+_SPY_MONTHLY = 0.005
+#: A crash month among small gains: a skew far below the -0.85 guard.
+CRASH_EXCESS = (0.01,) * 11 + (-0.2,)
+
+
+def _write_insample_equity(
+    conn: duckdb.DuckDBPyConnection, hyp: registry.HypothesisRecord, excess: tuple[float, ...]
+) -> None:
+    """The signed-off in-sample trial's base-cost strategy and SPY equity at each
+    month-end, the strategy beating SPY by `excess` (cycled) each month."""
+    (trial_id,) = conn.execute(
+        "SELECT MAX(trial_id) FROM trials WHERE hypothesis_id = ?", [hyp.hypothesis_id]
+    ).fetchone() or (None,)
+    ends = rebalance_sessions(*_INSAMPLE_SPAN, "month_end")
+    strategy, spy = 100.0, 100.0
+    for i, session in enumerate(ends):
+        if i:
+            spy *= 1 + _SPY_MONTHLY
+            strategy *= 1 + _SPY_MONTHLY + excess[(i - 1) % len(excess)]
+        for series, level, bps in (("strategy", strategy, 15.0), ("SPY", spy, 0.0)):
+            conn.execute(
+                "INSERT INTO trial_equity VALUES (?, ?, ?, ?, ?, ?)",
+                [trial_id, series, bps, session, level, None],
+            )
+
+
+KILL_LINE = "https://github.com/josejuarez96/tradepartner/issues/1#issuecomment-1"
+_LEDGER_HEAD = 'budget = {budget}\nbudget_adr = "docs/decisions/0016.md#rule-5"\n'
+
+
+def _ledger_entry(
+    seq: int,
+    *,
+    fingerprint: str,
+    book: str = "main",
+    start: date = NEXT_MONTH_END,
+    window_id: int = 0,
+    outcome: str = "pending",
+    kill_line: str = KILL_LINE,
+    campaign_k: int = -1,
+) -> str:
+    outcome_on = start if outcome in ("pending", "running") else start + timedelta(days=400)
+    return (
+        f'\n[[exam]]\nseq = {seq}\nhypothesis = "h{seq}"\n'
+        f'hypothesis_fingerprint = "{fingerprint}"\nfamily = "momentum"\n'
+        f'book_id = "{book}"\nwindow_id = {window_id}\nstart_date = {start.isoformat()}\n'
+        f'kill_line = "{kill_line}"\ncampaign_k = {campaign_k}\noutcome = "{outcome}"\n'
+        f"outcome_on = {outcome_on.isoformat()}\n"
+    )
+
+
+def _ledger(*entries: str, budget: int = 4) -> str:
+    return _LEDGER_HEAD.format(budget=budget) + "".join(entries)
+
+
+def _fingerprint(settings: Settings, slug: str = "h1") -> str:
+    with open_read_only(settings) as conn:
+        return window._fingerprint_of(registry.get_hypothesis(conn, slug))
+
+
+def _texts(text: str | None, committed: str | None = "same") -> Callable[[], window.LedgerTexts]:
+    """A ledger reader whose two copies are `text` (and `committed`, default equal)."""
+    return lambda: window.LedgerTexts(text, text if committed == "same" else committed)
+
+
+def _pending(
+    settings: Settings,
+    *,
+    slug: str = "h1",
+    book: str = "main",
+    t_0: date = NEXT_MONTH_END,
+    before: tuple[str, ...] = (),
+) -> Callable[[], window.LedgerTexts]:
+    """The reviewed ledger with `before` and one `pending` entry naming this start;
+    built lazily, so the fingerprint is read from the store at the start."""
+
+    def read() -> window.LedgerTexts:
+        entry = _ledger_entry(
+            len(before) + 1, fingerprint=_fingerprint(settings, slug), book=book, start=t_0
+        )
+        text = _ledger(*before, entry)
+        return window.LedgerTexts(text, text)
+
+    return read
 
 
 def test_forward_holdout_starts_inside_the_holdout(
@@ -1963,7 +2055,12 @@ def test_forward_holdout_starts_inside_the_holdout(
     first month-end on or after `holdout.start` and after today, inside the holdout."""
     hyp = _register_forward(journal_settings, tmp_path)
     result = window.start(
-        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+        journal_settings,
+        _connect(journal_settings),
+        _fake(fixed_clock),
+        fixed_clock,
+        "h1",
+        ledger_texts=_pending(journal_settings),
     )
     assert result.window.window_id is not None
     assert result.window.hypothesis_id == hyp.hypothesis_id
@@ -1978,7 +2075,12 @@ def test_forward_holdout_starting_today_is_accepted(
     month-end on or after it."""
     _register_forward(journal_settings, tmp_path, holdout_start=date(2026, 10, 1))
     result = window.start(
-        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+        journal_settings,
+        _connect(journal_settings),
+        _fake(fixed_clock),
+        fixed_clock,
+        "h1",
+        ledger_texts=_pending(journal_settings),
     )
     assert result.window.first_rebalance_session == NEXT_MONTH_END
 
@@ -2050,7 +2152,12 @@ def test_forward_holdout_starts_for_a_paper_family(
     newly paper-ready family opens inside its holdout, as momentum's does (T152)."""
     hyp = _register_forward(journal_settings, tmp_path, family=family)
     result = window.start(
-        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+        journal_settings,
+        _connect(journal_settings),
+        _fake(fixed_clock),
+        fixed_clock,
+        "h1",
+        ledger_texts=_pending(journal_settings),
     )
     assert result.window.hypothesis_id == hyp.hypothesis_id
     assert result.window.first_rebalance_session == NEXT_MONTH_END
@@ -2067,7 +2174,12 @@ def test_forward_holdout_at_week_end_starts_at_the_first_week_end(
         params=_params(**{"schedule.rebalance_cadence": "week_end", GAP_KEY: 0.05}),
     )
     result = window.start(
-        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+        journal_settings,
+        _connect(journal_settings),
+        _fake(fixed_clock),
+        fixed_clock,
+        "h1",
+        ledger_texts=_pending(journal_settings, t_0=NEXT_WEEK_END),
     )
     assert result.window.first_rebalance_session == NEXT_WEEK_END
     assert json.loads(result.window.frozen_json)["paper.min_rebalances"] == 13
@@ -2078,7 +2190,12 @@ def test_forward_holdout_still_allows_one_open_window(
 ) -> None:
     _register_forward(journal_settings, tmp_path)
     window.start(
-        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+        journal_settings,
+        _connect(journal_settings),
+        _fake(fixed_clock),
+        fixed_clock,
+        "h1",
+        ledger_texts=_pending(journal_settings),
     )
     with pytest.raises(window.StartRefusedError) as exc:
         window.start(
@@ -2093,13 +2210,28 @@ def test_forward_holdout_still_needs_a_flat_account(
     _register_forward(journal_settings, tmp_path)
     fake = _fake(fixed_clock)
     fake.submit(OrderRequest(client_order_id="o1", symbol="SPY", side=Side.BUY, quantity=1))
+    pending = _pending(journal_settings)
     with pytest.raises(window.StartRefusedError) as exc:
-        window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "h1")
+        window.start(
+            journal_settings,
+            _connect(journal_settings),
+            fake,
+            fixed_clock,
+            "h1",
+            ledger_texts=pending,
+        )
     assert exc.value.reason == "open_orders"
     held = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
     held.extra_quantity["SPY"] = 1.0
     with pytest.raises(window.StartRefusedError) as exc:
-        window.start(journal_settings, _connect(journal_settings), held, fixed_clock, "h1")
+        window.start(
+            journal_settings,
+            _connect(journal_settings),
+            held,
+            fixed_clock,
+            "h1",
+            ledger_texts=pending,
+        )
     assert exc.value.reason == "not_flat"
     with open_for_write(journal_settings) as conn:
         assert latest_window(conn) is None
@@ -2587,3 +2719,401 @@ def test_hold_target_names_count_only_under_hold_weighting(
     else:
         result = window.start(settings, _connect(settings), fake, fixed_clock, "h1")
         assert [w[0] for w in _windows(settings)] == [result.window.window_id]
+
+
+# --- the forward return exam at `paper start` (plan T381a; ADR 0016 #3143, #3146) ----
+
+EXAM_KEYS = {
+    "paper.exam_looks_months": [12, 24, 36],
+    "paper.exam_bounds": [4.762, 3.367, 2.75],
+    "paper.exam_futility_months": 6,
+    "paper.exam_max_count": 4,
+    "paper.exam_min_insample_skew": -0.85,
+    "exam.benchmark": "SPY",
+}
+_PAST = datetime(2026, 1, 5, 15, 0, tzinfo=UTC)
+
+
+def _store_window(
+    settings: Settings,
+    book: str,
+    *,
+    exam_class: str | None = "exam",
+    started_at: datetime = _PAST,
+    first: date = date(2026, 1, 30),
+    slug: str = "h1",
+) -> int:
+    """Append a window of `slug` on `book`'s own account, frozen with `exam_class`
+    (None: a window started before T381a)."""
+    frozen: dict[str, Any] = {} if exam_class is None else {"exam_class": exam_class}
+    with open_for_write(settings) as conn:
+        hyp = registry.get_hypothesis(conn, slug)
+        window_id = append(
+            conn,
+            PaperWindowRow(
+                hypothesis_id=hyp.hypothesis_id,
+                first_rebalance_session=first,
+                account_id=f"PA-{book}",
+                starting_cash=1000.0,
+                starting_equity=1000.0,
+                code_version="test",
+                started_at=started_at,
+                frozen_json=json.dumps(frozen),
+                frozen_sha256="0" * 64,
+                book_id=book,
+                known_at=started_at,
+                ingested_at=started_at,
+            ),
+        )
+    assert window_id is not None
+    return window_id
+
+
+def _paper_windows(settings: Settings) -> list[Any]:
+    with open_read_only(settings) as conn:
+        return conn.execute("SELECT * FROM paper_windows ORDER BY window_id").fetchall()
+
+
+def _refused(
+    settings: Settings, clock: FixedClock, texts: Callable[[], window.LedgerTexts]
+) -> window.StartRefusedError:
+    """Start `h1` on `main`, expect a refusal before any broker call or write."""
+    broker = CallCountingFake(
+        clock=clock, price_of=lambda _s: REFERENCE_PRICE, auto_fill=False, account_id=ACCOUNT_ID
+    )
+    before = _paper_windows(settings)
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(settings, _connect(settings), broker, clock, "h1", ledger_texts=texts)
+    assert broker.broker_calls == []
+    assert _paper_windows(settings) == before
+    return exc.value
+
+
+def _start_h1(
+    settings: Settings, clock: FixedClock, texts: Callable[[], window.LedgerTexts]
+) -> window.StartResult:
+    return window.start(settings, _connect(settings), _fake(clock), clock, "h1", ledger_texts=texts)
+
+
+def test_an_exam_window_freezes_the_exam_line(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """The five exam keys, the benchmark, the in-sample skew and `exam_class`."""
+    _register_forward(journal_settings, tmp_path)
+    frozen = json.loads(
+        _start_h1(journal_settings, fixed_clock, _pending(journal_settings)).window.frozen_json
+    )
+    assert {k: frozen[k] for k in EXAM_KEYS} == EXAM_KEYS
+    assert frozen["exam_class"] == "exam"
+    with open_read_only(journal_settings) as conn:
+        series = window.insample_monthly_excess(conn, registry.get_hypothesis(conn, "h1"))
+    assert len(series) == 59
+    assert frozen["exam.insample_skew"] == pytest.approx(exam_rules.insample_skew(series))
+    assert frozen["exam.insample_skew"] > -0.85
+
+
+def test_a_tracking_window_freezes_only_its_class_and_reads_no_ledger(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    def no_ledger() -> window.LedgerTexts:
+        raise AssertionError("a tracking window reads no ledger")
+
+    result = _start_h1(journal_settings, fixed_clock, no_ledger)
+    frozen = json.loads(result.window.frozen_json)
+    assert frozen["exam_class"] == "tracking"
+    assert not [k for k in frozen if k.startswith("exam.") or k.startswith("paper.exam_")]
+
+
+def test_a_skew_below_the_guard_is_refused(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    _register_forward(journal_settings, tmp_path, excess=CRASH_EXCESS)
+    refusal = _refused(journal_settings, fixed_clock, _pending(journal_settings))
+    assert refusal.reason == "exam_skew_out_of_range"
+    assert "below the guard -0.85" in str(refusal)
+
+
+def test_a_spent_forward_holdout_is_refused(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """#3149 item 1 (orchestrator, fail-closed): no exam on a spent forward holdout,
+    so the backfill `unexamined` entry stays for windows started before T381a."""
+    _register_forward(journal_settings, tmp_path)
+    with open_for_write(journal_settings) as conn:
+        hyp = registry.get_hypothesis(conn, "h1")
+        conn.execute(
+            "INSERT INTO trials SELECT * REPLACE (trial_id + 1000 AS trial_id, "
+            "'holdout' AS kind) FROM trials WHERE hypothesis_id = ?",
+            [hyp.hypothesis_id],
+        )
+    assert _refused(journal_settings, fixed_clock, _pending(journal_settings)).reason == (
+        "exam_holdout_spent"
+    )
+
+
+def test_the_fifth_exam_is_refused_after_four_whatever_their_outcomes(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    _register_forward(journal_settings, tmp_path)
+    fp = _fingerprint(journal_settings)
+    entries = []
+    for seq, outcome in enumerate(("passed", "failed", "failed_futility", "failed_void"), 1):
+        book = f"b{seq}"
+        first = date(2026, seq, 28) if seq != 2 else date(2026, 2, 27)
+        wid = _store_window(
+            journal_settings, book, started_at=_PAST + timedelta(days=seq), first=first
+        )
+        entries.append(
+            _ledger_entry(
+                seq, fingerprint=fp, book=book, start=first, window_id=wid, outcome=outcome
+            )
+        )
+    refusal = _refused(
+        journal_settings, fixed_clock, _pending(journal_settings, before=tuple(entries))
+    )
+    assert refusal.reason == "exam_budget_spent"
+    # a ledger budget of 5 with the config at 4 still refuses the fifth
+    five = _ledger(*entries, _ledger_entry(5, fingerprint=fp), budget=5)
+    assert _refused(journal_settings, fixed_clock, _texts(five)).reason == "exam_budget_spent"
+    # paper.exam_max_count above the ledger's budget is a mismatch
+    three = _ledger(*entries, _ledger_entry(5, fingerprint=fp), budget=3)
+    assert _refused(journal_settings, fixed_clock, _texts(three)).reason == "exam_ledger_mismatch"
+
+
+def test_a_not_started_entry_frees_its_slot(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    _register_forward(journal_settings, tmp_path)
+    fp = _fingerprint(journal_settings)
+    entries = [_ledger_entry(1, fingerprint=fp, outcome="not_started")]
+    for seq in (2, 3, 4):
+        book = f"b{seq}"
+        first = date(2026, 3, 31) if seq == 2 else date(2026, seq + 1, 30)
+        wid = _store_window(
+            journal_settings, book, started_at=_PAST + timedelta(days=seq), first=first
+        )
+        entries.append(
+            _ledger_entry(
+                seq, fingerprint=fp, book=book, start=first, window_id=wid, outcome="failed"
+            )
+        )
+    result = _start_h1(
+        journal_settings, fixed_clock, _pending(journal_settings, before=tuple(entries))
+    )
+    assert json.loads(result.window.frozen_json)["exam_class"] == "exam"
+
+
+def test_a_pre_t381a_window_counts_and_needs_its_backfill_entry(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """A window with no `exam_class` on a forward holdout is an exam window: with no
+    ledger entry the next exam start is refused, with its `unexamined` backfill it
+    starts."""
+    _register_forward(journal_settings, tmp_path)
+    old = _store_window(journal_settings, "old", exam_class=None)
+    with open_read_only(journal_settings) as conn:
+        assert [k.window_id for _r, k in window.store_exam_windows(conn)] == [old]
+    refusal = _refused(journal_settings, fixed_clock, _pending(journal_settings))
+    assert refusal.reason == "exam_ledger_mismatch"
+    backfill = _ledger_entry(
+        1,
+        fingerprint=_fingerprint(journal_settings),
+        book="old",
+        start=date(2026, 1, 30),
+        window_id=old,
+        outcome="unexamined",
+        kill_line="none",
+    )
+    assert _start_h1(journal_settings, fixed_clock, _pending(journal_settings, before=(backfill,)))
+
+
+def test_the_stored_class_holds_and_a_pre_t381a_window_that_flips_is_refused(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """An older registration imported later moves the family's first day back: a
+    window whose stored class is `tracking` stays tracking, a window started before
+    T381a re-derives as an exam window and the start is refused (fail-closed)."""
+    _register_forward(
+        journal_settings, tmp_path, first_registered=datetime(2026, 9, 2, 15, 0, tzinfo=UTC)
+    )
+    _store_window(journal_settings, "kept", exam_class="tracking")
+    _store_window(journal_settings, "old", exam_class=None, started_at=_PAST + timedelta(days=1))
+    with open_read_only(journal_settings) as conn:
+        assert window.store_exam_windows(conn) == []
+    with open_for_write(journal_settings) as conn:
+        older = _register(
+            conn, journal_settings, "h0", FORWARD_END, params=_params(**{GAP_KEY: 0.05})
+        )
+        conn.execute(
+            "UPDATE hypotheses SET registered_at = ? WHERE hypothesis_id = ?",
+            [FIRST_REGISTERED, older.hypothesis_id],
+        )
+    with open_read_only(journal_settings) as conn:
+        assert [r.book_id for r, _k in window.store_exam_windows(conn)] == ["old"]
+    assert _refused(journal_settings, fixed_clock, _pending(journal_settings)).reason == (
+        "exam_ledger_mismatch"
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("missing", "exam_ledger_invalid"),
+        ("unparsable", "exam_ledger_invalid"),
+        ("local_extra_pending", "exam_ledger_unreviewed"),
+        ("lagging", "exam_ledger_unreviewed"),
+        ("no_git", "exam_ledger_unreviewed"),
+        ("no_pending", "exam_ledger_mismatch"),
+        ("two_pending", "exam_ledger_mismatch"),
+        ("other_book", "exam_ledger_mismatch"),
+        ("other_t0", "exam_ledger_mismatch"),
+        ("other_hypothesis", "exam_ledger_mismatch"),
+        ("entry_without_window", "exam_ledger_mismatch"),
+    ],
+)
+def test_each_ledger_refusal_comes_before_any_broker_call_or_write(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path, case: str, reason: str
+) -> None:
+    _register_forward(journal_settings, tmp_path)
+    fp = _fingerprint(journal_settings)
+    pending = _ledger_entry(1, fingerprint=fp)
+    good = _ledger(pending)
+    texts = {
+        "missing": _texts(None, good),
+        "unparsable": _texts("budget = [", good),
+        "local_extra_pending": _texts(good, _ledger()),
+        "lagging": _texts(
+            _ledger(
+                _ledger_entry(1, fingerprint=fp, outcome="not_started"),
+                _ledger_entry(2, fingerprint=fp),
+            ),
+            _ledger(
+                _ledger_entry(1, fingerprint=fp, outcome="not_started"),
+                _ledger_entry(2, fingerprint=fp),
+                "# newer\n",
+            ),
+        ),
+        "no_git": _texts(good, None),
+        "no_pending": _texts(_ledger()),
+        "two_pending": _texts(_ledger(pending, _ledger_entry(2, fingerprint=fp))),
+        "other_book": _texts(_ledger(_ledger_entry(1, fingerprint=fp, book="b"))),
+        "other_t0": _texts(_ledger(_ledger_entry(1, fingerprint=fp, start=date(2026, 11, 30)))),
+        "other_hypothesis": _texts(_ledger(_ledger_entry(1, fingerprint="f" * 64))),
+        "entry_without_window": _texts(
+            _ledger(
+                _ledger_entry(1, fingerprint=fp, book="gone", window_id=7, outcome="running"),
+                _ledger_entry(2, fingerprint=fp),
+            )
+        ),
+    }[case]
+    assert _refused(journal_settings, fixed_clock, texts).reason == reason
+
+
+def test_a_store_window_out_of_ledger_order_is_a_mismatch(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    _register_forward(journal_settings, tmp_path)
+    fp = _fingerprint(journal_settings)
+    a = _store_window(journal_settings, "a", first=date(2026, 1, 30))
+    b = _store_window(
+        journal_settings, "b", started_at=_PAST + timedelta(days=1), first=date(2026, 2, 27)
+    )
+    swapped = (
+        _ledger_entry(
+            1, fingerprint=fp, book="b", start=date(2026, 2, 27), window_id=b, outcome="running"
+        ),
+        _ledger_entry(
+            2, fingerprint=fp, book="a", start=date(2026, 1, 30), window_id=a, outcome="running"
+        ),
+    )
+    refusal = _refused(journal_settings, fixed_clock, _pending(journal_settings, before=swapped))
+    assert refusal.reason == "exam_ledger_mismatch"
+
+
+def test_a_forward_file_called_a_shakedown_counts_like_any_other(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """The class comes from the stored holdout and the family's first registration
+    day, never from a name: a forward `shakedown` slug needs its ledger entry."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(
+            conn,
+            journal_settings,
+            "shakedown",
+            FORWARD_END,
+            params=_params(**{GAP_KEY: 0.05}),
+            holdout_start=FORWARD_START,
+        )
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+        _write_insample_equity(conn, hyp, (0.01, -0.005, 0.02, -0.01, 0.0, 0.015))
+        conn.execute("UPDATE hypotheses SET registered_at = ?", [FIRST_REGISTERED])
+    broker = CallCountingFake(
+        clock=fixed_clock,
+        price_of=lambda _s: REFERENCE_PRICE,
+        auto_fill=False,
+        account_id=ACCOUNT_ID,
+    )
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(
+            journal_settings,
+            _connect(journal_settings),
+            broker,
+            fixed_clock,
+            "shakedown",
+            ledger_texts=_texts(_ledger()),
+        )
+    assert exc.value.reason == "exam_ledger_mismatch"
+    assert broker.broker_calls == []
+
+
+def test_the_committed_ledger_parses_empty_with_budget_4() -> None:
+    root = window.repository_root()
+    assert root is not None
+    ledger = exam_ledger.load_ledger((root / window.EXAM_LEDGER_PATH).read_text())
+    assert ledger.entries == () and ledger.budget == 4
+
+
+def test_the_ledger_is_read_from_the_repository_root_not_the_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = window.repository_root()
+    assert root is not None
+    monkeypatch.chdir(tmp_path)
+    texts = window.read_ledger_texts(fetch=False)
+    assert texts.local == (root / window.EXAM_LEDGER_PATH).read_text()
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+def test_read_ledger_texts_compares_with_origin_main_and_fails_closed_without_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The local copy against `origin/main`'s after a fetch; a checkout git cannot
+    read gives no committed copy (refused `exam_ledger_unreviewed`)."""
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    origin, clone = tmp_path / "origin.git", tmp_path / "clone"
+    _git(tmp_path, "init", "--bare", "-b", "main", str(origin))
+    _git(tmp_path, "clone", str(origin), str(clone))
+    _git(clone, "config", "user.email", "t@example.com")
+    _git(clone, "config", "user.name", "t")
+    path = clone / window.EXAM_LEDGER_PATH
+    path.parent.mkdir(parents=True)
+    path.write_text(_ledger())
+    _git(clone, "add", ".")
+    _git(clone, "commit", "-m", "ledger")
+    _git(clone, "push", "origin", "main")
+    texts = window.read_ledger_texts(clone)
+    assert texts.local == texts.committed == _ledger()
+    path.write_text(_ledger() + "# local\n")
+    texts = window.read_ledger_texts(clone)
+    assert texts.local != texts.committed
+    plain = tmp_path / "plain"
+    (plain / "docs" / "research").mkdir(parents=True)
+    (plain / window.EXAM_LEDGER_PATH).write_text(_ledger())
+    no_git = window.read_ledger_texts(plain, fetch=False)
+    assert no_git.local == _ledger() and no_git.committed is None
+    assert window.read_ledger_texts(tmp_path / "nowhere", fetch=False).local is None

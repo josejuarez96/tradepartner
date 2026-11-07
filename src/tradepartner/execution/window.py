@@ -82,6 +82,28 @@ adjustments a spin-off explained (see below). It takes the run lock (T59) for
 its writes, and migrates a store version 4 has left behind (`init_schema` on
 the write connection) before writing.
 
+**The exam (plan T381a; ADR 0016 amendments 2026-11-06 #3125, 2026-11-07 #3143
+and #3146).** Every start freezes `exam_class` into `frozen_json`: `exam` for a
+forward holdout (`_forward`, read from the stored holdout and the family's first
+registration day, never from a name), `tracking` otherwise. A tracking window
+freezes nothing else and reads no ledger. An exam window, in the read chunk before
+any broker call or write, is refused:
+- `exam_config` when `paper.exam_max_count` is a bool;
+- `exam_holdout_spent` when the family's holdout is already spent (#3149 item 1,
+  fail-closed: the `unexamined` backfill stays for windows started before T381a);
+- `exam_skew_out_of_range` when the signed-off in-sample trial's monthly net excess
+  skew over SPY (T381's `insample_skew` on `trial_equity`) is below
+  `paper.exam_min_insample_skew`, or cannot be read;
+- `exam_ledger_invalid`, `exam_ledger_unreviewed`, `exam_ledger_mismatch` and
+  `exam_budget_spent` by T381b's `check_exam_start` (#3146 rule 4), reading the
+  ledger under the repository root of the running code and `origin/main`'s copy
+  after `git fetch origin main` (#3149 item 5; a failed fetch is unreviewed). The
+  store's exam windows are every book's windows of class `exam` (the frozen key,
+  or `_forward()` re-run for a window started before T381a), in `started_at`
+  order. The ledger check runs again in the write chunk, before the append.
+An accepted exam window also freezes T381's five keys, the benchmark (`SPY`) and the
+in-sample skew.
+
 **The book (ADR 0017 B.2 to B.5, plan T155).** Every command here takes
 `book_id` (keyword, default `paper.book_id`, the spec's `--book` default;
 `ValueError` outside the token grammar), takes that book's run lock
@@ -235,12 +257,14 @@ from __future__ import annotations
 
 import json
 import math
+import subprocess
 import time
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, cast, get_args
 from zoneinfo import ZoneInfo
@@ -255,6 +279,7 @@ from tradepartner.adapters.broker import (
     Order,
     UnknownOrderError,
 )
+from tradepartner.backtest.frozen import fingerprint as hypothesis_fingerprint
 from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.holdout import Frozen, is_forward
 from tradepartner.backtest.schedule import rebalance_sessions
@@ -271,8 +296,9 @@ from tradepartner.config import (
     Settings,
 )
 from tradepartner.errors import ClockError, ReconciliationError
+from tradepartner.execution import exam as exam_rules
+from tradepartner.execution import exam_ledger, switch
 from tradepartner.execution import plan as plan_rules
-from tradepartner.execution import switch
 from tradepartner.execution.collect import _check_unchanged
 from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import resolve_book, run_lock
@@ -495,6 +521,286 @@ def _forward(conn: duckdb.DuckDBPyConnection, hyp: registry.HypothesisRecord) ->
     if registered_on is None or hyp.holdout_start <= registered_on:
         return False
     return is_forward(Frozen.from_hypothesis(hyp, registered_on=registered_on))
+
+
+# --- the forward return exam at `paper start` (plan T381a; ADR 0016, #3125, #3143, #3146)
+
+#: The frozen key that classes every window started since T381a (#3146 rule 1).
+EXAM_CLASS_KEY = "exam_class"
+EXAM_CLASS = "exam"
+TRACKING_CLASS = "tracking"
+#: `StartRefusedError.reason` codes of the exam gate (module docstring, "The exam").
+EXAM_SKEW_OUT_OF_RANGE = "exam_skew_out_of_range"
+EXAM_HOLDOUT_SPENT = "exam_holdout_spent"
+EXAM_CONFIG = "exam_config"
+#: The ledger's path under the repository root of the running code (#3146 rule 4).
+EXAM_LEDGER_PATH = "docs/research/exam-ledger.toml"
+#: The benchmark an exam window freezes: SPY under ADR 0005 (no hypothesis file
+#: names another today; ADR 0016 decision 2).
+EXAM_BENCHMARK = "SPY"
+_GIT_TIMEOUT_SECONDS = 60
+
+
+@dataclass(frozen=True)
+class LedgerTexts:
+    """The two copies of the exam ledger an exam start compares (#3146 rule 4):
+    `local` is the file under the running code's repository root (None when it is
+    missing), `committed` is `origin/main`'s copy after a fetch (None when git could
+    not be read or fetched), `detail` says why either is None."""
+
+    local: str | None
+    committed: str | None
+    detail: str = ""
+
+
+def _git_out(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=_GIT_TIMEOUT_SECONDS,
+    ).stdout
+
+
+def repository_root(start: Path | None = None) -> Path | None:
+    """The git top level of the checkout holding `start` (default: this module's own
+    checkout, the editable install `uv sync` makes), never the working directory;
+    None outside a checkout."""
+    here = start if start is not None else Path(__file__).resolve().parent
+    try:
+        return Path(_git_out(here, "rev-parse", "--show-toplevel").strip())
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def read_ledger_texts(root: Path | None = None, *, fetch: bool = True) -> LedgerTexts:
+    """Read the exam ledger at the edge (#3146 rule 4; #3149 item 5): the file under
+    `root` (default `repository_root()`), and, after `git fetch origin main` when
+    `fetch`, `git show origin/main:docs/research/exam-ledger.toml`. A failed fetch or
+    show gives `committed = None`, which `check_exam_start` refuses
+    `exam_ledger_unreviewed` (fail-closed: a stale `origin/main` is never trusted)."""
+    top = root if root is not None else repository_root()
+    if top is None:
+        return LedgerTexts(None, None, "the running code is not in a git checkout")
+    path = top / EXAM_LEDGER_PATH
+    local = path.read_text(encoding="utf-8") if path.is_file() else None
+    detail = "" if local is not None else f"no ledger at {path}"
+    try:
+        if fetch:
+            _git_out(top, "fetch", "--quiet", "origin", "main")
+        committed: str | None = _git_out(top, "show", f"origin/main:{EXAM_LEDGER_PATH}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        committed = None
+        detail = (detail + "; " if detail else "") + f"git failed ({type(exc).__name__})"
+    return LedgerTexts(local, committed, detail)
+
+
+def committed_ledger(texts: LedgerTexts) -> exam_ledger.ExamLedger | None:
+    """`origin/main`'s copy of the ledger, loaded, or None when it cannot be read or
+    is invalid: the only copy a report reads a pass from (#3147, rule 2(b))."""
+    if texts.committed is None:
+        return None
+    try:
+        return exam_ledger.load_ledger(texts.committed)
+    except exam_ledger.ExamLedgerRefused:
+        return None
+
+
+def _frozen_dict(window: PaperWindowRow) -> dict[str, Any]:
+    try:
+        parsed = json.loads(window.frozen_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"window {window.window_id} frozen_json is not JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"window {window.window_id} frozen_json is not an object")
+    return parsed
+
+
+def window_exam_class(conn: duckdb.DuckDBPyConnection, window: PaperWindowRow) -> str:
+    """`exam` or `tracking` (#3146 rule 1): the frozen `exam_class`, or, for a window
+    started before T381a (no key), `_forward()` re-run on today's store."""
+    frozen = _frozen_dict(window)
+    if EXAM_CLASS_KEY in frozen:
+        value = frozen[EXAM_CLASS_KEY]
+        if value not in (EXAM_CLASS, TRACKING_CLASS):
+            raise ValueError(f"window {window.window_id} has exam_class {value!r}")
+        return str(value)
+    hyp = registry.get_hypothesis_by_id(conn, window.hypothesis_id)
+    return EXAM_CLASS if _forward(conn, hyp) else TRACKING_CLASS
+
+
+def is_unexamined(window: PaperWindowRow) -> bool:
+    """An exam window that froze no exam line (started before T381a): it counts and
+    can never pass ("exam window, unexamined, counted", #3146 rule 1)."""
+    return EXAM_CLASS_KEY not in _frozen_dict(window)
+
+
+def _all_windows(conn: duckdb.DuckDBPyConnection) -> list[PaperWindowRow]:
+    """Every `paper_windows` row of every book, in `started_at` order."""
+    names = [f.name for f in fields(PaperWindowRow)]
+    columns = ", ".join(f'"{name}"' for name in names)
+    try:
+        rows = conn.execute(
+            f"SELECT {columns} FROM {PaperWindowRow.TABLE} ORDER BY started_at, window_id"
+        ).fetchall()
+    except duckdb.CatalogException:
+        return []  # a store with no journal has no window
+    return [PaperWindowRow(**dict(zip(names, row, strict=True))) for row in rows]
+
+
+def _fingerprint_of(hyp: registry.HypothesisRecord) -> str:
+    """The hypothesis's registry fingerprint (`backtest.frozen.fingerprint`), the
+    ledger's `hypothesis_fingerprint`."""
+    return hypothesis_fingerprint(hyp.family, hyp.params, hyp.in_sample_start)
+
+
+def store_exam_windows(
+    conn: duckdb.DuckDBPyConnection,
+) -> list[tuple[PaperWindowRow, exam_ledger.StoreExamWindow]]:
+    """The store's exam windows (#3146 rule 1), every book, in `started_at` order,
+    each with the key the ledger matches it on."""
+    out: list[tuple[PaperWindowRow, exam_ledger.StoreExamWindow]] = []
+    for row in _all_windows(conn):
+        if window_exam_class(conn, row) != EXAM_CLASS:
+            continue
+        assert row.window_id is not None
+        hyp = registry.get_hypothesis_by_id(conn, row.hypothesis_id)
+        out.append(
+            (
+                row,
+                exam_ledger.StoreExamWindow(
+                    window_id=row.window_id,
+                    hypothesis_fingerprint=_fingerprint_of(hyp),
+                    book_id=row.book_id,
+                    start_date=row.first_rebalance_session,
+                ),
+            )
+        )
+    return out
+
+
+def _signed_off_trial(conn: duckdb.DuckDBPyConnection, hypothesis_id: int) -> int | None:
+    """The latest `ok`, non-synthetic `in_sample` trial a `gap_signoff` names: the
+    promoted hypothesis's in-sample trial the skew guard reads."""
+    row = conn.execute(
+        """
+        SELECT MAX(t.trial_id) FROM owner_decisions od
+        JOIN trials t ON t.trial_id = od.trial_id
+        JOIN trial_results r ON r.trial_id = t.trial_id
+        WHERE od.kind = ? AND od.hypothesis_id = ? AND t.hypothesis_id = ?
+          AND r.status = 'ok' AND NOT t.synthetic AND t.kind = 'in_sample'
+        """,
+        [_GAP_SIGNOFF, hypothesis_id, hypothesis_id],
+    ).fetchone()
+    return None if row is None or row[0] is None else int(row[0])
+
+
+def insample_monthly_excess(
+    conn: duckdb.DuckDBPyConnection, hyp: registry.HypothesisRecord
+) -> list[float]:
+    """The in-sample trial's monthly net excess series over the benchmark: the
+    strategy's base-cost equity and the SPY series of `trial_equity`, month-end to
+    month-end over the trial's span. `ValueError` when it cannot be read."""
+    trial_id = _signed_off_trial(conn, hyp.hypothesis_id)
+    if trial_id is None:
+        raise ValueError("no signed-off in-sample trial")
+    span = conn.execute(
+        "SELECT start_session, end_session FROM trials WHERE trial_id = ?", [trial_id]
+    ).fetchone()
+    assert span is not None
+    base_level = float(frozen_values(hyp)[registry.BASE_COST_KEY])
+    rows = conn.execute(
+        "SELECT series, session, equity FROM trial_equity WHERE trial_id = ? "
+        "AND series IN ('strategy', ?) AND (series <> 'strategy' OR cost_per_side_bps = ?)",
+        [trial_id, EXAM_BENCHMARK, base_level],
+    ).fetchall()
+    levels: dict[str, dict[date, float]] = {"strategy": {}, EXAM_BENCHMARK: {}}
+    for series, session, equity in rows:
+        levels[str(series)][session] = float(equity)
+    ends = [
+        s
+        for s in rebalance_sessions(span[0], span[1], "month_end")
+        if s in levels["strategy"] and s in levels[EXAM_BENCHMARK]
+    ]
+    book, bench = levels["strategy"], levels[EXAM_BENCHMARK]
+    return [(book[b] / book[a] - 1.0) - (bench[b] / bench[a] - 1.0) for a, b in pairwise(ends)]
+
+
+def _exam_refused(error: exam_ledger.ExamLedgerRefused) -> StartRefusedError:
+    return StartRefusedError(error.reason, str(error))
+
+
+def _check_ledger(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    texts: LedgerTexts,
+    start: exam_ledger.ExamStart,
+) -> None:
+    """#3146 rule 4 against `conn`'s store: `exam_ledger_invalid`,
+    `exam_ledger_unreviewed`, `exam_ledger_mismatch` or `exam_budget_spent`."""
+    if texts.local is None:
+        raise StartRefusedError(
+            exam_ledger.EXAM_LEDGER_INVALID,
+            f"{exam_ledger.EXAM_LEDGER_INVALID}: the exam ledger is missing ({texts.detail})",
+        )
+    try:
+        ledger = exam_ledger.load_ledger(texts.local)
+        exam_ledger.check_exam_start(
+            ledger,
+            texts.committed,
+            [key for _row, key in store_exam_windows(conn)],
+            start,
+            max_count=settings.paper.exam_max_count,
+        )
+    except exam_ledger.ExamLedgerRefused as exc:
+        raise _exam_refused(exc) from None
+
+
+def _exam_gate(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    hyp: registry.HypothesisRecord,
+    start: exam_ledger.ExamStart,
+    ledger_texts: Callable[[], LedgerTexts],
+) -> tuple[dict[str, Any], LedgerTexts]:
+    """An exam window's refusals, before any broker call or write, and the keys it
+    freezes (module docstring, "The exam")."""
+    paper = settings.paper
+    if isinstance(paper.exam_max_count, bool):
+        raise StartRefusedError(EXAM_CONFIG, "paper.exam_max_count must be an integer")
+    looks = exam_rules.ExamFrozen.from_config(paper)  # the shape the verdict needs
+    if spends := registry.family_holdout_spends(conn, hyp.family):
+        raise StartRefusedError(
+            EXAM_HOLDOUT_SPENT,
+            f"family {hyp.family!r}'s forward holdout is already spent (trials "
+            f"{', '.join(str(s.trial_id) for s in spends)}): it cannot be an exam (#3149)",
+        )
+    try:
+        skew = exam_rules.insample_skew(insample_monthly_excess(conn, hyp))
+    except ValueError as exc:
+        raise StartRefusedError(
+            EXAM_SKEW_OUT_OF_RANGE, f"the in-sample monthly skew cannot be read: {exc}"
+        ) from exc
+    if not skew >= paper.exam_min_insample_skew:
+        raise StartRefusedError(
+            EXAM_SKEW_OUT_OF_RANGE,
+            f"the in-sample monthly net excess skew {skew:.4f} is below the guard "
+            f"{paper.exam_min_insample_skew}",
+        )
+    texts = ledger_texts()
+    _check_ledger(conn, settings, texts, start)
+    frozen: dict[str, Any] = {
+        "paper.exam_looks_months": list(looks.looks_months),
+        "paper.exam_bounds": list(looks.bounds),
+        "paper.exam_futility_months": looks.futility_months,
+        "paper.exam_max_count": paper.exam_max_count,
+        "paper.exam_min_insample_skew": paper.exam_min_insample_skew,
+        "exam.benchmark": EXAM_BENCHMARK,
+        "exam.insample_skew": skew,
+    }
+    return frozen, texts
 
 
 def _forward_first_session(holdout_start: date, today: date, cadence: Cadence) -> date:
@@ -850,12 +1156,14 @@ def start(
     *,
     book_id: str | None = None,
     now: bool = False,
+    ledger_texts: Callable[[], LedgerTexts] = read_ledger_texts,
 ) -> StartResult:
     """`paper start --book <book> --hypothesis <slug>` (module docstring; `book_id`
     defaults to `paper.book_id`). Raises `LockHeld` while another process holds
     the book's run lock, `registry.UnknownHypothesis` for an unregistered slug,
     `ValueError` for a book outside the token grammar, and `StartRefusedError`
-    for every other refusal, all before any write."""
+    for every other refusal, all before any write. `ledger_texts` reads the exam
+    ledger's two copies, only for an exam window (a test passes its own)."""
     book = resolve_book(settings, book_id)
     if now and book != SANDBOX_BOOK_ID:
         raise ValueError("--now is only for book 'sandbox' on a marked temp copy")
@@ -921,6 +1229,19 @@ def start(
                     raise StartRefusedError(
                         "now_data", "--now needs the previous session's stored close"
                     )
+            exam_class = EXAM_CLASS if forward else TRACKING_CLASS
+            exam_keys: dict[str, Any] = {}
+            exam_texts: LedgerTexts | None = None
+            exam_start: exam_ledger.ExamStart | None = None
+            if forward:
+                exam_start = exam_ledger.ExamStart(
+                    hypothesis_fingerprint=_fingerprint_of(hyp),
+                    book_id=book,
+                    start_date=t_0_now
+                    if now
+                    else _forward_first_session(hyp.holdout_start, today, cadence),
+                )
+                exam_keys, exam_texts = _exam_gate(conn, settings, hyp, exam_start, ledger_texts)
 
         try:
             account = broker.account()
@@ -964,6 +1285,8 @@ def start(
             t_0 = _first_rebalance_session(hyp.holdout_end, today, cadence)
         commit, _dirty = registry.code_version()
         params = _frozen_params(settings, registered, cadence)
+        params[EXAM_CLASS_KEY] = exam_class
+        params.update(exam_keys)
         frozen_json = registry.canonical_params_json(params)
         frozen_sha256 = registry.params_sha256(params)
 
@@ -991,6 +1314,10 @@ def start(
             if open_window(write_conn, book) is not None:
                 raise StartRefusedError("window_open", "a paper window is already open")
             _refuse_account_in_use(account.account_id, _other_books_accounts(write_conn, book))
+            if exam_start is not None:
+                # Again under the write: another book's exam may have started since.
+                assert exam_texts is not None and exam_start.start_date == t_0
+                _check_ledger(write_conn, settings, exam_texts, exam_start)
             window_id = append(write_conn, row)
             assert window_id is not None
             session = plan.carried_session or t_0
