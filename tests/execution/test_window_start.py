@@ -121,8 +121,9 @@ def _sign_off(
     kind: registry.TrialKind = "in_sample",
     synthetic: bool = False,
     real: bool = True,
-) -> None:
-    """Open a trial for `hyp`, close it `ok`, and sign off its gap.
+) -> int:
+    """Open a trial for `hyp`, close it `ok`, sign off its gap and return the
+    trial's id.
 
     `real=False` opens the trial under a `settings` whose `store.path`
     differs from `conn`'s file, so `open_trial`'s synthetic-on-the-real-store
@@ -150,6 +151,7 @@ def _sign_off(
         hypothesis_id=hyp.hypothesis_id,
         trial_id=handle.trial_id,
     )
+    return handle.trial_id
 
 
 @pytest.fixture
@@ -762,6 +764,111 @@ def test_refuses_on_holdout_trial_signoff(
             journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
         )
     assert exc.value.reason == "gap_signoff"
+
+
+def _close_release(
+    conn: duckdb.DuckDBPyConnection,
+    name: str = "repair-a",
+    sessions_from: date = date(2018, 1, 2),
+    sessions_to: date = date(2022, 12, 30),
+) -> None:
+    """Open and close a named data release (the store stands in for its own
+    backup, as `tests/store/test_registry.py` does)."""
+    registry.open_data_release(
+        conn, conn, name=name, backup_path=f"data/tradepartner.{name}.duckdb", reason="#1 fix"
+    )
+    registry.close_data_release(
+        conn, name=name, sessions_from=sessions_from, sessions_to=sessions_to
+    )
+
+
+def test_refuses_a_signoff_trial_from_before_the_latest_release(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """#3178 (a): a sign-off on a trial that read the store before the latest
+    closed release reached its window is refused, naming the release."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(conn, journal_settings, "h1", HOLDOUT_END_PAST)
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+        _close_release(conn, "repair-monday")
+    broker = CallCountingFake(
+        clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, auto_fill=False
+    )
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, _connect(journal_settings), broker, fixed_clock, "h1")
+    assert exc.value.reason == "gap_signoff"
+    assert "repair-monday" in str(exc.value)
+    assert broker.broker_calls == []
+
+
+def test_accepts_a_signoff_trial_run_after_the_latest_release(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """#3178 (b): a sign-off on a trial opened after the release closed passes,
+    beside an older sign-off on a pre-release trial."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(conn, journal_settings, "h1", HOLDOUT_END_PAST)
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+        _close_release(conn, "repair-monday")
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    assert result.window.window_id is not None
+
+
+def test_accepts_a_pre_release_trial_the_release_did_not_reach(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """A release whose touched sessions all start after the trial's data cutoff
+    leaves the trial's read unchanged (`data_vintage`'s release rule), so its
+    sign-off still passes."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(conn, journal_settings, "h1", HOLDOUT_END_PAST)
+        _sign_off(conn, journal_settings, hyp, tmp_path)  # cutoff 2026-09-25
+        _close_release(
+            conn, "repair-later", sessions_from=date(2026, 10, 1), sessions_to=date(2026, 10, 2)
+        )
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    assert result.window.window_id is not None
+
+
+def test_a_store_without_a_release_keeps_the_old_rule_even_without_stamps(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """#3178 (c): no closed release, no new check: a sign-off trial with no
+    recorded data vintage still passes, as before."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(conn, journal_settings, "h1", HOLDOUT_END_PAST)
+        trial_id = _sign_off(conn, journal_settings, hyp, tmp_path)
+        conn.execute("UPDATE trials SET data_vintage = NULL WHERE trial_id = ?", [trial_id])
+        assert registry.data_releases(conn) == []
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    assert result.window.window_id is not None
+
+
+@pytest.mark.parametrize("column", ["data_vintage", "data_cutoff"])
+def test_refuses_a_signoff_trial_missing_its_stamp_once_a_release_exists(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path, column: str
+) -> None:
+    """#3178 (d): with a closed release on the store, a sign-off trial with no
+    recorded `data_vintage` or `data_cutoff` cannot show it read the released
+    store, so it fails closed, even when opened after the release."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(conn, journal_settings, "h1", HOLDOUT_END_PAST)
+        _close_release(conn, "repair-monday")
+        trial_id = _sign_off(conn, journal_settings, hyp, tmp_path)
+        conn.execute(f"UPDATE trials SET {column} = NULL WHERE trial_id = ?", [trial_id])
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(
+            journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+        )
+    assert exc.value.reason == "gap_signoff"
+    assert "repair-monday" in str(exc.value)
 
 
 def test_refuses_incomplete_holdout_end(

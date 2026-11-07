@@ -17,6 +17,7 @@ from tradepartner.calendar import next_session, previous_session, session_close
 from tradepartner.config import Settings
 from tradepartner.errors import ClockError
 from tradepartner.execution import reconcile_run, true_up
+from tradepartner.execution.lots import LedgerAccount, rebuild
 from tradepartner.execution.reconcile import Explanations
 from tradepartner.execution.reconcile_run import _journal_state, _ledger, frozen_risk
 from tradepartner.execution.window import WindowCommandRefused
@@ -29,6 +30,8 @@ from tradepartner.store.journal import (
     adjustments_for,
     append,
     break_events_for,
+    fills_for,
+    orders_for,
 )
 from tradepartner.store.schema import AUTO_TRUE_UP_KIND, OWNER_TRUE_UP_KIND
 
@@ -45,6 +48,7 @@ from .test_reconcile_run import (  # noqa: F401  (fixtures used by name)
     _reconcile,
     _rows,
     _run,
+    _sell_spy,
     fake,
     flip_fake,
     frozen_window,
@@ -251,6 +255,51 @@ def test_a_reconcile_stated_before_a_reversal_refuses_and_writes_nothing(
         opened.broker_quantity,
         opened.cash_amount,
     )
+
+
+def _rebuild_lots(settings: Settings, window: PaperWindowRow) -> None:
+    """Replay the window's lot ledger over every journal row, as a run does."""
+    window_id = window.window_id or 0
+    with open_read_only(settings) as conn:
+        orders = orders_for(conn, window_id=window_id)
+        rebuild(
+            fills_for(conn, window_id=window_id),
+            orders,
+            {},
+            LedgerAccount(account_id="book", account_type="paper", owner="self"),
+            adjustments=adjustments_for(conn, window_id),
+            symbols={o.security_id: o.symbol for o in orders},
+        )
+
+
+def test_reverse_refuses_when_a_later_sale_could_not_replay(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    frozen_window: PaperWindowRow,  # noqa: F811
+    fixed_clock: FixedClock,
+) -> None:
+    """#3189 exec-3: true up SPY 10 -> 11, sell the 11, then reverse. The
+    reversal would leave the sale of 11 against 10 shares, so every later lot
+    rebuild would raise `LotLedgerError`; it refuses and writes nothing."""
+    opened = _open_quantity_and_cash_break(journal_settings, fake, frozen_window, fixed_clock)
+    _true_up(journal_settings, fake, fixed_clock, opened.break_id)
+    _sell_spy(
+        journal_settings,
+        _run(journal_settings, frozen_window),
+        fixed_clock.advance(seconds=1),
+        quantity=11.0,
+    )
+    _rebuild_lots(journal_settings, frozen_window)
+    fixed_clock.advance(seconds=1)
+    before = _snapshot(journal_settings, frozen_window)
+
+    with pytest.raises(WindowCommandRefused, match="more than the ledger holds") as refused:
+        _reverse(journal_settings, fake, fixed_clock, opened.break_id)
+
+    assert refused.value.reason == "replay"
+    assert _snapshot(journal_settings, frozen_window) == before
+    assert _events(journal_settings, frozen_window)[-1].event == "trued_up"
+    _rebuild_lots(journal_settings, frozen_window)
 
 
 def test_reverse_refuses_open_break_on_same_name_without_writing(
