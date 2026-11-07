@@ -1,6 +1,6 @@
 # 0016. One development boundary, frozen in the store; exams for frozen finalists only; forward exams judged by the paper book
 
-**Status:** Accepted (2026-10-08, by the owner's merge of PR #1320; header set by #1331; the open questions below are his, and nothing here pre-empts them)  ·  **Date:** 2026-10-08  ·  **Amended:** 2026-10-28 (#2444, the owner's decision of that date: point 8, a new family's frozen finalist may take one historical exam on the post-boundary months; points 1 to 7 stand); 2026-11-06 (#3125, #3128, the orchestrator's fail-closed decision for the owner's word: no live choice until a returns-judging exam passes, the forward return exam, point 8 not qualified until a return rule; see the amendment of that date); 2026-11-07 (#3143, the orchestrator's decision for the owner's word: the forward return exam becomes group-sequential at 12/24/36 months, total size 1.25%; see the amendment at the end)  ·  **Issue:** #1319  ·  **Plan:** the history-and-identity amendment to the [data-foundation plan](../plans/data-foundation.md) (#1319, its second PR) holds the code tasks  ·  **Related:** #1301 (the owner's discussion of 2026-10-08 and his research-governance brief, comment 6065810154), #1303 (the decision record of 2026-10-08, its newest comment: the data-architecture evaluation accepted as direction), #1292 (B4, parked), [strategy-lab spec](../specs/strategy-lab.md) (family rules, req 1, req 5), [backtest spec](../specs/backtest.md) (holdout, trial registry, `owner_decisions`), [research-registry spec](../specs/research-registry.md) (sealed periods, the same shape for research runs), [ADR 0005](0005-objective-benchmark-stop-criteria.md) (the paper tracking check, `paper.min_rebalances`), [ADR 0009](0009-price-vendor.md) (history from 2016-01-04), [ADR 0014](0014-strategies-as-registered-objects.md) (families and lineage), [ADR 0015](0015-expansion-seams.md) (the book id)
+**Status:** Accepted (2026-10-08, by the owner's merge of PR #1320; header set by #1331; the open questions below are his, and nothing here pre-empts them)  ·  **Date:** 2026-10-08  ·  **Amended:** 2026-10-28 (#2444, the owner's decision of that date: point 8, a new family's frozen finalist may take one historical exam on the post-boundary months; points 1 to 7 stand); 2026-11-06 (#3125, #3128, the orchestrator's fail-closed decision for the owner's word: no live choice until a returns-judging exam passes, the forward return exam, point 8 not qualified until a return rule; see the amendment of that date); 2026-11-07 (#3143, the orchestrator's decision for the owner's word: the forward return exam becomes group-sequential at 12/24/36 months, total size 1.25%; see the amendment of that date); 2026-11-07 (#3146, the orchestrator's fail-closed decision for the owner's word: the four-exam budget counts every exam window ever started and is kept in a git-tracked ledger, `docs/research/exam-ledger.toml`; see the amendment at the end)  ·  **Issue:** #1319  ·  **Plan:** the history-and-identity amendment to the [data-foundation plan](../plans/data-foundation.md) (#1319, its second PR) holds the code tasks  ·  **Related:** #1301 (the owner's discussion of 2026-10-08 and his research-governance brief, comment 6065810154), #1303 (the decision record of 2026-10-08, its newest comment: the data-architecture evaluation accepted as direction), #1292 (B4, parked), [strategy-lab spec](../specs/strategy-lab.md) (family rules, req 1, req 5), [backtest spec](../specs/backtest.md) (holdout, trial registry, `owner_decisions`), [research-registry spec](../specs/research-registry.md) (sealed periods, the same shape for research runs), [ADR 0005](0005-objective-benchmark-stop-criteria.md) (the paper tracking check, `paper.min_rebalances`), [ADR 0009](0009-price-vendor.md) (history from 2016-01-04), [ADR 0014](0014-strategies-as-registered-objects.md) (families and lineage), [ADR 0015](0015-expansion-seams.md) (the book id)
 
 ## Context
 
@@ -113,7 +113,7 @@ The [strategy-lab spec](../specs/strategy-lab.md)'s open question 4 keeps the 0.
 - **The futility kill.** At month 6, if the sum of the first six returns is below 0, the exam is failed (futility). The rule can only stop a pass, so it cannot raise the false-pass rate. In the sizing run it ended a noise exam at month 6 in 54.20% of runs at a 1.1%/yr drag. It cost a true IR of 2 nothing: 13.49% with or without it, in the futility block's own draw. The power table's 13.41% is a separate draw of the same cell.
 - **A void exam is a failed exam.** A window that ends before month 12, or that has not met ADR 0023's minimums by month 12, is failed (void).
 - **One exam per family, no retry** (points 3 and 8 (b)). A changed strategy is a new hypothesis whose trials count (strategy-lab req 4), and its exam counts too.
-- **The programme budget: four exams.** `paper start` refuses a fifth exam window under this rule (`exam_budget_spent`, `paper.exam_max_count` = 4). Every started exam counts, whatever its outcome. A fifth exam needs a new dated amendment with a smaller per-exam rate.
+- **The programme budget: four exams.** *(Amended 2026-11-07, #3146: what counts, the ledger, the refusals and the two changes a fifth exam needs are in [the exam ledger](#amendment-2026-11-07-3146-the-four-exam-budget-is-counted-in-the-store-and-in-a-git-tracked-ledger).)* `paper start` refuses a fifth exam window under this rule (`exam_budget_spent`, `paper.exam_max_count` = 4). Every started exam counts, whatever its outcome. A fifth exam needs a new dated amendment with a smaller per-exam rate.
 - **The values are pinned.** The config validator refuses an `exam_alpha` above 0.0025, a horizon other than 12, a futility month other than 6, a `paper.exam_max_count` above 4 and a skew guard below −0.85. So the exam can be made stricter in config, never looser.
 
 **The arithmetic: why the rate is under 5% for four ideas.**
@@ -172,10 +172,10 @@ The rest of point 8 stands. The reasons:
   - *(amended 2026-11-07, #3143: these are gross-IR figures; at the 60 bp paper cost a net IR-0.5 slow book passes 0.29% as written and 0.84% under the [group-sequential exam](#amendment-2026-11-07-3143-the-forward-return-exam-becomes-group-sequential))* a real IR-0.5 edge passes about 0.55% of the time and an IR-2 edge 13.41%, so the likely outcome for a year or more is that nothing is chosen;
   - H1 cannot be chosen at all under this record (open question 8);
   - a strongly negatively skewed finalist cannot take the exam;
-  - after four exams the budget is spent until a new amendment.
+  - after four exams the budget is spent until a new amendment *(amended 2026-11-07, #3146: and a config change; both are named in [the exam ledger](#amendment-2026-11-07-3146-the-four-exam-budget-is-counted-in-the-store-and-in-a-git-tracked-ledger), rule 5)*.
 - **Reversibility:** cheap before any exam starts. After one starts, its frozen line and its place in the budget stand.
 - **Revisit if:**
-  - a fifth exam is wanted;
+  - a fifth exam is wanted *(only through [the exam ledger](#amendment-2026-11-07-3146-the-four-exam-budget-is-counted-in-the-store-and-in-a-git-tracked-ledger), rule 5)*;
   - a sequential rule (SPRT or alpha-spending) is calibrated with Audit B's `paths.py` and the skewed nulls, and shown to keep the same family-wise rate with more power *(taken up 2026-11-07, #3143, at a worst-case 4.9% for four exams rather than the same rate: [the group-sequential exam](#amendment-2026-11-07-3143-the-forward-return-exam-becomes-group-sequential))*;
   - longer history (#1303 items 4 and 5) gives point 8 virgin months;
   - the live account's size grows past the charter's $100.
@@ -252,3 +252,77 @@ The paper-net IR at which the exam passes half the time falls from 3.50 (written
 - **Good:** a real IR-0.5 slow edge reaches a live order in about 12.1% of programmes with B, against 1.45% today; a strong edge can still pass at 12 months; the worst-case false-pass rate stays at or under the 5% budget.
 - **Bad / accepted:** the median time to the first live order, given a pass, rises from about 22 to about 42-46 months; an exam slot can be held for 36 months; the event book gains nothing until paper cost falls; T381 and T381a change before they are built.
 - **Reversibility:** cheap until the first exam's kill line is posted. After that, the posted line and its slot stand.
+
+## Amendment 2026-11-07 (#3146): the four-exam budget is counted in the store and in a git-tracked ledger
+
+*The orchestrator's fail-closed decision on #3146 (a sub-issue of #3125; the owner delegated it), recorded for the owner's word on this class-B PR. It replaces the budget bullet of the 2026-11-06 amendment's decision 2 and the budget lines of that amendment's consequences. The group-sequential exam, the skew guard, one exam per family and `paper.exam_max_count` = 4 stand. **No exam has started** (origin/main `1e8eeeea`: `src/` counts no exams; the registered families, `momentum` and `profitability`, have historical holdouts only; the two files with forward holdouts, B9 and the B4 sweep, are unregistered). So nothing is unwound and the ledger starts empty.*
+
+**Why.** The family-vet review (2026-11-06/07, read-only, origin/main `1e8eeeea`; `~/tradepartner-probes/family-vet/review.md` on the owner's machine, sha256 `647d2fa3f3ef208b4ee18b052c1485aabd54aa4d3407de6562060a4d0816097a`), Q3: "Today it is not enforced at all. `paper.exam_max_count` and `exam_budget_spent` exist only in ADR 0016 l.116 and plan line T381a. Nothing in `src/` counts exams." Once built, it is "relabel-able in at least five ways": by amendment ("ADR 0016 l.116, l.175 and l.178 make a fifth exam an amendment away"), by window class, by timing ("A window started before T381a counts as unexamined"), by store ("a store-only count [is] as durable as the store") and by exam kind (point 8). Each rule below closes one of them.
+
+**Rule 1: what counts.** The budget counts **every exam window ever started**, whatever its outcome and whenever it started:
+- an exam window is a `paper_windows` row whose hypothesis's holdout is forward (`_forward()`, ADR 0016 point 4) when the window starts. The class is decided once, at start, from the stored holdout and the family's first registration day, and never re-read later. A later spend of that holdout (open question 2) does not take the window out of the count;
+- `passed`, `failed`, `failed_futility` and `failed_void` windows all count, and so does a running one;
+- a window started before T381a is built counts. It froze no exam line, so it can never pass; it is reported as "exam window, unexamined, counted" (this replaces "a window started before T381a counts as unexamined" in plan line T381a);
+- the four are a **programme** budget across all families, and never reset.
+
+**Rule 2: a relabelled window counts.** A window, run or verdict counts toward the budget **unless it can never be read as edge evidence**, whatever it is called (a "shakedown", an "operations book", a "machine test", or a kind named in a new ADR). This is checked in three places, all mechanical except the last:
+- **(a) The class comes from dates, not from names.** Rule 1's test reads only the stored holdout and the family's first registration day, so a file name, a label or a book id cannot move a window out of the count. A holdout that starts on or before its family's first registration day can never be an exam on unseen data, because its months existed when the family was registered. Moving a book there makes it a tracking window, which decision 1 already bars from the live choice. Operations files and the shakedown cannot reach a forward holdout today (`hypothesis.py`'s forward-holdout refusal for operations files), and T381a's test keeps that true.
+- **(b) The live switch reads a pass only through the ledger.** T163b's `exam_not_passed` refusal accepts only a `passed` verdict whose window has a ledger entry (rule 3) marked `passed`. A result outside the ledger, whatever it is called, cannot name a book for live money, so it can never be read as edge evidence by the code that matters. The same holds for "forward return exam passed" in `paper status` and `lab status`: they print it only for a ledger entry marked `passed`.
+- **(c) A new kind of exam is an amendment that names its slots.** Any ADR, spec or plan amendment that creates a route by which a result can be named in the live choice (decision 1), including a point-8 historical exam (decision 3), states in its own text that each start of that route takes a ledger entry and a budget slot, and names the count after it. The class-B review checks this: spec-critic on every `docs/decisions`, `docs/specs` and `docs/plans` PR, and the owner's word. This is the one judgment-based part. Rules (a) and (b) mean that skipping it gives a route that cannot reach the live switch.
+
+**Rule 3: the exam ledger.** [`docs/research/exam-ledger.toml`](../research/exam-ledger.toml) is git-tracked and append-only, with one `[[exam]]` entry per exam start. It holds the budget too, so a store rebuild, restore or copy cannot reset the count:
+- **The fields.** Each entry has:
+  - `seq`: 1, 2, ..., contiguous;
+  - `hypothesis`: the file's slug;
+  - `hypothesis_fingerprint`: its registry fingerprint;
+  - `family`;
+  - `book_id`;
+  - `window_id`: the store's `paper_windows.window_id`, 0 while `pending`;
+  - `start_date`: the window's first rebalance session, `T_0`;
+  - `kill_line`: the URL of the kill line comment posted on the finalist's issue;
+  - `campaign_k`: the k its kill line states under the idea-pipeline multiplicity rule, or −1 when the line states none;
+  - `outcome`: one of `pending`, `running`, `passed`, `failed`, `failed_futility`, `failed_void` or `not_started`;
+  - `outcome_on`: the date the outcome was last set, or the start date while `pending` or `running`.
+- **The order of work for one exam.** The ledger leads the store, so it cannot lag the store:
+  1. The kill line is posted on the issue (decision 2).
+  2. A class-B PR appends the entry with `outcome = "pending"` and `window_id = 0`. It lands on the owner's word.
+  3. `paper start` runs from a checkout that has that entry.
+  4. A class-B PR sets `window_id` and `outcome = "running"`.
+  5. A class-B PR sets the terminal outcome when T381's verdict is final.
+- **Append-only means:**
+  - an entry is never removed or reordered, and no field other than `window_id`, `outcome` and `outcome_on` changes;
+  - `window_id` changes once, from 0 to the store's id;
+  - `outcome` moves only forward: `pending` → `running` or `not_started`, then `running` → a terminal state, and a terminal state never changes;
+  - `not_started` is allowed only for an entry whose `paper start` never succeeded (its `window_id` is 0). Such an entry stays in the file, and it does not count toward the budget because it read no exam month.
+- **The file is class B whatever its path.** `docs/research/` is class A by default (git-workflow rule 7). The ledger is an exception: every change to it lands only on the owner's word, never in an orchestrator train. The merge-train classifier gains this exception in a follow-up (#3147). Until that lands, the orchestrator treats the file as class B by this rule.
+- **The budget lives in the file too.** The ledger's top-level `budget` (4 today) and `budget_adr` (the link to the rule that sets it) are the programme budget of record.
+
+**Rule 4: what T381a refuses (fail-closed).** At `paper start` of an exam window (rule 1), before any broker call or write, T381a loads the ledger from the checkout and checks it against the store:
+- **`exam_ledger_invalid`** refuses a start when the file is missing, does not parse, has a non-contiguous `seq`, a repeated non-zero `window_id`, an unknown `outcome`, or a `pending` entry with a non-zero `window_id`.
+- **`exam_ledger_mismatch`** refuses a start when the store and the ledger disagree:
+  - the store's exam windows (rule 1, in `started_at` order) must match, one to one and in order, the entries whose outcome is not `pending` or `not_started`, on `window_id`, `hypothesis_fingerprint`, `book_id` and `start_date`;
+  - exactly one `pending` entry must exist, and it must name this start's hypothesis fingerprint, book and `T_0`;
+  - `paper.exam_max_count` must not be above the ledger's `budget`.
+- **`exam_budget_spent`** refuses a start when the count reaches the budget. The count is every entry that is not `not_started`, this start's `pending` entry included. A start is refused when the count is above `min(paper.exam_max_count, budget)`. So with four exams counted, a fifth `pending` entry is refused.
+- A tracking window (rule 1's test false) reads no ledger and is never refused by it.
+
+**Rule 5: a fifth exam needs two changes, both on the owner's word:**
+- **(i) A class-B amendment of this ADR that names the count.** It states the new budget, lists the ledger entries already spent by `seq`, and gives the smaller per-exam rate that keeps the family-wise rate (decision 2, as amended 2026-11-07).
+- **(ii) A config change.** This means a new pinned maximum for `paper.exam_max_count` in the config validator (T381), plus the ledger's `budget` and `budget_adr` updated to name that amendment. The ledger change is class B (rule 3).
+- **Neither works alone.** Rule 4's `exam_ledger_mismatch` refuses a config whose `paper.exam_max_count` is above the ledger's `budget`. A higher `budget` with the validator's pin at 4 is still refused at 4.
+
+**Display (diagnostic only).** `lab status` prints **"campaign k <k>"** beside each family's N. The value is the family's latest ledger entry's `campaign_k`, or "campaign k not recorded" when the family has no entry or its entry says −1. `paper status` prints "exam budget <count> of <budget> (ledger), <S> exam windows in the store". No refusal, gate or verdict reads campaign k; it is shown so that a reader sees how many looks lie behind a family's finalist (the review, Q2 point 1: "campaign k is a draft").
+
+**What is not changed.** The point-8 historical exam stays outside the budget until an amendment under decision 3, which must follow rule 2(c). Family N, SR\* and the 0.5 floor are not changed here.
+
+**Consequences.**
+- **Good:**
+  - the budget survives a store rebuild, restore or copy, because the ledger is in git;
+  - the five relabelling routes of the review are each closed or made visible (amendment: rule 5; window class: rules 1 and 2(a); timing: rule 1; store: rules 3 and 4; exam kind: rule 2(c));
+  - each exam start gets the owner's word on a named entry before the window opens.
+- **Bad / accepted:**
+  - every exam start now needs a class-B PR before `paper start`, and two more afterwards;
+  - a `paper start` from a checkout whose ledger lags `origin/main` is refused;
+  - rule 2(c) is still a review judgment, and rule 2(b) is its backstop;
+  - until #3147 lands, the class-B status of the ledger is a written rule, not code.
+- **Reversibility:** cheap before the first `pending` entry. After it, the entry and its slot stand.
