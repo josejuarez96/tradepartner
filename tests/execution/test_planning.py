@@ -950,6 +950,86 @@ def test_a_name_with_no_bar_by_s_minus_1_raises(env: Env) -> None:
         planning.reference_prices(env.conn, F_I, {"SEC_NONE"}, _splits())
 
 
+# --- a held chained predecessor (#3051) --------------------------------------------------
+
+
+def _chain(env: Env, predecessor: str, successor: str, known_at: datetime) -> None:
+    """A live 1:1 successor chain (#821) `predecessor -> successor` known at `known_at`."""
+    stamp = {"known_at": known_at, "ingested_at": known_at}
+    insert_row(
+        env.conn,
+        "successor_chains",
+        {
+            "predecessor_id": predecessor,
+            "successor_id": successor,
+            "evidence_accession": f"SEC-{predecessor}-{successor}",
+            "evidence_form": "8-K12B",
+            "retracted": False,
+            "withdrawn_known_at": None,
+            "source": "edgar",
+            "provenance": "filing",
+            **stamp,
+        },
+    )
+
+
+def test_a_held_chained_predecessor_is_priced_through_its_successor(env: Env) -> None:
+    """#3051: a chain known at close(S-1) files the predecessor's bars under its
+    successor (#821); the reference price of the predecessor id is the
+    successor's latest bar (a successor split before that bar is already in it)."""
+    close = _copy_bar(env, "SEC_OLD", T_I)
+    _chain(env, "SEC_OLD", "SEC_NEW", session_close(T_I) - timedelta(minutes=1))
+    splits = _splits(("SEC_NEW", T_I, 2.0))
+
+    prices = planning.reference_prices(env.conn, F_I, {"SEC_OLD"}, splits)
+
+    assert prices == {"SEC_OLD": pytest.approx(close)}
+
+
+def test_a_successor_split_after_the_bar_refuses_the_predecessors_price(env: Env) -> None:
+    """#3051 (fail closed): a successor split ex S is keyed to the successor, so
+    the ledger's quantity of the held predecessor never counts it (#3062); a
+    price on the split's basis would halve its value, so the name is refused."""
+    _copy_bar(env, "SEC_OLD", T_I)
+    _chain(env, "SEC_OLD", "SEC_NEW", session_close(T_I) - timedelta(minutes=1))
+    splits = _splits(("SEC_NEW", F_I, 2.0))
+
+    with pytest.raises(ValueError, match=r"SEC_OLD: its chain successor SEC_NEW's split"):
+        planning.reference_prices(env.conn, F_I, {"SEC_OLD"}, splits)
+
+
+def test_a_predecessor_and_its_successor_are_both_priced(env: Env) -> None:
+    close = _copy_bar(env, "SEC_OLD", T_I)
+    _chain(env, "SEC_OLD", "SEC_NEW", session_close(T_I) - timedelta(minutes=1))
+
+    prices = planning.reference_prices(env.conn, F_I, {"SEC_OLD", "SEC_NEW"}, _splits())
+
+    assert prices == {"SEC_OLD": pytest.approx(close), "SEC_NEW": pytest.approx(close)}
+
+
+def test_a_chain_known_only_after_the_cut_keeps_the_predecessors_own_bars(env: Env) -> None:
+    """No look-ahead: a chain stamped after close(S-1) is not read on S, so the
+    predecessor keeps its own bars and the successor's splits do not apply."""
+    close = _copy_bar(env, "SEC_OLD", T_I)
+    _chain(env, "SEC_OLD", "SEC_NEW", session_close(T_I) + timedelta(minutes=1))
+    splits = _splits(("SEC_NEW", F_I, 2.0))
+
+    prices = planning.reference_prices(env.conn, F_I, {"SEC_OLD"}, splits)
+
+    assert prices == {"SEC_OLD": pytest.approx(close)}
+
+
+def test_a_predecessor_with_two_live_successors_is_not_priced(env: Env) -> None:
+    """#3051 (fail closed): which successor holds the position is never guessed."""
+    _copy_bar(env, "SEC_OLD", T_I)
+    known = session_close(T_I) - timedelta(minutes=1)
+    _chain(env, "SEC_OLD", "SEC_NEW", known)
+    _chain(env, "SEC_OLD", "SEC_NEW2", known)
+
+    with pytest.raises(ValueError, match=r"SEC_OLD.*more than one live successor"):
+        planning.reference_prices(env.conn, F_I, {"SEC_OLD"}, _splits())
+
+
 # --- review fixes (safety-reviewer and quant-auditor on #431) ---------------------------
 
 

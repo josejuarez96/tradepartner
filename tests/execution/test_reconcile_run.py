@@ -2083,6 +2083,104 @@ def test_a_held_predecessor_is_not_remapped_when_the_successor_is_journaled(
     assert found.symbols[SUCC] == SUCC_SYMBOL
 
 
+def test_a_held_chained_predecessors_mapping_is_recorded_for_the_order_path(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#3031: the reconciliation that follows a held predecessor's chain records
+    `SPY -> SPYN` on its row (never a difference), and the order path's map then
+    sends `SPY` under `SPYN`. Before that row exists the order map keeps `SPY`,
+    the broker's symbol until it re-books the position, and is not ambiguous."""
+    _held_chained_predecessor(journal_settings, fake, open_window, CUT - timedelta(minutes=1))
+
+    before = _order_symbols(journal_settings, open_window, SPY, MTUM)
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+    after = _order_symbols(journal_settings, open_window, SPY, MTUM)
+
+    assert result.status == OK
+    assert result.symbol_changes == (SymbolChangeRecord(SPY, "SPY", SUCC_SYMBOL),)
+    assert after.symbols == {SPY: SUCC_SYMBOL, MTUM: "MTUM"}
+    assert after.ambiguous == {}
+    assert after.chained == {SPY: SUCC}
+    assert before.symbols == {SPY: "SPY", MTUM: "MTUM"}
+    assert before.ambiguous == {}
+    assert before.chained == {}
+
+
+def test_the_order_map_never_follows_a_chain_the_reconciliation_did_not_record(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#3031 (fail closed): the reconciliation on S recorded `SPY -> SPYN`, but the
+    order map is asked for the successor too, so two ids would claim `SPYN` and
+    it cannot follow the chain: `SPY` is ambiguous with a note, never sent under
+    `SPY` (the broker no longer holds it) nor a guessed `SPYN`."""
+    _held_chained_predecessor(journal_settings, fake, open_window, CUT - timedelta(minutes=1))
+    _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    found = _order_symbols(journal_settings, open_window, SPY, SUCC)
+
+    assert SPY not in found.symbols
+    assert f"SPY -> {SUCC_SYMBOL}" in found.ambiguous[SPY]
+    assert found.symbols[SUCC] == SUCC_SYMBOL
+
+
+def test_a_predecessor_with_two_live_successors_maps_nothing_and_is_not_sent(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """#3031 (fail closed): two live chains from `SPY` leave which successor holds
+    the position unknown. Reconcile follows neither (the break stands) and the
+    order map leaves `SPY` out with a note; nothing is guessed."""
+    _held_chained_predecessor(journal_settings, fake, open_window, CUT - timedelta(minutes=1))
+    _chain(journal_settings, SPY, MTUM, CUT - timedelta(minutes=1))
+
+    found = _held_explanations(journal_settings, open_window)
+    mapped = _order_symbols(journal_settings, open_window, SPY)
+
+    assert found.symbols[SPY] == "SPY"
+    assert found.symbol_changes == {}
+    assert mapped.symbols == {}
+    assert "more than one live successor" in mapped.ambiguous[SPY]
+
+
+def test_a_successors_dividend_credited_under_its_symbol_is_the_held_predecessors(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#3031: the chained read keys the dividend to `SUCC`, and the broker credits
+    it under `SPYN`, the held `SPY`'s symbol now. The due is the predecessor's,
+    so the credit is explained `dividend_cash` on `SPY`, not a cash break."""
+    _held_chained_predecessor(journal_settings, fake, open_window, CUT - timedelta(minutes=1))
+    _dividend(journal_settings, SUCC, 0.5, CUT - timedelta(minutes=1))
+    fake.activities = [FUNDING, CashActivity("div-succ", "DIV", S, "executed", 5.0, SUCC_SYMBOL)]
+    fake.extra_cash = 5.0
+
+    assert _held_explanations(journal_settings, open_window).dividends == pytest.approx({SPY: 5.0})
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    assert [
+        (a.kind, a.security_id, a.cash) for a in _adjustments(journal_settings, open_window)
+    ] == [("dividend_cash", SPY, pytest.approx(5.0))]
+
+
+def test_a_successors_dividend_stays_unexplained_when_its_chain_is_known_after_the_cut(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """#3031 (no look-ahead): with the chain known only after close(S-1) nothing is
+    followed, so the successor's dividend is owed on no held name."""
+    _held_chained_predecessor(journal_settings, fake, open_window, CUT + timedelta(microseconds=1))
+    _dividend(journal_settings, SUCC, 0.5, CUT - timedelta(minutes=1))
+
+    assert _held_explanations(journal_settings, open_window).dividends == {}
+
+
 # --- a when-issued spin-off child at the broker (#2112) ------------------------
 
 #: The broker form of a when-issued child (Alpaca's `spin_offs.new_symbol`).

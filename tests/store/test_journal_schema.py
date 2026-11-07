@@ -169,7 +169,7 @@ def test_the_three_name_tuples_are_pairwise_disjoint() -> None:
 
 
 def test_current_schema_version_is_31() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_LIST_POSITION_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RESUME_BOOK_VERSION + 1
     assert schema._PRE_FEE_ACTIVITIES_VERSION == 24
     assert schema._PRE_FILING_NAME_VERSION == 25
     assert schema._PRE_CASH_IN_LIEU_VERSION == 26
@@ -1015,7 +1015,7 @@ def test_the_short_reasons_are_appended_last_and_the_version_is_the_next() -> No
         )
         assert (table, "reason") in schema.NULLABLE_JOURNAL_ENUMS
     assert schema._PRE_SHORT_REASONS_VERSION >= schema._PRE_PENDING_UNRESOLVED_VERSION + 1
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_LIST_POSITION_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RESUME_BOOK_VERSION + 1
 
 
 def test_the_schema_docstring_names_the_short_reasons_version() -> None:
@@ -2778,3 +2778,43 @@ def test_last_ok_reconciliation_uses_the_latest_breaks_base(
     )
     row = last_ok_reconciliation(fresh, 1)
     assert row is not None and (row.status, row.broker_cash) == ("breaks", 80.0)
+
+
+def test_version_47_adds_a_null_resume_book_and_keeps_every_resume() -> None:
+    """#2490: a version-46 `resume_invocations` (no `book_id`) migrates with every
+    row kept and its book NULL (unknown); a fresh row then carries its book."""
+    conn = duckdb.connect(":memory:")
+    try:
+        schema.init_schema(conn)
+        conn.execute("DROP TABLE resume_invocations")
+        conn.execute(schema._CREATE_RESUME_INVOCATIONS.replace("book_id VARCHAR,", ""))
+        at = datetime(2026, 11, 2, 15, tzinfo=UTC)
+        conn.execute(
+            'INSERT INTO resume_invocations (resume_id, "at", reason, accept_broker_fills, '
+            "accept_rejections, known_at, ingested_at) VALUES (1, ?, 'old', FALSE, FALSE, ?, ?)",
+            [at, at, at],
+        )
+        conn.execute("DELETE FROM schema_version")
+        conn.execute("INSERT INTO schema_version VALUES (46, TIMESTAMPTZ '2026-11-01 00:00:00+00')")
+        [before] = conn.execute("SELECT max(version) FROM schema_version").fetchone()
+        assert before == schema._PRE_RESUME_BOOK_VERSION == 46
+        schema.init_schema(conn)
+        assert conn.execute(
+            "SELECT resume_id, reason, book_id FROM resume_invocations"
+        ).fetchall() == [(1, "old", None)]
+        conn.execute(
+            'INSERT INTO resume_invocations (resume_id, "at", reason, accept_broker_fills, '
+            "accept_rejections, book_id, known_at, ingested_at) "
+            "VALUES (2, ?, 'new', FALSE, FALSE, 'main', ?, ?)",
+            [at, at, at],
+        )
+        assert conn.execute(
+            "SELECT book_id FROM resume_invocations ORDER BY resume_id"
+        ).fetchall() == [
+            (None,),
+            ("main",),
+        ]
+        [version] = conn.execute("SELECT max(version) FROM schema_version").fetchone()
+        assert version == schema.CURRENT_SCHEMA_VERSION == 47
+    finally:
+        conn.close()
