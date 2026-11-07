@@ -164,7 +164,9 @@ Phase 3 (T42):
   full frozen set and its hash (spec req 10). With `--operations-book-of
   <variant-slug> --reason` (both or neither; strategy-lab spec req 1, amendment
   2026-10-10, paper plan T160b) it registers an operations file of that sweep
-  variant through `hypothesis.register_operations_book` and also prints the
+  variant or pre-lab hypothesis (differing only in `execution.fill_price` and a
+  higher `costs.per_side_bps`, #3118 item 2) through
+  `hypothesis.register_operations_book` and also prints the
   `operations_book` decision's id; it is never a promotion.
 - `tradepartner trials [--hypothesis] [--include-synthetic]` lists trials newest
   first, `unfinished`, failed and refused ones with their message; synthetic
@@ -484,6 +486,8 @@ from tradepartner.backtest.hypothesis import (
 )
 from tradepartner.backtest.metrics import METRIC_KEYS
 from tradepartner.backtest.run import RunOutcome, run_hypothesis
+from tradepartner.calendar import is_session as _is_session
+from tradepartner.calendar import session_close as _session_close
 from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.close_gap import close_gaps
 from tradepartner.config import Settings, clean_message, get_settings
@@ -1999,6 +2003,37 @@ def _lock_holder(exc: BaseException | str) -> str:
     if "already open in this process" in str(exc):
         return "another connection in this process"
     return "an unidentified process"
+
+
+def _cost_lines(
+    book_id: str, window_id: int, cutoff: datetime, cost: paper_slippage.MeasuredCost
+) -> list[str]:
+    """`paper cost`'s output: buys, sells, pooled, the counts and the figure to freeze."""
+
+    def part(name: str, group: paper_slippage.SideSlippage) -> str:
+        if group.wmean_bp is None:
+            return f"{name} n=0"
+        return f"{name} n={group.count} {group.wmean_bp:+.1f}"
+
+    pool = cost.slippage
+    stop = "no stop" if cost.stop_session is None else f"stop session {cost.stop_session}"
+    figure = (
+        "no order measured, nothing to freeze"
+        if cost.figure_bp is None
+        else f"{cost.figure_bp:.0f} bp per side (pooled, rounded to 5 bp)"
+    )
+    return [
+        f"paper cost: book {book_id}, window {window_id}, as of {_et(cutoff)}; per order "
+        "against the session's bar open, weighted by filled notional (bp, positive = paid "
+        "more)",
+        f"  {part('buys', pool.buy)}; {part('sells', pool.sell)}; {part('pooled', pool.overall)}",
+        f"  left out: {cost.stop_run} orders of stop runs, {cost.after_stop} on or after "
+        f"the stop ({stop})",
+        f"  counted apart: no bar {pool.no_bar}, off session {pool.off_session}, "
+        f"pending {pool.pending}",
+        f"  {part('on sessions a month-end book also traded (in the pool)', cost.month_end)}",
+        f"  figure to freeze: {figure}",
+    ]
 
 
 def _paper_call[T](settings: Settings, call: Callable[[], T]) -> T:
@@ -4079,8 +4114,10 @@ def make_app(
             str | None,
             typer.Option(
                 "--operations-book-of",
-                help="register as an operations file of this sweep variant's slug "
-                "(a paper book's machine test, never a promotion); needs --reason",
+                help="register as an operations file of this sweep variant's or "
+                "pre-lab hypothesis's slug (a paper book's road, never a promotion); it "
+                "may differ only in execution.fill_price and a higher "
+                "costs.per_side_bps; needs --reason",
             ),
         ] = None,
         reason: Annotated[
@@ -6115,6 +6152,64 @@ def make_app(
             *([f"paper report: {result.window_note}"] if result.window_note else []),
         ]
         for line in lines:
+            _echo_scrubbed(line, s)
+
+    @paper_app.command("cost")
+    def paper_cost(
+        book: Annotated[str | None, _BOOK_OPTION] = None,
+        window_id: Annotated[
+            int | None,
+            typer.Option(
+                "--window",
+                help="the window to measure (default the book's latest)",
+                allow_from_autoenv=False,
+            ),
+        ] = None,
+        through: Annotated[
+            str | None,
+            typer.Option(
+                "--through",
+                help="read only what was known at this session's close, YYYY-MM-DD",
+                allow_from_autoenv=False,
+            ),
+        ] = None,
+    ) -> None:
+        """The book's measured per-side cost against the open, from its own orders and
+        fills (paper spec amendment 2026-11-07 #3118 item 3); read-only."""
+        chosen = _checked_book(book)
+        last = _parse_day("--through", through)
+        if last is not None and not _is_session(last):
+            raise _fail(f"--through must be an XNYS session, got {through}", USAGE_ERROR)
+        s = paper_settings()
+        paper_schema_gate(s, read_only=True)
+        book_id = chosen if chosen is not None else s.paper.book_id
+
+        def read() -> tuple[int, datetime, paper_slippage.MeasuredCost]:
+            with open_read_only(s) as conn:
+                now = ensure_tz_aware_utc(clock(), field_name="clock()")
+                cutoff = now if last is None else min(_session_close(last), now)
+                if window_id is None:
+                    latest = journal.latest_window(conn, book_id)
+                    if latest is None or latest.window_id is None:
+                        raise window.WindowCommandRefused(
+                            window.NO_WINDOW, f"no window for book {book_id!r}"
+                        )
+                    target = latest.window_id
+                else:
+                    owner = paper_slippage.window_book(conn, window_id)
+                    if owner is None:
+                        raise window.WindowCommandRefused(
+                            window.NO_WINDOW, f"no window {window_id}"
+                        )
+                    if owner != book_id:
+                        raise window.WindowCommandRefused(
+                            "other_book", f"window {window_id} is book {owner!r}, not {book_id!r}"
+                        )
+                    target = window_id
+                return target, cutoff, paper_slippage.window_cost(conn, target, cutoff)
+
+        target, cutoff, cost = _paper_call(s, read)
+        for line in _cost_lines(book_id, target, cutoff, cost):
             _echo_scrubbed(line, s)
 
     @paper_app.command("check")
