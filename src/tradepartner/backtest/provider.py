@@ -167,6 +167,13 @@ class DataProvider(Protocol):
         delisting path) and counts each held one as `n_refused_chains`."""
         ...
 
+    def pending_chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        """The stored chains known at `t` that `chains(t)` leaves out as pending
+        (#3108, `store.asof.pending_chains`): the successor has no bar known at `t`
+        yet. Nothing is renamed through them; the engine counts each held
+        predecessor once as `n_pending_chains`."""
+        ...
+
     def adjusted_prices(
         self,
         t: datetime,

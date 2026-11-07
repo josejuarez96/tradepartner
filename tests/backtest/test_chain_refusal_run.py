@@ -20,6 +20,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from conftest import load_universe_fixtures
 
 from tradepartner.backtest import engine
 from tradepartner.backtest.provider import GapReading
@@ -27,10 +28,11 @@ from tradepartner.backtest.schedule import fill_session, rebalance_sessions
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import all_sessions, session_close
 from tradepartner.config import Settings
-from tradepartner.store import lab_schema, registry, schema
+from tradepartner.store import registry, schema
 from tradepartner.store.db import configure_connection, insert_row, open_for_write, open_read_only
 
 OLD, NEW, B = "0000000100", "0000000200", "0000000300"
+UNIVERSE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
 START, END = date(2023, 1, 31), date(2023, 3, 31)
 FORM25 = datetime(2023, 3, 3, 22, tzinfo=UTC)
 CAPITAL = 1_000_000.0
@@ -56,8 +58,9 @@ def _build(path: Path, *, bankruptcy: bool, new_close: float, chain_known: datet
     try:
         configure_connection(conn)
         schema.init_schema(conn)
-        lab_schema.create_store_markers(conn)
-        lab_schema.write_fixture_marker(conn, "test_chain_refusal_run")
+        # The fixture universe (and its fixture marker) under the scenario's own rows,
+        # whose ids it does not use.
+        load_universe_fixtures(conn, UNIVERSE_DIR)
         listed = datetime(2022, 12, 30, 21, tzinfo=UTC)
         for sid, ticker, valid_from, known in (
             (OLD, "ABC", date(2022, 1, 3), listed),
@@ -274,6 +277,7 @@ def test_a_chain_known_before_the_first_bar_renames_nothing_until_it_is_judged(
     is seen, the chain is refused and OLD exits at 1.0."""
     result = _run(tmp_path, monkeypatch, bankruptcy=False, chain_known=EARLY_CHAIN)
     assert sum(row.counts.get("n_chained_positions", 0) for row in result.rebalances) == 0
+    assert sum(row.counts.get("n_pending_chains", 0) for row in result.rebalances) == 1
     assert sum(row.counts.get("n_refused_chains", 0) for row in result.rebalances) == 1
     final = [r for r in result.equity if r.series == engine.STRATEGY_SERIES][-1].equity
     assert final / CAPITAL - 1 == pytest.approx(-0.4758, abs=2e-3)

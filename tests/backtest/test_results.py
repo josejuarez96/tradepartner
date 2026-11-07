@@ -1113,6 +1113,7 @@ class TestRefusals:
                     "strategy.hold_top_fraction",
                     "backtest.delisting_failure_return",
                     "universe.shares_split_dating",
+                    "master.chain_max_bound_ratio",
                     "portfolio.",
                     "costs.borrow",
                 )

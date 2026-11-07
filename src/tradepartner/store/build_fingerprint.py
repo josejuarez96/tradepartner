@@ -76,6 +76,7 @@ STORED_STATEMENT_KEYS = ("edgar.statement_tags", "edgar.statement_fact_units")
 # reporting, and health thresholds do not change a builder's derived rows.
 EXCLUDED_SETTINGS_KEYS = (
     "master.chain_max_price_ratio",
+    "master.chain_max_bound_ratio",  # #3108: a read-side bound, no derived row moves.
     "edgar.cache_dir",
     "edgar.requests_per_second",
     "edgar.retry_backoff_seconds",

@@ -513,7 +513,8 @@ def refused_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[Refuse
       outside `[1 / r, r]`, `r = master.chain_max_price_ratio` (the bound
       health's `chain_price_break` warns on; Audit A s10b with no reason
       row: x25); beyond `master.transfer_window_sessions` sessions between
-      the two bars the bound grows with the gap (`_price_bound`).
+      the two bars the bound grows with the gap, capped at
+      `master.chain_max_bound_ratio` (`_price_bound`).
 
     A chain whose successor has no traded bar known at `t` is **pending**:
     `live_chains` leaves it out too, but it is not refused (`_judged`).
@@ -526,6 +527,17 @@ def refused_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[Refuse
     `t` must be tz-aware (a bare date raises `TypeError`)."""
     pairs = stored_chains(conn, t)
     return _judged(conn, t, pairs)[0] if pairs else ()
+
+
+def pending_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[tuple[str, str], ...]:
+    """The stored chains known at `t` that `live_chains(t)` leaves out as
+    **pending** (#3108, `_judged`): not refused, but the successor has no own
+    traded bar on or after its hand-over day known at `t`, so the hand-over
+    close cannot be judged yet. Sorted by successor.
+
+    `t` must be tz-aware (a bare date raises `TypeError`)."""
+    pairs = stored_chains(conn, t)
+    return _judged(conn, t, pairs)[1] if pairs else ()
 
 
 def stored_chains(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[tuple[str, str], ...]:
@@ -642,22 +654,28 @@ def _judged(
         ratio, gap = close
         if master is None:
             master = get_settings().master
-        bound = _price_bound(master.chain_max_price_ratio, master.transfer_window_sessions, gap)
+        bound = _price_bound(
+            master.chain_max_price_ratio,
+            master.transfer_window_sessions,
+            gap,
+            master.chain_max_bound_ratio,
+        )
         if not 1.0 / bound <= ratio <= bound:
             refused.append(RefusedChain(predecessor, successor, f"hand_over_price:{ratio:.4g}"))
     ordered = tuple(sorted(refused, key=lambda r: (r.successor_id, r.predecessor_id)))
     return ordered, tuple(pending)
 
 
-def _price_bound(ratio: float, span: int, gap: int) -> float:
+def _price_bound(ratio: float, span: int, gap: int, cap: float) -> float:
     """The hand-over close bound over `gap` sessions (#3108): `ratio` for a gap
     of at most `span` sessions (`master.transfer_window_sessions`, a hand-over's
-    own span), growing as `ratio ** ceil(gap / span)` beyond it, so a month's
-    drift over an unfilled rule-9 hole (x1.25 over 21 sessions: bound ~x2.0)
-    passes while a x25 splice never does."""
-    if span <= 0:
-        return float(ratio) ** max(1, gap)
-    return float(ratio) ** max(1, math.ceil(gap / span))
+    own span), growing as `ratio ** ceil(gap / span)` beyond it and capped at
+    `cap` (`master.chain_max_bound_ratio`, 1.75), so a month's drift over an
+    unfilled rule-9 hole (x1.25 over 21 sessions) passes while a x25 splice, or
+    any break above the cap however long the gap, is refused. Never below
+    `ratio`."""
+    steps = max(1, gap) if span <= 0 else max(1, math.ceil(gap / span))
+    return max(float(ratio), min(float(ratio) ** steps, float(cap)))
 
 
 def _raw_traded_closes(

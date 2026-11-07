@@ -475,6 +475,11 @@ class MasterConfig(_ClosedConfig):
     #: `chain_price_break` (#821): the ratio or its inverse. 1.15, so a break
     #: over 15% either way.
     chain_max_price_ratio: float = Field(default=1.15, gt=0)
+    #: The cap on the hand-over close bound the chain-aware reads grow with the gap
+    #: between the predecessor's last bar and the successor's first (#3108,
+    #: `store.asof._price_bound`): beyond it a chain is refused, however long the
+    #: gap. 1.75, about `chain_max_price_ratio ** 4`.
+    chain_max_bound_ratio: float = Field(default=1.75, gt=0)
 
     @field_validator("keep_successors")
     @classmethod

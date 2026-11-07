@@ -303,6 +303,8 @@ class _Book:
     chained_positions: int = 0  # #821: positions renamed by a successor chain this step
     refused_chains: int = 0  # #3097: held predecessors of a refused chain this step
     refused_seen: set[str] = field(default_factory=set)  # #3097: counted once per name
+    pending_chains: int = 0  # #3108: held predecessors of a pending chain this step
+    pending_seen: set[str] = field(default_factory=set)  # #3108: counted once per name
     series: str = STRATEGY_SERIES
     borrow_bps: float | None = None
     pending_covers: set[str] = field(default_factory=set)
@@ -1331,18 +1333,22 @@ def _step(
 def _rebalance_counts(plan: Plan, book: _Book) -> Mapping[str, int]:
     """The rebalance row's counts: the plan's, plus `n_chained_positions` (#821,
     T187b) on the one step whose read saw the chain and renamed `book`'s
-    positions, and `n_refused_chains` (#3097) on the one step whose read refused
-    a chain naming a held predecessor (0 in every other step, so no extra count
-    row is written)."""
-    if not book.chained_positions and not book.refused_chains:
+    positions, `n_refused_chains` (#3097) on the one step whose read refused a
+    chain naming a held predecessor, and `n_pending_chains` (#3108) on the one
+    step whose read found such a chain pending (0 in every other step, so no
+    extra count row is written)."""
+    if not (book.chained_positions or book.refused_chains or book.pending_chains):
         return plan.counts
     counts = dict(plan.counts)
     if book.chained_positions:
         counts["n_chained_positions"] = book.chained_positions
     if book.refused_chains:
         counts["n_refused_chains"] = book.refused_chains
+    if book.pending_chains:
+        counts["n_pending_chains"] = book.pending_chains
     book.chained_positions = 0
     book.refused_chains = 0
+    book.pending_chains = 0
     return counts
 
 
@@ -1601,6 +1607,9 @@ class _SharedReads:
     def refused_chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
         return self._once(("refused_chains", t), lambda: self._provider.refused_chains(t))
 
+    def pending_chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        return self._once(("pending_chains", t), lambda: self._provider.pending_chains(t))
+
     def adjusted_prices(
         self,
         t: datetime,
@@ -1718,6 +1727,9 @@ class _Requests:
 
     def refused_chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
         return self.view.refused_chains(t)
+
+    def pending_chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        return self.view.pending_chains(t)
 
     def adjusted_prices(
         self,
@@ -2104,6 +2116,12 @@ def _run_group(
         if refused:
             for variant in group:
                 _count_refused(variant, refused)
+        # #3108: a pending chain (no successor bar known yet) renames nothing either;
+        # its held predecessor is counted once, the run's conservative cost.
+        pending = view.pending_chains(t)
+        if pending:
+            for variant in group:
+                _count_pending(variant, pending)
         own = [_marking_ids(variant, benchmarks) for variant in group]
         t_prev = read_time(cast(Plan, group[0].plan).session, cadence)
         view.share(
@@ -2176,13 +2194,29 @@ def _cash_accruals(
     return session_accruals(every, yields, series=series)
 
 
+def _count_pending(variant: _Variant, pending: Sequence[tuple[str, str]]) -> None:
+    """Count, per book, the predecessors of the pending chains (#3108) it holds or
+    its pending plan targets (the names `_rename_chained` would rename), each once
+    per run: nothing is renamed while the successor has no bar, so a held
+    predecessor whose listing ends exits by the normal delisting path."""
+    targets = variant.plan.targets if variant.plan is not None else {}
+    for book in variant.books:
+        for predecessor, _ in pending:
+            named = predecessor in book.positions or predecessor in targets
+            if named and predecessor not in book.pending_seen:
+                book.pending_seen.add(predecessor)
+                book.pending_chains += 1
+
+
 def _count_refused(variant: _Variant, refused: Sequence[tuple[str, str]]) -> None:
-    """Count, per book, the held predecessors of the refused chains (#3097), each
-    name once per run: the predecessor keeps its own id, so the step's listing-end
-    read exits it like any other delisted name."""
+    """Count, per book, the predecessors of the refused chains (#3097) it holds or
+    its pending plan targets, each name once per run: the predecessor keeps its
+    own id, so the step's listing-end read exits it like any other delisted name."""
+    targets = variant.plan.targets if variant.plan is not None else {}
     for book in variant.books:
         for predecessor, _ in refused:
-            if predecessor in book.positions and predecessor not in book.refused_seen:
+            named = predecessor in book.positions or predecessor in targets
+            if named and predecessor not in book.refused_seen:
                 book.refused_seen.add(predecessor)
                 book.refused_chains += 1
 

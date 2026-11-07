@@ -233,6 +233,7 @@ class FakeProvider:
     )
     chain_pairs: tuple[tuple[str, str], ...] = ()
     refused_pairs: tuple[tuple[str, str], ...] = ()
+    pending_pairs: tuple[tuple[str, str], ...] = ()
     n_assets_intersected: int = 0
     assets_intersection_skipped: bool = False
     calls: list[Call] = field(default_factory=list)
@@ -258,6 +259,10 @@ class FakeProvider:
     def refused_chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
         self._record("refused_chains", t)
         return self.refused_pairs
+
+    def pending_chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        self._record("pending_chains", t)
+        return self.pending_pairs
 
     def universe(self, t: datetime) -> Universe:
         t = self._record("universe", t)

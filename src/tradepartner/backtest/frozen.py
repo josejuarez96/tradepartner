@@ -124,6 +124,11 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     # #3055: rule 7's split dating (a post-split count dated before the ex-date). `false`
     # is today's rule, so no stored canonical set or fingerprint moves.
     ("universe.shares_split_dating", False, 46),
+    # #3108: the cap on the chain-aware reads' gap-scaled hand-over bound. A store-read
+    # key like `master.chain_max_price_ratio` (`StoreProvider` refuses a run whose
+    # frozen value is not the live one); at its default no stored canonical set or
+    # fingerprint moves.
+    ("master.chain_max_bound_ratio", 1.75, 47),
 )
 
 #: Keys added to a family's own listed section **after** that family's first

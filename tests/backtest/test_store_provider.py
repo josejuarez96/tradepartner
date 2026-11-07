@@ -828,6 +828,7 @@ def test_calendar_differing_from_the_live_one_refused(store: Store) -> None:
     [
         ("chain_window_sessions", 66, "66"),
         ("chain_max_price_ratio", 1.2, "1.2"),
+        ("chain_max_bound_ratio", 2.0, "2.0"),
         ("transfer_window_sessions", 6, "6"),
     ],
 )

@@ -1794,6 +1794,7 @@ TWIN_CALL_METHODS = {
     "universe",
     "chains",
     "refused_chains",
+    "pending_chains",
     "adjusted_prices",
     "raw_prices",
     "static_listing_count",
@@ -1804,8 +1805,10 @@ TWIN_CALL_METHODS = {
     "late_dividends",
     "late_splits",
 }
-TWIN_N_CALLS = 49  # #3097 `refused_chains` and #3096 `late_splits`: one read each per step
-TWIN_CALL_LOG_SHA256 = "823f008d85f40cd5e6a7d7b5a62f3a929e9f4b387ed83e7f5562ed26ed4024cb"
+TWIN_N_CALLS = (
+    53  # #3097 `refused_chains`, #3108 `pending_chains`, #3096 `late_splits`: one each per step
+)
+TWIN_CALL_LOG_SHA256 = "d01bd810dcd558613df4c38da7e28066b870e93b9b3119c4f719389b86d1e5f5"
 #: Per cost level: a SHA-256 over the equity, rebalance (counts included), weight and
 #: target rows, floats rounded to nine places.
 TWIN_RUN_DIGESTS = {
@@ -1897,6 +1900,18 @@ class TestSuccessorChains:
         assert counts["n_refused_chains"] == 1  # OTHER is not held
         assert "n_chained_positions" not in counts
         engine._count_refused(variant, (("PRE", "POST"),))
+        assert engine._rebalance_counts(plan, book) is plan.counts
+
+    def test_a_pending_chain_renames_nothing_and_is_counted_once(self) -> None:
+        """#3108: a pending chain (no successor bar known yet) is never renamed through;
+        its held predecessor lands once as `n_pending_chains`."""
+        variant = self._variant()
+        book = variant.books[0]
+        engine._count_pending(variant, (("PRE", "POST"), ("OTHER", "ELSE")))
+        assert book.positions == {"PRE": 1234.0}
+        plan = cast(engine.Plan, variant.plan)
+        assert engine._rebalance_counts(plan, book)["n_pending_chains"] == 1
+        engine._count_pending(variant, (("PRE", "POST"),))
         assert engine._rebalance_counts(plan, book) is plan.counts
 
     def test_a_collision_sums_the_values(self) -> None:

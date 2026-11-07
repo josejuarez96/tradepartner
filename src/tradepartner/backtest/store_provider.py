@@ -149,6 +149,7 @@ from tradepartner.store.asof import (
     live_chains,
     marking_changed_ids_as_of,
     mergers_as_of,
+    pending_chains,
     prices_as_of,
     rates_as_of,
     refused_chains,
@@ -292,7 +293,12 @@ class StoreProvider:
         # #3108: likewise `master.chain_max_price_ratio`, the hand-over close bound,
         # and `master.transfer_window_sessions`, the span its bound grows over.
         live_master = get_settings().master
-        for key in ("chain_window_sessions", "chain_max_price_ratio", "transfer_window_sessions"):
+        for key in (
+            "chain_window_sessions",
+            "chain_max_price_ratio",
+            "chain_max_bound_ratio",
+            "transfer_window_sessions",
+        ):
             live, frozen = getattr(live_master, key), getattr(frozen_settings.master, key)
             if frozen != live:
                 raise ValueError(
@@ -377,6 +383,11 @@ class StoreProvider:
         t = check_t(t)
         found = refused_chains(self._at(t), t)
         return tuple((r.predecessor_id, r.successor_id) for r in found)
+
+    def pending_chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        """The stored chains known at `t` that `chains(t)` leaves pending (#3108)."""
+        t = check_t(t)
+        return pending_chains(self._at(t), t)
 
     def adjusted_prices(
         self,

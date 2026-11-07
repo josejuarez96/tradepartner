@@ -33,6 +33,7 @@ from tradepartner.store.asof import (
     chained_read_ids,
     facts_as_of,
     live_chains,
+    pending_chains,
     prices_as_of,
     refused_chains,
     stored_chains,
@@ -572,6 +573,7 @@ def test_a_chain_before_the_successors_first_bar_is_pending() -> None:
         assert stored_chains(conn, before) == ((OLD, NEW),)
         assert live_chains(conn, before) == ()
         assert refused_chains(conn, before) == ()
+        assert pending_chains(conn, before) == ((OLD, NEW),)
         assert chained_read_ids(conn, before, [OLD]) == ({OLD: OLD}, {})
         assert [r.why for r in refused_chains(conn, late)] == ["hand_over_price:25"]
     finally:
@@ -633,6 +635,32 @@ def test_an_unusable_split_is_left_out_and_a_double_split_counts_once() -> None:
         assert [r.why for r in refused_chains(conn, T)] == ["hand_over_price:0.51"]
         _action(conn, OLD, "split", date(2023, 3, 1), 2.0, known.replace(day=21))
         _action(conn, NEW, "split", date(2023, 3, 1), 2.0, known)
+        assert live_chains(conn, T) == ((OLD, NEW),)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(("close", "live"), [(1.70, True), (1.90, False)])
+def test_the_growing_bound_is_capped(close: float, live: bool) -> None:
+    """Over 21 sessions the grown bound (1.15 ** 5, about 2.01) is capped at
+    `master.chain_max_bound_ratio` (1.75): x1.70 passes, x1.90 is refused."""
+    conn = _price_store(close)
+    try:
+        conn.execute("DELETE FROM prices_daily WHERE security_id = ?", [NEW])
+        _bar(conn, NEW, date(2023, 3, 29), close)
+        assert (live_chains(conn, T) == ((OLD, NEW),)) is live
+    finally:
+        conn.close()
+
+
+def test_the_cap_is_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = _price_store(1.90)
+    try:
+        conn.execute("DELETE FROM prices_daily WHERE security_id = ?", [NEW])
+        _bar(conn, NEW, date(2023, 3, 29), 1.90)
+        assert pending_chains(conn, T) == ()
+        assert live_chains(conn, T) == ()
+        monkeypatch.setenv("MASTER__CHAIN_MAX_BOUND_RATIO", "2.0")
         assert live_chains(conn, T) == ((OLD, NEW),)
     finally:
         conn.close()
