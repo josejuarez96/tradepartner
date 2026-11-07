@@ -2998,6 +2998,25 @@ def test_filename_conflict_fails_closed_for_its_cik_only() -> None:
     )
 
 
+def test_filename_conflict_fails_closed_without_a_pre_cover_10k() -> None:
+    """#3190: with no pre-cover 10-K reading the conflict check still runs, so
+    the Form 25 fallback writes no `filing_name` row from the latest cover's
+    class map (`ZZ` on class B from the calendar start)."""
+    bad = "0000004999"
+    world = _conflict_world(bad)  # its 2016 10-K stays indexed but gives no reading
+    world["filename_listings"] = [
+        replace(f, accepted_at=_at(2020, 6, 1), valid_from=date(2020, 6, 1))
+        for f in world["filename_listings"]
+        if f.form != "10-K"
+    ]
+    world["delistings"] = [replace(d, accepted_at=_at(2020, 6, 1)) for d in world["delistings"]]
+    settings = _settings(edgar={"filename_listings": True})
+    build = build_master(FixtureFilingSource(**world), settings, ingested_at=INGESTED_AT)
+    assert build.filename_counts["filename_conflicts"] == 1
+    assert build.filename_conflict_ciks == (bad,)
+    assert not [r for r in build.listings if r["provenance"] == "filing_name"]
+
+
 def test_chain_candidates_ignore_a_predecessor_row_after_the_handover() -> None:
     """#2939: a predecessor that keeps filing under the old ticker after the
     successor's first listing row (ExxonMobil's 2026-08-03 co-filed 10-Q gave
