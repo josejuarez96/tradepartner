@@ -2763,9 +2763,11 @@ CREATE TABLE IF NOT EXISTS resume_invocations (
 )
 """
 
-# One row per resume given `--accept-rejections` (#472), written once its
-# rejection-cap verdicts are judged and before its reconciliation and release:
-# a JSON list of the verdicts the flag accepted, `[]` when there was none. It is
+# One row per resume given `--accept-rejections` (#472) or accepting a fill-band
+# fault with `--accept-fill-band` (#3130), written once its verdicts are judged and
+# before its reconciliation and release: a JSON list of the rejection-cap verdicts
+# the flag accepted (`[]` when there was none) and of the band faults accepted
+# (entries with `"kind": "fill_band"`). It is
 # not a release: that is the `kill_switch` `released` row citing the resume_id.
 _CREATE_RESUME_ACCEPTANCES = f"""
 CREATE TABLE IF NOT EXISTS resume_acceptances (

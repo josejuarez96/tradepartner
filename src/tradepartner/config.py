@@ -922,7 +922,9 @@ class PaperConfig(BaseModel):
     #: (#3130): real overnight gaps of 25% or more occur at about 8.6e-4 per
     #: name-session (Audit C; INTC 10-30 at -29.3%), so 0.25 halted the books about
     #: once in eight daily sessions, while a 100x, 0.01x or 10x fill (a broker-side bad
-    #: print, a unit error) is still far outside. After a halt, `paper resume
+    #: print, a unit error) is still far outside. The band is linear, [0.5x, 1.5x]:
+    #: a real gap past it still halts (Audit C's extract: one +51.6% takeover gap in
+    #: 7,165 name-sessions, about one halt in 35 daily sessions). After a halt, `paper resume
     #: --accept-fill-band` releases once the owner has checked the print. Read at run
     #: time, never frozen, so the open windows see it.
     max_fill_price_deviation: float = Field(default=0.5, gt=0, lt=1)

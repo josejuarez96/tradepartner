@@ -566,6 +566,41 @@ def test_clock_step_back_rechecks_an_earlier_refused_invocation(
         )
 
 
+def test_accept_fill_band_never_accepts_a_rejudged_fill_nobody_has_seen(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review on #3140: a halt read's bad fill whose engagement write failed (#3027)
+    has no band engagement, so no output ever showed it. Even with the flag, the
+    resume that first rejudges it refuses (engaging and naming it); the next
+    flagged resume, after the owner has seen it, accepts it."""
+    started = DAY1 - timedelta(hours=1)
+    run_id = _run(journal_settings, window, started, finished=False)
+    order = _order(journal_settings, fake, run_id, "tp-unseen", 2.0, started)
+    fake.apply("tp-unseen", FillAt(200.0))
+    collect(
+        fake,
+        lambda: open_for_write(journal_settings),
+        [order],
+        fixed_clock,
+        "run",
+        run_id,
+        FROZEN,
+        journal_settings,
+    )
+    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
+    first = _resume(journal_settings, fake, fixed_clock, accept_fill_band=True)
+    assert first.status == REFUSED, first.reasons
+    assert any("tp-unseen" in r for r in first.reasons)
+    assert _engaged(journal_settings, window)
+    second = _resume(journal_settings, fake, fixed_clock, accept_fill_band=True)
+    assert second.status == RELEASED, second.reasons
+    assert any("tp-unseen" in a for a in second.accepted_fill_band)
+
+
 @pytest.mark.parametrize("price, expected", [(200.0, REFUSED), (100.0, RELEASED)])
 def test_a_run_fill_whose_band_engagement_was_never_written_is_rejudged(
     journal_settings: Settings,

@@ -239,6 +239,8 @@ class ResumeOutcome:
     reconciliation_id: int | None = None
     released_event_id: int | None = None
     accepted_rejections: tuple[str, ...] = ()
+    #: The band faults `--accept-fill-band` accepted (#3130), as journaled.
+    accepted_fill_band: tuple[str, ...] = ()
     fill_prices: tuple[tuple[str, float], ...] = ()
     fill_warnings: tuple[str, ...] = ()
 
@@ -753,6 +755,7 @@ def resume(
             )
 
         accepted: tuple[RejectionBreach, ...] = ()
+        accepted_band: tuple[str, ...] = ()
         fill_warnings: list[str] = []
 
         def outcome(
@@ -771,6 +774,7 @@ def resume(
                 reconciliation_id=reconciliation_id,
                 released_event_id=released_event_id,
                 accepted_rejections=tuple(b.message for b in accepted),
+                accepted_fill_band=accepted_band,
                 fill_prices=fill_prices,
                 fill_warnings=tuple(fill_warnings),
             )
@@ -812,7 +816,9 @@ def resume(
             prior_band_faults = [
                 event.reason
                 for event in events
-                if (event.event_id or 0) > last_release and is_fill_band_fault(event.reason)
+                if event.reason is not None
+                and (event.event_id or 0) > last_release
+                and is_fill_band_fault(event.reason)
             ]
         if prior_band_faults and not accept_fill_band:
             return outcome(
@@ -822,10 +828,18 @@ def resume(
             )
         with connect() as conn:
             prior_violations = _rejudged_band_violations(conn, window, events, resume_id, settings)
-        if prior_violations and not accept_fill_band:
+        # A rejudged fill (#3027) is accepted only once a band engagement since the
+        # last release names its order, i.e. once an output has shown it to the owner;
+        # until then it refuses (and engages, naming it) even with the flag.
+        unseen = [
+            v
+            for v in prior_violations
+            if not any(v.split(" ", 1)[0] in reason for reason in prior_band_faults)
+        ]
+        if prior_violations and (not accept_fill_band or unseen):
             return refuse_bad_fill("fill_price_outside_band: " + "; ".join(prior_violations))
         band_accepted = [
-            *(str(reason) for reason in prior_band_faults),
+            *prior_band_faults,
             *("fill_price_outside_band: " + v for v in prior_violations),
         ]
         faulted = _faulted_run_breaches(connect, window, frozen)
@@ -835,6 +849,7 @@ def resume(
             accepted = faulted
         if accept_rejections or band_accepted:
             _accept(connect, resume_id, accepted, clock, stamps, band_accepted)
+            accepted_band = tuple(band_accepted)
         cleared = {b.run_id for b in accepted}
         reasons = [b.message for b in collected.rejections if b.run_id not in cleared]
         judged = {b.run_id for b in collected.rejections}

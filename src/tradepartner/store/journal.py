@@ -412,7 +412,8 @@ class ResumeInvocationRow:
 @dataclass(frozen=True, kw_only=True)
 class ResumeAcceptanceRow:
     """One `resume_acceptances` row: the rejection-cap verdicts a resume given
-    `--accept-rejections` accepted, as a JSON list (`[]` for none; #472). Not a
+    `--accept-rejections` accepted, as a JSON list (`[]` for none; #472), plus the
+    fill-band faults `--accept-fill-band` accepted (`"kind": "fill_band"`, #3130). Not a
     release: that is the `kill_switch` `released` row citing the `resume_id`."""
 
     TABLE: ClassVar[str] = "resume_acceptances"

@@ -6052,6 +6052,7 @@ def make_app(
             *(f"  fill {o}: {price}" for o, price in outcome.fill_prices),
             *(f"  warning: {warning}" for warning in outcome.fill_warnings),
             *(f"  accepted {a}" for a in outcome.accepted_rejections),
+            *(f"  accepted fill band: {a}" for a in outcome.accepted_fill_band),
         ]
         for line in lines:
             _echo_scrubbed(line, s)
