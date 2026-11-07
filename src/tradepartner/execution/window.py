@@ -88,7 +88,9 @@ forward holdout (`_forward`, read from the stored holdout and the family's first
 registration day, never from a name), `tracking` otherwise. A tracking window
 freezes nothing else and reads no ledger. An exam window, in the read chunk before
 any broker call or write, is refused:
-- `exam_config` when `paper.exam_max_count` is a bool;
+- `exam_config` when `paper.exam_max_count` is a bool, or `paper.min_exam_fills`
+  has no entry for the cadence (it is not in config yet, #3214, so every exam start
+  is refused until it lands);
 - `exam_holdout_spent` when the family's holdout is already spent (#3149 item 1,
   fail-closed: the `unexamined` backfill stays for windows started before T381a);
 - `exam_skew_out_of_range` when the signed-off in-sample trial's monthly net excess
@@ -101,8 +103,8 @@ any broker call or write, is refused:
   store's exam windows are every book's windows of class `exam` (the frozen key,
   or `_forward()` re-run for a window started before T381a), in `started_at`
   order. The ledger check runs again in the write chunk, before the append.
-An accepted exam window also freezes T381's five keys, the benchmark (`SPY`) and the
-in-sample skew.
+An accepted exam window also freezes T381's five keys, `paper.min_exam_fills`, the
+benchmark (`SPY`) and the in-sample skew.
 
 **The book (ADR 0017 B.2 to B.5, plan T155).** Every command here takes
 `book_id` (keyword, default `paper.book_id`, the spec's `--book` default;
@@ -257,6 +259,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import subprocess
 import time
 from collections.abc import Callable, Mapping
@@ -557,6 +560,7 @@ def _git_out(root: Path, *args: str) -> str:
     return subprocess.run(
         ["git", *args],
         cwd=root,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
         check=True,
         capture_output=True,
         text=True,
@@ -585,8 +589,11 @@ def read_ledger_texts(root: Path | None = None, *, fetch: bool = True) -> Ledger
     if top is None:
         return LedgerTexts(None, None, "the running code is not in a git checkout")
     path = top / EXAM_LEDGER_PATH
-    local = path.read_text(encoding="utf-8") if path.is_file() else None
-    detail = "" if local is not None else f"no ledger at {path}"
+    try:
+        local: str | None = path.read_text(encoding="utf-8") if path.is_file() else None
+    except (OSError, UnicodeDecodeError):
+        local = None  # refused `exam_ledger_invalid`, as a missing file is
+    detail = "" if local is not None else f"no readable ledger at {path}"
     try:
         if fetch:
             _git_out(top, "fetch", "--quiet", "origin", "main")
@@ -719,11 +726,10 @@ def insample_monthly_excess(
     levels: dict[str, dict[date, float]] = {"strategy": {}, EXAM_BENCHMARK: {}}
     for series, session, equity in rows:
         levels[str(series)][session] = float(equity)
-    ends = [
-        s
-        for s in rebalance_sessions(span[0], span[1], "month_end")
-        if s in levels["strategy"] and s in levels[EXAM_BENCHMARK]
-    ]
+    ends = rebalance_sessions(span[0], span[1], "month_end")
+    for end in ends:
+        if end not in levels["strategy"] or end not in levels[EXAM_BENCHMARK]:
+            raise ValueError(f"trial {trial_id} has no strategy or SPY equity at {end}")
     book, bench = levels["strategy"], levels[EXAM_BENCHMARK]
     return [(book[b] / book[a] - 1.0) - (bench[b] / bench[a] - 1.0) for a, b in pairwise(ends)]
 
@@ -758,9 +764,21 @@ def _check_ledger(
         raise _exam_refused(exc) from None
 
 
+def _min_exam_fills(settings: Settings, cadence: Cadence) -> int | None:
+    """`paper.min_exam_fills` for `cadence` (ADR 0023), or None while config has no
+    such key (#3214): an exam started without it could only end `failed_void` and
+    would spend a budget slot, so `_exam_gate` refuses it."""
+    table = getattr(settings.paper, "min_exam_fills", None)
+    if not isinstance(table, Mapping):
+        return None
+    value = table.get(cadence)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def _exam_gate(
     conn: duckdb.DuckDBPyConnection,
     settings: Settings,
+    cadence: Cadence,
     hyp: registry.HypothesisRecord,
     start: exam_ledger.ExamStart,
     ledger_texts: Callable[[], LedgerTexts],
@@ -770,6 +788,13 @@ def _exam_gate(
     paper = settings.paper
     if isinstance(paper.exam_max_count, bool):
         raise StartRefusedError(EXAM_CONFIG, "paper.exam_max_count must be an integer")
+    min_fills = _min_exam_fills(settings, cadence)
+    if min_fills is None:
+        raise StartRefusedError(
+            EXAM_CONFIG,
+            f"paper.min_exam_fills has no {cadence} entry (#3214): the exam's looks could "
+            "never be met, so it would only spend a budget slot",
+        )
     looks = exam_rules.ExamFrozen.from_config(paper)  # the shape the verdict needs
     if spends := registry.family_holdout_spends(conn, hyp.family):
         raise StartRefusedError(
@@ -797,6 +822,7 @@ def _exam_gate(
         "paper.exam_futility_months": looks.futility_months,
         "paper.exam_max_count": paper.exam_max_count,
         "paper.exam_min_insample_skew": paper.exam_min_insample_skew,
+        "paper.min_exam_fills": min_fills,
         "exam.benchmark": EXAM_BENCHMARK,
         "exam.insample_skew": skew,
     }
@@ -1241,7 +1267,9 @@ def start(
                     if now
                     else _forward_first_session(hyp.holdout_start, today, cadence),
                 )
-                exam_keys, exam_texts = _exam_gate(conn, settings, hyp, exam_start, ledger_texts)
+                exam_keys, exam_texts = _exam_gate(
+                    conn, settings, cadence, hyp, exam_start, ledger_texts
+                )
 
         try:
             account = broker.account()
@@ -1316,7 +1344,11 @@ def start(
             _refuse_account_in_use(account.account_id, _other_books_accounts(write_conn, book))
             if exam_start is not None:
                 # Again under the write: another book's exam may have started since.
-                assert exam_texts is not None and exam_start.start_date == t_0
+                if exam_texts is None or exam_start.start_date != t_0:
+                    raise StartRefusedError(
+                        exam_ledger.EXAM_LEDGER_MISMATCH,
+                        f"the exam start's T_0 {exam_start.start_date} is not the window's {t_0}",
+                    )
                 _check_ledger(write_conn, settings, exam_texts, exam_start)
             window_id = append(write_conn, row)
             assert window_id is not None

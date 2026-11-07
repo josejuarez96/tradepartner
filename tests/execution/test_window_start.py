@@ -2723,7 +2723,15 @@ def test_hold_target_names_count_only_under_hold_weighting(
 
 # --- the forward return exam at `paper start` (plan T381a; ADR 0016 #3143, #3146) ----
 
+
+@pytest.fixture(autouse=True)
+def min_exam_fills(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`paper.min_exam_fills` is not in config yet (#3214); these tests stand in 60."""
+    monkeypatch.setattr(window, "_min_exam_fills", lambda _settings, _cadence: 60)
+
+
 EXAM_KEYS = {
+    "paper.min_exam_fills": 60,
     "paper.exam_looks_months": [12, 24, 36],
     "paper.exam_bounds": [4.762, 3.367, 2.75],
     "paper.exam_futility_months": 6,
@@ -3117,3 +3125,71 @@ def test_read_ledger_texts_compares_with_origin_main_and_fails_closed_without_gi
     no_git = window.read_ledger_texts(plain, fetch=False)
     assert no_git.local == _ledger() and no_git.committed is None
     assert window.read_ledger_texts(tmp_path / "nowhere", fetch=False).local is None
+
+
+def test_an_exam_start_is_refused_while_config_has_no_min_exam_fills(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the key (#3214) an exam could only end `failed_void` and would spend a
+    budget slot: refused `exam_config` before any broker call or write."""
+    monkeypatch.undo()
+    assert window._min_exam_fills(journal_settings, "month_end") is None
+    _register_forward(journal_settings, tmp_path)
+    refusal = _refused(journal_settings, fixed_clock, _pending(journal_settings))
+    assert refusal.reason == "exam_config"
+    assert "paper.min_exam_fills" in str(refusal)
+
+
+class _RacingFake(CallCountingFake):
+    """Another exam window is written to the store while `start` reads the broker."""
+
+    def __init__(self, settings: Settings, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.settings = settings
+
+    def account(self) -> Account:
+        if not self.broker_calls:
+            _store_window(self.settings, "racer", started_at=_PAST)
+        return super().account()
+
+
+def test_the_ledger_is_checked_again_under_the_write(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """An exam window that lands between the read chunk and the write (another book's
+    start) makes the store disagree with the ledger: refused, and no row is added."""
+    _register_forward(journal_settings, tmp_path)
+    broker = _RacingFake(
+        journal_settings,
+        clock=fixed_clock,
+        price_of=lambda _s: REFERENCE_PRICE,
+        auto_fill=False,
+        account_id=ACCOUNT_ID,
+    )
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(
+            journal_settings,
+            _connect(journal_settings),
+            broker,
+            fixed_clock,
+            "h1",
+            ledger_texts=_pending(journal_settings),
+        )
+    assert exc.value.reason == "exam_ledger_mismatch"
+    assert "account" in broker.broker_calls
+    assert [row[0] for row in _windows(journal_settings)] == [1]
+    assert [row[1] for row in _windows(journal_settings)] == ["racer"]
+
+
+def test_the_in_sample_skew_refuses_a_missing_month_end(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    _register_forward(journal_settings, tmp_path)
+    with open_for_write(journal_settings) as conn:
+        conn.execute("DELETE FROM trial_equity WHERE session = ?", [date(2020, 6, 30)])
+    refusal = _refused(journal_settings, fixed_clock, _pending(journal_settings))
+    assert refusal.reason == "exam_skew_out_of_range"
+    assert "2020-06-30" in str(refusal)
