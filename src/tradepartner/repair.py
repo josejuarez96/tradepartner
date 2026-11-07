@@ -130,6 +130,7 @@ from tradepartner.store.restamp_precheck import (
     read_instants,
     window_first_session,
 )
+from tradepartner.store.spinoff_splits import SpinoffSplit, spinoff_splits
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 REPAIR = "repair"
@@ -907,6 +908,180 @@ def _delete_identities(
     before = _rows(conn, "corporate_actions")
     conn.execute(
         "DELETE FROM corporate_actions WHERE source = ? AND action_type = 'dividend' "
+        "AND (security_id, source_action_id) IN (SELECT (security_id, source_action_id) "
+        "FROM _retract_ids)",
+        [ACTIONS_SOURCE],
+    )
+    conn.execute("DROP TABLE _retract_ids")
+    return before - _rows(conn, "corporate_actions")
+
+
+# --- #3058: the reviewed delete of split rows that are spin-offs ---
+
+
+@dataclass(frozen=True)
+class SpinoffSplitsRetracted:
+    """What `retract_spinoff_splits` found for the reviewed list and, unless
+    `dry_run`, deleted (`DividendsRetracted`'s shape)."""
+
+    #: The list's entries.
+    entries: int
+    #: Entries whose identity still has rows, none stale.
+    identities: int
+    #: The rows (every revision) those identities hold.
+    action_rows: int
+    #: Entries whose identity has no row at all.
+    already_repaired: int
+    #: One line per stale entry (refuses a real run).
+    stale: tuple[str, ...]
+    #: The distinct ex-dates of the identities found.
+    ex_dates: tuple[date, ...]
+    dry_run: bool
+
+    def summary(self) -> str:
+        """One line for the run row and the terminal."""
+        verb = "would delete" if self.dry_run else "deleted"
+        span = (
+            f" on {len(self.ex_dates)} ex-dates {self.ex_dates[0]}..{self.ex_dates[-1]}"
+            if self.ex_dates
+            else ""
+        )
+        return (
+            f"{verb} {self.action_rows} spin-off split rows of {self.identities} identities"
+            f"{span}; entries {self.entries}, already repaired {self.already_repaired}, "
+            f"stale {len(self.stale)}"
+        )
+
+
+def _spinoff_split_stale(rows: list[tuple[Any, ...]], entry: SpinoffSplit) -> str | None:
+    """Why one entry may not be deleted, or None. `rows` are every row of the
+    identity, oldest first, as `(source, action_type, ex_date,
+    ratio_or_amount, cancelled)`. Every row must be an `ACTIONS_SOURCE`
+    split, and the latest must hold the reviewed ex-date and ratio (exact
+    `DOUBLE` equality): a source that changed the event since the review
+    needs a new review, never a silent delete."""
+    for source, action_type, *_ in rows:
+        if source != ACTIONS_SOURCE or action_type != "split":
+            return f"the identity holds a {source} {action_type} row"
+    _, _, ex_date, ratio, _ = rows[-1]
+    if ex_date != entry.ex_date or ratio != entry.ratio:
+        return (
+            f"the latest row is {ex_date} {ratio!r}, "
+            f"not the reviewed {entry.ex_date} {entry.ratio!r}"
+        )
+    return None
+
+
+def retract_spinoff_splits(
+    settings: Settings,
+    *,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+    expect: int | None = None,
+    release: str | None = None,
+    reviewed: Sequence[SpinoffSplit] | None = None,
+) -> SpinoffSplitsRetracted:
+    """Delete every row of each reviewed spin-off split identity (`reviewed`,
+    default `store.spinoff_splits.spinoff_splits()`): every revision of
+    `(security_id, source_action_id)`, in one transaction, and record the run
+    (#3058); with `dry_run`, count them on a read-only connection and change
+    nothing.
+
+    The rows are deleted, not cancelled: the split never happened, so every
+    read at every `t` must stop applying it, and only a back-dated change does
+    that (a cancel from the clock on, `action-retract`, leaves every past read
+    as it was). That moves the data vintage, so it runs only inside a named
+    data release, like `retract_dividends`. Ingest refuses a listed identity
+    with its reviewed values from then on
+    (`AlpacaPriceSource.corporate_actions`).
+
+    An entry whose identity has no row is `already_repaired`. An entry is
+    stale (`_spinoff_split_stale`) when a row of the identity is not an
+    `ACTIONS_SOURCE` split or the latest row's ex-date or ratio differs from
+    the reviewed one; a dry run lists the stale entries, a real run refuses on
+    any. A real run deletes only the dry run's row count (`expect`) and only
+    inside the open data release `release`; anything else raises
+    `RepairRefused` before anything is deleted. Raises `StoreLockedError` like
+    ingest when the store stays locked."""
+    if not dry_run and expect is None:
+        raise ValueError("a repair deletes only the counts of a dry run: pass expect")
+    if not dry_run and release is None:
+        raise ValueError("a repair writes only inside a named data release: pass release")
+    entries = list(spinoff_splits() if reviewed is None else reviewed)
+    started = ensure_tz_aware_utc(clock(), field_name="clock()")
+    opened: AbstractContextManager[duckdb.DuckDBPyConnection] = (
+        _read(settings) if dry_run else open_for_write(settings)
+    )
+    with opened as conn:
+        if release is not None and not dry_run and (why := release_refusal(conn, release)):
+            raise RepairRefused(f"{why}; nothing deleted")
+        already = rows_found = 0
+        found: list[SpinoffSplit] = []
+        stale: list[str] = []
+        for entry in entries:
+            rows = conn.execute(
+                "SELECT source, action_type, ex_date, ratio_or_amount, cancelled "
+                "FROM corporate_actions WHERE security_id = ? AND source_action_id = ? "
+                "ORDER BY known_at, ingested_at",
+                [entry.security_id, entry.source_action_id],
+            ).fetchall()
+            if not rows:
+                already += 1
+                continue
+            if (why := _spinoff_split_stale(rows, entry)) is not None:
+                stale.append(
+                    f"  {entry.security_id} {entry.ex_date} {entry.ratio!r} "
+                    f"{entry.source_action_id} ({entry.ticker or 'no ticker'}): {why}"
+                )
+                continue
+            found.append(entry)
+            rows_found += len(rows)
+        result = SpinoffSplitsRetracted(
+            entries=len(entries),
+            identities=len(found),
+            action_rows=rows_found,
+            already_repaired=already,
+            stale=tuple(stale),
+            ex_dates=tuple(sorted({e.ex_date for e in found})),
+            dry_run=dry_run,
+        )
+        if not dry_run:
+            if stale:
+                raise RepairRefused(
+                    f"{len(stale)} stale list entries; nothing deleted, re-review them on "
+                    "#3058:\n" + "\n".join(stale)
+                )
+            if result.action_rows != expect:
+                raise RepairRefused(
+                    f"found {result.action_rows} action rows, not the expected {expect}; "
+                    "nothing deleted, run --dry-run again"
+                )
+            deleted = _delete_split_identities(conn, [e.identity for e in found])
+            if deleted != result.action_rows:  # never a partial repair
+                raise RuntimeError(
+                    f"repair deleted {deleted} rows where it counted {result.action_rows}; "
+                    "rolled back"
+                )
+            message = f"{result.summary()}; release {release}"
+            run = SourceRun("alpaca", REPAIRED, 0, "", message)
+            _write_run(conn, uuid.uuid4().hex, started, clock(), run, REPAIR)
+    return result
+
+
+def _delete_split_identities(
+    conn: duckdb.DuckDBPyConnection, identities: Sequence[tuple[str, str]]
+) -> int:
+    """Delete every `ACTIONS_SOURCE` split row whose `(security_id,
+    source_action_id)` is in `identities`; the number deleted."""
+    if not identities:
+        return 0
+    conn.execute(
+        "CREATE OR REPLACE TEMP TABLE _retract_ids (security_id VARCHAR, source_action_id VARCHAR)"
+    )
+    conn.executemany("INSERT INTO _retract_ids VALUES (?, ?)", [list(i) for i in identities])
+    before = _rows(conn, "corporate_actions")
+    conn.execute(
+        "DELETE FROM corporate_actions WHERE source = ? AND action_type = 'split' "
         "AND (security_id, source_action_id) IN (SELECT (security_id, source_action_id) "
         "FROM _retract_ids)",
         [ACTIONS_SOURCE],

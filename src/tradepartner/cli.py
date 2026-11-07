@@ -92,7 +92,15 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   retract identity of every `duplicate` entry of the reviewed list
   (`store/dividend_reviews.csv`) with an ex-date on or before `--to`, counts
   the later ones deferred, and lists every stale entry (a dry run exits 1 on
-  any; a real run refuses).
+  any; a real run refuses). `tradepartner repair-spinoff-splits --release
+  <name> [--dry-run | --expect-action-rows N]` runs
+  `repair.retract_spinoff_splits` (#3058) under the same rules: it deletes
+  every row of each split identity on the reviewed spin-off list
+  (`store/spinoff_splits.csv`), and lists every stale entry. `tradepartner
+  spinoff-backfill --since <date> [--through <date>] --release <name>
+  [--dry-run]` runs `ingest.ingest_spinoff_backfill` (#3058): Alpaca's
+  `spin_offs` asked per symbol, month by month, for the months before
+  `alpaca.actions_backfill_floor` that the symbol-less scan cannot reach.
 - `tradepartner build-form4-roles-manifest --zip-dir DIR --output FILE`
   reads the store and cached insider zips to list rows with the old bulk role
   parse. `repair-form4-roles --manifest FILE --release NAME --expect-rows N
@@ -518,6 +526,7 @@ from tradepartner.ingest import (
     ingest_rates,
     ingest_sec_forms,
     ingest_session,
+    ingest_spinoff_backfill,
     manifest_release,
     rates_seeded,
     read_manifest,
@@ -533,6 +542,7 @@ from tradepartner.repair import (
     repair_rename_listings,
     repair_resolution,
     retract_dividends,
+    retract_spinoff_splits,
     store_resolver,
 )
 from tradepartner.repair_form4_multi_owner import (
@@ -3341,6 +3351,96 @@ def make_app(
             raise _fail(
                 f"{len(result.stale)} stale list entries: re-review them before a real run", 1
             )
+
+    @app.command("repair-spinoff-splits")
+    def repair_spinoff_splits(
+        release: Annotated[str, typer.Option(help="the open data release (checked on a real run)")],
+        dry_run: Annotated[
+            bool, typer.Option(help="count what would be deleted and change nothing")
+        ] = False,
+        expect_action_rows: Annotated[
+            int | None, typer.Option(help="the dry run's action row count (required to delete)")
+        ] = None,
+    ) -> None:
+        """Delete the reviewed list's split rows that are spin-offs (#3058)."""
+        expect: int | None = None
+        if not dry_run:
+            if expect_action_rows is None:
+                raise _fail(
+                    "run --dry-run first, then pass its count as --expect-action-rows",
+                    USAGE_ERROR,
+                )
+            if _blank_text(release):
+                raise _fail(
+                    "a repair writes only inside a data release: pass --release <name>",
+                    USAGE_ERROR,
+                )
+            expect = expect_action_rows
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            result = retract_spinoff_splits(
+                s, clock=clock, dry_run=dry_run, expect=expect, release=release
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except RepairRefused as exc:
+            raise _fail(f"repair refused: {exc}", 1) from None
+        except ValueError as exc:
+            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+        typer.echo(result.summary())
+        for line in result.stale:
+            typer.echo(line)
+        if result.stale:
+            raise _fail(
+                f"{len(result.stale)} stale list entries: re-review them before a real run", 1
+            )
+
+    @app.command("spinoff-backfill")
+    def spinoff_backfill(
+        since: Annotated[str, typer.Option(help="first month's day, YYYY-MM-DD")],
+        release: Annotated[
+            str | None, typer.Option(help="the open data release (required to write)")
+        ] = None,
+        through: Annotated[
+            str | None,
+            typer.Option(help="last day, YYYY-MM-DD (default: the day before the floor)"),
+        ] = None,
+        dry_run: Annotated[
+            bool, typer.Option(help="fetch and count each month, write nothing")
+        ] = False,
+    ) -> None:
+        """Ask Alpaca for spin-offs per symbol before the actions floor (#3058)."""
+        start = _parse_day("--since", since)
+        last = _parse_day("--through", through)
+        assert start is not None
+        if not dry_run and _blank_text(release):
+            raise _fail(
+                "a spin-off backfill writes only inside a data release: pass --release <name>",
+                USAGE_ERROR,
+            )
+        s = _writer_settings(settings())
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        if (refusal := ingest_floor_refusal(s)) is not None:
+            raise _fail(refusal, 1)
+        if secrets := _missing_secrets(s, "alpaca"):
+            raise _fail(
+                f"missing required secret(s): {', '.join(secrets)}. "
+                "Set them in .env (see .env.example).",
+                USAGE_ERROR,
+            )
+        try:
+            result = ingest_spinoff_backfill(
+                s, since=start, through=last, release=release, clock=clock, dry_run=dry_run
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except (TypeError, ValueError) as exc:
+            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+        _print_result(result)
+        raise typer.Exit(result.exit_code)
 
     @app.command("repair-rename-listings")
     def repair_rename_listings_cmd(

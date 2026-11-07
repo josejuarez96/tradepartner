@@ -50,7 +50,9 @@ calling a writer; an open one in the same process makes the write fail at once.
   peak resets to. It is the only gate in code before a `released` row, so it
   checks, in one transaction, that: the window is open; the reconciliation is
   this window's latest and `ok`, and not older than the resume; the resume is
-  the latest `resume_invocations` row and no `released` row cites it yet; no
+  the window's book's latest `resume_invocations` row (a row with no book,
+  written before schema 47, counts for every book; a resume of another book
+  refuses, #3030) and no `released` row cites it yet; no
   run of the window is unfinished; no `engaged` row of the window was
   written after the resume (its `event_id` above the caller's
   `seen_event_id`: an engagement the owner did not see when resuming needs a
@@ -363,8 +365,17 @@ def release(
         resume = next((r for r in resumes if r.resume_id == resume_id), None)
         if resume is None:
             raise ReleaseRefused(f"no resume_invocations row {resume_id}")
-        if resume_id != max(r.resume_id or 0 for r in resumes):
-            raise ReleaseRefused(f"resume {resume_id} is not the latest resume")
+        # The latest resume of the window's own book (#3030): run locks are per
+        # book, so another book's resume may journal its row before this release.
+        # A row with no book (written before schema 47) counts for every book.
+        if resume.book_id is not None and resume.book_id != window.book_id:
+            raise ReleaseRefused(
+                f"resume {resume_id} is book {resume.book_id!r}'s, not window {window_id}'s "
+                f"book {window.book_id!r}"
+            )
+        own = [r for r in resumes if r.book_id is None or r.book_id == window.book_id]
+        if resume_id != max(r.resume_id or 0 for r in own):
+            raise ReleaseRefused(f"resume {resume_id} is not the latest resume of its book")
         # Resumes carry no window, so a release in any window consumes one.
         cited = conn.execute(
             "SELECT window_id FROM kill_switch WHERE state = ? AND resume_id = ? LIMIT 1",
