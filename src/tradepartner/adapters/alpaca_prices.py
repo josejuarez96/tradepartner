@@ -370,9 +370,11 @@ from tradepartner.adapters.prices import (
 )
 from tradepartner.calendar import is_session, next_session, previous_session
 from tradepartner.config import AlpacaConfig, Settings, get_settings
+from tradepartner.store import spinoff_splits as spinoff_split_list
 from tradepartner.store.classify import EQUITY, listing_kind
 from tradepartner.store.delistings import DELISTED
 from tradepartner.store.dividend_reviews import DUPLICATE, ReviewedGroup, reviewed_groups
+from tradepartner.store.spinoff_splits import SpinoffSplit
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import SHARES_FACT
 
@@ -615,7 +617,13 @@ class RegistrantEvidence:
     (#847) Each such listing's last bar before its security's next row,
     keyed `(security_id, valid_from, ticker)`, and how many sessions
     without a bar before that next row mean the line had stopped trading
-    (`master.transfer_window_sessions`; `None`: never judged)."""
+    (`master.transfer_window_sessions`; `None`: never judged). (#3056)
+    Each such listing's Form 25 filing day (New York), keyed like
+    `last_bars`, and per `(security_id, filing day)` the security's last
+    traded bar on or before that day (`filed_bars`, from bars known at the
+    run): a line with no bar for more than the window before its Form 25
+    was filed had stopped trading there, and its span ends the session
+    after that bar instead of on the effective day."""
 
     last_filed: Mapping[str, date]
     share_counts: Mapping[str, frozenset[tuple[date, float]]]
@@ -627,6 +635,30 @@ class RegistrantEvidence:
     )
     last_bars: Mapping[tuple[str, date, str], date] = field(default_factory=dict)
     stop_after_sessions: int | None = None
+    filed_on: Mapping[tuple[str, date, str], date] = field(default_factory=dict)
+    filed_bars: Mapping[tuple[str, date], date] = field(default_factory=dict)
+
+    def stopped_at(self, security_id: str, valid_from: date, ticker: str) -> date | None:
+        """The session after the last bar of the delisted listing
+        `(security_id, valid_from, ticker)` when its line had stopped
+        trading before its Form 25 was filed (#3056): more than
+        `stop_after_sessions` sessions lie strictly between that bar and the
+        session after the filing day (the filing day counted when a session),
+        so no bar sat within the window before the filing. Post-bankruptcy
+        equity first printing under the old ticker before the old Form 25
+        takes effect (WW, 2025-07-07, effective 07-13; the old line's last
+        print 05-15) is then no one's (rule 7). `None` without a filing
+        day, a bar or a window, or when the line traded within the window."""
+        filed = self.filed_on.get((security_id, valid_from, ticker))
+        if filed is None or self.stop_after_sessions is None:
+            return None
+        last_bar = self.filed_bars.get((security_id, filed))
+        if last_bar is None or last_bar < valid_from:
+            return None
+        window = self.stop_after_sessions
+        if _sessions_between(last_bar, next_session(filed), window + 1) <= window:
+            return None
+        return next_session(last_bar)
 
     def stopped_before(
         self, security_id: str, valid_from: date, ticker: str, row: date, effective: date
@@ -681,6 +713,7 @@ def registrant_evidence(
     quiet_after_days: int,
     transfer_window_sessions: int,
     class_symbols: Mapping[str, str] | None = None,
+    filed_bars: Mapping[tuple[str, date], date] | None = None,
 ) -> RegistrantEvidence:
     """`RegistrantEvidence` from `facts` rows (`shares_outstanding` only;
     the UTC day of `known_at` is the filing day) and `listing_ends` rows
@@ -690,7 +723,9 @@ def registrant_evidence(
     day after the Form 25's acceptance (`delisting_filed_at`, when given),
     with the listing's `valid_from` and ticker; a transfer is not
     leaving), with each such listing's `end_session` as its last bar and
-    `transfer_window_sessions` as the stop window (#847)."""
+    `transfer_window_sessions` as the stop window (#847); `filed_bars`
+    (#3056, `repair.filed_bars`) maps `(security_id, Form 25 New York
+    filing day)` to the security's last traded bar on or before it."""
     last: dict[str, date] = {}
     counts: dict[str, set[tuple[date, float]]] = defaultdict(set)
     for row in facts:
@@ -703,6 +738,7 @@ def registrant_evidence(
     delisted: dict[str, set[date]] = defaultdict(set)
     ended: dict[str, set[tuple[date, str, date]]] = defaultdict(set)
     last_bars: dict[tuple[str, date, str], date] = {}
+    filed_on: dict[tuple[str, date, str], date] = {}
     for row in listing_ends:
         if (
             row["status"] != DELISTED
@@ -723,6 +759,11 @@ def registrant_evidence(
             ended[str(row["security_id"])].add((row["valid_from"], keyed, day))
             if row["end_session"] is not None:
                 last_bars[(str(row["security_id"]), row["valid_from"], keyed)] = row["end_session"]
+            if accepted is not None:
+                filed_at = ensure_tz_aware_utc(accepted, field_name="delisting_filed_at")
+                filed_on[(str(row["security_id"]), row["valid_from"], keyed)] = filed_at.astimezone(
+                    _NEW_YORK
+                ).date()
     return RegistrantEvidence(
         last_filed=last,
         share_counts={company: frozenset(rows) for company, rows in counts.items()},
@@ -732,6 +773,8 @@ def registrant_evidence(
         delisted_listings={sid: tuple(sorted(rows)) for sid, rows in ended.items()},
         last_bars=last_bars,
         stop_after_sessions=transfer_window_sessions,
+        filed_on=filed_on,
+        filed_bars=dict(filed_bars or {}),
     )
 
 
@@ -985,6 +1028,13 @@ class ListingResolver:
         # superseded (started before it), never a later one.
         self._vacated: dict[str, list[TickerSpan]] = defaultdict(list)
         cut: set[TickerSpan] = set()  # spans ended at their own delisting
+        # #3056: per ticker, `(successor id, row day)` of every repair
+        # successor's row (`<cik>@<date>`), for rule 7's stopped-before-filing cut.
+        self._successor_rows: dict[str, list[tuple[str, date]]] = defaultdict(list)
+        for sid, rows_of in by_security.items():
+            if _SUCCESSOR_ID.fullmatch(sid):
+                for row_of in rows_of:
+                    self._successor_rows[row_of.ticker].append((sid, row_of.day))
         placeholder_spans: set[TickerSpan] = set()
         placeholder = same_day_listings = same_day_typos = kept_spans = unreadable = 0
         stopped_spans = accepted_spans = 0
@@ -1617,8 +1667,24 @@ class ListingResolver:
                 return False
             return True
 
+        def stopped_day(valid_from: date, listed: str, day: date) -> date:
+            # #3056: a line that stopped before its Form 25 was filed ends
+            # the session after its last bar, never before the span starts,
+            # but only when a successor of its company lists the ticker
+            # later (the prints after the gap are the new equity's): a
+            # halted line's own last prints stay on it.
+            stop = evidence.stopped_at(security_id, valid_from, listed)
+            if stop is None or not any(
+                later > stop and _succeeds(other, security_id)
+                for other, later in self._successor_rows.get(ticker, ())
+            ):
+                return day
+            return max(min(day, stop), next_session(start))
+
         inside = [
-            (day, ends(valid_from, listed, day), valid_from < last)
+            (stopped_day(valid_from, listed, day), True, valid_from < last)
+            if ends(valid_from, listed, day)
+            else (day, False, valid_from < last)
             for valid_from, listed, day in evidence.delisted_listings.get(security_id, ())
             if (listed == ticker or (valid_from, listed) in aliases)
             and start <= valid_from
@@ -2284,6 +2350,20 @@ class ActionsParse:
     #: the id `repair.retract_dividends` deleted), refused so a backfill never
     #: re-inserts them; counted on the run message.
     reviewed_duplicates_refused: int = 0
+    #: #3058: `(parent security, ex_date)` of every `spin_offs` row read whose
+    #: parent resolved, its child resolved or not: the days a split row of
+    #: that parent is the spin-off's echo, not a split.
+    spinoff_parents: tuple[tuple[str, date], ...] = ()
+    #: #3058: split rows refused as the echo of their security's spin-off on
+    #: the same ex-date (`AlpacaPriceSource.corporate_actions`), each named
+    #: "security_id ex_date ratio" on the run message for review: a real split
+    #: refused this way leaves an unexplained price jump (`price_jumps`), never
+    #: a silent one.
+    spinoff_echo_splits_refused: tuple[str, ...] = ()
+    #: #3058: split rows on the reviewed spin-off list (`store.spinoff_splits`,
+    #: the identity `repair.retract_spinoff_splits` deleted), refused so a
+    #: backfill never re-inserts them.
+    reviewed_spinoff_splits_refused: int = 0
 
 
 #: Alpaca's merger categories and the `Merger.kind` of each (spec "Mergers").
@@ -2504,6 +2584,8 @@ def parse_corporate_actions(
     A `spin_offs` row's child is resolved under `regular_way_symbol(new_symbol)`
     on its ex-date, so a when-issued `MSGR.WI` is the master's `MSGR` (#2112);
     with no such listing that session it is unresolved under Alpaca's symbol.
+    The resolved parent and ex-date of every `spin_offs` row read, its child
+    resolved or not, are returned in `spinoff_parents` (#3058).
 
     Several `spin_offs` rows of one identity (child, parent) are revisions
     of one record (#1673; spec "Spin-offs": a second distribution from the
@@ -2525,6 +2607,7 @@ def parse_corporate_actions(
     # (child, parent) -> known_at -> record: each distinct distribution of a
     # spin-off identity (#1673); a stamp with two differing rows is unordered.
     spins: dict[tuple[str, str], dict[datetime, CorporateAction]] = defaultdict(dict)
+    spin_parents: set[tuple[str, date]] = set()  # #3058: (parent, ex_date)
     unordered: dict[tuple[str, str], str] = {}
     reused_symbols: list[str] = []
 
@@ -2656,6 +2739,8 @@ def parse_corporate_actions(
                     child = holder(regular_way_symbol(row["new_symbol"]), ex_date)
                     if parent is None:
                         unresolved.append((row["source_symbol"], ex_date))
+                    else:
+                        spin_parents.add((parent, ex_date))
                     if child is None:
                         unresolved.append((row["new_symbol"], ex_date))
                     if parent is None or child is None:
@@ -2790,6 +2875,7 @@ def parse_corporate_actions(
         tuple(stock_refused),
         spinoff_revisions=spinoff_revisions,
         spinoff_unordered=tuple(sorted(unordered.values())),
+        spinoff_parents=tuple(sorted(spin_parents)),
         mergers=merged["mergers"],
         merger_rows_refused=merged["refused"],
         merger_conflict=merged["conflict"],
@@ -2936,7 +3022,8 @@ class AlpacaPriceSource(PriceSource):
     for ingest to count or refuse. `fetch_bars` and
     `fetch_actions` default to `alpaca_raw` (network, owner's keys); tests
     pass recorded payloads. Construction loads the packaged
-    `dividend_reviews.csv` and raises `ReviewsError` if it is malformed.
+    `dividend_reviews.csv` and `spinoff_splits.csv` and raises `ReviewsError`
+    or `SpinoffSplitsError` if one is malformed.
     """
 
     def __init__(
@@ -2950,8 +3037,15 @@ class AlpacaPriceSource(PriceSource):
         settings: Settings | None = None,
         fill_handovers: bool = False,
         reviewed: Sequence[ReviewedGroup] | None = None,
+        spinoff_splits: Sequence[SpinoffSplit] | None = None,
     ) -> None:
         self._resolver = resolver
+        # #3058: a split row reviewed as a spin-off (the repair deleted it) is
+        # never stored again; the packaged list unless a test hands its own.
+        listed = spinoff_split_list.spinoff_splits() if spinoff_splits is None else spinoff_splits
+        self._spinoff_splits: dict[tuple[str, str], tuple[date, float]] = {
+            row.identity: (row.ex_date, row.ratio) for row in listed
+        }
         # #2957: a reviewed duplicate dividend repair deleted is never stored
         # again; the list is the packaged one unless a test hands its own.
         self._retracted: dict[tuple[str, str], tuple[date, float]] = dict(
@@ -3214,6 +3308,16 @@ class AlpacaPriceSource(PriceSource):
                     f"; {self.last_actions_report.reviewed_duplicates_refused} reviewed "
                     "duplicate dividend(s) refused"
                 )
+            if echoes := self.last_actions_report.spinoff_echo_splits_refused:
+                line += (
+                    f"; {len(echoes)} split row(s) refused as the parent's same-day "
+                    f"spin-off: {', '.join(echoes)}"
+                )
+            if self.last_actions_report.reviewed_spinoff_splits_refused:
+                line += (
+                    f"; {self.last_actions_report.reviewed_spinoff_splits_refused} reviewed "
+                    "spin-off split row(s) refused"
+                )
             if self.last_actions_report.stock_rows_unusable:
                 line += (
                     f"; {self.last_actions_report.stock_rows_unusable} "
@@ -3319,6 +3423,7 @@ class AlpacaPriceSource(PriceSource):
                         )
                     ),
                     unresolved=parsed.unresolved + spins.unresolved,
+                    spinoff_parents=spins.spinoff_parents,
                     self_spinoff=spins.self_spinoff,
                     spinoff_revisions=spins.spinoff_revisions,
                     spinoff_unordered=spins.spinoff_unordered,
@@ -3330,6 +3435,12 @@ class AlpacaPriceSource(PriceSource):
         kept: list[CorporateAction] = []
         unrequested = 0
         reviewed_refused = 0
+        # #3058: a spin-off is not a split. A split row of a security on the
+        # ex-date of its own spin-off in this answer is that spin-off's echo;
+        # a reviewed identity with its reviewed values is one judged so.
+        spin_parents = set(parsed.spinoff_parents)
+        echo_refused: list[str] = []
+        reviewed_spin_refused = 0
         # The reviewed key uses exact stored DOUBLE amounts, as in
         # equal_amount_groups. Another retract id cannot stand in for a kept id.
         kept_paid = {
@@ -3357,12 +3468,22 @@ class AlpacaPriceSource(PriceSource):
                     and (a.security_id, a.ex_date, a.ratio_or_amount) in kept_paid
                 ):
                     reviewed_refused += 1  # #2957: reviewed as a duplicate, repair deleted it
+                elif a.action_type is ActionType.SPLIT and (a.security_id, a.ex_date) in (
+                    spin_parents
+                ):
+                    echo_refused.append(f"{a.security_id} {a.ex_date} {a.ratio_or_amount!r}")
+                elif a.action_type is ActionType.SPLIT and self._spinoff_splits.get(
+                    (a.security_id, a.source_action_id or "")
+                ) == (a.ex_date, a.ratio_or_amount):
+                    reviewed_spin_refused += 1
                 else:
                     kept.append(a)
         self.last_actions_report = replace(
             parsed,
             spinoffs_unrequested=unrequested,
             reviewed_duplicates_refused=reviewed_refused,
+            spinoff_echo_splits_refused=tuple(echo_refused),
+            reviewed_spinoff_splits_refused=reviewed_spin_refused,
         )
         return kept
 

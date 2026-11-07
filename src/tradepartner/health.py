@@ -65,6 +65,16 @@ here is this module's and is stated once:
   effective date). Report-only, like `delisted_names`: no rule reads it,
   `health --check` does not fail on it, and it has no grace period, so a
   genuine relisting whose first bars are not in yet shows until they are.
+- **Spliced series** (`spliced_series`, #3056): each security's consecutive
+  traded bars known at `t` (latest revision, volume above zero) with more
+  than `master.transfer_window_sessions` XNYS sessions strictly between
+  them and a close ratio above `health.splice_max_price_ratio` or below
+  its inverse: another equity's prints chained onto the id at a ticker or
+  chain hand-over (post-bankruptcy equity on the old company's series:
+  GPOR, CBL, WW). One row per gap, raw ids (never re-keyed by a chain).
+  Report-only, like `listed_without_bars`: `health --check` does not fail
+  on it; `repair-resolution` removes the ones the resolver no longer
+  assigns, and the rest (no Form 25 to end the old line) are listed here.
 - **Price jumps** (`price_jumps`): the owner's review list (#787),
   `store.asof.price_jumps_as_of` at `t` over every security: each one-day
   close move between traded bars outside the `universe` jump bounds that no
@@ -860,6 +870,77 @@ class ListedWithoutBars:
     def count(self) -> int:
         """How many securities are listed with no bars after a Form 25."""
         return self.frame.height
+
+
+@dataclass(frozen=True, eq=False)
+class SplicedSeries:
+    """Bar gaps with a close jump on one security at `t` (#3056; module
+    docstring), one row per gap."""
+
+    frame: pl.DataFrame
+
+    @property
+    def count(self) -> int:
+        """How many gaps look spliced."""
+        return self.frame.height
+
+
+_SPLICED_SCHEMA: dict[str, Any] = {
+    "security_id": pl.String,
+    "prev_session": pl.Date,
+    "session": pl.Date,
+    "prev_close": pl.Float64,
+    "close": pl.Float64,
+    "ratio": pl.Float64,
+    "gap_sessions": pl.Int64,
+}
+
+
+def spliced_series(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings
+) -> SplicedSeries:
+    """The `spliced_series` block at `t` (#3056; module docstring): only
+    bars known at `t` are read, so a later bar never adds a gap to an
+    earlier report. A bare date raises `TypeError`, a naive datetime
+    `ValueError`."""
+    t = _validate_t(t)
+    window = settings.master.transfer_window_sessions
+    maximum = settings.health.splice_max_price_ratio
+    sessions = pl.DataFrame(
+        {"session": list(all_sessions())}, schema={"session": pl.Date}
+    ).with_row_index("idx")
+    conn.register("_splice_sessions", sessions)
+    try:
+        frame = conn.execute(
+            """
+            WITH latest AS (
+                SELECT security_id, session, close, volume, ROW_NUMBER() OVER (
+                    PARTITION BY security_id, session ORDER BY known_at DESC
+                ) AS _rn
+                FROM prices_daily WHERE known_at <= ?
+            ), traded AS (
+                SELECT l.security_id, l.session, l.close, CAST(s.idx AS BIGINT) AS idx
+                FROM latest l JOIN _splice_sessions s ON s.session = l.session
+                WHERE l._rn = 1 AND l.volume > 0 AND l.close > 0
+            ), paired AS (
+                SELECT security_id, session, close, idx,
+                    LAG(session) OVER w AS prev_session,
+                    LAG(close) OVER w AS prev_close,
+                    LAG(idx) OVER w AS prev_idx
+                FROM traded WINDOW w AS (PARTITION BY security_id ORDER BY session)
+            )
+            SELECT security_id, prev_session, session, prev_close, close,
+                close / prev_close AS ratio, idx - prev_idx - 1 AS gap_sessions
+            FROM paired
+            WHERE prev_idx IS NOT NULL AND idx - prev_idx - 1 > ?
+                AND (close / prev_close > ? OR close / prev_close < ?)
+            ORDER BY security_id, session
+            """,
+            [t, window, maximum, 1 / maximum],
+        ).pl()
+    finally:
+        conn.unregister("_splice_sessions")
+    return SplicedSeries(frame=pl.DataFrame(frame.rows(), schema=_SPLICED_SCHEMA, orient="row"))
 
 
 @dataclass(frozen=True, eq=False)
@@ -2020,6 +2101,10 @@ class HealthReport:
     form4_compare: Form4Compare | None = None
     #: The shares cap-jump review list (#3055).
     shares_cap_jumps: SharesCapJumps = field(default_factory=SharesCapJumps)
+    #: Bar gaps with a close jump on one id (#3056); report-only.
+    spliced: SplicedSeries = field(
+        default_factory=lambda: SplicedSeries(pl.DataFrame([], schema=_SPLICED_SCHEMA))
+    )
 
     @property
     def failures(self) -> tuple[str, ...]:
@@ -2163,6 +2248,7 @@ def health_report(
         delisted=_delisted_names(current),
         listed_without_bars=_listed_without_bars(conn, t, session, listings, current),
         price_jumps=_price_jumps(conn, t, settings, jumps_before),
+        spliced=spliced_series(conn, t, settings),
         shares_outliers=_shares_outliers(conn, t, settings, jumps_before),
         shares_cap_jumps=_shares_cap_jumps(conn, t, settings, jumps_before),
         accepted_same_day_pairs=AcceptedSameDayPairs(accepted_pairs),

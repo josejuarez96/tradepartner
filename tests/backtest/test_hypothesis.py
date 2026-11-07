@@ -663,6 +663,7 @@ def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path:
             "adjust.apply_spin_offs",
             "strategy.hold_top_fraction",
             "backtest.delisting_failure_return",
+            "universe.shares_split_dating",
             "portfolio.",
             "costs.borrow",
         ),
@@ -1353,6 +1354,7 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
         "adjust.apply_spin_offs",
         "strategy.hold_top_fraction",
         "backtest.delisting_failure_return",
+        "universe.shares_split_dating",
         "portfolio.side",
         "portfolio.gross_exposure",
         "portfolio.net_exposure",
@@ -1737,6 +1739,7 @@ def test_h1s_unchanged_file_registered_before_the_terms_writes_nothing(
         "adjust.apply_spin_offs",
         "strategy.hold_top_fraction",
         "backtest.delisting_failure_return",
+        "universe.shares_split_dating",
     }
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     stored = registry.register_hypothesis(

@@ -322,6 +322,13 @@ class HealthConfig(_ClosedConfig):
     # before it when it is the latest, is listed. Report only.
     shares_cap_jump_ratio: float = Field(default=2.0, gt=1, allow_inf_nan=False)
     shares_cap_close_days: int = Field(default=10, ge=0)
+    # #3056: the close ratio across a bar gap of more than
+    # `master.transfer_window_sessions` sessions on one security above which
+    # `health` lists it in `spliced_series` (the ratio or its inverse). A
+    # post-bankruptcy equity spliced onto the old company's id jumps ~100x
+    # across the months it was off the exchange (GPOR, CBL, WW); 5, so a
+    # five-fold move across a gap is reviewed. Report-only, never frozen.
+    splice_max_price_ratio: float = Field(default=5.0, gt=1, allow_inf_nan=False)
 
 
 class BorrowConfig(_ClosedConfig):
