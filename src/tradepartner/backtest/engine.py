@@ -666,7 +666,7 @@ class _ExitContext:
 
     `read_time` is the step's read (the deciding read of every exit it books) and
     `listings` its ended listings (`_ended_listings`). Under a policy other than `none`,
-    `terms` are the version's frozen terms and `reasons` / `mergers` the rows of
+    `terms` are the version's frozen terms and `reasons` / `merger_rows` the rows of
     `DataProvider.delisting_reasons` / `merger_exits`, read at the run's data cutoff
     (`known_at <= cutoff`, owner 2026-10-31), keyed by security; under `none` `terms` is
     None and the exit is the last-close one, untouched."""
@@ -676,7 +676,7 @@ class _ExitContext:
     policy: str = "none"
     terms: DelistingPolicy | None = None
     reasons: Mapping[str, Sequence[Mapping[str, object]]] = field(default_factory=dict)
-    mergers: Mapping[str, Sequence[Mapping[str, object]]] = field(default_factory=dict)
+    merger_rows: Mapping[str, Sequence[Mapping[str, object]]] = field(default_factory=dict)
 
 
 def _window_end(first: date, sessions: int) -> date:
@@ -723,7 +723,7 @@ def _policy_value(
         if final is None
         else [
             row
-            for row in context.mergers.get(sid, ())
+            for row in context.merger_rows.get(sid, ())
             if final
             <= cast(date, row["effective_date"])
             <= _window_end(final, terms.merger_window_sessions)
@@ -2006,7 +2006,7 @@ class _Variant:
     cutoff: datetime | None = None
     evidence_ids: set[str] = field(default_factory=set)
     reasons: dict[str, list[dict[str, object]]] = field(default_factory=dict)
-    mergers: dict[str, list[dict[str, object]]] = field(default_factory=dict)
+    merger_rows: dict[str, list[dict[str, object]]] = field(default_factory=dict)
 
     @property
     def trial_id(self) -> int:
@@ -2572,7 +2572,7 @@ def _exit_context(
     if new:
         for target, frame in (
             (variant.reasons, view.delisting_reasons(cutoff, new)),
-            (variant.mergers, view.merger_exits(cutoff, new)),
+            (variant.merger_rows, view.merger_exits(cutoff, new)),
         ):
             for row in frame.iter_rows(named=True):
                 target.setdefault(row["security_id"], []).append(row)
@@ -2583,5 +2583,5 @@ def _exit_context(
         policy=policy,
         terms=DELISTING_POLICIES[policy],
         reasons=variant.reasons,
-        mergers=variant.mergers,
+        merger_rows=variant.merger_rows,
     )
