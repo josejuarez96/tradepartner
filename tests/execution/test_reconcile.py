@@ -1514,6 +1514,26 @@ def test_a_non_finite_filled_quantity_is_a_bad_reading(journaled: float, bad: fl
     assert result.lagging_ids == ()
 
 
+@pytest.mark.parametrize(
+    ("journaled", "bad"),
+    [(10.0, float("nan")), (10.0, float("inf")), (10.0, float("-inf")), (0.0, float("nan"))],
+)
+def test_a_non_finite_filled_avg_price_is_a_bad_reading(journaled: float, bad: float) -> None:
+    """#3169: `Order` refuses a non-finite `filled_avg_price`, but a reading that
+    slips past it must be `bad_reading` even when every share is journaled (no
+    lag to bound), since collect withholds its terminal event."""
+    item = _excess_sell(journaled, OrderStatus.FILLED, 10.0)
+    assert item.reading is not None
+    object.__setattr__(item.reading, "filled_avg_price", bad)  # bypass Order's validator
+    result = _run(_ledger(1_500.0, SEC_A=0.0), {}, 1_500.0, journal_open=[item])
+
+    assert result.status == "mismatch"
+    (mismatch,) = [m for m in result.mismatches if m.kind == "bad_reading"]
+    assert mismatch.client_order_id == "tp-20261007-SEC_A-sell-1"
+    assert "filled_avg_price" in mismatch.detail and "not a finite" in mismatch.detail
+    assert result.lagging_ids == ()
+
+
 def test_a_credited_dividend_while_a_buy_lags_is_allowed_and_deferred() -> None:
     """#399: the broker filled 5 (journal 2) and credited $4.50 on SEC_B."""
     result = _run(
