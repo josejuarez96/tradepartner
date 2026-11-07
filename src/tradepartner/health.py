@@ -531,6 +531,7 @@ from tradepartner.store.schema import (
     TABLE_PROVENANCE_VALUES,
     has_retracted,
 )
+from tradepartner.store.successor_reviews import reviewed_chains
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import (
     SHARES_CAP_JUMP_SCHEMA,
@@ -626,6 +627,7 @@ FIGI_TYPES_DISAGREEMENTS = "figi_types_disagreements"
 #: successor listing under the predecessor's ticker, and no predecessor bar
 #: after the hand-over.
 CHAIN_IDS_DISTINCT_CIKS = "chain_ids_distinct_ciks"
+CHAIN_NOT_REVIEWED = "chain_not_reviewed"
 CHAIN_KNOWN_AT_LE_INGESTED_AT = "chain_known_at_le_ingested_at"
 CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS = "chain_known_at_ge_successor_rows"
 CHAIN_SUCCESSOR_LISTED_UNDER_PREDECESSOR_TICKER = "chain_successor_listed_under_predecessor_ticker"
@@ -679,6 +681,7 @@ INTEGRITY_RULES: tuple[str, ...] = (
     MERGER_UNIQUE,
     DUPLICATE_DIVIDENDS,
     BORROW_STATUS_UNIQUE,
+    CHAIN_NOT_REVIEWED,
     CHAIN_IDS_DISTINCT_CIKS,
     CHAIN_KNOWN_AT_LE_INGESTED_AT,
     CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS,
@@ -3405,9 +3408,43 @@ def _integrity_checks(
         **_merger_rules(conn),
         DUPLICATE_DIVIDENDS: dividends.violations,
         BORROW_STATUS_UNIQUE: _borrow_duplicates(conn),
+        CHAIN_NOT_REVIEWED: _unreviewed_chains(conn),
         **_chain_rule_rows(conn, t),
     }
     return tuple(IntegrityCheck(rule=rule, violations=violations[rule]) for rule in INTEGRITY_RULES)
+
+
+def _unreviewed_chains(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
+    """Every stored chain without a matching reviewed predecessor, successor and session."""
+    reviewed = reviewed_chains()
+    if "successor_chains" not in _present_tables(conn):
+        return pl.DataFrame(
+            [
+                {
+                    "predecessor_id": "<missing table>",
+                    "successor_id": "",
+                    "known_at": None,
+                    "detail": "successor_chains table is required; #3097 #3108 #3142",
+                }
+            ],
+            schema=_CHAIN_RULE_SCHEMA,
+        )
+    rows = conn.execute(
+        "SELECT c.predecessor_id, c.successor_id, c.known_at, "
+        "(SELECT min(l.valid_from) FROM listings l WHERE l.security_id = c.successor_id) "
+        "FROM successor_chains c ORDER BY c.predecessor_id, c.successor_id, c.known_at"
+    ).fetchall()
+    violations = [
+        {
+            "predecessor_id": predecessor,
+            "successor_id": successor,
+            "known_at": known_at,
+            "detail": f"effective_session {session}; review #3097 #3108 #3142",
+        }
+        for predecessor, successor, known_at, session in rows
+        if (predecessor, successor, session) not in reviewed
+    ]
+    return pl.DataFrame(violations, schema=_CHAIN_RULE_SCHEMA)
 
 
 _RATE_RULE_SCHEMA: dict[str, Any] = {
