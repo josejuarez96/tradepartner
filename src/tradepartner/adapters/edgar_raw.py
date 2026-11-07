@@ -149,11 +149,16 @@ class _RateLimiter:
         self._lock = threading.Lock()
 
     def wait(self, min_interval_seconds: float) -> None:
+        """Sleep off what is left of `min_interval_seconds` since the last
+        call, never more than one interval: a stamp ahead of the clock
+        (a clock that stepped back, or another caller's fake) waits one full
+        interval, not the gap to the stamp (#3039: that gap, slept under the
+        lock, hung every thread behind it)."""
         with self._lock:
             now = time.monotonic()
             if self._last_request_monotonic is not None:
                 elapsed = now - self._last_request_monotonic
-                remaining = min_interval_seconds - elapsed
+                remaining = min(min_interval_seconds - elapsed, min_interval_seconds)
                 if remaining > 0:
                     time.sleep(remaining)
             self._last_request_monotonic = time.monotonic()
