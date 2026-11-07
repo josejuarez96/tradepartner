@@ -81,17 +81,13 @@ path's read, `paper resume`'s settlement). In order:
    rejections again; without a verdict the back-fill's error propagates as is.
 
 5. **The fill-price band** (#1981; with `price_band` given, a run's collectors), after
-   the collection has committed, in two tiers (#3130). Each fill this call journaled is
-   compared with its order's reference price (the split-adjusted close of S-1, moved
-   back to the order's session for a late fill; judged on one side only across a
-   spin-off ex-date of the filled name, #2112). A fill outside
-   [reference / `paper.max_fill_price_ratio`, reference x that ratio] (a unit error or
-   bad print: 10x, 0.01x), or with a non-finite or non-positive price, raises
-   `SystemFaultError` naming `fill_price_outside_band` (a rejection verdict of the call
-   is named in the message), so the caller halts. A fill inside that but further than
-   `paper.max_fill_price_deviation` from the reference is a real overnight gap (Audit C:
-   about 8.6e-4 per name-session at 25%): it is returned on `Collected.gaps`, a
-   `fill_price_gap` note, and never halts. The journal and the broker agree on a bad fill, so no
+   the collection has committed: every fill this call journaled must sit within
+   `paper.max_fill_price_deviation` of its order's reference price (the split-adjusted
+   close of S-1, moved back to the order's session for a late fill; judged on one side
+   only across a spin-off ex-date of the filled name, #2112). A fill outside it,
+   raises `SystemFaultError` naming
+   `fill_price_outside_band` (a rejection verdict of the call is named in the message),
+   so the caller halts. The journal and the broker agree on a bad fill, so no
    reconciliation can see it. Resume and the halt path's read use the same band;
    a newly journaled bad fill refuses release or is named in the halt notes.
 
@@ -249,14 +245,12 @@ class WriteOffContext:
 class PriceBand:
     """The fill-price sanity band (#1981): the reference price on `session` (a pure
     lookup over data already loaded, as `WriteOffContext.price_of`), the splits known
-    at close(S-1), the configured `paper.max_fill_price_deviation` (the gap-note
-    threshold) and `paper.max_fill_price_ratio` (the halt band, #3130)."""
+    at close(S-1), and the configured `paper.max_fill_price_deviation`."""
 
     price_of: Callable[[str], float]
     actions_as_of: pl.DataFrame
     session: date
     deviation: float
-    halt_ratio: float
 
 
 @dataclass(frozen=True)
@@ -278,9 +272,6 @@ class Collected:
     one_sided: tuple[str, ...] = ()
     #: Warnings that our clock runs ahead of the broker's (#2186); they never halt.
     clock_notes: tuple[str, ...] = ()
-    #: Fills past `paper.max_fill_price_deviation` but inside the halt ratio: real
-    #: gaps, noted and never halted (#3130). One message per fill.
-    gaps: tuple[str, ...] = ()
 
     @property
     def lagging(self) -> tuple[OrderReading, ...]:
@@ -302,8 +293,6 @@ def note_unjudged(collected: Collected, notes: list[str]) -> None:
             "fill-price band: one side only (a spin-off ex-date) for "
             + ", ".join(sorted(set(collected.one_sided)))
         )
-    if collected.gaps:
-        notes.append("fill_price_gap (not halted): " + "; ".join(collected.gaps))
 
 
 @dataclass(frozen=True)
@@ -456,11 +445,8 @@ def collect(
 
     unjudged: tuple[str, ...] = ()
     one_sided: tuple[str, ...] = ()
-    gaps: tuple[str, ...] = ()
     if price_band is not None:
-        unjudged, one_sided, gaps = _judge_fill_band(
-            connect, orders, journaled, price_band, rejections
-        )
+        unjudged, one_sided = _judge_fill_band(connect, orders, journaled, price_band, rejections)
 
     return Collected(
         since=since,
@@ -474,7 +460,6 @@ def collect(
         unjudged=unjudged,
         one_sided=one_sided,
         clock_notes=tuple(clock_notes),
-        gaps=gaps,
     )
 
 
@@ -484,15 +469,15 @@ def _judge_fill_band(
     journaled: Sequence[str],
     band: PriceBand,
     rejections: Sequence[RejectionBreach],
-) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    """Return the ids of the fills the band could not price, of those it judged
-    on one side only (#2112), and the gap messages (#3130; notes for the caller);
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return the ids of the fills the band could not price and of those it judged
+    on one side only (#2112; notes for the caller);
     raise `SystemFaultError` naming `fill_price_outside_band` for a fill this
-    collection journaled outside the halt ratio (#1981, #3130). It runs after the collection has
+    collection journaled outside the band (#1981). It runs after the collection has
     committed, so the fill is journaled as the broker holds it; a rejection verdict
     of the same collection is named in the message, never dropped."""
     if not journaled:
-        return (), (), ()
+        return (), ()
     new = set(journaled)
     with connect() as conn:
         fills = [
@@ -500,14 +485,13 @@ def _judge_fill_band(
             for f in fills_for(conn, client_order_ids=[o.client_order_id for o in orders])
             if f.fill.broker_fill_id in new
         ]
-    found = fill_band_halts(fills, band)
+    found = fill_band_violations(fills, band)
     if found:
         verdicts = [b.message for b in rejections]
         raise SystemFaultError("; ".join([_FILL_BAND_FAULT + ": " + "; ".join(found), *verdicts]))
     return (
         tuple(f.fill.client_order_id for f in fills if _unpriced(f, band)),
         tuple(f.fill.client_order_id for f in fills if _one_sided(f, band)),
-        fill_band_violations(fills, band),
     )
 
 
@@ -841,31 +825,6 @@ def fill_band_violations(fills: Iterable[OrderedFill], band: PriceBand) -> tuple
             out.append(
                 f"{who}: fill price {price} is outside {band.deviation:.0%} of the "
                 f"reference price {ref}"
-            )
-    return tuple(out)
-
-
-def fill_band_halts(fills: Iterable[OrderedFill], band: PriceBand) -> tuple[str, ...]:
-    """One message per fill outside the halt band (#3130): below
-    `reference / band.halt_ratio` or above `reference x band.halt_ratio`, inclusive
-    bounds, or a non-finite or non-positive price. The reference, the unpriced rule
-    and the spin-off one-sided rule (#2112) are `fill_band_violations`'s. A unit error
-    or bad print (100x, 0.01x, 10x) is far outside; a real overnight gap of 30% or
-    even 60% is inside, and only `fill_band_violations` (a note) names it."""
-    out = []
-    for item in fills:
-        fill = item.fill
-        ref = _reference(item, band)
-        if ref is None:
-            continue
-        price = fill.price
-        low_side, high_side = _spinoff_sides(item, band)
-        low = ref / band.halt_ratio if low_side else 0.0
-        high = ref * band.halt_ratio if high_side else math.inf
-        if not (math.isfinite(price) and price > 0 and low <= price <= high):
-            out.append(
-                f"{fill.client_order_id} ({item.security_id}): fill price {price} is outside "
-                f"[1/{band.halt_ratio:g}, {band.halt_ratio:g}] x the reference price {ref}"
             )
     return tuple(out)
 

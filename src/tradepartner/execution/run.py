@@ -175,7 +175,7 @@ the run's.
 
 **The fill-price band** (#1981). Every collection of the run (step 3, step 7b and the
 wrapper's sells and buys collections) passes `collect` a `PriceBand`: a fill it
-journals outside `paper.max_fill_price_deviation` (run-time, default 0.25) of its
+journals outside `paper.max_fill_price_deviation` (run-time, default 0.5, #3130) of its
 reference price raises `SystemFaultError` naming
 `fill_price_outside_band`, so the run takes the halt path (a `halted` alert, the kill
 switch) before the next phase sizes anything on the bad fill's cash.
@@ -1808,7 +1808,6 @@ class _Run:
             context.actions_as_of,
             context.session,
             self.settings.paper.max_fill_price_deviation,
-            self.settings.paper.max_fill_price_ratio,
         )
 
     def _collect(self) -> Collected:

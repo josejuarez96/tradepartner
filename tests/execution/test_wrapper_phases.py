@@ -391,7 +391,7 @@ def test_wrapper_collection_notes_a_fill_without_a_reference(
     )
     env.fake.simulate_fill(coid)
     # collect catches the KeyError from an unread or unpriced reference.
-    band = PriceBand({}.__getitem__, pl.DataFrame(), S, 0.25, 3.0)
+    band = PriceBand({}.__getitem__, pl.DataFrame(), S, 0.25)
     notes: list[str] = []
     _gate(env, alerter_conn)._collect(env.run, [order], price_band=band, notes=notes)
     assert notes == [f"fill-price band: no reference price for {coid}"]
@@ -419,9 +419,7 @@ def test_run_notes_receive_unjudged_wrapper_phase_fills(
     gate = _gate(env, alerter_conn)
     # Keep phase sizing priced, but make the collection's reference unreadable.
     monkeypatch.setattr(
-        gate,
-        "_price_band",
-        lambda _run, _book: PriceBand({}.__getitem__, pl.DataFrame(), S, 0.25, 3.0),
+        gate, "_price_band", lambda _run, _book: PriceBand({}.__getitem__, pl.DataFrame(), S, 0.25)
     )
     notes: list[str] = []
     context = SimpleNamespace(gate=gate, run=env.run, notes=notes)

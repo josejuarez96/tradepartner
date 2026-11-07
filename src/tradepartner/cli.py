@@ -296,7 +296,7 @@ Paper trading (Phase 4 spec req 16; plans T67 and T90; ADR 0010 amendment
 
 - `tradepartner paper start --hypothesis <slug>`, `stop --reason`, `run`,
   `reconcile`, `kill --reason`, `resume --reason [--accept-broker-fills]
-  [--accept-rejections]`, `report`, `check`, `status`, `abandon --reason`,
+  [--accept-rejections] [--accept-fill-band]`, `report`, `check`, `status`, `abandon --reason`,
   `override --kind [--session --name] --reason` (T67), `settle --order
   <client_order_id> --reason` (T84c; `--order` exactly once) and `true-up --break
   <break_id> --reason` (T283b; `--break` exactly once) each call the one
@@ -317,7 +317,9 @@ Paper trading (Phase 4 spec req 16; plans T67 and T90; ADR 0010 amendment
   switch or a limit: `override --session` names the rebalance session the
   override applies to (spec req 9), never the session a command runs on.
   `--accept-rejections` is spec req 5's owner acceptance of rejection-cap
-  verdicts (#472), which lifts no other refusal.
+  verdicts (#472), which lifts no other refusal. `--accept-fill-band` is the
+  owner's word that a `fill_price_outside_band` print was checked (#3130): it
+  lifts only the prior band refusals and is journaled in `resume_acceptances`.
   `report`, `check` and `status` take `--book <token>` (ADR 0017 B.7, plan
   T156; default `paper.book_id`; a token outside the grammar is a usage error,
   2, before the store is opened): each reads only that book's latest window.
@@ -6012,6 +6014,14 @@ def make_app(
                 allow_from_autoenv=False,
             ),
         ] = False,
+        accept_fill_band_flag: Annotated[
+            bool,
+            typer.Option(
+                "--accept-fill-band",
+                help="release past a checked fill_price_outside_band fault (#3130)",
+                allow_from_autoenv=False,
+            ),
+        ] = False,
     ) -> None:
         """Settle, collect, reconcile and release the book's kill switch (spec req 5)."""
         chosen = _checked_book(book)
@@ -6028,6 +6038,7 @@ def make_app(
                 reason,
                 accept_broker_fills,
                 accept_rejections=accept_rejections_flag,
+                accept_fill_band=accept_fill_band_flag,
                 book_id=bk,
             ),
         )

@@ -916,20 +916,16 @@ class PaperConfig(BaseModel):
     #: with the window's length. Read at run time, never frozen; `paper report`
     #: keeps the full window (its `paper_reports` row is the record).
     status_slippage_sessions: int = Field(default=20, gt=0)
-    #: The fill-price gap note (#1981, #3130): a fill journaled by a run whose price is
+    #: The fill-price sanity band (#1981): a fill journaled by a run whose price is
     #: further than this fraction from the order's reference price (the close of S-1,
-    #: split-adjusted) but inside `max_fill_price_ratio` is a real overnight gap: a
-    #: `fill_price_gap` note on the run, never a halt. Audit C measured real 25% gaps
-    #: at about 8.6e-4 per name-session, so halting on them abandoned windows. Also
-    #: the whole-share buy price before the open (reference x (1 + this)). Read at
-    #: run time, never frozen, so the open windows see it.
-    max_fill_price_deviation: float = Field(default=0.25, gt=0, lt=1)
-    #: The fill-price halt band (#3130): a fill below reference / this or above
-    #: reference x this halts the run with a `fill_price_outside_band` fault, and
-    #: `paper resume` then refuses (#3028). 3.0 keeps the band's purpose, a broker-side
-    #: bad print or a unit error (100x, 0.01x, 10x), while a real gap of 30-60% goes
-    #: on. Read at run time, never frozen.
-    max_fill_price_ratio: float = Field(default=3.0, gt=1)
+    #: split-adjusted) halts the run with a `fill_price_outside_band` fault. 0.5
+    #: (#3130): real overnight gaps of 25% or more occur at about 8.6e-4 per
+    #: name-session (Audit C; INTC 10-30 at -29.3%), so 0.25 halted the books about
+    #: once in eight daily sessions, while a 100x, 0.01x or 10x fill (a broker-side bad
+    #: print, a unit error) is still far outside. After a halt, `paper resume
+    #: --accept-fill-band` releases once the owner has checked the print. Read at run
+    #: time, never frozen, so the open windows see it.
+    max_fill_price_deviation: float = Field(default=0.5, gt=0, lt=1)
     #: Per-book buy timing (paper spec amendment 2026-11-01 item 7, T369), keyed by
     #: book token; run-time, not frozen. A book absent from the map behaves as today.
     execution: dict[str, BookExecution] = Field(default_factory=dict)

@@ -509,7 +509,13 @@ PAPER_OPTIONS = {
     "run": {"--book"},
     "reconcile": {"--book"},
     "kill": {"--reason", "--book", "--all"},
-    "resume": {"--reason", "--accept-broker-fills", "--accept-rejections", "--book"},
+    "resume": {
+        "--reason",
+        "--accept-broker-fills",
+        "--accept-rejections",
+        "--accept-fill-band",
+        "--book",
+    },
     "report": {"--book"},
     "check": {"--book", "--verbose"},
     "status": {"--book", "--all"},
@@ -1232,13 +1238,21 @@ def test_commands_under_a_held_run_lock_exit_locked(clock: _Clock, factory: _Fac
     assert factory.fake.calls == before
 
 
-@pytest.mark.parametrize(("flags", "accepted"), [((), False), (("--accept-rejections",), True)])
+@pytest.mark.parametrize(
+    ("flags", "accepted", "band"),
+    [
+        ((), False, False),
+        (("--accept-rejections",), True, False),
+        (("--accept-fill-band",), False, True),
+    ],
+)
 def test_resume_passes_the_owners_flags_on_unchanged(
     monkeypatch: pytest.MonkeyPatch,
     clock: _Clock,
     factory: _Factory,
     flags: tuple[str, ...],
     accepted: bool,
+    band: bool,
 ) -> None:
     seen: list[tuple[Any, ...]] = []
 
@@ -1249,14 +1263,17 @@ def test_resume_passes_the_owners_flags_on_unchanged(
     monkeypatch.setattr(paper_resume, "resume", recording)
     out = _paper(clock, factory, "resume", "--reason", LONG_REASON, *flags)
     assert out.exit_code == 0, out.output
-    assert seen == [(False, {"accept_rejections": accepted, "book_id": "main"})]
+    assert seen == [
+        (False, {"accept_rejections": accepted, "accept_fill_band": band, "book_id": "main"})
+    ]
 
 
-def test_accept_rejections_is_a_plain_off_by_default_flag() -> None:
+@pytest.mark.parametrize("flag", ["--accept-rejections", "--accept-fill-band"])
+def test_accept_rejections_is_a_plain_off_by_default_flag(flag: str) -> None:
     group: Any = typer.main.get_command(cli.make_app())
     resume_command = group.commands["paper"].commands["resume"]
-    (param,) = [p for p in resume_command.params if "--accept-rejections" in p.opts]
-    assert param.opts == ["--accept-rejections"]
+    (param,) = [p for p in resume_command.params if flag in p.opts]
+    assert param.opts == [flag]
     assert param.secondary_opts == []
     assert param.default is False
     assert param.envvar is None
@@ -1275,12 +1292,13 @@ def test_accept_rejections_ignores_an_auto_envvar_prefix(
 
     monkeypatch.setattr(paper_resume, "resume", recording)
     monkeypatch.setenv("TP_PAPER_RESUME_ACCEPT_REJECTIONS_FLAG", "1")
+    monkeypatch.setenv("TP_PAPER_RESUME_ACCEPT_FILL_BAND_FLAG", "1")
     app = cli.make_app(clock=clock, broker=factory)
     result = CliRunner().invoke(
         app, ["paper", "resume", "--reason", LONG_REASON], auto_envvar_prefix="TP"
     )
     assert result.exit_code == 0, result.output
-    assert seen == [{"accept_rejections": False, "book_id": "main"}]
+    assert seen == [{"accept_rejections": False, "accept_fill_band": False, "book_id": "main"}]
 
 
 # --- `--book` and the multi-book `paper run` (ADR 0017 B.2 to B.5; plan T155b) -----------

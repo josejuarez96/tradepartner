@@ -2125,7 +2125,6 @@ class RiskGatedBroker:
             book.actions,
             run.session,
             self._settings.paper.max_fill_price_deviation,
-            self._settings.paper.max_fill_price_ratio,
         )
 
     def _collect(
@@ -2346,7 +2345,6 @@ class RiskGatedBroker:
                 actions,
                 run.session,
                 self._settings.paper.max_fill_price_deviation,
-                self._settings.paper.max_fill_price_ratio,
             )
         except Exception as exc:
             # A halt still reads back fills when its reference-price read fails.

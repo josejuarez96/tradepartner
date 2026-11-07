@@ -250,6 +250,7 @@ def _resume(
     *,
     accept: bool = False,
     accept_rejections: bool = False,
+    accept_fill_band: bool = False,
     book_id: str | None = None,
 ) -> Any:
     # A real clock moves between reads; the release must be stamped after the
@@ -263,6 +264,7 @@ def _resume(
         "owner checked",
         accept,
         accept_rejections=accept_rejections,
+        accept_fill_band=accept_fill_band,
         book_id=book_id,
     )
 
@@ -386,9 +388,7 @@ def test_a_pending_order_the_fake_filled_is_settled_with_its_fills_before_its_fi
     assert not _engaged(journal_settings, window)
 
 
-@pytest.mark.parametrize(
-    "price, expected", [(400.0, REFUSED), (150.0, RELEASED), (100.0, RELEASED)]
-)
+@pytest.mark.parametrize("price, expected", [(200.0, REFUSED), (100.0, RELEASED)])
 def test_resume_judges_a_new_fill_and_reports_its_price(
     journal_settings: Settings,
     fake: SkewedFake,
@@ -439,6 +439,62 @@ def test_resume_judges_a_new_fill_and_reports_its_price(
         assert _engaged(journal_settings, window)
 
 
+def test_accept_fill_band_releases_a_checked_bad_fill_and_journals_it(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3130: the owner checks the print and resumes with `accept_fill_band`. The
+    resume that first journals the bad fill still refuses (the owner has not seen
+    it); a later one with the flag releases, records the accepted fault in its
+    `resume_acceptances` row, and a later band fault refuses again."""
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _order(journal_settings, fake, crashed, "tp-bad", 2.0, DAY1 - timedelta(hours=1))
+    fake.apply("tp-bad", FillAt(200.0))
+    _engage(journal_settings, window, fixed_clock)
+    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
+    first = _resume(journal_settings, fake, fixed_clock, accept_fill_band=True)
+    assert first.status == REFUSED
+    assert any("fill_price_outside_band" in r for r in first.reasons)
+    plain = _resume(journal_settings, fake, fixed_clock)
+    assert plain.status == REFUSED
+    assert any("prior fill_price_outside_band" in r for r in plain.reasons)
+    accepted = _resume(journal_settings, fake, fixed_clock, accept_fill_band=True)
+    assert accepted.status == RELEASED, accepted.reasons
+    assert not _engaged(journal_settings, window)
+    with open_read_only(journal_settings) as conn:
+        (row,) = conn.execute(
+            "SELECT accepted_json FROM resume_acceptances WHERE resume_id = ?",
+            [accepted.resume_id],
+        ).fetchall()
+    entries = json.loads(row[0])
+    # The engagement and the crashed run's rejudged fill: both accepted, both named.
+    assert entries and {e["kind"] for e in entries} == {"fill_band"}
+    assert all("fill_price_outside_band" in e["message"] for e in entries)
+    assert any("tp-bad" in e["message"] for e in entries)
+    # A new band fault after that release refuses a plain resume again.
+    switch.engage(
+        journal_settings,
+        fixed_clock,
+        window_id=window.window_id,  # type: ignore[arg-type]
+        source="fault",
+        fault_type="SystemFaultError",
+        reason="SystemFaultError: fill_price_outside_band: tp-y 400 vs 100",
+    )
+    later = _resume(journal_settings, fake, fixed_clock)
+    assert later.status == REFUSED
+    assert any("tp-y" in r for r in later.reasons) and not any("tp-bad" in r for r in later.reasons)
+
+
+def test_accept_fill_band_must_be_a_bool(
+    journal_settings: Settings, fake: SkewedFake, fixed_clock: FixedClock
+) -> None:
+    with pytest.raises(TypeError, match="accept_fill_band"):
+        _resume(journal_settings, fake, fixed_clock, accept_fill_band=1)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize("initially_engaged", [False, True])
 def test_bad_fill_stays_refused_if_fault_engagement_write_fails(
     journal_settings: Settings,
@@ -450,7 +506,7 @@ def test_bad_fill_stays_refused_if_fault_engagement_write_fails(
 ) -> None:
     crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=True)
     _order(journal_settings, fake, crashed, "tp-bad-write", 2.0, DAY1 - timedelta(hours=1))
-    fake.apply("tp-bad-write", FillAt(400.0))
+    fake.apply("tp-bad-write", FillAt(200.0))
     if initially_engaged:
         _engage(journal_settings, window, fixed_clock)
     monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
@@ -483,7 +539,7 @@ def test_clock_step_back_rechecks_an_earlier_refused_invocation(
 ) -> None:
     crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=True)
     _order(journal_settings, fake, crashed, "tp-backward-bad", 2.0, DAY1 - timedelta(hours=1))
-    fake.apply("tp-backward-bad", FillAt(400.0))
+    fake.apply("tp-backward-bad", FillAt(200.0))
     _engage(journal_settings, window, fixed_clock)
     monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
     real_engage = switch.engage
@@ -510,9 +566,7 @@ def test_clock_step_back_rechecks_an_earlier_refused_invocation(
         )
 
 
-@pytest.mark.parametrize(
-    "price, expected", [(400.0, REFUSED), (150.0, RELEASED), (100.0, RELEASED)]
-)
+@pytest.mark.parametrize("price, expected", [(200.0, REFUSED), (100.0, RELEASED)])
 def test_a_run_fill_whose_band_engagement_was_never_written_is_rejudged(
     journal_settings: Settings,
     fake: SkewedFake,
