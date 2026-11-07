@@ -2484,6 +2484,21 @@ def test_a_registration_with_an_empty_default_window_is_refused(
     _family(conn, settings, "momentum", date(2023, 11, 30), (date(2024, 1, 1), date(2026, 9, 30)))
 
 
+@pytest.mark.parametrize(
+    "holdout", [(date(2020, 1, 2), date(2020, 12, 31)), (date(2023, 12, 20), date(2026, 9, 30))]
+)
+def test_a_registration_whose_holdout_starts_on_or_before_the_boundary_is_refused(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, holdout: tuple[date, date]
+) -> None:
+    """#3151, ADR 0016 points 3 and 8: every holdout starts after the development
+    boundary, the line `write_development_boundary` holds for boundary moves."""
+    registry.write_development_boundary(conn, boundary=date(2023, 12, 20), reason="r")
+    with pytest.raises(registry.BoundaryRefused, match=r"holdout.start .* development boundary"):
+        _family(conn, settings, "momentum", date(2010, 1, 4), holdout)
+    assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (0,)
+    _family(conn, settings, "momentum", date(2010, 1, 4), (date(2023, 12, 21), date(2026, 9, 30)))
+
+
 # --- the shakedown decisions (#1388, paper-trading plan T157; ADR 0017 part E) -------
 
 
