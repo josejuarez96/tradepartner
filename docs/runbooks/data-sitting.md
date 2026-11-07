@@ -21,7 +21,7 @@ Owner and orchestrator only, on the owner's job checkout and real store. Target 
 | 13 | `actions-3054` | #3054, #3073 | origin/main |
 | 14 | `actions-3074` (only if rows) | #3074, #3085 | origin/main |
 | 15 | `rename-listings-3057b` (only if residual) | #3068 after step 13 | origin/main |
-| 16 | no release: exposures | #3116, #3110 (conditional) | origin/main |
+| 16 | no release: candidate 5's exposures | #3116, #3176 (#3110 skipped) | origin/main |
 | 17 | no release: gap sign-off replay | #3117 | origin/main |
 
 **Counts per release.** After each `close`, post one comment on #1682 headed with the release name and its `before`/`after` decision ids. It lists every command run in that release, in order, each with its dry-run count and its applied count. A release's figures are the counts of its own commands only; never fold a later step's counts into an earlier release.
@@ -166,7 +166,7 @@ Purpose: move the job checkout from the pinned `1fe51c9f` to origin/main once, s
 
 - [ ] The pull is **all of origin/main**, not a T198-only diff. On 2026-11-06 that was 54+ commits. They include T198's flip and FSN/COVER bumps (#2975), the schema 47 fill cursor (#3029), and ingest behaviour changes #3073, #3064, #3068, #3090, #3086 and #3095. `BUILD_RULES_VERSION` is 6 (#3064, then #3095), so step 9's first `ingest --source edgar` is a full master rebuild. #2975's bumps make it re-extract every FSN period too. Read its census with that in mind (step 9).
 - [ ] Record what is pulled. Only what is merged at this moment is in the sitting; nothing merged later is pulled mid-sitting.
-  - **Open on 2026-11-06:** #3071 (shares split dating), the #3070 flip that follows it, #3091 (issuer-class tags, schema 48) and the #3116 exposure-backfill tool. Steps 9, 16 and 17 depend on whether each is in.
+  - **Open on 2026-11-06:** #3071 (shares split dating), the #3070 flip that follows it and #3091 (issuer-class tags, schema 48). Steps 9 and 17 depend on whether each is in. The #3116 exposure-backfill tool will not come (#3133 closed). Step 16 needs only #3176's kill-line copy, `docs/research/2026-10-31-candidate-5-kill-line.md`, to be in the pull.
   - **T214 (PR #1968):** closed without merging, so there is nothing to merge. D8's lapse needs its dated strike note in the data-foundation plan, outside this sheet.
 
   ```bash
@@ -179,7 +179,7 @@ Purpose: move the job checkout from the pinned `1fe51c9f` to origin/main once, s
   uv sync
   ```
 
-  Stop if the merge is not a fast-forward or the working tree is dirty. Paste both hashes, the commit count and which of #3071, the #3070 flip, #3091 and the #3116 tool are in, on #1682.
+  Stop if the merge is not a fast-forward or the working tree is dirty. Paste both hashes, the commit count and which of #3071, the #3070 flip, #3091 and #3176 are in, on #1682.
 - [ ] **Schema.** The store is at 46 and origin/main needs 47 (48 if #3091 is in). The migration runs on the first store write after the pull, which is step 6's `decision data-release open`. Step 6's checkpoint is therefore the last copy at schema 46. Restoring it with origin/main code migrates it again on the next write.
 - [ ] **#3070 `universe.shares_split_dating` flip (conditional).** This step applies only if the flip PR, which follows #3071, is in the pull; otherwise the switch stays `false` and this sitting does nothing for it. It needs no store write: 115 shares facts straddle a split, and 62 of them are read as already split once it is on. It moves the pinned twin fingerprints, so list the trials it stales under [named data releases](data-releases.md), and run step 17 after it.
 - [ ] Copy the two local id lists this sheet uses, `starts3053/ids.txt` (step 6, 79 ids) and `spyacts3074-ids.txt` (step 14), from the orchestrator's scratchpad under `/private/tmp` to a durable local folder outside the repo. Do this before the sitting: `/private/tmp` does not survive a restart. Check that `tr ',' '\n' < <ids file> | grep -c .` prints 79 for the first.
@@ -423,18 +423,113 @@ Purpose: add the new-ticker rows implied by the 2016–2020 name changes that st
 
   Stop rules and restore as in step 8, using `<rename-b-copy>`.
 
-## 16. Desk-read exposures (#3116, #3110; conditional)
+## 16. Desk-read exposures: candidate 5 (#3116, #3176)
 
-Purpose: write the `research_exposures` rows the desk reads never got (0 rows on 2026-11-06). Profitability's N stays at 1 where the rule gives 3, and `exposures --candidates` cannot check the search limit, until they exist. These are research-registry rows, not a data release.
+Purpose: write the two `research_exposures` rows for candidate 5's store launches (#2689). That table had 0 rows on 2026-11-07. Profitability's N is 1 (B3's trial 3) where the rule gives 3. Each launch is one `store` record with 1 configuration, so N goes from 1 to 3. These are research-registry rows, not store facts: no data release, and no `store backup` of their own. The #3116 backfill tool will not exist (#3133 closed as oversized), so this step uses the existing `tradepartner exposure record`.
 
-- [ ] **Only if the #3116 backfill tool is in step 5's pull.** Without it, record nothing here, leave #3116 and #3110 open, and note on both that the sitting skipped them. If it is in, run its dry run, then the real run, with the exact commands its PR names. Cover every read #3116 lists: candidate 5 (#2689, 2 launches), CBOperProf, I1, issuance/Q1, XFIN (#2828), composite (#2888), cfp (#2946), and #3092's `open_data` read (#3110: the pinned Chen-Zimmermann files, kind `open_data`, counted as a candidate, 3 of 4). A repeat record prints the first id and writes nothing. A refusal exits 2 with nothing written; stop and paste it on #3116.
+**Not recorded here** (an `open_data` record adds 0 to N, research-registry spec "How it enters N"):
+- **#3092 (#3110).** The record is not cheap, so it is skipped. Its kill line is in the issue body, and `--kill-line-url` takes only an issue comment or a file at a commit. Its window and configuration count also need calls nobody has made. Leave #3110 open and note the skip there.
+- **CBOperProf, I1, issuance/Q1, XFIN, composite and cfp** stay on #3116, not recorded.
+
+**No dry run.** `exposure record` has none, and every call writes the real store. The rules that protect it:
+- It refuses with exit 2 and writes nothing on a bad value: a probe hash mismatch, a probe that isn't verified, a naive time, a window after `read_at`, a missing `store_max_ingested_at` pin, a family or verdict outside its set, or a holdout overlap without a reason.
+- A repeat with the same candidate, probe hash and `read_at` prints the first id and writes nothing, so re-running a command is safe.
+- There is no delete. A wrong row stays, so do every check below first.
+
+Every value below comes from the record named beside it:
+
+| Field | Launch 2 | Launch 3 | Evidence |
+|---|---|---|---|
+| kill line | [#2689 comment 6548103186](https://github.com/josejuarez96/tradepartner/issues/2689#issuecomment-6548103186), posted 2026-10-31T19:29:02Z, never edited | same | `gh api repos/josejuarez96/tradepartner/issues/comments/6548103186` (`created_at` = `updated_at`) |
+| kill-line copy | `docs/research/2026-10-31-candidate-5-kill-line.md`, the comment body byte for byte, SHA-256 `7a2b91fb5ce5427548091a5efd3d669d138b05f68103fd1eeb7810b5f91a15d6` | same | the same `gh api` call |
+| probe | the frozen file, SHA-256 `916339ee…a770`, gone from disk. It is rebuilt by reverting the crash-only hunk. Its hash is in the kill line, so `probe_verified` | `~/tradepartner-probes/cbl/probe.py`, SHA-256 `bb32fdb0…fb08b`, mtime 2026-10-31T19:31:44Z, before the launch, so `probe_verified` | audit [comment 6548223852](https://github.com/josejuarez96/tradepartner/issues/2689#issuecomment-6548223852) §1; the desk read's launch ledger |
+| `read_at` (launch start) | 2026-10-31T19:29:43.089Z. It crashed at 19:31:30.937Z: `RuntimeError: no last close for held 0001235010` | 2026-10-31T19:31:49.105Z. It finished at 19:36:01.497Z | the builder's Codex session log, `~/.codex/sessions/2026/10/31/rollout-2026-10-31T15-29-17-01a19370-0f6b-7a60-8734-9b20e045d300.jsonl` (tool-call times). Launch 1 failed in `uv` before Python started and read nothing |
+| window | 2020-08-31 to 2023-12-29 | same | kill line; spec backfill table |
+| configurations, verdict | 1, `incomplete` | 1, `fail` | spec backfill table; desk read |
+| family | `profitability` | same | spec backfill table; holdout 2024-01-01..2026-09-30, no overlap |
+| store read | `data/tradepartner.duckdb.bak-20261031-0441`, read-only | same | the `--store` argument in the session log |
+| `store_max_ingested_at` | `2026-10-31T00:03:40.029464+00:00`, declared | same | that copy is gone. Read-only on the live store (2026-11-07): it is the newest `ingested_at` before 04:41Z. No `ingestion_runs` row started between 00:03:40Z and 16:21:12Z. roles-2691 restamped 30,439 Form 4 rows, but 2.67M rows still carry 00:03:40.029464Z |
+| inputs | none hashed. `companyfacts.zip` was replaced 2026-11-07T00:31:10Z, so today's hash is not the hash that was read; it is a declared pin instead | same | `stat` |
+| desk read, audit | `docs/research/2026-10-31-cash-profitability-long-only-desk-read.md`, audit comment 6548223852 | same | #2704 |
+
+- [ ] **Read-only checks first.** Run from the job checkout root (the kill-line copy path is relative). Stop if any output differs from the expected value given beside it.
 
   ```bash
   uv run tradepartner exposures
-  uv run tradepartner exposures --candidates --since <earliest read date>
+  uv run tradepartner exposures --candidates --since 2026-10-30
+  uv run python -c 'from tradepartner.config import get_settings; from tradepartner.store.db import open_read_only; from tradepartner.backtest.results import family_n_split; cm = open_read_only(get_settings()); conn = cm.__enter__(); print(family_n_split(conn, "profitability")); print(conn.execute("SELECT exposure_id, candidate_ref, read_at, probe_sha256 FROM research_exposures WHERE candidate_ref = ? ORDER BY exposure_id", ["#2689"]).fetchall()); cm.__exit__(None, None, None)'
+  shasum -a 256 docs/research/2026-10-31-candidate-5-kill-line.md ~/tradepartner-probes/cbl/probe.py
+  TZ=UTC stat -f '%Sm %N' -t '%Y-%m-%dT%H:%M:%SZ' ~/tradepartner-probes/cbl/probe.py
   ```
 
-  Paste each exposure id against its read on #3116, and #3092's on #3110. Citing the ids in the desk-read notes and on TP-10 in `docs/research/claims.toml` is a later PR.
+  Expected:
+  - Each `exposures` command prints its header line and no rows. Any other row is a finding: paste it on #3116 before going on.
+  - The snippet prints `FamilyN(trials=1, research=0, exposures=0)` and `[]`. If `[]` lists rows, this step already ran. The commands below then print those ids again and write nothing.
+  - The two hashes are `7a2b91fb…a15d6` and `bb32fdb0…fb08b`.
+  - The mtime is `2026-10-31T19:31:44Z`. A later mtime means the file was touched, and launch 3 would be refused. Stop.
+
+- [ ] **Rebuild the frozen probe** beside the current one. It writes only `~/tradepartner-probes/cbl/probe-frozen-916339ee.py`. It refuses unless the hunk is found exactly once and the result hashes to the kill line's `916339ee…a770`. A rerun rewrites the same bytes.
+
+  ```bash
+  uv run python -c 'import hashlib, pathlib; d = pathlib.Path.home() / "tradepartner-probes/cbl"; s = (d / "probe.py").read_bytes(); i = b" " * 12; old = i + b"# The holding value is already marked at the previous month close.\n" + i + b"# If no later traded bar is available, settle at that last close.\n" + i + b"cash += value\n"; assert s.count(old) == 1, "crash-fix hunk not found exactly once"; r = s.replace(old, i + b"raise RuntimeError(f\x27no last close for held {sid}\x27)\n"); h = hashlib.sha256(r).hexdigest(); assert h == "916339eea57d431558532680662516285cdf16b6e3c0c52edad69086089ba770", h; out = d / "probe-frozen-916339ee.py"; assert not out.exists() or out.read_bytes() == r, "a different probe-frozen file is already there"; out.write_bytes(r); print(out, h)'
+  ```
+
+- [ ] **Record launch 2**, the crashed run on the frozen probe:
+
+  ```bash
+  uv run tradepartner exposure record --candidate "#2689" --source store --family profitability \
+    --kill-line-url "https://github.com/josejuarez96/tradepartner/issues/2689#issuecomment-6548103186" \
+    --kill-line-file docs/research/2026-10-31-candidate-5-kill-line.md \
+    --kill-line-posted-at 2026-10-31T19:29:02+00:00 \
+    --probe ~/tradepartner-probes/cbl/probe-frozen-916339ee.py \
+    --probe-sha256 916339eea57d431558532680662516285cdf16b6e3c0c52edad69086089ba770 \
+    --read-at 2026-10-31T19:29:43.089+00:00 \
+    --window-start 2020-08-31 --window-end 2023-12-29 \
+    --pin store_max_ingested_at=2026-10-31T00:03:40.029464+00:00 \
+    --pin store_file=data/tradepartner.duckdb.bak-20261031-0441 \
+    --pin "companyfacts_zip=data/edgar_cache/bulk/companyfacts.zip (sha256 at read not recorded; file replaced 2026-11-07T00:31:10Z)" \
+    --configurations 1 --verdict incomplete \
+    --desk-read docs/research/2026-10-31-cash-profitability-long-only-desk-read.md \
+    --audit-url "https://github.com/josejuarez96/tradepartner/issues/2689#issuecomment-6548223852" \
+    --note "candidate 5 launch 2 (launch 1 failed in uv before Python). read_at is the tool-call start in Codex session 01a19370-0f6b-7a60-8734-9b20e045d300; crashed 19:31:30.937Z with RuntimeError no last close for held 0001235010, a return exposure per the audit. Probe rebuilt by reverting the crash-only hunk; its hash is the kill line's. store_max_ingested_at: the 0441 copy is gone; rebuilt read-only from the live store on 2026-11-07 as the newest ingested_at before 04:41Z; no ingestion run started 00:03:40Z-16:21:12Z on 10-31; roles-2691 restamped 30,439 Form 4 rows, but 2.67M rows keep 00:03:40.029464Z (#3176)"
+  ```
+
+- [ ] **Record launch 3**, the completed run on the audited probe:
+
+  ```bash
+  uv run tradepartner exposure record --candidate "#2689" --source store --family profitability \
+    --kill-line-url "https://github.com/josejuarez96/tradepartner/issues/2689#issuecomment-6548103186" \
+    --kill-line-file docs/research/2026-10-31-candidate-5-kill-line.md \
+    --kill-line-posted-at 2026-10-31T19:29:02+00:00 \
+    --probe ~/tradepartner-probes/cbl/probe.py \
+    --probe-sha256 bb32fdb0587cfecc35e9cafd41926ab9d760c19271364fdebe55463b357fb08b \
+    --read-at 2026-10-31T19:31:49.105+00:00 \
+    --window-start 2020-08-31 --window-end 2023-12-29 \
+    --pin store_max_ingested_at=2026-10-31T00:03:40.029464+00:00 \
+    --pin store_file=data/tradepartner.duckdb.bak-20261031-0441 \
+    --pin "companyfacts_zip=data/edgar_cache/bulk/companyfacts.zip (sha256 at read not recorded; file replaced 2026-11-07T00:31:10Z)" \
+    --configurations 1 --verdict fail \
+    --desk-read docs/research/2026-10-31-cash-profitability-long-only-desk-read.md \
+    --audit-url "https://github.com/josejuarez96/tradepartner/issues/2689#issuecomment-6548223852" \
+    --note "candidate 5 launch 3, after the crash-only edit (probe mtime 19:31:44Z). read_at is the tool-call start in Codex session 01a19370-0f6b-7a60-8734-9b20e045d300; finished 19:36:01.497Z, output in out.txt. store_max_ingested_at as launch 2's record (#3176)"
+  ```
+
+  Each command prints `exposure <id>`. A refusal exits 2 and writes nothing: stop and paste it on #3116. If launch 2 wrote and launch 3 refused, launch 2's row stays (there is no delete), and N is 2. Paste both outputs on #3116 and run nothing more here.
+
+- [ ] **After.** Re-run the read-only checks:
+
+  ```bash
+  uv run tradepartner exposures
+  uv run tradepartner exposures --candidates --since 2026-10-30
+  uv run python -c 'from tradepartner.config import get_settings; from tradepartner.store.db import open_read_only; from tradepartner.backtest.results import family_n_split; cm = open_read_only(get_settings()); conn = cm.__enter__(); print(family_n_split(conn, "profitability")); cm.__exit__(None, None, None)'
+  ```
+
+  Expected:
+  - Two rows, both `#2689  store  profitability`, window `2020-08-31..2023-12-29`, 1 configuration, holdout `-`, probe `verified`, store `real`. The verdicts are `fail` and `incomplete`.
+  - One candidate line: `#2689  2026-10-31T19:29:43.089000+00:00  2  incomplete,fail  no`.
+  - `FamilyN(trials=1, research=0, exposures=2)`, so profitability N goes from **1 to 3**.
+
+  Any other figure is a stop. Paste every printed output on #3116: the two exposure ids against launches 2 and 3, the before and after listings, and N. On #3110, note that #3092 was not recorded, and why (above). Citing the ids in the desk-read note and in `docs/research/claims.toml` is a later PR.
 
 ## 17. Gap sign-off replay (#3117)
 
