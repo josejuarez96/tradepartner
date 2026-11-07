@@ -19,7 +19,7 @@ from tradepartner.store import schema
 
 # Bump when a builder changes its derivation from unchanged inputs. Cache and
 # schema versions below are read from their owners at call time, never copied.
-BUILD_RULES_VERSION = 5  # 5: #3056, new equity after a 25-NSE on another exchange; 4: #2941
+BUILD_RULES_VERSION = 6  # 6: #3084, issuer HTML Form 25s and unit/comma class titles; 5: #3056
 
 HASHED_SETTINGS_KEYS = (
     "benchmarks",
@@ -119,6 +119,7 @@ CACHE_VERSION_NAMES = (
     "COVER_VERSION",
     "HEADER_VERSION",
     "DELISTING_VERSION",
+    "DELISTING_HTML_VERSION",  # #3084: a bump re-reads unread issuer HTML Form 25s
     "FSN_VERSION",
     "STAMPS_LAYOUT",
     # Not in the amendment's list of six, but a bump re-parses cached entries, so

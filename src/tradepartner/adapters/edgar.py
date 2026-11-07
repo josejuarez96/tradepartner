@@ -1420,6 +1420,109 @@ def parse_delisting(
     )
 
 
+#: The forms an issuer files as an HTML document (#3084): its own Form 25
+#: and amendment. An exchange's 25-NSE is always the XML form, so an HTML
+#: 25-NSE is never read here.
+HTML_DELISTING_FORMS: Final = frozenset({"25", "25/A"})
+
+#: The venues an HTML Form 25's issuer block can name, in match order (a
+#: longer NYSE name before plain NYSE). Nasdaq's tiers ("The Nasdaq Capital
+#: Market") are one code, as `_MIC_EXCHANGES` reads them; Nasdaq BX and PHLX
+#: are other venues and match none.
+_FORM25_HTML_EXCHANGE = re.compile(
+    r"\b(?:(?P<NYSE_AMERICAN>NYSE\s*(?:AMERICAN|MKT|AMEX)|AMERICAN\s+STOCK\s+EXCHANGE)"
+    r"|(?P<NYSE_ARCA>NYSE\s*ARCA)"
+    r"|(?P<NYSE_CHICAGO>NYSE\s+CHICAGO|CHICAGO\s+STOCK\s+EXCHANGE)"
+    r"|(?P<NYSE_NATIONAL>NYSE\s+NATIONAL)"
+    r"|(?P<CBOE_BZX>CBOE\s+BZX|BATS\s+BZX)"
+    r"|(?P<OTHER>NASDAQ\s+(?:OMX\s+)?(?:BX|PHLX))"
+    r"|(?P<NASDAQ>NASDAQ)"
+    r"|(?P<NYSE>NEW\s+YORK\s+STOCK\s+EXCHANGE|NYSE))\b",
+    re.IGNORECASE,
+)
+#: The form's printed labels (General Instructions layout): the issuer and
+#: exchange stand above the first, the address above the second's line, the
+#: class above the third.
+_FORM25_ISSUER_LABEL = re.compile(
+    r"\(\s*exact\s+name\s+of\s+(?:the\s+)?(?:issuer|registrant)", re.I
+)
+_FORM25_ADDRESS_LABEL = re.compile(r"\(\s*address\b[^()<]{0,400}\)", re.I)
+_FORM25_CLASS_LABEL = re.compile(
+    r"\(\s*description\s+of\s+(?:the\s+)?class(?:es)?\s+of\s+securit", re.I
+)
+#: The heading line above the issuer block (`Commission File Number 001-39273`).
+_FORM25_FILE_NUMBER = re.compile(r"file\s+n(?:o|umber)\.?\s*:?\s*[\d-]*", re.I)
+#: Upper bounds of the two readings: the issuer block read back from its
+#: label, and a class description (the longest seen is about 200 characters).
+_FORM25_ISSUER_BLOCK_CHARS: Final = 600
+_FORM25_CLASS_MAX_CHARS: Final = 300
+
+
+def _form25_html_text(text: str) -> str:
+    """`text` with script and style bodies and every tag dropped, entities
+    unescaped and whitespace (no-break spaces too) collapsed to one space.
+    Each tag pattern stops at the next `<`, as `_cover_12b_marks`' do, so a
+    mangled document stays linear in its length."""
+    plain = re.sub(r"(?is)<(script|style)\b[^<>]*>.*?</\1\s*>", " ", text)
+    plain = re.sub(r"(?is)<[^<>]*>", " ", plain)
+    return " ".join(html.unescape(plain).replace("\xa0", " ").split())
+
+
+@_fail_closed
+def parse_delisting_html(
+    html_text: str, *, cik: str, form: str, accession: str, accepted_at: datetime
+) -> DelistingFiling:
+    """An issuer's HTML Form 25 or 25/A (#3084): the class description and
+    the exchange removing it, as the printed form lays them out, known at
+    `accepted_at`. The form states no CIK, so `cik` is the filer the index
+    lists it under (an issuer files its own; the caller passes only an
+    accession one CIK holds). `effective_on` is left to the store's Rule
+    12d2-2 default, as for `parse_delisting`.
+
+    Nothing is guessed (#609 D1): a document missing the issuer, address or
+    class label, an issuer block naming no known exchange or two different
+    ones, or an empty or overlong class description raises `ValueError`, and
+    the notice stays a failure for the owner to accept."""
+    if form not in HTML_DELISTING_FORMS:
+        raise ValueError(f"{accession}: not an issuer Form 25: {form!r}")
+    accepted_at = ensure_tz_aware_utc(accepted_at, field_name="accepted_at")
+    text = _form25_html_text(html_text)
+    issuer = _FORM25_ISSUER_LABEL.search(text)
+    described = _FORM25_CLASS_LABEL.search(text, issuer.end()) if issuer else None
+    if issuer is None or described is None:
+        raise ValueError(f"{accession}: {form} is not the Form 25 layout (labels not found)")
+
+    block = text[max(0, issuer.start() - _FORM25_ISSUER_BLOCK_CHARS) : issuer.start()]
+    headings = list(_FORM25_FILE_NUMBER.finditer(block))
+    if headings:
+        block = block[headings[-1].end() :]
+    codes = {match.lastgroup for match in _FORM25_HTML_EXCHANGE.finditer(block) if match.lastgroup}
+    if len(codes) != 1 or "OTHER" in codes:
+        found = ", ".join(sorted(codes)) or "none"
+        raise ValueError(
+            f"{accession}: {form} names no single exchange above its issuer label ({found}); "
+            "the exchange is not guessed, so the notice is not recorded"
+        )
+
+    addresses = list(_FORM25_ADDRESS_LABEL.finditer(text, issuer.end(), described.start()))
+    if not addresses:
+        raise ValueError(f"{accession}: {form} is not the Form 25 layout (no address label)")
+    class_title = text[addresses[-1].end() : described.start()].strip(" ,;:")
+    if not re.search(r"[A-Za-z]", class_title) or len(class_title) > _FORM25_CLASS_MAX_CHARS:
+        raise ValueError(
+            f"{accession}: {form} names no class of security above its description label; "
+            "the class is not guessed, so the notice is not recorded"
+        )
+    return DelistingFiling(
+        cik=_cik(cik),
+        form=form,
+        class_title=class_title,
+        exchange=codes.pop(),
+        accession=accession,
+        accepted_at=accepted_at,
+    )
+
+
 #: The 8-K items that can evidence why a listing ended (spec amendment 2026-10-30,
 #: #2670 req 1; plan T327): 1.03 bankruptcy or receivership, 2.01 completion of an
 #: acquisition, 3.01 notice of delisting. `filing_events` already stores every

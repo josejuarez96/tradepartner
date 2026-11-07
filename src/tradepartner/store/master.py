@@ -583,6 +583,44 @@ def _named_common_titles(title: str) -> tuple[str, ...]:
     return tuple(names)
 
 
+#: A listing title's tail naming the units (or SAIL securities) a class also
+#: trades inside: "Class A common stock included as part of the units" is a
+#: SPAC's common class, the shares themselves (#3084).
+_UNIT_COMPONENT = re.compile(
+    r"[\s,]*\b(?:included|includes)\s+(?:as\s+(?:a\s+)?part\s+of|in)\s+"
+    r"(?:the\s+|each\s+)?(?:units?\b|sail\S*\s+securities\b).*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+#: `_NOT_COMMON_WORDS` at a word start, so "Community Bancorp" names no unit.
+_OTHER_CLASS_WORD = re.compile(r"\b(?:" + "|".join(_NOT_COMMON_WORDS) + ")", re.IGNORECASE)
+
+
+def _form25_title(title: str) -> str:
+    """`title` as Form 25 class matching reads it (#3084), never as a
+    class's identity (`_norm_title`, which names ids, is unchanged):
+
+    - a unit-component tail is dropped ("Class A common stock included as
+      part of the units" reads "Class A common stock");
+    - a title naming no warrant, unit, right, preferred, depositary or debt
+      class whose head before the first comma names no common equity (a
+      company name, "HD Supply Holdings, Inc. common stock, par value ...",
+      or a par value, "$.01 Par Value, Common Stock") reads from the first
+      comma part that does.
+
+    Anything else is returned as it is."""
+    cut = _UNIT_COMPONENT.sub("", title)
+    if _is_common(cut) or _OTHER_CLASS_WORD.search(cut):
+        return cut
+    parts = cut.split(",")
+    for index in range(1, len(parts)):
+        rest = ",".join(parts[index:]).strip()
+        if _is_common(rest):
+            return rest
+    return cut
+
+
 def _form25_classes[K](title: str, classes: Mapping[K, Collection[str | None]]) -> tuple[K, ...]:
     """The keys of `classes` (each class listed on the Form 25's exchange,
     with its titles there; `None` is an untitled row) that a Form 25
@@ -602,7 +640,27 @@ def _form25_classes[K](title: str, classes: Mapping[K, Collection[str | None]]) 
        exact title match gives, never a guessed class); failing that, for a
        plain-common title naming at most one class, the one class whose
        titles are all plain common.
-    Anything else is `()`: never a guess."""
+    Anything else is `()`: never a guess.
+
+    4. Only when 1-3 resolve nothing, 1-3 again with every title, the
+       filing's and the classes', read through `_form25_title` (#3084), so
+       a filing resolved today keeps exactly its classes."""
+    found = _form25_classes_read(title, classes)
+    if found:
+        return found
+    return _form25_classes_read(
+        _form25_title(title),
+        {
+            key: [None if t is None else _form25_title(t) for t in titles]
+            for key, titles in classes.items()
+        },
+    )
+
+
+def _form25_classes_read[K](
+    title: str, classes: Mapping[K, Collection[str | None]]
+) -> tuple[K, ...]:
+    """`_form25_classes`' rules 1-3 over the titles as given."""
 
     def by_title(name: str) -> list[K]:
         return [

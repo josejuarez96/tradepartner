@@ -53,8 +53,9 @@ def test_every_listed_setting_changes_hash(key: str) -> None:
 # `FSN_VERSION` and `COVER_VERSION` 7, then #2490's `CURRENT_SCHEMA_VERSION` 47
 # (`resume_invocations.book_id`; at 46 the hash is still da136ce7...785df1), then
 # #3012's move of the two Form 4 routing keys out of the hash (before T324 seeds
-# the real store), then #3056's `BUILD_RULES_VERSION` 5.
-MAIN_DEFAULT_HASH = "aac8cee3e9f15fe577b6871a82557bfd5a3100052aab3c1808330d07830d6dc4"
+# the real store), then #3056's `BUILD_RULES_VERSION` 5, then #3084's
+# `BUILD_RULES_VERSION` 6 with `DELISTING_HTML_VERSION` in the cache names.
+MAIN_DEFAULT_HASH = "f3e661a8dad003132b11c98042ee16e474221e39ad1e42e9706ac52094088f09"
 
 
 def test_hash_at_defaults_equals_the_hex_pinned_from_main() -> None:

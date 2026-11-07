@@ -5056,6 +5056,7 @@ def _source_counts(filings: FilingSource) -> str:
         ("cover_exchange_axis_mismatch", "cover exchange-axis mismatches"),
         ("fsn_missing", "FSN missing"),  # T11d: older cover-form accessions not in FSN
         ("pre_xml_delistings", "pre-XML delistings"),
+        ("unread_html_delistings", "unread HTML delistings"),  # #3084
         ("unstamped_delistings", "unstamped delistings"),  # T11f
         ("failed_filings", "failed filings"),  # T11h: the failure policy
         ("quarantined", "quarantined"),
