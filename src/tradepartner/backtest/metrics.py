@@ -448,7 +448,7 @@ def deflated_sharpe(
     if n_trials < max(1, len(pair_sharpes)):
         raise ValueError(
             f"n_trials ({n_trials}) must be at least 1 and at least the number of "
-            f"pairs ({len(pair_sharpes)}): N counts every trial, reruns included"
+            f"pairs ({len(pair_sharpes)}): N counts every distinct return series"
         )
     if periods_per_year < 1:
         raise ValueError(f"periods_per_year must be positive, got {periods_per_year}")
