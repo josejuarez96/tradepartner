@@ -345,6 +345,9 @@ class EdgarConfig(BaseModel):
     # read stops at the table or here, whichever comes first (#1597), so a
     # filing whose table is never written costs one bounded read.
     filename_document_max_bytes: int = Field(default=4_000_000, gt=0)
+    # #3106: maximum bytes in an issuer's HTML Form 25. A larger document,
+    # including one found in the raw filing cache, is counted as unreadable.
+    form25_html_max_bytes: int = Field(default=2_000_000, gt=0)
     # #2932: how many of one CIK's filing-name fetches are in flight at once.
     # Every request still goes through `edgar_raw`'s one process-wide limiter,
     # so the total stays at or under `requests_per_second`; the answer and the

@@ -1072,6 +1072,39 @@ def test_an_unreadable_html_form_25_is_counted_not_failed_and_not_refetched(
     assert document_url not in router.urls[before:]
 
 
+@pytest.mark.parametrize("cached", [False, True])
+def test_over_cap_html_form_25_is_unreadable_and_counted(tmp_path: Path, cached: bool) -> None:
+    router, source, accession = _html_form_25(tmp_path, _HTML_FORM_25 + " " * 100)
+    source._settings = edgar_settings(tmp_path, form25_html_max_bytes=len(_HTML_FORM_25.encode()))
+    document = "form25.htm"
+    path = edgar_raw.cached_filing_path(
+        "0005555580", accession, document, settings=source._settings
+    )
+    if cached:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes((_HTML_FORM_25 + " " * 100).encode())
+    assert accession not in {d.accession for d in source.delistings()}
+    assert source.unread_html_delistings == 1
+    assert source.failed_filings == 0
+    assert not path.exists()
+    source.check_failures()
+    document_url = _download_url("0005555580", accession, document)
+    before = router.urls.count(document_url)
+    assert accession not in {d.accession for d in source.delistings()}
+    assert router.urls.count(document_url) == before
+
+    source._settings = edgar_settings(tmp_path, form25_html_max_bytes=2_000_000)
+    assert accession in {d.accession for d in source.delistings()}
+    assert router.urls.count(document_url) == before + 1
+
+
+def test_html_form_25_path_safety_error_propagates(tmp_path: Path) -> None:
+    _, source, _ = _html_form_25(tmp_path, _HTML_FORM_25, document="../form25.htm")
+    with pytest.raises(edgar_raw.InvalidFilingReferenceError):
+        source.delistings()
+    assert source.unread_html_delistings == 0
+
+
 @pytest.mark.parametrize(("form", "document"), [("25-NSE", "form25.htm"), ("25", "form25.pdf")])
 def test_an_html_25nse_or_another_document_stays_pre_xml(
     tmp_path: Path, form: str, document: str

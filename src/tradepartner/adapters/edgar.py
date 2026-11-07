@@ -1461,9 +1461,24 @@ _FORM25_CLASS_MAX_CHARS: Final = 300
 def _form25_html_text(text: str) -> str:
     """`text` with script and style bodies and every tag dropped, entities
     unescaped and whitespace (no-break spaces too) collapsed to one space.
-    Each tag pattern stops at the next `<`, as `_cover_12b_marks`' do, so a
-    mangled document stays linear in its length."""
-    plain = re.sub(r"(?is)<(script|style)\b[^<>]*>.*?</\1\s*>", " ", text)
+    An unclosed script or style consumes the remaining document. Each scan
+    resumes after the preceding match, so malformed input stays linear."""
+    opener = re.compile(r"(?is)<(script|style)\b[^<>]*>")
+    closes = {
+        "script": re.compile(r"(?is)</script\s*>"),
+        "style": re.compile(r"(?is)</style\s*>"),
+    }
+    parts: list[str] = []
+    start = 0
+    while match := opener.search(text, start):
+        parts.append(text[start : match.start()])
+        close = closes[match.group(1).lower()].search(text, match.end())
+        if close is None:
+            start = len(text)
+            break
+        start = close.end()
+    parts.append(text[start:])
+    plain = " ".join(parts)
     plain = re.sub(r"(?is)<[^<>]*>", " ", plain)
     return " ".join(html.unescape(plain).replace("\xa0", " ").split())
 
