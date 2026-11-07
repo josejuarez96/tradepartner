@@ -1942,6 +1942,8 @@ STATUS_MAIN = (
     "reconciliation n/a\n"
     "slippage vs open (bp, adverse positive, per order): buy n=0; sell n=0; all n=0; "
     "no bar 0; off session 0; pending 0\n"
+    "slippage split at arrival (bp, open->arrival + arrival->fill = total, per order "
+    "with an arrival price): buy n=0; sell n=0; all n=0; no arrival price 0\n"
     "no successful EDGAR ingest yet; run `tradepartner ingest`\n"
     "alerts (0):\n"
 )
@@ -2733,7 +2735,8 @@ def test_status_bounds_the_slippage_read_to_the_configured_sessions(
 def test_report_prints_the_slippage_line(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
 ) -> None:
-    """#1733: a report that carries a slippage summary prints its one line last."""
+    """#1733: a report that carries a slippage summary prints its line, then its
+    arrival split (#3179), last."""
     side = paper_slippage.SideSlippage(2, 15.0, 12.5, 20.0)
     canned = paper_report.Report(
         comparison=paper_report.PeriodComparison(
@@ -2755,16 +2758,22 @@ def test_report_prints_the_slippage_line(
             no_bar=3,
             off_session=1,
             pending=2,
+            buy_split=paper_slippage.ArrivalSplit(1, 10.0, 4.0, 6.0),
+            overall_split=paper_slippage.ArrivalSplit(1, 10.0, 4.0, 6.0),
+            no_arrival=1,
         ),
     )
     monkeypatch.setattr(paper_report, "report", lambda *_a, **_k: canned)
     out = _paper(clock, factory, "report")
     assert out.exit_code == 0
-    assert out.output.splitlines()[-1] == (
+    assert out.output.splitlines()[-2:] == [
         "slippage vs open (bp, adverse positive, per order): "
         "buy n=2 wmean 15.00 median 12.50 p90 20.00; sell n=0; "
-        "all n=2 wmean 15.00 median 12.50 p90 20.00; no bar 3; off session 1; pending 2"
-    )
+        "all n=2 wmean 15.00 median 12.50 p90 20.00; no bar 3; off session 1; pending 2",
+        "slippage split at arrival (bp, open->arrival + arrival->fill = total, per order "
+        "with an arrival price): buy n=1 +4.00 + +6.00 = +10.00; sell n=0; "
+        "all n=1 +4.00 + +6.00 = +10.00; no arrival price 1",
+    ]
 
 
 # --- `paper shakedown` (ADR 0017 part E; plan T157b) --------------------------------
@@ -3148,6 +3157,10 @@ _COST = paper_slippage.MeasuredCost(
         no_bar=2,
         off_session=1,
         pending=3,
+        buy_split=paper_slippage.ArrivalSplit(900, 50.0, 0.0, 50.0),
+        sell_split=paper_slippage.ArrivalSplit(850, 90.0, 0.0, 90.0),
+        overall_split=paper_slippage.ArrivalSplit(1750, 60.0, 0.0, 60.0),
+        no_arrival=94,
     ),
     month_end=paper_slippage.SideSlippage(190, 70.0, 5.0, 100.0),
     stop_run=142,
@@ -3189,6 +3202,11 @@ def test_paper_cost_prints_the_sides_the_counts_and_the_figure_for_the_latest_wi
     assert "left out: 142 orders of stop runs, 4 on or after the stop (stop session " in (
         out.stdout
     )
+    assert (
+        "split at arrival (open->arrival + arrival->fill = total, orders with an arrival "
+        "price): buys n=900 +0.00 + +50.00 = +50.00; sells n=850 +0.00 + +90.00 = +90.00; "
+        "pooled n=1750 +0.00 + +60.00 = +60.00; no arrival price 94"
+    ) in out.stdout
     assert "counted apart: no bar 2, off session 1, pending 3" in out.stdout
     assert "on sessions a month-end book also traded (in the pool) n=190 +70.0" in out.stdout
     assert "figure to freeze: 60 bp per side (pooled, rounded to 5 bp)" in out.stdout
