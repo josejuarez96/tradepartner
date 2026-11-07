@@ -1688,6 +1688,22 @@ def _check_span_values(values: Mapping[str, Any]) -> None:
         )
 
 
+def research_families_known_at(conn: duckdb.DuckDBPyConnection, as_of: datetime) -> set[str]:
+    """The families of `research_registrations` and `research_exposures` rows known at
+    or before `as_of` (`known_at`), NULL families left out; empty for a table the
+    store lacks. The root-family check's view of experiment-only families (#3126)."""
+    found: set[str] = set()
+    for table in ("research_registrations", "research_exposures"):
+        if not _has_table(conn, table):
+            continue
+        rows = conn.execute(
+            f"SELECT DISTINCT family FROM {table} WHERE family IS NOT NULL AND known_at <= ?",
+            [as_of],
+        ).fetchall()
+        found |= {str(row[0]) for row in rows}
+    return found
+
+
 def _check_family_root_values(values: Mapping[str, Any]) -> None:
     """A `family_root` row's `values` (#3126): exactly `family`, a root family in
     `FAMILY_PARENTS`, and `overlapping_families`, a non-empty list of other families

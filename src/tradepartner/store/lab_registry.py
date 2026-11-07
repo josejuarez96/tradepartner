@@ -73,6 +73,7 @@ from tradepartner.store.registry import (
     code_version,
     family_holdout_spends,
     get_hypothesis_by_id,
+    research_families_known_at,
 )
 
 CADENCE_KEY: Final = "schedule.rebalance_cadence"
@@ -378,22 +379,22 @@ def signal_input_overlaps(
     conn: duckdb.DuckDBPyConnection, family: str, *, as_of: datetime
 ) -> dict[str, tuple[str, ...]]:
     """Every other non-`oracle` family with a `hypotheses` row registered at or before
-    `as_of`, or a `research_registrations` or `research_exposures` row known at or
-    before it (an experiment-only family such as `spinoff` has N but no hypotheses),
+    `as_of`, or a research registration or exposure row known at or before it
+    (`registry.research_families_known_at`: an experiment-only family such as
+    `spinoff` has N but no hypotheses),
     whose signal inputs share a table with `family`'s, mapped to the shared tables
     (sorted). A family with no `FAMILIES` entry has unknown inputs and counts as
     overlapping (fail-closed). Reads only rows known at `as_of`."""
     require_lab(conn)
     ours = family_signal_inputs(family)
-    sources = ["SELECT family FROM hypotheses WHERE registered_at <= ?"]
-    for table in ("research_registrations", "research_exposures"):
-        if _table_exists(conn, table):
-            sources.append(f"SELECT family FROM {table} WHERE known_at <= ?")
-    others = conn.execute(
-        f"SELECT DISTINCT family FROM ({' UNION ALL '.join(sources)}) "
-        "WHERE family IS NOT NULL AND family <> ? AND family <> ? ORDER BY family",
-        [*([as_of] * len(sources)), family, ORACLE_FAMILY],
-    ).fetchall()
+    hypothesis_families = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT family FROM hypotheses WHERE registered_at <= ?", [as_of]
+        ).fetchall()
+    }
+    known = hypothesis_families | research_families_known_at(conn, as_of)
+    others = [(f,) for f in sorted(known - {family, ORACLE_FAMILY})]
     found: dict[str, tuple[str, ...]] = {}
     for (other,) in others:
         if other not in _config_backtest.FAMILIES:
@@ -436,15 +437,6 @@ def root_family_refusal(
             f"overlapping families {missing} (overlaps: {named})"
         )
     return None
-
-
-def _table_exists(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
-    (count,) = conn.execute(  # type: ignore[misc]
-        "SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = current_database() "
-        "AND schema_name = current_schema() AND table_name = ?",
-        [table],
-    ).fetchone()
-    return bool(count)
 
 
 def check_root_family(conn: duckdb.DuckDBPyConnection, family: str, *, as_of: datetime) -> None:
