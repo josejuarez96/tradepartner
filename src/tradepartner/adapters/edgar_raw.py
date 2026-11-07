@@ -39,7 +39,10 @@ streamed `GET`, each attempt and retry still behind `_RateLimiter`:
   `403` (or `429` past its backoff) fails at once instead of waiting
   another 10 minutes, so a block that persists (e.g. a refused
   `User-Agent`) costs one wait per run, not one per request. Any success
-  clears it.
+  clears it, except during the wait itself (#3205): while one request
+  waits a block out, every other send, retries included, is refused as a
+  `403` without being sent, and a success that lands then (a request sent
+  before the block) clears nothing; the wait's end lifts that cooldown.
 - **A corrupt or truncated bulk zip** (one that won't open, a member whose
   deflate data won't inflate or ends early, or `testzip()` naming a CRC
   mismatch): `_stream_to_with_headers` re-downloads it once more; a zip
@@ -238,10 +241,19 @@ class _RateLimitBlock:
     """Process-wide memory of SEC's rate-limit block (#761): set when a
     request waits a block out, cleared by any successful response. While
     set, a block status fails at once rather than waiting again (module
-    docstring). `threading.Lock`-guarded, like `_RateLimiter`."""
+    docstring). `threading.Lock`-guarded, like `_RateLimiter`.
+
+    The wait itself is a cooldown (#3205): from `start_cooldown` to
+    `end_cooldown` no request is sent (`_wait_to_send`, checked
+    before every send), and a success that lands then (a request sent
+    before the block) clears nothing; only the wait's end lifts the
+    cooldown, and the waiting request's retry is the first send after it."""
 
     def __init__(self) -> None:
         self._waited_since_last_success = False
+        # Waits in progress: two requests whose `403`s crossed may both wait,
+        # and the cooldown lasts until the last of them ends.
+        self._waits_running = 0
         self._lock = threading.Lock()
 
     def is_set(self) -> bool:
@@ -253,13 +265,44 @@ class _RateLimitBlock:
             self._waited_since_last_success = True
 
     def clear(self) -> None:
+        """A success: the block is over, unless its wait is still running."""
         with self._lock:
-            self._waited_since_last_success = False
+            if self._waits_running == 0:
+                self._waited_since_last_success = False
+
+    def start_cooldown(self) -> None:
+        with self._lock:
+            self._waited_since_last_success = True
+            self._waits_running += 1
+
+    def end_cooldown(self) -> None:
+        with self._lock:
+            self._waits_running = max(self._waits_running - 1, 0)
+
+    def in_cooldown(self) -> bool:
+        with self._lock:
+            return self._waits_running > 0
 
 
 # Module-level and process-wide on purpose, like `_LIMITER`: SEC blocks the
 # client, not one request.
 _RATE_LIMIT_BLOCK = _RateLimitBlock()
+
+
+def _wait_to_send(min_interval_seconds: float, method: str, url: str) -> None:
+    """`_LIMITER`'s wait, then the block check every send makes (#3205): while
+    another request waits SEC's block out, raise the block's `403` as an
+    `httpx.HTTPStatusError` (every caller already handles it as a block)
+    instead of sending. Checked after the limiter, so a send that queued
+    there before the block began is refused too."""
+    _LIMITER.wait(min_interval_seconds)
+    if _RATE_LIMIT_BLOCK.in_cooldown():
+        request = httpx.Request(method, url)
+        raise httpx.HTTPStatusError(
+            f"not sent: SEC's rate-limit block is being waited out ({method} {url})",
+            request=request,
+            response=httpx.Response(_RATE_LIMIT_STATUS_CODE, request=request),
+        )
 
 
 def rate_limit_blocked() -> bool:
@@ -364,8 +407,11 @@ class _RetryPolicy:
         if self._rate_limit_waited or _RATE_LIMIT_BLOCK.is_set():
             response.raise_for_status()
         self._rate_limit_waited = True
-        _RATE_LIMIT_BLOCK.set()
-        time.sleep(self._settings.edgar.rate_limit_wait_seconds)
+        _RATE_LIMIT_BLOCK.start_cooldown()
+        try:
+            time.sleep(self._settings.edgar.rate_limit_wait_seconds)
+        finally:
+            _RATE_LIMIT_BLOCK.end_cooldown()
         if observer := _retry_observer.get():
             observer()
         return True
@@ -376,16 +422,19 @@ def _execute_with_retry(
     *,
     settings: Settings,
     min_interval_seconds: float,
+    method: str,
+    url: str,
 ) -> httpx.Response:
-    """Call `make_request()` (behind `_LIMITER`, which also spaces out every
-    retry) until it succeeds or `_RetryPolicy` gives up. Raises
+    """Call `make_request()` (`method url`; behind `_LIMITER`, which also
+    spaces out every retry, and the block check, `_wait_to_send`) until it
+    succeeds or `_RetryPolicy` gives up. Raises
     `httpx.TransportError` (a transport error on the last allowed attempt)
     or `httpx.HTTPStatusError` (a second `403`, a last `429`/`503`, or any
     status the policy doesn't retry) on final failure.
     """
     policy = _RetryPolicy(settings)
     while True:
-        _LIMITER.wait(min_interval_seconds)
+        _wait_to_send(min_interval_seconds, method, url)
         try:
             response = make_request()
         except httpx.TransportError:
@@ -417,6 +466,8 @@ def _get(
         lambda: http_client.get(url, headers=headers, timeout=timeout),
         settings=settings,
         min_interval_seconds=min_interval_seconds,
+        method="GET",
+        url=url,
     )
 
 
@@ -880,7 +931,7 @@ def filing_document_head(
     min_interval_seconds = 1.0 / settings.edgar.requests_per_second
     policy = _RetryPolicy(settings)
     while True:
-        _LIMITER.wait(min_interval_seconds)
+        _wait_to_send(min_interval_seconds, "GET", url)
         buffer = bytearray()
         try:
             with http_client.stream("GET", url, headers=headers, timeout=timeout) as response:
@@ -986,7 +1037,7 @@ def _bounded_get(
     )
     policy = _RetryPolicy(settings)
     while True:
-        _LIMITER.wait(1.0 / settings.edgar.requests_per_second)
+        _wait_to_send(1.0 / settings.edgar.requests_per_second, "GET", url)
         try:
             with http_client.stream(
                 "GET", url, headers=headers, timeout=settings.edgar.request_timeout_seconds
@@ -1213,7 +1264,7 @@ def _stream_to_with_headers(
     policy = _RetryPolicy(settings)
     zip_redownloaded = False
     while True:
-        _LIMITER.wait(min_interval_seconds)
+        _wait_to_send(min_interval_seconds, "GET", url)
         try:
             with http_client.stream("GET", url, headers=headers, timeout=timeout) as response:
                 if sent_validator and response.status_code == httpx.codes.NOT_MODIFIED:
@@ -1344,6 +1395,8 @@ def fsn_validators(
         lambda: http_client.request("HEAD", url, headers=headers, timeout=timeout),
         settings=settings,
         min_interval_seconds=min_interval_seconds,
+        method="HEAD",
+        url=url,
     )
     return response.headers
 
@@ -1433,11 +1486,14 @@ def insider_bulk_validators(
         return lambda: http_client.request("HEAD", url, headers=headers, timeout=timeout)
 
     for template in _INSIDER_BULK_URLS:
+        url = template.format(quarter=quarter)
         try:
             response = _execute_with_retry(
-                head(template.format(quarter=quarter)),
+                head(url),
                 settings=settings,
                 min_interval_seconds=1.0 / settings.edgar.requests_per_second,
+                method="HEAD",
+                url=url,
             )
         except httpx.HTTPStatusError as error:
             if error.response.status_code != httpx.codes.NOT_FOUND:

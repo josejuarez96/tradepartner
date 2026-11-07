@@ -9,7 +9,7 @@ is worse by exactly the exit's cost, with the proceeds in cash.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, ClassVar
 
 import polars as pl
@@ -494,3 +494,415 @@ class TestRebalanceCounters:
             (0.0, 0.0),
             (0.02, 0.01),
         ]
+
+
+# --- the delisting failure-return policy (spec amendment #2670, req 2; plan T328c) ------
+
+#: X's Form 25 episode: the filing that ends its listing, on `EXCHANGE` by default.
+FILED = datetime(2024, 2, 16, 21, 0, tzinfo=UTC)
+FORM = "25-NSE"
+POLICY_COUNTS = set(engine.POLICY_COUNT_NAMES)
+
+
+class TestDelistingPolicy:
+    """X delists on `END` (known before the T1 read); the run's data cutoff is
+    close(T2). Each policy run is compared with the same run at `none`: up to `END`
+    they agree, and from it on the policy run's cash differs by exactly the change in
+    the sale value, net of the per-side cost on it."""
+
+    END = date(2024, 2, 15)
+    CUTOFF = read_time(T2, "month_end")
+    DECIDING = read_time(T1, "month_end")
+
+    def _provider(
+        self,
+        *,
+        exchange: str = "NYSE",
+        reasons: Sequence[tuple[str, datetime]] = (),
+        mergers: Sequence[dict[str, Any]] = (),
+        status: str = delistings.DELISTED,
+    ) -> FakeProvider:
+        skip = [("X", s) for s in SESSIONS if s > self.END]
+        provider = _provider(skip=skip, x_until=T0)
+        provider.listing_ends_rows = pl.DataFrame(
+            [
+                {
+                    "security_id": "X",
+                    "valid_from": date(2010, 1, 4),
+                    "exchange": exchange,
+                    "status": status,
+                    "end_session": self.END,
+                    "delisting_form": FORM,
+                    "delisting_filed_at": FILED,
+                    "known_at": session_close(date(2024, 2, 20)),
+                }
+            ],
+            schema={
+                "security_id": pl.Utf8,
+                "valid_from": pl.Date,
+                "exchange": pl.Utf8,
+                "status": pl.Utf8,
+                "end_session": pl.Date,
+                "delisting_form": pl.Utf8,
+                "delisting_filed_at": KNOWN,
+                "known_at": KNOWN,
+            },
+        )
+        provider.delisting_reason_rows = pl.DataFrame(
+            [
+                {
+                    "security_id": "X",
+                    "delisting_form": FORM,
+                    "delisting_class_title": f"Class {i}",
+                    "delisting_exchange": exchange,
+                    "delisting_filed_at": FILED,
+                    "reason": reason,
+                    "reason_source": "eightk_item",
+                    "known_at": known_at,
+                }
+                for i, (reason, known_at) in enumerate(reasons)
+            ],
+            schema=provider.delisting_reason_rows.schema,
+        )
+        provider.merger_exit_rows = pl.DataFrame(
+            [
+                {
+                    "security_id": "X",
+                    "source_action_id": f"m{i}",
+                    "kind": "cash",
+                    "cash_per_share": None,
+                    "share_ratio": None,
+                    "effective_date": self.END,
+                    "acquirer_security_id": None,
+                    "acquirer_raw_close": None,
+                    "known_at": session_close(date(2024, 2, 20)),
+                    **row,
+                }
+                for i, row in enumerate(mergers)
+            ],
+            schema=provider.merger_exit_rows.schema,
+        )
+        return provider
+
+    def _run(self, provider: FakeProvider, policy: str) -> BacktestResult:
+        params = _params(
+            backtest={"stale_exit_sessions": NO_STALE, "delisting_failure_return": policy}
+        )
+        return _run(provider, params)[LEVEL]
+
+    def _pair(self, policy: str, **kwargs: Any) -> tuple[BacktestResult, BacktestResult]:
+        return self._run(self._provider(**kwargs), policy), self._run(
+            self._provider(**kwargs), "none"
+        )
+
+    def _sold_for(self, ours: BacktestResult, base: BacktestResult) -> float:
+        """X's sale value in `ours`, from the cash difference to the `none` run (whose
+        sale is X's marked value at `END`), the per-side cost backed out; the two runs
+        must agree before `END` and differ by one constant from it through T1 (the next
+        fill reinvests the cash)."""
+        mine, theirs = _strategy(ours), _strategy(base)
+        for session in _steps(T0, previous_session(self.END)):
+            assert mine[session] == pytest.approx(theirs[session], rel=1e-12)
+        gaps = {
+            session: cast_cash(mine[session]) - cast_cash(theirs[session])
+            for session in _steps(self.END, T1)
+        }
+        first = gaps[self.END]
+        assert all(gap == pytest.approx(first, abs=1e-6) for gap in gaps.values())
+        return self._marked(base) + first / (1 - LEVEL / 10_000)
+
+    def _marked(self, base: BacktestResult) -> float:
+        """X's marked value at `END`: the `none` run's sale value, read from the twin
+        that never exits it (the exiting runs zero it from `END` on)."""
+        skip = [("X", s) for s in SESSIONS if s > self.END]
+        twin = _run(_provider(skip=skip, x_until=T0), _no_stale())[LEVEL]
+        marked = _value(twin, "X", self.END)
+        assert marked > 0
+        return marked
+
+    def _x_close(self) -> float:
+        bars = _bars(GROWTH).filter(
+            (pl.col("security_id") == "X") & (pl.col("session") == self.END)
+        )
+        return float(bars["close"].item())
+
+    @pytest.mark.parametrize(
+        ("policy", "exchange", "reason", "shock"),
+        [
+            ("failure_v1", "NYSE", "performance_failure", -0.30),
+            ("failure_v1", "NYSE_AMERICAN", "bankruptcy", -0.30),
+            ("failure_v1", "NASDAQ", "performance_failure", -0.55),
+            ("severe_v1", "NYSE", "bankruptcy", -0.55),
+            ("severe_v1", "NYSE_AMERICAN", "performance_failure", -0.55),
+            ("severe_v1", "NASDAQ", "bankruptcy", -1.00),
+        ],
+    )
+    def test_a_confirmed_failure_takes_its_exchange_shock(
+        self, policy: str, exchange: str, reason: str, shock: float
+    ) -> None:
+        ours, base = self._pair(
+            policy, exchange=exchange, reasons=[(reason, session_close(date(2024, 2, 20)))]
+        )
+        assert self._sold_for(ours, base) == pytest.approx(
+            self._marked(base) * (1 + shock), rel=1e-9
+        )
+        counts = _row(ours, T0).counts
+        assert {k: counts[k] for k in POLICY_COUNTS} == {
+            **dict.fromkeys(POLICY_COUNTS, 0),
+            "n_failure_shocks": 1,
+        }
+        assert _row(ours, T0).n_delisting_exits == 1
+        # The ordinary cost is on the shocked value: cost_paid falls by the shock's share.
+        assert _row(ours, T0).cost_paid == pytest.approx(
+            _row(base, T0).cost_paid + self._marked(base) * shock * LEVEL / 10_000, rel=1e-9
+        )
+
+    @pytest.mark.parametrize(
+        ("policy", "exchange", "shock", "unknown"),
+        [
+            ("failure_v1", "NASDAQ", 0.0, 1),
+            ("severe_v1", "NYSE", -0.55, 1),
+            ("severe_v1", "NASDAQ", -1.00, 1),
+        ],
+    )
+    def test_an_unknown_exit_is_shocked_only_under_severe(
+        self, policy: str, exchange: str, shock: float, unknown: int
+    ) -> None:
+        ours, base = self._pair(policy, exchange=exchange)
+        assert self._sold_for(ours, base) == pytest.approx(
+            self._marked(base) * (1 + shock), rel=1e-9, abs=1e-9
+        )
+        counts = _row(ours, T0).counts
+        assert counts["n_unknown_exits"] == unknown
+        assert counts["n_failure_shocks"] == (shock != 0.0)
+
+    @pytest.mark.parametrize("policy", ["failure_v1", "severe_v1"])
+    def test_a_voluntary_exit_is_never_shocked(self, policy: str) -> None:
+        ours, base = self._pair(
+            policy,
+            exchange="NASDAQ",
+            reasons=[("voluntary_other", session_close(date(2024, 2, 20)))],
+        )
+        assert self._sold_for(ours, base) == pytest.approx(self._marked(base), rel=1e-9)
+        assert _row(ours, T0).counts["n_failure_shocks"] == 0
+
+    def test_an_unmapped_exchange_fails_the_trial_naming_it(self) -> None:
+        provider = self._provider(
+            exchange="NYSE_ARCA", reasons=[("bankruptcy", session_close(date(2024, 2, 20)))]
+        )
+        with pytest.raises(ValueError, match=r"X: listing exchange 'NYSE_ARCA' is outside"):
+            self._run(provider, "failure_v1")
+
+    def test_an_unknown_unmapped_exit_under_severe_fails_too(self) -> None:
+        with pytest.raises(ValueError, match=r"'NYSE_ARCA' is outside"):
+            self._run(self._provider(exchange="NYSE_ARCA"), "severe_v1")
+
+    def test_merger_consideration_reads_the_raw_acquirer_close(self) -> None:
+        # The acquirer A is held and marked in the frame at another (adjusted) price; the
+        # consideration must use the row's raw close (80), not A's frame close.
+        merger = {
+            "kind": "stock_and_cash",
+            "cash_per_share": 10.0,
+            "share_ratio": 0.5,
+            "acquirer_security_id": "A",
+            "acquirer_raw_close": 80.0,
+        }
+        reasons = [("merger_acquisition", session_close(date(2024, 2, 20)))]
+        ours, base = self._pair("severe_v1", exchange="NASDAQ", reasons=reasons, mergers=[merger])
+        shares = self._marked(base) / self._x_close()
+        assert self._sold_for(ours, base) == pytest.approx(shares * (10.0 + 0.5 * 80.0), rel=1e-9)
+        a_close = float(
+            _bars(GROWTH)
+            .filter((pl.col("security_id") == "A") & (pl.col("session") == self.END))["close"]
+            .item()
+        )
+        assert a_close != pytest.approx(80.0)
+        assert self._sold_for(ours, base) != pytest.approx(shares * (10.0 + 0.5 * a_close))
+        counts = _row(ours, T0).counts
+        assert (counts["n_merger_consideration"], counts["n_failure_shocks"]) == (1, 0)
+
+    @pytest.mark.parametrize(
+        ("kind", "cash", "ratio", "value"),
+        [("cash", 120.0, None, 120.0), ("stock", None, 2.0, 2.0 * 55.0)],
+    )
+    def test_a_one_component_deal_uses_its_component(
+        self, kind: str, cash: float | None, ratio: float | None, value: float
+    ) -> None:
+        merger = {
+            "kind": kind,
+            "cash_per_share": cash,
+            "share_ratio": ratio,
+            "acquirer_security_id": None if ratio is None else "A",
+            "acquirer_raw_close": None if ratio is None else 55.0,
+        }
+        reasons = [("merger_acquisition", session_close(date(2024, 2, 20)))]
+        ours, base = self._pair("failure_v1", reasons=reasons, mergers=[merger])
+        shares = self._marked(base) / self._x_close()
+        assert self._sold_for(ours, base) == pytest.approx(shares * value, rel=1e-9)
+
+    @pytest.mark.parametrize(
+        ("mergers", "fallbacks", "conflicts"),
+        [
+            ([], 1, 0),
+            (
+                [
+                    {"cash_per_share": 120.0},
+                    {"cash_per_share": 130.0, "effective_date": date(2024, 2, 20)},
+                ],
+                1,
+                1,
+            ),
+            (
+                [
+                    {
+                        "kind": "stock",
+                        "share_ratio": 2.0,
+                        "acquirer_security_id": "A",
+                        "acquirer_raw_close": None,
+                    }
+                ],
+                1,
+                0,
+            ),
+            # Outside the window: before `end_session`, and 11 sessions after it.
+            ([{"cash_per_share": 120.0, "effective_date": date(2024, 2, 14)}], 1, 0),
+            ([{"cash_per_share": 120.0, "effective_date": date(2024, 3, 4)}], 1, 0),
+        ],
+    )
+    def test_a_merger_without_one_usable_row_falls_back_to_the_last_close_counted(
+        self, mergers: list[dict[str, Any]], fallbacks: int, conflicts: int
+    ) -> None:
+        reasons = [("merger_acquisition", session_close(date(2024, 2, 20)))]
+        ours, base = self._pair("severe_v1", exchange="NASDAQ", reasons=reasons, mergers=mergers)
+        assert self._sold_for(ours, base) == pytest.approx(self._marked(base), rel=1e-9)
+        counts = _row(ours, T0).counts
+        assert (counts["n_merger_fallbacks"], counts["n_merger_conflicts"]) == (
+            fallbacks,
+            conflicts,
+        )
+        assert (counts["n_merger_consideration"], counts["n_failure_shocks"]) == (0, 0)
+
+    def test_the_window_end_is_ten_trading_sessions_after_end_session(self) -> None:
+        # 2024-02-15 + 10 sessions (Presidents' Day 02-19 closed) is 2024-03-01.
+        assert engine._window_end(self.END, 10) == date(2024, 3, 1)
+        merger = {"cash_per_share": 120.0, "effective_date": date(2024, 3, 1)}
+        reasons = [("merger_acquisition", session_close(date(2024, 2, 20)))]
+        ours, base = self._pair("failure_v1", reasons=reasons, mergers=[merger])
+        shares = self._marked(base) / self._x_close()
+        assert self._sold_for(ours, base) == pytest.approx(shares * 120.0, rel=1e-9)
+
+    def test_two_matching_reasons_are_unknown_and_counted(self) -> None:
+        known = session_close(date(2024, 2, 20))
+        reasons = [("bankruptcy", known), ("merger_acquisition", known)]
+        ours, base = self._pair("failure_v1", exchange="NASDAQ", reasons=reasons)
+        assert self._sold_for(ours, base) == pytest.approx(self._marked(base), rel=1e-9)
+        counts = _row(ours, T0).counts
+        assert (counts["n_reason_conflicts"], counts["n_unknown_exits"]) == (1, 1)
+
+    def test_a_reason_for_another_episode_does_not_match(self) -> None:
+        provider = self._provider(
+            exchange="NASDAQ", reasons=[("bankruptcy", session_close(date(2024, 2, 20)))]
+        )
+        provider.delisting_reason_rows = provider.delisting_reason_rows.with_columns(
+            pl.lit("NYSE").alias("delisting_exchange")
+        )
+        ours = self._run(provider, "failure_v1")
+        assert _row(ours, T0).counts["n_unknown_exits"] == 1
+        assert _row(ours, T0).counts["n_failure_shocks"] == 0
+
+    def test_evidence_known_after_the_cutoff_leaves_the_last_close(self) -> None:
+        late = self.CUTOFF + timedelta(microseconds=1)
+        merger = {"cash_per_share": 120.0, "known_at": late}
+        for reasons, mergers in (
+            ([("bankruptcy", late)], []),
+            ([("merger_acquisition", session_close(date(2024, 2, 20)))], [merger]),
+        ):
+            ours, base = self._pair(
+                "failure_v1", exchange="NASDAQ", reasons=reasons, mergers=mergers
+            )
+            assert self._sold_for(ours, base) == pytest.approx(self._marked(base), rel=1e-9)
+            assert _row(ours, T0).counts["n_failure_shocks"] == 0
+            assert _row(ours, T0).counts["n_merger_consideration"] == 0
+
+    def test_evidence_after_the_deciding_read_but_by_the_cutoff_applies(self) -> None:
+        # Owner 2026-10-31: the data cutoff alone decides; the deciding read (close T1)
+        # only decides that X exits.
+        at_cutoff = self.CUTOFF
+        assert at_cutoff > self.DECIDING
+        ours, base = self._pair(
+            "failure_v1", exchange="NASDAQ", reasons=[("bankruptcy", at_cutoff)]
+        )
+        assert self._sold_for(ours, base) == pytest.approx(self._marked(base) * 0.45, rel=1e-9)
+        merger = {"cash_per_share": 120.0, "known_at": at_cutoff}
+        reasons = [("merger_acquisition", at_cutoff)]
+        ours, base = self._pair("failure_v1", reasons=reasons, mergers=[merger])
+        shares = self._marked(base) / self._x_close()
+        assert self._sold_for(ours, base) == pytest.approx(shares * 120.0, rel=1e-9)
+
+    def test_the_evidence_is_read_once_at_the_cutoff_for_the_ended_names(self) -> None:
+        provider = self._provider(reasons=[("bankruptcy", session_close(date(2024, 2, 20)))])
+        self._run(provider, "severe_v1")
+        calls = [c for c in provider.calls if c.method in {"delisting_reasons", "merger_exits"}]
+        assert [(c.method, c.t, c.ids) for c in calls] == [
+            ("delisting_reasons", self.CUTOFF, ("X",)),
+            ("merger_exits", self.CUTOFF, ("X",)),
+        ]
+
+    def test_a_short_delisting_exit_is_refused(self) -> None:
+        context = engine._ExitContext(
+            read_time=self.DECIDING,
+            listings={"X": {"exchange": "NYSE"}},
+            policy="failure_v1",
+            terms=engine.DELISTING_POLICIES["failure_v1"],
+        )
+        counts = dict.fromkeys(engine.POLICY_COUNT_NAMES, 0)
+        with pytest.raises(ValueError, match="refused_delisting_short"):
+            engine._policy_value("X", -100.0, 1.0, self.END, context, counts)
+
+    def test_a_transfer_is_never_shocked(self) -> None:
+        provider = self._provider(
+            exchange="NASDAQ",
+            status=delistings.TRANSFERRED,
+            reasons=[("bankruptcy", session_close(date(2024, 2, 20)))],
+        )
+        # Kept trading on its new exchange: no trailing gap.
+        provider.prices = _bars(GROWTH)
+        ours = self._run(provider, "severe_v1")
+        assert [r.n_delisting_exits for r in ours.rebalances] == [0, 0]
+        assert all(r.counts["n_failure_shocks"] == 0 for r in ours.rebalances)
+        assert ours.delisting_exits == ()
+        assert "delisting_reasons" not in {c.method for c in provider.calls}
+
+    def test_none_makes_no_evidence_read_and_ignores_the_evidence(self) -> None:
+        known = session_close(date(2024, 2, 20))
+        merger = {"cash_per_share": 120.0}
+        with_rows = self._provider(
+            exchange="NASDAQ", reasons=[("bankruptcy", known)], mergers=[merger]
+        )
+        plain = self._provider(exchange="NASDAQ")
+        ours, theirs = self._run(with_rows, "none"), self._run(plain, "none")
+        methods = {c.method for c in with_rows.calls}
+        assert not methods & {"delisting_reasons", "merger_exits"}
+        assert _strategy(ours) == _strategy(theirs)
+        assert ours.rebalances == theirs.rebalances
+        assert not POLICY_COUNTS & set(_row(ours, T0).counts)
+
+    @pytest.mark.parametrize("policy", ["none", "failure_v1"])
+    def test_every_policy_records_the_delisting_exit(self, policy: str) -> None:
+        ours = self._run(self._provider(exchange="NASDAQ"), policy)
+        assert ours.delisting_exits == (
+            engine.DelistingExit(
+                security_id="X",
+                read_time=self.DECIDING,
+                end_session=self.END,
+                exchange="NASDAQ",
+                delisting_form=FORM,
+                delisting_filed_at=FILED,
+            ),
+        )
+
+
+def cast_cash(point: tuple[float, float | None]) -> float:
+    cash = point[1]
+    assert cash is not None
+    return cash

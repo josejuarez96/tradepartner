@@ -1407,8 +1407,8 @@ def test_a_screened_registration_runs_at_its_frozen_fraction(
     and T239 applies `strategy.hold_top_fraction` (#657), so `NOT_YET_APPLIED_KEYS` is
     empty and a registration at 0.20 loads at 0.20 (until T165c, quant-auditor on #1387
     had it refused)."""
-    # T328a (#2670): the delisting policy key waits for its engine task.
-    assert frozenset({"backtest.delisting_failure_return"}) == hypothesis.NOT_YET_APPLIED_KEYS
+    # T328c (#2670) applies the delisting policy key, so the set is empty again.
+    assert frozenset() == hypothesis.NOT_YET_APPLIED_KEYS
     _register(conn, _with_turnover(tmp_path, FIXTURE, SLUG, "0.20"), settings)
     loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
     assert loaded.strategy.turnover_top_fraction == 0.20
@@ -2546,20 +2546,22 @@ def _delisting_policy_file(tmp_path: Path, slug: str, value: str) -> Path:
     return path
 
 
-def test_the_delisting_policy_is_post_registration_and_not_yet_applied() -> None:
+def test_the_delisting_policy_is_post_registration_and_applied() -> None:
     assert DELISTING_POLICY_KEY in frozen.POST_REGISTRATION_BACKTEST_KEYS
-    assert DELISTING_POLICY_KEY in hypothesis.NOT_YET_APPLIED_KEYS
+    # T328c: the engine applies the policy, so it left `NOT_YET_APPLIED_KEYS`.
+    assert DELISTING_POLICY_KEY not in hypothesis.NOT_YET_APPLIED_KEYS
     assert DELISTING_POLICY_KEY not in hypothesis.required_keys("momentum")
 
 
 @pytest.mark.parametrize("value", ["failure_v1", "severe_v1"])
-def test_a_nonzero_policy_registers_but_cannot_run_until_the_engine_applies_it(
+def test_a_nonzero_policy_registers_and_loads_at_its_frozen_value(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings, value: str
 ) -> None:
+    """Refused by `load_frozen` until T328c wired the engine; now it runs at its value."""
     record = _register(conn, _delisting_policy_file(tmp_path, SLUG, value), settings)
     assert record.params[DELISTING_POLICY_KEY] == value
-    with pytest.raises(HypothesisFileError, match=rf"{DELISTING_POLICY_KEY}.*cannot run"):
-        hypothesis.load_frozen(conn, SLUG, settings=settings)
+    loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
+    assert loaded.backtest.delisting_failure_return == value
 
 
 def test_the_none_policy_loads_as_the_last_close_exit(
