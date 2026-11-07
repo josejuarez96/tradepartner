@@ -26,7 +26,10 @@ This module holds only evidence for a decision, never store input:
 Nothing outside this module and the CLI imports it (a source-scan test pins
 that), so every universe, backtest and paper read is unchanged. Writing master
 rows, bars and delistings for these banks waits on an ADR 0022 amendment that
-says how to key a security whose identity is not read from EDGAR filings.
+says how to key a security whose identity is not read from EDGAR filings, and
+what dated evidence, public at the time, lets a listing row carry a `known_at`
+before the sessions it covers. A row stamped at this list's review date would
+be free of look-ahead but would still keep every 2023 read without the bank.
 """
 
 from __future__ import annotations
