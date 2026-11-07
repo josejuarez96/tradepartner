@@ -48,6 +48,9 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   month through the same `StorePriceSource`. It needs the Alpaca keys, prints
   one line per month and exits like `ingest`; a refused symbol or identity is
   a usage error (2), with nothing fetched.
+- `tradepartner close-gap --reference FILE [--symbol SPY]` (#3077) compares a benchmark's
+  stored daily closes with owner-supplied official closes (`session,close` CSV) and exits 1
+  on any session off by more than `index_check.max_close_gap`; read-only.
 - `tradepartner index-check [--start YYYY-MM] [--end YYYY-MM] [--out PATH]` runs
   `backtest.index_check_store.run_index_check` (backtest spec
   amendment #1598, plan T245): the whole universe, equal and cap weight, against RSP
@@ -465,6 +468,7 @@ from tradepartner.backtest.hypothesis import (
 from tradepartner.backtest.metrics import METRIC_KEYS
 from tradepartner.backtest.run import RunOutcome, run_hypothesis
 from tradepartner.cli_record import _configured_secrets, scrub_text
+from tradepartner.close_gap import close_gaps
 from tradepartner.config import Settings, clean_message, get_settings
 from tradepartner.corpus import departure_fetch
 from tradepartner.diskfloor import ingest_floor_refusal, low_disk_warning
@@ -613,7 +617,7 @@ from tradepartner.store import (
 )
 from tradepartner.store import backup as store_backup_module
 from tradepartner.store import migrate as store_migrate
-from tradepartner.store.asof import ASSETS_SOURCE
+from tradepartner.store.asof import ASSETS_SOURCE, prices_as_of
 from tradepartner.store.db import (
     StoreLockedError,
     open_for_write,
@@ -6320,6 +6324,43 @@ def make_app(
             payload["header"]["code_version"] = version
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    @app.command("close-gap")
+    def close_gap_(
+        reference: Annotated[
+            Path, typer.Option(help="CSV of the official closes: columns session,close")
+        ],
+        symbol: Annotated[str, typer.Option(help="benchmark symbol (BENCH:<symbol>)")] = "SPY",
+    ) -> None:
+        """Stored daily closes against official closes for a benchmark (#3077).
+
+        Read-only. Prints every session off by more than `index_check.max_close_gap`
+        (a missing stored bar counts) and exits 1 if there is one."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            official = pl.read_csv(reference, schema_overrides={"session": pl.Date}).select(
+                "session", pl.col("close").cast(pl.Float64)
+            )
+            with open_read_only(s) as conn:
+                stored = prices_as_of(conn, clock(), [f"BENCH:{symbol}"], traded_only=True)
+            gaps = close_gaps(stored, official, s.index_check.max_close_gap)
+        except (ValueError, OSError, pl.exceptions.PolarsError) as exc:
+            raise _fail(_scrubbed(f"close-gap failed: {exc}", s), USAGE_ERROR) from None
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        typer.echo(
+            f"close-gap {symbol}: {gaps.height} of {official.height} official sessions "
+            f"off by more than {s.index_check.max_close_gap:.2%} (nothing written)"
+        )
+        for row in gaps.iter_rows(named=True):
+            gap = "no stored bar" if row["gap"] is None else f"{row['gap']:+.2%}"
+            typer.echo(
+                f"{row['session']}  stored {row['stored']}  official {row['official']}  {gap}"
+            )
+        if gaps.height:
+            raise typer.Exit(1)
 
     return app
 
