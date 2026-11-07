@@ -64,6 +64,7 @@ jobs:
       checks: read
     outputs:
       tests-needed: ${{ steps.scope.outputs.needed }}
+      dashboard-tests: ${{ steps.scope.outputs.dashboard }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -72,7 +73,9 @@ jobs:
       # ready_pr.py), which skips every shard below too (their `if:` reads this output).
       # A push to main skips the shards only when scripts/ci_tested_tree.py prints exactly
       # `skip`: the commit's tree is a PR head's tree that already passed every shard (#1192).
-      # `train/**` pushes always need tests. Fails closed: a failed diff fails
+      # `train/**` pushes always need tests. A PR whose diff misses the dashboard
+      # (ci_tested_tree.py --dashboard-tests-needed) prints dashboard=no and its shards skip
+      # tests/dashboard (#3221); every push runs it. Fails closed: a failed diff fails
       # the step, an empty diff or anything but "no" runs tests, and the tree lookup prints
       # `run` (or fails, read as `run`) on any doubt.
       - name: Test scope
@@ -83,10 +86,12 @@ jobs:
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           needed=yes
+          dashboard=yes
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             files=$(git -c core.quotePath=false diff --no-renames --name-only "origin/$BASE_REF...HEAD")
             if [ -n "$files" ]; then
               needed=$(printf '%s\n' "$files" | python3 scripts/ready_pr.py --tests-needed)
+              dashboard=$(printf '%s\n' "$files" | python3 scripts/ci_tested_tree.py --dashboard-tests-needed)
             fi
             # A refresh that only merged docs from main into an already fully tested head
             # keeps that head's result (#2279); any doubt prints `run`.
@@ -106,8 +111,9 @@ jobs:
               echo "Main: running the full suite."
             fi
           fi
-          echo "Tests needed: $needed"
+          echo "Tests needed: $needed; tests/dashboard: $dashboard"
           echo "needed=$needed" >> "$GITHUB_OUTPUT"
+          echo "dashboard=$dashboard" >> "$GITHUB_OUTPUT"
 
   checks-fast:
     if: ${{ !(github.event.action == 'labeled' && github.event.label.name != 'ci:full') }}
@@ -170,8 +176,11 @@ jobs:
         run: uv sync --locked
       # xdist: one worker per core with work stealing; each test gets its own tmp_path
       # (#581). The header prints the collected count; durations re-measure shard weights.
+      # tests/dashboard is ignored only on the scope's explicit `no` (#3221); the bucketing
+      # then packs the remaining files across all shards. The Book page's kill-action test
+      # (it guards the `paper kill` path) lives in tests/execution, so it always runs.
       - name: Tests (this shard)
-        run: uv run pytest -n auto --dist worksteal --durations=0 --durations-min=1.0
+        run: uv run pytest -n auto --dist worksteal --durations=0 --durations-min=1.0 ${{ needs.scope.outputs.dashboard-tests == 'no' && '--ignore=tests/dashboard' || '' }}
 
   # Required check name every piece of merge tooling reads literally: the `protect-main`
   # ruleset, scripts/ready_pr.py's `checks_state`, and scripts/merge_train.py's

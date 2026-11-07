@@ -202,3 +202,41 @@ def test_uv_cache_is_keyed_on_the_lock_and_only_main_saves_it() -> None:
     assert "cache-dependency-glob: uv.lock" in text
     assert "save-cache: ${{ github.ref == 'refs/heads/main' }}" in text
     assert "uv sync --locked" in text
+
+
+def _scope_step() -> str:
+    text = CI.read_text()
+    return text[text.index("\n  scope:\n") : text.index("\n  checks-fast:\n")]
+
+
+def test_a_pr_missing_the_dashboard_ignores_tests_dashboard_and_every_push_runs_it() -> None:
+    """#3221 (owner 2026-11-07): on a PR, tests/dashboard runs only when the diff touches
+    the dashboard. The scope starts at `yes` and only a PR's diff can set `no`, so a push
+    to main or `train/**` always runs it; the shard ignores it only on an explicit `no`."""
+    scope = _scope_step()
+    assert "dashboard-tests: ${{ steps.scope.outputs.dashboard }}" in scope
+    assert "          dashboard=yes\n" in scope
+    pr_branch = scope[scope.index('"pull_request" ]; then') : scope.index("elif")]
+    assert (
+        "dashboard=$(printf '%s\\n' \"$files\" | "
+        "python3 scripts/ci_tested_tree.py --dashboard-tests-needed)"
+    ) in pr_branch
+    # Assigned twice only: the default and the PR diff.
+    assert len(re.findall(r"^\s+dashboard=", scope, re.MULTILINE)) == 2, scope
+    assert 'echo "dashboard=$dashboard" >> "$GITHUB_OUTPUT"' in scope
+    text = CI.read_text()
+    shard = text[text.index("\n  pytest-shard:\n") : text.index("\n  checks:\n")]
+    assert (
+        "run: uv run pytest -n auto --dist worksteal --durations=0 --durations-min=1.0 "
+        "${{ needs.scope.outputs.dashboard-tests == 'no' && '--ignore=tests/dashboard' || '' }}"
+    ) in shard
+    assert text.count("--ignore=") == 1
+
+
+def test_the_kill_action_test_still_gates_every_pr() -> None:
+    """Safety review of #3221: the Book page's "Stop this book now" test guards the
+    `paper kill` path, so it lives outside the tests/dashboard the PR shards ignore."""
+    tests = CI.parents[2] / "tests"
+    kept = tests / "execution" / "test_book_actions.py"
+    assert "from tradepartner.dashboard import book_actions" in kept.read_text()
+    assert not (tests / "dashboard" / "test_book_actions.py").exists()
