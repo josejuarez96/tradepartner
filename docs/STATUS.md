@@ -15,20 +15,20 @@
 - Data-sitting step 16 now records candidate 5's two store exposures (#2689) with `exposure record`, values from evidence; profitability N 1 -> 3 at the sitting; #3092's open_data record skipped (#3110).
 
 ## Teams
-Direction: [ADR 0023](decisions/0023-break-first-fast-books-paper-exam.md) (#1740): break first, fast books, paper as the exam. The D5 pause list (T189c, #1598, T187-T187c, T184h, T174c and labeling, T171d, T23, T116c, T141, T204) is stopped; lines stay, no claims. Orchestrator: main checkout, team atlas. Live teams and claims: `team.py status`. Handovers: issue #836.
+Direction: [ADR 0023](decisions/0023-break-first-fast-books-paper-exam.md) (#1740): break first, fast books, paper as the exam. The D5 pause list (T189c, T187-T187c, T184h, T174c and labeling, T171d, T23, T116c, T141, T204) is stopped; lines stay, no claims. Orchestrator: main checkout, team atlas. Live teams and claims: `team.py status`. Handovers: issue #836.
 
 ## In progress
-- Paper: daily's window 5 closed 2026-11-06; book `main` (an execution shakedown only, H1 retired) closes window 6 at its 2026-11-09 08:05 stop run. After the sitting both books restart at the open with a measured 60 bp per side (T385; #3134, T382-T384 done).
+- Paper: daily's window 5 closed 2026-11-06; book `main` closes window 6 at its 2026-11-09 08:05 stop run. After the sitting, daily restarts at the open with a measured 60 bp per side once step 17's gap replay passes; main stays closed unless relabelled an execution shakedown on #3117 (T385; #3134).
 - Data: the one sitting is Monday 2026-11-09, 17 steps including the owner's checkout pull ([runbook](runbooks/data-sitting.md)).
-- Candidates: none. Retired: H1 by its own rule (TP-12, #3117), B10 on 10-27 (TP-11, #3123; T165e still reads ready), published slow signals (TP-10, #3107).
-- Live choice: no book reaches it before a forward exam passes (ADR 0016 amendments #3129, #3144, #3148: 12/24/36-month looks, four exams, ledger); T381-T381b next. Rung 1 prices cost at 60 bp (ADR 0023).
+- Candidates: none. Retired: H1 by its own rule (TP-12, #3117), B10 on 10-27 (TP-11, #3119), published slow signals (TP-10, #3107).
+- Live choice: no book reaches it before a forward exam passes (ADR 0016 amendments #3129, #3144, #3148: 12/24/36-month looks, four exams, a ledger); T381 and T381b next, then T381a. Rung 1 prices exam-eligible ideas at 60 bp (ADR 0023, #3143).
 - Open PRs: `gh pr list --state open`. On hold: #2124 (live ADR draft), #3136/#3137 (#3131).
 
 ## Ready frontier snapshot
-Claim through `team.py claim`; read each task line for gates (board-ready is not plan-ready). Agent: T381, T381b, T195 (#1726). Owner: T385 (after 11-09), T197 and T186c (sitting steps), T359, T246, T248f, T343. T165e lists as ready but B10 is retired (#3182). Unclaimed issues: `team.py status`.
+Claim through `team.py claim`; read each task line for gates (board-ready is not plan-ready). Agent: T381, T381b. Owner: T385 (after 11-09), T197 (sitting step 1), T246, T248f; T359 (candidate 5's rows land at sitting step 16). Tick only: T186c (done 11-05), T343 (answered 10-31). T165e lists as ready but B10 is retired (#3182). T195 is parked. Unclaimed issues: `team.py status`.
 
 ## Blocked
-T23 and T204 (paused), T146-T149b (after T144's verdict and T145), T163b (after T163 and a passed forward exam), T378 (after T386), T126 (#1351, the owner's call). T214 (#1968) holds until T198's sitting.
+T23 and T204 (paused), T146-T149b (after T144's verdict and T145), T163 (T162, #813, the kill-ladder gate), then T163b (also T381a, T381b) and T163c; T378 (after T386), T126 (#1351, the owner's call). T214 lapsed (PR #1968 closed; strike note pending).
 
 ## Decisions needed from owner
 - Merge when ready (class B): this fold (#3121).
