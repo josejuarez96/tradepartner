@@ -48,9 +48,10 @@ from tradepartner.backtest.riskfree import RiskFreeMissing, constant_period_retu
 from tradepartner.backtest.schedule import read_time, rebalance_sessions
 from tradepartner.calendar import all_sessions, session_close
 from tradepartner.config import FAMILIES, Cadence, Settings
+from tradepartner.research import exposure_backfill
 from tradepartner.research.experiment import ParsedExperiment, hash_file, parse_experiment_file
 from tradepartner.research.gates import Flags, Reasons
-from tradepartner.store import exposure_backfill, registry, research, schema
+from tradepartner.store import registry, research, schema
 from tradepartner.store.db import insert_row
 
 HISTORY_START, HISTORY_END = date(2022, 12, 1), date(2024, 10, 31)

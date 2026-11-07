@@ -92,7 +92,7 @@ class RawManifest:
     """The manifest as text: its header and each entry's fields, checked for shape only
     (no file read), so a test can check the committed manifest off the owner's Mac."""
 
-    path: Path
+    source_file: Path
     sha256: str
     release: str
     title: str
@@ -116,7 +116,7 @@ class BackfillEntry:
 class BackfillManifest:
     """A manifest whose every named file hashed to its pinned digest when loaded."""
 
-    path: Path
+    source_file: Path
     sha256: str
     release: str
     title: str
@@ -195,7 +195,7 @@ def read_manifest_text(path: Path) -> RawManifest:
         keys.add(entry["key"])
         entries.append(entry)
     return RawManifest(
-        path=path,
+        source_file=path,
         sha256=sha256(data).hexdigest(),
         release=release,
         title=title,
@@ -336,7 +336,7 @@ def load_manifest(path: Path) -> BackfillManifest:
             raise _refuse(f"exposure {entry.key!r}", "the launch repeats an earlier entry")
         launches.add(launch)
     return BackfillManifest(
-        path=path, sha256=raw.sha256, release=raw.release, title=raw.title, entries=entries
+        source_file=path, sha256=raw.sha256, release=raw.release, title=raw.title, entries=entries
     )
 
 
@@ -345,7 +345,7 @@ def _with_provenance(manifest: BackfillManifest, entry: BackfillEntry) -> resear
     parts = [
         *([entry.spec.note] if entry.spec.note else []),
         f"read_at {basis}: {entry.read_at_evidence}",
-        f"backfill {manifest.path.name} sha256 {manifest.sha256[:12]}, "
+        f"backfill {manifest.source_file.name} sha256 {manifest.sha256[:12]}, "
         f"release {manifest.release}, entry {entry.key}",
     ]
     return replace(entry.spec, note="; ".join(parts))

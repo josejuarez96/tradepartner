@@ -19,7 +19,7 @@ import duckdb
 import pytest
 
 from tradepartner.config import Settings
-from tradepartner.store import exposure_backfill as eb
+from tradepartner.research import exposure_backfill as eb
 from tradepartner.store import registry, research, schema
 
 RELEASE = "exposures-test"

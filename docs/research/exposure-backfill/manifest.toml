@@ -1,5 +1,5 @@
 # Desk-read exposure backfill manifest (plan T359, #3116; research-registry spec,
-# amendment 2026-10-31 "Backfill"). Read by src/tradepartner/store/exposure_backfill.py.
+# amendment 2026-10-31 "Backfill"). Read by src/tradepartner/research/exposure_backfill.py.
 #
 # One [[exposure]] per desk-read launch, one record per candidate per launch.
 # Times are UTC. File times come from `stat -f '%Sm' -t '%Y-%m-%dT%H:%M:%S%z'` (local

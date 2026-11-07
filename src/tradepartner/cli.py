@@ -597,6 +597,7 @@ from tradepartner.research import (
     DatasetChanged,
     RunHandle,
     datafiles,
+    exposure_backfill,
     load_dataset,
 )
 from tradepartner.research.event_study.run import run_study
@@ -624,7 +625,6 @@ from tradepartner.research.labeling.questions import DEFAULT_OPTION_SET, REVERSE
 from tradepartner.retract import RetractRefused, master_retract
 from tradepartner.store import (
     archive_cmd,
-    exposure_backfill,
     journal,
     lab_queries,
     lab_registry,
