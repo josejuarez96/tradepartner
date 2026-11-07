@@ -1788,7 +1788,8 @@ def test_the_twin_pin_fails_if_the_screen_reads_or_runs_at_the_default(
 
 #: The provider methods the twin's run calls: no turnover read. `chains` (#821,
 #: T187b) is the engine's once-per-step live successor-chain read; it is empty on
-#: the fake and changes no run digest, only the call log.
+#: the fake and changes no run digest, only the call log. `late_splits` (#3096) is the
+#: once-per-step late-split read; the twin has none, so it too moved only the log.
 TWIN_CALL_METHODS = {
     "universe",
     "chains",
@@ -1800,9 +1801,10 @@ TWIN_CALL_METHODS = {
     "listing_ends",
     "dropped_dividends",
     "late_dividends",
+    "late_splits",
 }
-TWIN_N_CALLS = 41
-TWIN_CALL_LOG_SHA256 = "84941e2098cbff6122a610b8b2a0b2b63f13a7a8c6a23378fb25116ac867f25a"
+TWIN_N_CALLS = 45
+TWIN_CALL_LOG_SHA256 = "a2cf056104ff5167b445aaecd8d36d719b1b1fc845f2ad5aac260116df76d56c"
 #: Per cost level: a SHA-256 over the equity, rebalance (counts included), weight and
 #: target rows, floats rounded to nine places.
 TWIN_RUN_DIGESTS = {
