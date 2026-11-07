@@ -425,11 +425,13 @@ COVER_VERSION = 7
 #: As `COVER_VERSION`, for per-document `parse_sgml_header` results (T11d).
 HEADER_VERSION = 1
 #: As `COVER_VERSION`, for per-document `parse_delisting` results (T11f).
-#: Version 2 also re-reads successful issuer HTML Form 25s after #3106's
-#: unclosed-script behavior changed.
+#: #3106 (linear script/style strip, size cap) shipped without a bump: its
+#: output differs only for a document with an unclosed script or style tag or
+#: over the cap, which EDGAR rejects or a one-page Form 25 never reaches, so
+#: parses cached before it stand. A bump would re-download every Form 25.
 DELISTING_VERSION = 1
 #: The issuer HTML Form 25s `parse_delisting_html` read and found no class or
-#: exchange in (`delisting_html_unread/v2/`, #3084): bump when that parser reads
+#: exchange in (`delisting_html_unread/v1/`, #3084): bump when that parser reads
 #: more, so they are fetched again. A successful read goes to the
 #: `DELISTING_VERSION` cache like an XML one, so only a `DELISTING_VERSION`
 #: bump re-reads those (a parser change that alters successful readings needs it).
