@@ -588,7 +588,7 @@ def _gap_signoff_refusal(
     closed then."""
     rows = conn.execute(
         """
-        SELECT t.trial_id, t.data_cutoff, t.data_vintage FROM owner_decisions od
+        SELECT t.trial_id FROM owner_decisions od
         JOIN trials t ON t.trial_id = od.trial_id
         JOIN trial_results r ON r.trial_id = t.trial_id
         WHERE od.kind = ?
@@ -609,8 +609,28 @@ def _gap_signoff_refusal(
     releases = registry.vintage_releases(conn)
     if not releases:
         return None
+    trial_ids = [int(row[0]) for row in rows]
+    has_vintage = (
+        conn.execute(
+            "SELECT 1 FROM duckdb_columns() WHERE database_name = current_database() "
+            "AND schema_name = current_schema() AND table_name = 'trials' "
+            "AND column_name = 'data_vintage'"
+        ).fetchone()
+        is not None
+    )
+    stamps: dict[int, tuple[Any, Any]] = {}
+    if has_vintage:  # a store from before the vintage column has no stamps at all
+        stamps = {
+            int(i): (c, v)
+            for i, c, v in conn.execute(
+                "SELECT trial_id, data_cutoff, data_vintage FROM trials "
+                "WHERE list_contains(?, trial_id)",
+                [trial_ids],
+            ).fetchall()
+        }
     blocking: list[str] = []
-    for trial_id, cutoff, vintage in rows:
+    for trial_id in trial_ids:
+        cutoff, vintage = stamps.get(trial_id, (None, None))
         if cutoff is None or vintage is None:
             blocking.append(
                 f"trial {trial_id} has no recorded data_cutoff or data_vintage, so it "
