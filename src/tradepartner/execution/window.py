@@ -659,8 +659,8 @@ def _all_windows(conn: duckdb.DuckDBPyConnection) -> list[PaperWindowRow]:
 
 def _fingerprint_of(hyp: registry.HypothesisRecord) -> str:
     """The hypothesis's registry fingerprint (`backtest.frozen.fingerprint`), the
-    ledger's `hypothesis_fingerprint`."""
-    return hypothesis_fingerprint(hyp.family, hyp.params, hyp.in_sample_start)
+    ledger's `hypothesis_fingerprint`, read through `frozen_values` (the one accessor)."""
+    return hypothesis_fingerprint(hyp.family, frozen_values(hyp), hyp.in_sample_start)
 
 
 def store_exam_windows(
