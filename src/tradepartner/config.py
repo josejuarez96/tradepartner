@@ -262,10 +262,14 @@ class AlpacaConfig(BaseModel):
     #: Applied to NYSE listings only (`master_symbol`); the spelling is never
     #: guessed (CVNA, UAA, WLYB are real undotted symbols). Add a pair here
     #: when a NYSE class name has no bars; a value must be an Alpaca symbol.
+    #: `BIOB` (#3082): Bio-Rad's cover pages wrote class B `BIOb` from
+    #: 2019-08 to 2024-02 (a lower-case class letter folds to `BIOB`); not a
+    #: spelling rule, since `LEDs` (SemiLEDs, Nasdaq `LEDS`) has the same shape.
     class_symbols: dict[str, str] = Field(
         default_factory=lambda: {
             "BFA": "BF.A",
             "BFB": "BF.B",
+            "BIOB": "BIO.B",
             "HVTA": "HVT.A",
             "WSOB": "WSO.B",
         }
