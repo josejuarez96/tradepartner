@@ -588,3 +588,131 @@ def _seed_cost_window(conn: duckdb.DuckDBPyConnection) -> None:
         )
     for (security, session), open_ in _COST_OPENS.items():
         _bar_on(conn, security, session, open_=open_, close=open_)
+
+
+# --- the arrival split (#3179) ---------------------------------------------------------
+
+_PRE_OPEN = datetime(2026, 10, 14, 13, 0, tzinfo=UTC)  # 09:00 New York, before the open
+_AT_OPEN = datetime(2026, 10, 14, 13, 30, tzinfo=UTC)  # 09:30 New York, the open itself
+_MIDSESSION = datetime(2026, 10, 14, 14, 45, tzinfo=UTC)  # 10:45 New York (T377's window)
+
+
+def test_an_order_submitted_before_the_open_arrives_at_the_open() -> None:
+    assert slippage.arrival_price(100.0, SESSION, _PRE_OPEN) == 100.0
+
+
+def test_an_order_submitted_at_or_after_the_open_has_no_arrival_price() -> None:
+    """The store holds only the daily bar: a price after the open is never guessed."""
+    assert slippage.arrival_price(100.0, SESSION, _AT_OPEN) is None
+    assert slippage.arrival_price(100.0, SESSION, _MIDSESSION) is None
+    assert slippage.arrival_price(100.0, SESSION, None) is None
+
+
+def test_the_two_terms_carry_the_totals_sign_per_side() -> None:
+    # arrival 101 then fill 101.5 on an open of 100: the buy paid the move (+100) and
+    # its own trading (+50); the sell gained the move (-100) and paid nothing back (-50)
+    buy = slippage.split_bp("buy", 101.5, 100.0, 101.0)
+    sell = slippage.split_bp("sell", 101.5, 100.0, 101.0)
+    assert buy == (pytest.approx(100.0), pytest.approx(50.0))
+    assert sell == (pytest.approx(-100.0), pytest.approx(-50.0))
+
+
+_SPLIT_FILLS = [
+    _fill("buy", "A", 100.37, 1, order="b1", qty=7.0),
+    _fill("buy", "A", 100.41, 2, order="b1", qty=3.0),
+    _fill("buy", "B", 199.13, 3, order="b2", qty=4.0),
+    _fill("sell", "A", 99.71, 4, order="s1", qty=11.0),
+    _fill("sell", "B", 200.29, 5, order="s2", qty=2.0),
+]
+_SPLIT_OPENS = {("A", SESSION): 100.03, ("B", SESSION): 199.77}
+
+
+def test_every_orders_total_is_exactly_the_sum_of_its_two_terms() -> None:
+    for item in _SPLIT_FILLS:
+        open_price = _SPLIT_OPENS[(item.security_id, SESSION)]
+        arrival = slippage.arrival_price(open_price, SESSION, _PRE_OPEN)
+        assert arrival is not None
+        drift, impact = slippage.split_bp(item.side, item.fill.price, open_price, arrival)
+        assert drift + impact == slippage.slippage_bp(item.side, item.fill.price, open_price)
+
+
+def test_the_split_sums_exactly_to_the_unchanged_total_per_group() -> None:
+    submitted = {o: _PRE_OPEN for o in ("b1", "b2", "s1", "s2")}
+    before = slippage.summarise(_SPLIT_FILLS, _SPLIT_OPENS, AFTER)
+    out = slippage.summarise(_SPLIT_FILLS, _SPLIT_OPENS, AFTER, submitted)
+    assert (out.buy, out.sell, out.overall) == (before.buy, before.sell, before.overall)
+    for group, split in (
+        (out.buy, out.buy_split),
+        (out.sell, out.sell_split),
+        (out.overall, out.overall_split),
+    ):
+        assert split.count == group.count
+        assert split.total_wmean_bp == group.wmean_bp
+        assert split.open_to_arrival_wmean_bp is not None
+        assert split.arrival_to_fill_wmean_bp is not None
+        assert (
+            split.open_to_arrival_wmean_bp + split.arrival_to_fill_wmean_bp == split.total_wmean_bp
+        )
+    assert out.no_arrival == 0
+
+
+def test_an_order_without_an_arrival_price_stays_in_the_total_and_is_counted() -> None:
+    submitted = {"b1": _PRE_OPEN, "b2": _MIDSESSION, "s1": _AT_OPEN}  # s2 has none
+    before = slippage.summarise(_SPLIT_FILLS, _SPLIT_OPENS, AFTER)
+    out = slippage.summarise(_SPLIT_FILLS, _SPLIT_OPENS, AFTER, submitted)
+    assert out.overall == before.overall  # the total is untouched
+    assert (out.no_arrival, out.overall_split.count, out.buy_split.count) == (3, 1, 1)
+    assert out.sell_split == slippage.ArrivalSplit(0, None, None, None)
+    only_b1 = slippage.summarise(_SPLIT_FILLS[:2], _SPLIT_OPENS, AFTER)
+    assert out.buy_split.total_wmean_bp == only_b1.buy.wmean_bp
+
+
+def test_without_submit_times_every_measured_order_has_no_arrival_price() -> None:
+    out = slippage.summarise(_SPLIT_FILLS, _SPLIT_OPENS, AFTER)
+    assert (out.no_arrival, out.overall_split.count) == (4, 0)
+    pending = slippage.summarise(_SPLIT_FILLS, _SPLIT_OPENS, NOW, {"b1": _PRE_OPEN})
+    assert (pending.pending, pending.no_arrival) == (4, 0)  # pending is not measured
+
+
+def test_the_split_line_names_both_terms_and_the_orders_without_an_arrival() -> None:
+    out = slippage.summarise(
+        [_fill("buy", "A", 100.5, 1), _fill("sell", "A", 99.0, 2)],
+        {("A", SESSION): 100.0},
+        AFTER,
+        {"o1": _PRE_OPEN, "o2": _MIDSESSION},
+    )
+    assert slippage.slippage_report_lines(out) == [
+        slippage.slippage_line(out),
+        "slippage split at arrival (bp, open->arrival + arrival->fill = total, per order "
+        "with an arrival price): buy n=1 +0.00 + +50.00 = +50.00; sell n=0; "
+        "all n=1 +0.00 + +50.00 = +50.00; no arrival price 1",
+    ]
+
+
+def test_window_slippage_reads_each_orders_journaled_submit_time(
+    store: duckdb.DuckDBPyConnection,
+) -> None:
+    _seed_cost_window(store)  # every order journaled at 05:00 New York, before the open
+    store.execute(
+        "UPDATE orders SET known_at = ?, ingested_at = ? WHERE client_order_id = 'o4'",
+        [session_close(_TUE) - timedelta(hours=5), session_close(_TUE) - timedelta(hours=5)],
+    )
+    out = slippage.window_slippage(store, 1, _LATER)
+    assert out.overall.wmean_bp == pytest.approx(-54_250 / 6_995)  # the total as before
+    assert (out.no_arrival, out.overall_split.count, out.sell_split.count) == (1, 3, 1)
+    assert out.sell_split.total_wmean_bp == pytest.approx(200.0)  # o3 alone
+
+
+def test_the_measured_cost_splits_at_the_orders_known_at_and_keeps_its_figure() -> None:
+    known = {
+        o: datetime.combine(s, datetime.min.time(), UTC)
+        for o, s in (("o1", _MON), ("o2", _MON), ("o3", _TUE), ("o4", _TUE))
+    }
+    base = _cost(_COST_FILLS)
+    out = _cost(_COST_FILLS, known=known)
+    assert out.figure_bp == base.figure_bp == -10.0
+    assert out.slippage.overall == base.slippage.overall
+    split = out.slippage.overall_split
+    assert (split.count, split.total_wmean_bp) == (4, out.slippage.overall.wmean_bp)
+    assert split.open_to_arrival_wmean_bp == 0.0
+    assert split.arrival_to_fill_wmean_bp == split.total_wmean_bp
