@@ -834,7 +834,9 @@ def register_hypothesis(
     real store. With a development boundary in force (ADR 0016 point 2), refuses
     (`BoundaryRefused`) an `in_sample_start` on or after it, or one with no
     rebalance session at the frozen cadence on or before it, so no
-    registration's default window is ever empty.
+    registration's default window is ever empty, and a non-oracle
+    `holdout_start` on or before it (points 3 and 8, #3151), so no exam month
+    is a development month.
     """
     settings = settings if settings is not None else get_settings()
     if family not in settings.hypotheses.families:
@@ -868,6 +870,11 @@ def register_hypothesis(
             raise BoundaryRefused(
                 f"{slug!r}: in_sample_start {in_sample_start} leaves no {cadence} rebalance "
                 f"session on or before the development boundary {boundary}"
+            )
+        if family != ORACLE_FAMILY and holdout_start <= boundary:
+            raise BoundaryRefused(
+                f"{slug!r}: holdout.start {holdout_start} is on or before the development "
+                f"boundary {boundary}: exam months never become development months"
             )
     families = conn.execute(
         "SELECT DISTINCT family FROM hypotheses WHERE slug = ?", [slug]
