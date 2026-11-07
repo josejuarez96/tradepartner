@@ -622,6 +622,25 @@ def test_a_variant_with_no_rebalance_session_before_the_boundary_is_refused(
     _refused(ready, path, settings, DevelopmentBoundaryError, "no month_end rebalance session")
 
 
+@pytest.mark.parametrize(
+    "holdout", [(date(2020, 1, 2), date(2020, 12, 31)), (date(2022, 12, 30), date(2023, 1, 2))]
+)
+def test_a_root_family_whose_holdout_starts_on_or_before_the_boundary_is_refused(
+    ready: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    holdout: tuple[date, date],
+) -> None:
+    """#3151, ADR 0016 point 8: a new root family's holdout must start after the
+    development boundary. Accepted, its "exam" would cover months every family practised
+    on, the boundary could never be re-set and every other family's sweep would read its
+    holdout. Refused before any row is written."""
+    registry.write_development_boundary(ready, boundary=date(2022, 12, 30), reason="test")
+    path = _profitability_sweep(tmp_path, holdout=holdout)
+    _refused(ready, path, settings, DevelopmentBoundaryError, "development boundary 2022-12-30")
+    assert lab_registry.family_rules(ready, "profitability") is None
+
+
 def test_an_unrun_promoted_hypothesis_blocks_the_next_sweep(
     ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
