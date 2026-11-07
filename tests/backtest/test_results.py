@@ -50,7 +50,7 @@ from tradepartner.calendar import all_sessions, session_close
 from tradepartner.config import FAMILIES, Cadence, Settings
 from tradepartner.research.experiment import ParsedExperiment, hash_file, parse_experiment_file
 from tradepartner.research.gates import Flags, Reasons
-from tradepartner.store import registry, research, schema
+from tradepartner.store import exposure_backfill, registry, research, schema
 from tradepartner.store.db import insert_row
 
 HISTORY_START, HISTORY_END = date(2022, 12, 1), date(2024, 10, 31)
@@ -836,6 +836,56 @@ def _exposure(
     )
 
 
+def _backfill_manifest(tmp_path: Path) -> Path:
+    """A T359 backfill manifest (#3116): candidate 5's two `store` launches in
+    `profitability`, one configuration each, and one `open_data` read in the family,
+    which adds nothing to N (open question 1)."""
+    root = tmp_path / "backfill"
+    (root / "kill").mkdir(parents=True)
+    kill = root / "kill" / "2689.md"
+    kill.write_text("kill line: fail if t < 2\n", encoding="utf-8")
+    entries = []
+    for i, (source, minute) in enumerate((("store", 30), ("store", 40), ("open_data", 50))):
+        read_at = datetime(2026, 10, 31, 19, minute, tzinfo=UTC)
+        probe = root / f"probe-{i}.py"
+        probe.write_text(f"print({i})\n", encoding="utf-8")
+        os.utime(probe, (read_at.timestamp() - 60,) * 2)
+        pins = 'store_max_ingested_at = "2026-10-31T19:08:00+00:00"' if source == "store" else ""
+        entries.append(
+            f"""
+[[exposure]]
+key = "launch-{i}"
+candidate_ref = "{"#2689" if source == "store" else "#2675"}"
+source = "{source}"
+family = "profitability"
+issue_url = "https://github.com/o/r/issues/2689"
+kill_line_url = "https://github.com/o/r/issues/2689#issuecomment-1"
+kill_line_file = "kill/2689.md"
+kill_line_sha256 = "{sha256(kill.read_bytes()).hexdigest()}"
+kill_line_posted_at = "2026-10-31T19:29:02+00:00"
+read_at = "{read_at.isoformat()}"
+read_at_basis = "bound"
+read_at_evidence = "fixture"
+window_start = "2020-08-31"
+window_end = "2023-12-29"
+n_configurations = {1 if source == "store" else 12}
+verdict = "fail"
+desk_read_path = "docs/research/desk-read.md"
+probe_path = "probe-{i}.py"
+probe_sha256 = "{sha256(probe.read_bytes()).hexdigest()}"
+pins = {{ {pins} }}
+date_seen = "2026-11-06"
+evidence = ["fixture"]
+"""
+        )
+    path = root / "manifest.toml"
+    path.write_text(
+        '[manifest]\nschema = 1\nrelease = "exposures-test"\ntitle = "t"\n' + "".join(entries),
+        encoding="utf-8",
+    )
+    return path
+
+
 class TestExposuresInN:
     """N's third part is `family_exposure_count`; V is the backtest pairs' alone
     (research-registry spec amendment 2026-10-31, #2723; backtest spec req 8 as amended
@@ -897,6 +947,40 @@ class TestExposuresInN:
             assert after[column] == before[column]
         assert (before["n_trials"], before["n_exposure"]) == (1, 0)
         assert family_n(conn, "profitability") == 1 + 1
+
+    def test_the_t359_backfill_takes_profitability_n_from_1_to_3(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, fixture_store_path: Path
+    ) -> None:
+        """#3116: with one counted trial (B3 trial 3 on the owner's store), profitability's
+        N reads 1; backfilling candidate 5's two `store` launches makes it 3, the
+        `open_data` read adds nothing, and a second run adds nothing more. The trial's
+        stored N is not back-stamped."""
+        settings = _settings(tmp_path)
+        frozen = _profitability(conn, settings)
+        trial = _b3_trial(conn, frozen, tmp_path)
+        assert family_n(conn, "profitability") == 1
+        real = _settings(tmp_path, store={"path": str(fixture_store_path)})
+        manifest = exposure_backfill.load_manifest(_backfill_manifest(tmp_path))
+        plan = exposure_backfill.plan_backfill(conn, manifest, settings=real, repo_dir=tmp_path)
+        assert plan.n_added == {"profitability": 2}
+        registry.open_data_release(
+            conn, conn, name="exposures-test", backup_path="b.duckdb", reason="#3116"
+        )
+        for _ in range(2):
+            exposure_backfill.apply_backfill(
+                conn,
+                manifest,
+                release="exposures-test",
+                settings=real,
+                recorded_by="owner",
+                repo_dir=tmp_path,
+            )
+            assert family_n_split(conn, "profitability") == FamilyN(
+                trials=1, research=0, exposures=2
+            )
+            assert family_n(conn, "profitability") == 3
+        stored = _result_row(conn, trial.trial_id)
+        assert (stored["n_trials"], stored["n_exposure"]) == (1, 0)
 
     def test_a_store_without_the_exposure_table_reads_exposures_as_none(
         self, conn: duckdb.DuckDBPyConnection, tmp_path: Path

@@ -1519,26 +1519,28 @@ def _hash_durable_before(
     )
 
 
-def record_exposure(
+@dataclass(frozen=True)
+class ExposurePreview:
+    """What `record_exposure` would do with one spec, computed without writing: the
+    existing row a repeat returns (`row` is then None), or the row it would insert,
+    every computed column filled (`exposure_id` is the next free id at the preview)."""
+
+    existing: ExposureRecord | None
+    row: Mapping[str, Any] | None
+
+
+def preview_exposure(
     conn: duckdb.DuckDBPyConnection,
     spec: ExposureInput,
     recorded_by: str,
     *,
     settings: Settings | None = None,
     repo_dir: Path | None = None,
-) -> ExposureRecord:
-    """Record one desk-read launch (module docstring, "Exposures") and return its row.
-
-    Raises `ResearchError`, writing nothing, on: a blank candidate; a source outside
-    `EXPOSURE_SOURCES`; a `store` record without a family or a `store_max_ingested_at`
-    pin; a family outside `hypotheses.families`; a kill-line URL that is neither an
-    issue comment nor a blob at a commit; a naive timestamp; `read_at` after the write;
-    `window_end` before `window_start` or after `read_at`'s date; `n_configurations <
-    1`; a verdict outside the set; a desk-read path outside `docs/research/`; a probe
-    whose hash differs from the declared one; an unverified `store` probe; a `store`
-    record overlapping a family holdout without `holdout_reason`, and a reason on a
-    record that spends nothing. A repeated `(candidate_ref, probe_sha256, read_at)`
-    returns the existing row and adds none."""
+) -> ExposurePreview:
+    """Every refusal and every computed column of `record_exposure`, reading only:
+    safe on a read-only connection, so a dry run shows the `kill_line_basis`,
+    `probe_verified`, `overlaps_holdout` and `synthetic` the write would store.
+    Raises what `record_exposure` raises."""
     _require_exposures(conn)
     settings = settings if settings is not None else get_settings()
     known_at = utc_now()
@@ -1585,19 +1587,17 @@ def record_exposure(
         [spec.candidate_ref, probe_sha or "", read_at],
     ).fetchone()
     if existing is not None:
-        return _exposure_from_row(existing)
+        return ExposurePreview(existing=_exposure_from_row(existing), row=None)
     boundary = boundary_date(conn)
     note = spec.note
     if spec.probe_unavailable_reason is not None:
         unavailable = f"probe unavailable: {spec.probe_unavailable_reason.strip()}"
         note = unavailable if note is None else f"{unavailable}; {note}"
     commit, dirty = code_version(repo_dir)
-    exposure_id = _next_id(conn, "research_exposures", "exposure_id")
-    insert_row(
-        conn,
-        "research_exposures",
-        {
-            "exposure_id": exposure_id,
+    return ExposurePreview(
+        existing=None,
+        row={
+            "exposure_id": _next_id(conn, "research_exposures", "exposure_id"),
             "candidate_ref": spec.candidate_ref,
             "source": spec.source,
             "family": spec.family,
@@ -1627,9 +1627,36 @@ def record_exposure(
             "known_at": known_at,
         },
     )
+
+
+def record_exposure(
+    conn: duckdb.DuckDBPyConnection,
+    spec: ExposureInput,
+    recorded_by: str,
+    *,
+    settings: Settings | None = None,
+    repo_dir: Path | None = None,
+) -> ExposureRecord:
+    """Record one desk-read launch (module docstring, "Exposures") and return its row.
+
+    Raises `ResearchError`, writing nothing, on: a blank candidate; a source outside
+    `EXPOSURE_SOURCES`; a `store` record without a family or a `store_max_ingested_at`
+    pin; a family outside `hypotheses.families`; a kill-line URL that is neither an
+    issue comment nor a blob at a commit; a naive timestamp; `read_at` after the write;
+    `window_end` before `window_start` or after `read_at`'s date; `n_configurations <
+    1`; a verdict outside the set; a desk-read path outside `docs/research/`; a probe
+    whose hash differs from the declared one; an unverified `store` probe; a `store`
+    record overlapping a family holdout without `holdout_reason`, and a reason on a
+    record that spends nothing. A repeated `(candidate_ref, probe_sha256, read_at)`
+    returns the existing row and adds none. The checks are `preview_exposure`'s."""
+    preview = preview_exposure(conn, spec, recorded_by, settings=settings, repo_dir=repo_dir)
+    if preview.existing is not None:
+        return preview.existing
+    assert preview.row is not None
+    insert_row(conn, "research_exposures", preview.row)
     row = conn.execute(
         f"SELECT {_EXPOSURE_COLUMNS} FROM research_exposures WHERE exposure_id = ?",
-        [exposure_id],
+        [preview.row["exposure_id"]],
     ).fetchone()
     assert row is not None
     return _exposure_from_row(row)

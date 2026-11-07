@@ -1430,7 +1430,7 @@ def test_exposures_candidates_since_lists_first_read_at(tmp_path: Path) -> None:
 
 def test_exposure_has_no_edit_delete_or_withdraw_subcommand() -> None:
     group = typer.main.get_command(cli.make_app()).commands["exposure"]  # type: ignore[attr-defined]
-    assert sorted(group.commands) == ["record"]
+    assert sorted(group.commands) == ["backfill", "record"]
 
 
 def test_exposure_output_has_no_secret_shaped_string(tmp_path: Path) -> None:
@@ -1438,3 +1438,116 @@ def test_exposure_output_has_no_secret_shaped_string(tmp_path: Path) -> None:
     args[args.index("--candidate") + 1] = f"cand-{ALPACA_KEY}"
     out = _cli(*args)  # _cli asserts the scrub found nothing in the output
     assert ALPACA_KEY not in out.output
+
+
+# --- exposure backfill (plan T359, #3116) ------------------------------------------
+
+
+def _backfill_manifest(tmp_path: Path) -> Path:
+    """Two `store` launches of one candidate in `profitability`, one configuration each."""
+    root = tmp_path / "backfill"
+    root.mkdir()
+    kill = root / "kill.md"
+    kill.write_text("kill line: fail if t < 2\n", encoding="utf-8")
+    blocks = ['[manifest]\nschema = 1\nrelease = "exposures-cli"\ntitle = "t"\n']
+    for i, minute in enumerate((30, 40)):
+        read_at = datetime(2026, 10, 31, 19, minute, tzinfo=UTC)
+        probe = root / f"probe-{i}.py"
+        probe.write_text(f"print({i})\n", encoding="utf-8")
+        os.utime(probe, (read_at.timestamp() - 60,) * 2)
+        blocks.append(
+            f"""
+[[exposure]]
+key = "launch-{i}"
+candidate_ref = "#2689"
+source = "store"
+family = "profitability"
+issue_url = "https://github.com/josejuarez96/tradepartner/issues/2689"
+kill_line_url = "{KILL_URL}"
+kill_line_file = "kill.md"
+kill_line_sha256 = "{sha256(kill.read_bytes()).hexdigest()}"
+kill_line_posted_at = "2026-10-31T19:29:02+00:00"
+read_at = "{read_at.isoformat()}"
+read_at_basis = "bound"
+read_at_evidence = "fixture"
+window_start = "2020-08-31"
+window_end = "2023-12-29"
+n_configurations = 1
+verdict = "fail"
+desk_read_path = "{DESK_READ}"
+probe_path = "probe-{i}.py"
+probe_sha256 = "{sha256(probe.read_bytes()).hexdigest()}"
+pins = {{ store_max_ingested_at = "2026-10-31T19:08:00+00:00" }}
+date_seen = "2026-11-06"
+evidence = ["fixture"]
+"""
+        )
+    path = root / "manifest.toml"
+    path.write_text("".join(blocks), encoding="utf-8")
+    return path
+
+
+def _open_store_release(name: str) -> None:
+    with duckdb.connect(get_settings().store.path) as conn:
+        schema.init_schema(conn)
+        if name:
+            registry.open_data_release(
+                conn, conn, name=name, backup_path="b.duckdb", reason="#3116"
+            )
+
+
+def test_exposure_backfill_dry_run_writes_nothing_and_shows_n(tmp_path: Path) -> None:
+    manifest = _backfill_manifest(tmp_path)
+    _open_store_release("")
+    args = ["exposure", "backfill", "--manifest", str(manifest), "--release", "exposures-cli"]
+    out = _cli(*args, "--dry-run")
+    assert out.exit_code == 0, out.output
+    assert "2 new, 0 already recorded; N added: profitability +2" in out.stdout
+    assert "N profitability: 0 now, 2 after" in out.stdout
+    assert "a write would refuse" in out.stdout
+    assert _count("research_exposures") == 0
+    # A real run without the release open is refused and writes nothing.
+    refused = _cli(*args)
+    assert refused.exit_code == 2, refused.output
+    assert "no open data release" in refused.output
+    assert _count("research_exposures") == 0
+    wrong = _cli("exposure", "backfill", "--manifest", str(manifest), "--release", "other")
+    assert wrong.exit_code == 2 and "names release" in wrong.output
+
+
+def test_exposure_backfill_writes_once_under_the_open_release(tmp_path: Path) -> None:
+    manifest = _backfill_manifest(tmp_path)
+    _open_store_release("exposures-cli")
+    args = ["exposure", "backfill", "--manifest", str(manifest), "--release", "exposures-cli"]
+    out = _cli(*args)
+    assert out.exit_code == 0, out.output
+    assert "2 written, 0 already recorded" in out.stdout
+    assert "N profitability: 0 -> 2" in out.stdout
+    again = _cli(*args)
+    assert again.exit_code == 0, again.output
+    assert "0 written, 2 already recorded" in again.stdout
+    assert "N profitability: 2 -> 2" in again.stdout
+    assert _count("research_exposures") == 2
+
+
+def test_exposure_backfill_failure_mid_batch_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All or nothing inside `open_for_write`'s transaction: the second record fails
+    after the first was inserted, and the first is rolled back with it."""
+    manifest = _backfill_manifest(tmp_path)
+    _open_store_release("exposures-cli")
+    original = research.record_exposure
+    calls = {"n": 0}
+
+    def flaky(*args: Any, **kwargs: Any) -> research.ExposureRecord:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("disk went away")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(research, "record_exposure", flaky)
+    out = _cli("exposure", "backfill", "--manifest", str(manifest), "--release", "exposures-cli")
+    assert out.exit_code == 2, out.output
+    assert calls["n"] == 2
+    assert _count("research_exposures") == 0

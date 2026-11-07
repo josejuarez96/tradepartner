@@ -481,6 +481,7 @@ from tradepartner.backtest.hypothesis import (
     register_operations_book,
 )
 from tradepartner.backtest.metrics import METRIC_KEYS
+from tradepartner.backtest.results import family_n_split
 from tradepartner.backtest.run import RunOutcome, run_hypothesis
 from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.close_gap import close_gaps
@@ -623,6 +624,7 @@ from tradepartner.research.labeling.questions import DEFAULT_OPTION_SET, REVERSE
 from tradepartner.retract import RetractRefused, master_retract
 from tradepartner.store import (
     archive_cmd,
+    exposure_backfill,
     journal,
     lab_queries,
     lab_registry,
@@ -4877,6 +4879,79 @@ def make_app(
         except (*_RESEARCH_REFUSALS, OSError) as exc:
             raise _refusal(exc, s) from None
         _echo_scrubbed(f"exposure {record.exposure_id}", s)
+
+    @exposure_app.command("backfill")
+    def exposure_backfill_command(
+        manifest: Annotated[Path, typer.Option(help="the reviewed backfill manifest (TOML)")],
+        release: Annotated[str, typer.Option(help="the open data release the manifest names")],
+        dry_run: Annotated[
+            bool, typer.Option(help="compute every record and each family's N; write nothing")
+        ] = False,
+    ) -> None:
+        """Record a reviewed manifest's past desk-read launches (plan T359). Every file it
+        names must hash to its pin. The write needs the manifest's release open and is all
+        or nothing; a rerun adds no row. Exit 2 on a refusal, with nothing written."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            loaded = exposure_backfill.load_manifest(manifest)
+            if loaded.release != release:
+                raise exposure_backfill.BackfillRefused(
+                    f"the manifest names release {loaded.release!r}, not {release!r}"
+                )
+            families = sorted({e.spec.family for e in loaded.entries if e.spec.family})
+            if dry_run:
+                with open_read_only(s) as conn:
+                    schema.init_schema(conn)  # read-only: checks the version, never migrates
+                    before = {f: family_n_split(conn, f) for f in families}
+                    plan = exposure_backfill.plan_backfill(
+                        conn, loaded, settings=s, recorded_by=_REGISTERED_BY
+                    )
+                    refusal = exposure_backfill.release_refusal(conn, release)
+                for line in exposure_backfill.plan_lines(plan):
+                    _echo_scrubbed(line, s)
+                for f in families:
+                    n = before[f]
+                    _echo_scrubbed(
+                        f"N {f}: {n.total} now, {n.total + plan.n_added.get(f, 0)} after "
+                        f"(trials {n.trials}, research {n.research}, exposures {n.exposures})",
+                        s,
+                    )
+                _echo_scrubbed(
+                    f"release {release}: "
+                    + ("open" if refusal is None else f"a write would refuse: {refusal}"),
+                    s,
+                )
+                _echo_scrubbed("dry run: nothing written", s)
+                return
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+                before = {f: family_n_split(conn, f) for f in families}
+                result = exposure_backfill.apply_backfill(
+                    conn,
+                    loaded,
+                    release=release,
+                    settings=s,
+                    recorded_by=_REGISTERED_BY,
+                    own_transaction=False,  # open_for_write's transaction holds the batch
+                )
+                after = {f: family_n_split(conn, f) for f in families}
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except (*_RESEARCH_REFUSALS, OSError) as exc:
+            raise _refusal(exc, s) from None
+        for r in result.written:
+            _echo_scrubbed(f"exposure {r.exposure_id}  {r.candidate_ref}  written", s)
+        for r in result.existing:
+            _echo_scrubbed(f"exposure {r.exposure_id}  {r.candidate_ref}  already recorded", s)
+        for f in families:
+            _echo_scrubbed(f"N {f}: {before[f].total} -> {after[f].total}", s)
+        _echo_scrubbed(
+            f"{len(result.written)} written, {len(result.existing)} already recorded, "
+            f"release {release}",
+            s,
+        )
 
     @app.command()
     def exposures(

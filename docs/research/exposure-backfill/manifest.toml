@@ -1,0 +1,388 @@
+# Desk-read exposure backfill manifest (plan T359, #3116; research-registry spec,
+# amendment 2026-10-31 "Backfill"). Read by src/tradepartner/store/exposure_backfill.py.
+#
+# One [[exposure]] per desk-read launch, one record per candidate per launch.
+# Times are UTC. File times come from `stat -f '%Sm' -t '%Y-%m-%dT%H:%M:%S%z'` (local
+# EDT/EST) and, for sub-second values, Python `os.stat` (`st_mtime`, `st_birthtime`) on
+# 2026-11-06; a file's birth time is when it was first created.
+#
+# n_configurations rule, every entry: the distinct signal-or-book x construction x file x
+# window cells whose return statistic the launch printed or stored (decision cells,
+# labelled checks, descriptive and selection cells alike, as the spec counts CBOperProf's
+# OperProfRD checks). Not counted: cost multiples (2x stress), comparators (SPY, EW,
+# arm-minus-arm differences) and per-signal gate statistics the launch never printed.
+
+[manifest]
+schema = 1
+release = "exposures-2026-11-09"
+title = "Desk-read exposure backfill (T359, #3116)"
+reviewed_in = "#3116"
+
+# ---------------------------------------------------------------- candidate 5 (#2689)
+
+[[exposure]]
+key = "c5-launch-2"
+candidate_ref = "#2689"
+source = "store"
+family = "profitability"
+issue_url = "https://github.com/josejuarez96/tradepartner/issues/2689"
+kill_line_url = "https://github.com/josejuarez96/tradepartner/issues/2689#issuecomment-6548103186"
+kill_line_file = "kill-lines/2689-6548103186.md"
+kill_line_sha256 = "7a2b91fb5ce5427548091a5efd3d669d138b05f68103fd1eeb7810b5f91a15d6"
+kill_line_posted_at = "2026-10-31T19:29:02Z"
+read_at = "2026-10-31T19:29:33.481396+00:00"
+read_at_basis = "bound"
+read_at_evidence = "launch 2 started inside [19:29:33.481396Z, 19:31:44.369190Z]; read_at is the lower bound. Lower: ~/tradepartner-probes/cbl/out.txt birth time 2026-10-31T15:29:33-0400 (19:29:33.481396Z), the file launch 1's redirect created (DESK_READ ledger: launch 1's uv error went to out.txt, later overwritten), and launch 2 followed launch 1. Upper: probe.py mtime 2026-10-31T15:31:44-0400 (19:31:44.369190Z), the crash-only edit saved after launch 2 crashed. Both launches' output was overwritten by launch 3"
+window_start = "2020-08-31"
+window_end = "2023-12-29"
+n_configurations = 1
+verdict = "incomplete"
+desk_read_path = "docs/research/2026-10-31-cash-profitability-long-only-desk-read.md"
+probe_path = "probes/cbl-probe-launch2.py.txt"
+probe_sha256 = "916339eea57d431558532680662516285cdf16b6e3c0c52edad69086089ba770"
+audit_url = "https://github.com/josejuarez96/tradepartner/issues/2689#issuecomment-6548223852"
+pins = { store_max_ingested_at = "2026-10-31T19:08:00.166464+00:00" }
+date_seen = "2026-11-06"
+evidence = [
+  "https://github.com/josejuarez96/tradepartner/issues/2689#issuecomment-6548103186: frozen kill line, created 2026-10-31T19:29:02Z and never edited (updated_at equals created_at); it states the frozen probe.py SHA-256 916339eea57d431558532680662516285cdf16b6e3c0c52edad69086089ba770 in full",
+  "https://github.com/josejuarez96/tradepartner/issues/2689#issuecomment-6548223852: quant-auditor PASS; section 1 reverts the one hunk (probe.py:336-339, cash += value back to raise RuntimeError(f'no last close for held {sid}')) and gets 916339ee...a770 byte for byte; pyc records source size 20,841 bytes and mtime 19:26:19Z",
+  "probes/cbl-probe-launch2.py.txt: the rebuilt frozen file (that hunk reverted on ~/tradepartner-probes/cbl/probe.py, bb32fdb0...fb08b), 20,841 bytes, hashes to 916339ee...a770; stored as .txt so ruff format cannot rewrite it",
+  "~/tradepartner-probes/cbl/DESK_READ.md: exploratory-cut ledger, launch 2 crashed in the return loop (RuntimeError: no last close for held 0001235010) and counts as return exposure",
+  "docs/specs/research-registry.md: amendment 2026-10-31 Backfill table, candidate 5 launch 2 row",
+]
+note = "Launch 2 of 3 (launch 1 failed inside uv before Python started and is not a launch). The probe file is rebuilt, so probe_verified rests on the hash being in the kill line posted before read_at, not on its mtime. Configuration rule: the one candidate book; SPY and EW comparators and the 2x cost stress not counted (spec). store_max_ingested_at declared (spec fallback): the backup data/tradepartner.duckdb.bak-20261031-0441 no longer exists, so it is MAX(ingested_at) over every fact table with ingested_at <= read_at on the live store, read-only, 2026-11-07T02:48Z (team expo3116); the same value at both launches' read_at. Releases since read_at that rewrote ingested_at: roles-2691 (2026-10-31 23:27-23:40Z, 30,439 Form 4 rows) and restamp-1382b-retry (2026-11-04), so rows ingested before read_at and restamped later are not in this maximum"
+
+[[exposure]]
+key = "c5-launch-3"
+candidate_ref = "#2689"
+source = "store"
+family = "profitability"
+issue_url = "https://github.com/josejuarez96/tradepartner/issues/2689"
+kill_line_url = "https://github.com/josejuarez96/tradepartner/issues/2689#issuecomment-6548103186"
+kill_line_file = "kill-lines/2689-6548103186.md"
+kill_line_sha256 = "7a2b91fb5ce5427548091a5efd3d669d138b05f68103fd1eeb7810b5f91a15d6"
+kill_line_posted_at = "2026-10-31T19:29:02Z"
+read_at = "2026-10-31T19:31:44.369190+00:00"
+read_at_basis = "bound"
+read_at_evidence = "launch 3 started inside [19:31:44.369190Z, 19:36:01.400587Z]; read_at is the lower bound. Lower: ~/tradepartner-probes/cbl/probe.py mtime 2026-10-31T15:31:44-0400 (19:31:44.369190Z), the crash-only edit launch 3 ran. Upper: out.txt mtime 2026-10-31T15:36:01-0400 (19:36:01.400587Z), its completed output"
+window_start = "2020-08-31"
+window_end = "2023-12-29"
+n_configurations = 1
+verdict = "fail"
+desk_read_path = "docs/research/2026-10-31-cash-profitability-long-only-desk-read.md"
+probe_path = "~/tradepartner-probes/cbl/probe.py"
+probe_sha256 = "bb32fdb0587cfecc35e9cafd41926ab9d760c19271364fdebe55463b357fb08b"
+audit_url = "https://github.com/josejuarez96/tradepartner/issues/2689#issuecomment-6548223852"
+pins = { store_max_ingested_at = "2026-10-31T19:08:00.166464+00:00" }
+date_seen = "2026-11-06"
+evidence = [
+  "https://github.com/josejuarez96/tradepartner/issues/2689#issuecomment-6548223852: quant-auditor PASS, header 'reviewed probe sha bb32fdb0587cfecc35e9cafd41926ab9d760c19271364fdebe55463b357fb08b'; printed -0.000881, t -0.238, EW -0.000334, all three conditions fail",
+  "~/tradepartner-probes/cbl/probe.py: sha256 bb32fdb0...fb08b today, mtime 19:31:44Z, at or before read_at",
+  "~/tradepartner-probes/cbl/out.txt: launch 3's completed output (base verdict FAIL and the 2x stress), mtime 19:36:01Z",
+  "docs/research/2026-10-31-cash-profitability-long-only-desk-read.md: the desk read on main, verdict FAIL",
+]
+note = "Launch 3 of 3, completed. Configuration rule as launch 2. store_max_ingested_at declared (spec fallback): the backup data/tradepartner.duckdb.bak-20261031-0441 no longer exists, so it is MAX(ingested_at) over every fact table with ingested_at <= read_at on the live store, read-only, 2026-11-07T02:48Z (team expo3116); the same value at both launches' read_at. Releases since read_at that rewrote ingested_at: roles-2691 (2026-10-31 23:27-23:40Z, 30,439 Form 4 rows) and restamp-1382b-retry (2026-11-04), so rows ingested before read_at and restamped later are not in this maximum"
+
+# ---------------------------------------------------------------- CBOperProf (#2675)
+
+[[exposure]]
+key = "cbop-launch-1"
+candidate_ref = "#2675"
+source = "open_data"
+family = "profitability"
+issue_url = "https://github.com/josejuarez96/tradepartner/issues/2675"
+kill_line_url = "https://github.com/josejuarez96/tradepartner/blob/54eb295f6f5e35f5db83c562b05a29675b46b171/docs/research/hypothesis-backlog.md"
+kill_line_file = "kill-lines/2675-54eb295f-hypothesis-backlog.md"
+kill_line_sha256 = "fdbeca8967cfe595baecdf518008399433b35b65728a954c2e773390c9f6f051"
+kill_line_posted_at = "2026-10-31T05:06:46Z"
+read_at = "2026-10-31T05:03:41.446746+00:00"
+read_at_basis = "measured"
+read_at_evidence = "~/tradepartner-probes/cbop/out.txt birth time 2026-10-31T01:03:41-0400 (05:03:41.446746Z): the file the first run's output redirect created; it matches the desk read ledger's '01:03:41 EDT first run'"
+window_start = "2009-01-01"
+window_end = "2025-12-31"
+n_configurations = 12
+verdict = "fail"
+desk_read_path = "docs/research/2026-10-31-cash-op-profitability-desk-read.md"
+probe_unavailable_reason = "the first run's compute.py was overwritten in place by the 01:05:37 EDT display-only edit (same file, birth 01:03:36 EDT); no copy or hash of the first version exists, so it cannot be rebuilt (spec open question 4)"
+inputs = [
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_DecilesVW.parquet", sha256 = "95409cb1014d6b20d5ddf0468e98baeb8fec68ef514bef0e777565eb884679a8" },
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_LiqScreen_ME_gt_NYSE20pct.parquet", sha256 = "fcd2ae4053d7262868f5531be051ab6039161f7422091651116cf4a6990f3734" },
+]
+date_seen = "2026-11-06"
+evidence = [
+  "https://github.com/josejuarez96/tradepartner/blob/54eb295f6f5e35f5db83c562b05a29675b46b171/docs/research/hypothesis-backlog.md: the CBOperProf declared read and frozen kill line, first durable in PR #2676's commit 54eb295f (committer 2026-10-31T05:06:46Z), after both runs",
+  "docs/research/2026-10-31-cash-op-profitability-desk-read.md: exploratory-cut ledger, 12 cells named before any read; the 01:03:41 EDT first run printed all 12; overwritten by the 01:05:41 rerun; freeze time 01:02:44 EDT self-reported",
+  "~/tradepartner-probes/cz-data/: both parquets, mtime 2026-10-31T03:34:05Z, before the read",
+  "docs/specs/research-registry.md: amendment 2026-10-31 Backfill table, CBOperProf row (two launches, 12 per launch, posted_after_read)",
+]
+note = "Kill line is the backlog declaration as committed (no issue comment exists); posted_at is that commit's committer time, as the spec's table directs. The text's own 01:02:44 EDT freeze stamp is self-reported. Configurations: 6 CBOperProf decision cells plus 6 OperProfRD checks (2 files x 3 windows each). Overlaps profitability's unspent holdout [2024-01-01, 2026-09-30] through open data (spec open question 2 (ii): disclosure)"
+
+[[exposure]]
+key = "cbop-launch-2"
+candidate_ref = "#2675"
+source = "open_data"
+family = "profitability"
+issue_url = "https://github.com/josejuarez96/tradepartner/issues/2675"
+kill_line_url = "https://github.com/josejuarez96/tradepartner/blob/54eb295f6f5e35f5db83c562b05a29675b46b171/docs/research/hypothesis-backlog.md"
+kill_line_file = "kill-lines/2675-54eb295f-hypothesis-backlog.md"
+kill_line_sha256 = "fdbeca8967cfe595baecdf518008399433b35b65728a954c2e773390c9f6f051"
+kill_line_posted_at = "2026-10-31T05:06:46Z"
+read_at = "2026-10-31T05:05:41Z"
+read_at_basis = "bound"
+read_at_evidence = "the desk read ledger's rerun time 01:05:41 EDT, which equals ~/tradepartner-probes/cbop/out.txt mtime 2026-10-31T01:05:41-0400 (05:05:41.370794Z), the end of the rerun's output; the start lies in [compute.py mtime 05:05:37.130972Z, 05:05:41.370794Z]"
+window_start = "2009-01-01"
+window_end = "2025-12-31"
+n_configurations = 12
+verdict = "fail"
+desk_read_path = "docs/research/2026-10-31-cash-op-profitability-desk-read.md"
+probe_path = "~/tradepartner-probes/cbop/compute.py"
+probe_sha256 = "3fa7bafe5d5b9a212b303e833d3375ae2b5a8245e3e824a167dd1cb70dd111b2"
+inputs = [
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_DecilesVW.parquet", sha256 = "95409cb1014d6b20d5ddf0468e98baeb8fec68ef514bef0e777565eb884679a8" },
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_LiqScreen_ME_gt_NYSE20pct.parquet", sha256 = "fcd2ae4053d7262868f5531be051ab6039161f7422091651116cf4a6990f3734" },
+]
+date_seen = "2026-11-06"
+evidence = [
+  "~/tradepartner-probes/cbop/compute.py: sha256 3fa7bafe...11b2, mtime 2026-10-31T01:05:37-0400, at or before the rerun",
+  "~/tradepartner-probes/cbop/out.txt: the rerun's output, the 12 cells in the desk read",
+  "docs/research/2026-10-31-cash-op-profitability-desk-read.md: ledger, the 01:05:37 edit only split and reformatted printed lines; same cells and values",
+]
+note = "The rerun on the surviving compute.py. Configurations as cbop-launch-1. Kill line as cbop-launch-1 (backlog declaration, commit 54eb295f, after both runs)"
+
+# ---------------------------------------------------------------- issuance with Q1 (#2669) and I1
+
+[[exposure]]
+key = "issuance-launch-1"
+candidate_ref = "#2669"
+source = "open_data"
+issue_url = "https://github.com/josejuarez96/tradepartner/issues/2669"
+kill_line_url = "https://github.com/josejuarez96/tradepartner/blob/4fe22d78990d617d28dcbc6ff6dfc1db9e8f44bb/docs/research/2026-10-30-equity-issuance-desk-read.md"
+kill_line_file = "kill-lines/2669-4fe22d78-equity-issuance-desk-read.md"
+kill_line_sha256 = "2734e382cefdc032b2a3ded70ad37c1db9016ba3109fb141f98be438c63cd405"
+kill_line_posted_at = "2026-10-31T03:39:21Z"
+read_at = "2026-10-31T03:36:10.852243+00:00"
+read_at_basis = "measured"
+read_at_evidence = "~/tradepartner-probes/issuance/out.txt birth time 2026-10-30T23:36:10-0400 (03:36:10.852243Z): the file the first launch's output redirect created, 2.5 s after compute.py was first created (birth 23:36:08 EDT). The current out.txt is the second launch's, written in place over it"
+window_start = "2009-01-01"
+window_end = "2025-12-31"
+n_configurations = 18
+verdict = "fail"
+desk_read_path = "docs/research/2026-10-30-equity-issuance-desk-read.md"
+probe_unavailable_reason = "the first compute.py was rewritten in place at 2026-10-30 23:43:34 EDT (same file, birth 23:36:08 EDT; audit F item 3); its text and hash were never recorded"
+inputs = [
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_DecilesVW.parquet", sha256 = "95409cb1014d6b20d5ddf0468e98baeb8fec68ef514bef0e777565eb884679a8" },
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_LiqScreen_ME_gt_NYSE20pct.parquet", sha256 = "fcd2ae4053d7262868f5531be051ab6039161f7422091651116cf4a6990f3734" },
+]
+date_seen = "2026-11-06"
+evidence = [
+  "https://github.com/josejuarez96/tradepartner/blob/4fe22d78990d617d28dcbc6ff6dfc1db9e8f44bb/docs/research/2026-10-30-equity-issuance-desk-read.md: PR #2671's first commit (committer 2026-10-31T03:39:21Z), the kill line's first durable copy ('written 2026-10-30 23:35:22 EDT', self-reported), and the first report: 18 cells, ShareIss1Y PASS",
+  "https://github.com/josejuarez96/tradepartner/commit/8292b25b59d8d2f2bf83e6418354a88e641b99dd: 03:46:05Z, verdict flipped to FAIL on the second launch's output",
+  "~/tradepartner-probes/auditF/05-research.md: item 3, at least 2 launches, the first script is gone",
+  "https://github.com/josejuarez96/tradepartner/issues/2669: issue body (created 03:33:31Z, never edited) already quotes CZ VW post-2009 CompEquIss +0.72 (t 2.44) and ShareIss1Y +0.67 (t 2.48)",
+]
+note = "Launch count UNVERIFIED: at least 2 launches (this one and issuance-launch-2), established from out.txt and compute.py birth and mtime and the two commits; launches between 23:36:10 and 23:43:34 EDT cannot be excluded. Configurations: the 18 cells the first report printed (CompEquIss, ShareIss1Y, NetEquityFinance x VW and screened x 2009+, 2016+, 2020+); whether the first script also read AssetGrowth (I1) or the 2010-2019 window is UNVERIFIED, so no I1 record is written for this launch. Verdict: the first report read ShareIss1Y PASS from this output; the frozen line applied literally to the same numbers is FAIL (desk read on main). The kill line on main was extended after both launches (8292b25b adds the 24.2 bp spread rule and the turnover table under the same 'written 23:35:22' heading); the copy pinned here is the first durable text. Q1's own declared read (2026-10-19, ladder ledger, commit 3aa424ab) decided Q1 from launch 2's output"
+
+[[exposure]]
+key = "issuance-launch-2"
+candidate_ref = "#2669"
+source = "open_data"
+issue_url = "https://github.com/josejuarez96/tradepartner/issues/2669"
+kill_line_url = "https://github.com/josejuarez96/tradepartner/blob/4fe22d78990d617d28dcbc6ff6dfc1db9e8f44bb/docs/research/2026-10-30-equity-issuance-desk-read.md"
+kill_line_file = "kill-lines/2669-4fe22d78-equity-issuance-desk-read.md"
+kill_line_sha256 = "2734e382cefdc032b2a3ded70ad37c1db9016ba3109fb141f98be438c63cd405"
+kill_line_posted_at = "2026-10-31T03:39:21Z"
+read_at = "2026-10-31T03:43:34.669492+00:00"
+read_at_basis = "bound"
+read_at_evidence = "the launch started inside [03:43:34.669492Z, 03:43:34.939811Z]; read_at is the lower bound. Lower: ~/tradepartner-probes/issuance/compute.py mtime 2026-10-30T23:43:34-0400 (03:43:34.669492Z), the rewrite this launch ran. Upper: out.txt mtime 2026-10-30T23:43:34-0400 (03:43:34.939811Z), its output"
+window_start = "2009-01-01"
+window_end = "2025-12-31"
+n_configurations = 24
+verdict = "fail"
+desk_read_path = "docs/research/2026-10-30-equity-issuance-desk-read.md"
+probe_path = "~/tradepartner-probes/issuance/compute.py"
+probe_sha256 = "69218f40dfefafa8372d515d49a339463113f1465c20c8b3dad7009a212bdce7"
+inputs = [
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_DecilesVW.parquet", sha256 = "95409cb1014d6b20d5ddf0468e98baeb8fec68ef514bef0e777565eb884679a8" },
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_LiqScreen_ME_gt_NYSE20pct.parquet", sha256 = "fcd2ae4053d7262868f5531be051ab6039161f7422091651116cf4a6990f3734" },
+]
+date_seen = "2026-11-06"
+evidence = [
+  "~/tradepartner-probes/issuance/compute.py: sha256 69218f40...bdce7, SIGNALS CompEquIss, ShareIss1Y, NetEquityFinance, AssetGrowth; STARTS 2009, 2016, 2020, 2010 (2010-2019)",
+  "~/tradepartner-probes/issuance/out.txt: 2 files x 4 signals x 4 windows = 32 cells; Q1's screened ShareIss1Y 2010-2019 long leg +0.0996 (t 1.12)",
+  "https://github.com/josejuarez96/tradepartner/commit/8292b25b59d8d2f2bf83e6418354a88e641b99dd: 03:46:05Z, applies the frozen lines to this output, issuance and I1 FAIL",
+]
+note = "The shared issuance/I1 launch. This record holds the issuance cells only: 3 signals x 2 files x 4 windows = 24 (NetEquityFinance is a labelled check, counted as the spec counts OperProfRD); AssetGrowth's 8 cells are the I1 record i1-launch-2. Launch count UNVERIFIED as for issuance-launch-1"
+
+[[exposure]]
+key = "i1-launch-2"
+candidate_ref = "I1"
+source = "open_data"
+issue_url = "https://github.com/josejuarez96/tradepartner/issues/2669"
+kill_line_url = "https://github.com/josejuarez96/tradepartner/blob/56abb5c14a3451500c56d3a6b9a44043c02c0332/docs/research/hypothesis-backlog.md"
+kill_line_file = "kill-lines/i1-56abb5c1-hypothesis-backlog.md"
+kill_line_sha256 = "36fe23075e534010379c9f993acda5624c63829599f92811fae062940999bcdd"
+kill_line_posted_at = "2026-10-28T21:51:07Z"
+read_at = "2026-10-31T03:43:34.669492+00:00"
+read_at_basis = "bound"
+read_at_evidence = "the same launch as issuance-launch-2: started inside [compute.py mtime 03:43:34.669492Z, out.txt mtime 03:43:34.939811Z]; read_at is the lower bound"
+window_start = "2009-01-01"
+window_end = "2025-12-31"
+n_configurations = 8
+verdict = "fail"
+desk_read_path = "docs/research/2026-10-30-i1-asset-growth-desk-read.md"
+probe_path = "~/tradepartner-probes/issuance/compute.py"
+probe_sha256 = "69218f40dfefafa8372d515d49a339463113f1465c20c8b3dad7009a212bdce7"
+inputs = [
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_DecilesVW.parquet", sha256 = "95409cb1014d6b20d5ddf0468e98baeb8fec68ef514bef0e777565eb884679a8" },
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_LiqScreen_ME_gt_NYSE20pct.parquet", sha256 = "fcd2ae4053d7262868f5531be051ab6039161f7422091651116cf4a6990f3734" },
+]
+date_seen = "2026-11-06"
+evidence = [
+  "https://github.com/josejuarez96/tradepartner/blob/56abb5c14a3451500c56d3a6b9a44043c02c0332/docs/research/hypothesis-backlog.md: I1 entry, declared read (CZ AssetGrowth VW and size-screened legs, 2010-01 to 2019-12) and kill line, on main from 2026-10-28T21:51:07Z (#2527)",
+  "docs/research/2026-10-30-i1-asset-growth-desk-read.md: verdict FAIL rests on the backlog's declared read (screened long leg 2010-2019 +0.0076); its own frozen lines carry no wall time ('session clock') and were first committed at 8292b25b (2026-10-31T03:46:05Z), after this launch",
+  "~/tradepartner-probes/issuance/out.txt: the AssetGrowth cells, 2 files x 4 windows",
+]
+note = "I1 has no issue; issue_url is #2669, whose PR #2671 carried the I1 desk read. Kill line: the backlog declaration the verdict rests on (committer time of the merge commit 56abb5c1). If the reviewer holds that the desk read's own frozen lines govern, they were first durable at 8292b25b (03:46:05Z), after this launch, and the basis flips to posted_after_read. Configurations: AssetGrowth x 2 files x 4 windows = 8. Key numbered by the shared script's launch; no i1-launch-1 record because the first launch's reading of AssetGrowth is UNVERIFIED"
+
+# ---------------------------------------------------------------- XFIN (#2828)
+
+[[exposure]]
+key = "xfin-launch-1"
+candidate_ref = "#2828"
+source = "open_data"
+issue_url = "https://github.com/josejuarez96/tradepartner/issues/2828"
+kill_line_url = "https://github.com/josejuarez96/tradepartner/issues/2828#issuecomment-6567898743"
+kill_line_file = "kill-lines/2828-6567898743.md"
+kill_line_sha256 = "c869ebbcca76ea2fec26465e6f2bf34800c16c9b14444b70e133061a856215ee"
+kill_line_posted_at = "2026-11-02T02:52:38Z"
+read_at = "2026-11-02T02:53:07.667289+00:00"
+read_at_basis = "measured"
+read_at_evidence = "~/tradepartner-probes/xfin/out.txt birth time 2026-11-01T21:53:07-0500 (02:53:07.667289Z), created by the run's output redirect; the desk read says 'The script's single run started at 02:53:07 UTC'"
+window_start = "2009-01-01"
+window_end = "2025-12-31"
+n_configurations = 12
+verdict = "fail"
+desk_read_path = "docs/research/2026-11-01-net-external-financing-desk-read.md"
+probe_path = "~/tradepartner-probes/xfin/compute.py"
+probe_sha256 = "f3f4d25c0bdfc457ae032834dcc444d24dc11fb86e56fa3e7623fdcb0d5ac5c7"
+inputs = [
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_DecilesVW.parquet", sha256 = "95409cb1014d6b20d5ddf0468e98baeb8fec68ef514bef0e777565eb884679a8" },
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_LiqScreen_ME_gt_NYSE20pct.parquet", sha256 = "fcd2ae4053d7262868f5531be051ab6039161f7422091651116cf4a6990f3734" },
+]
+date_seen = "2026-11-06"
+evidence = [
+  "https://github.com/josejuarez96/tradepartner/issues/2828#issuecomment-6567898743: frozen kill line, created 2026-11-02T02:52:38Z, never edited",
+  "~/tradepartner-probes/xfin/compute.py: sha256 f3f4d25c...5c7, mtime 2026-11-01T21:53:02-0500 (02:53:02Z), before the run; out.txt prints both parquet pins",
+  "docs/research/2026-11-01-net-external-financing-desk-read.md: ledger, one run, no rerun or edit; structure.py read no ret column",
+  "~/tradepartner-probes/auditF/05-research.md: item 3, XFIN 02:52:38Z before out.txt 02:53:12Z",
+]
+note = "One launch. Configurations: 6 XFIN decision cells plus 6 NetEquityFinance secondary cells (2 files x 3 windows each). structure.py (02:51:28Z) read no returns and is not a launch"
+
+# ---------------------------------------------------------------- composite (#2888)
+
+[[exposure]]
+key = "composite-launch-1"
+candidate_ref = "#2888"
+source = "open_data"
+issue_url = "https://github.com/josejuarez96/tradepartner/issues/2888"
+kill_line_url = "https://github.com/josejuarez96/tradepartner/issues/2888#issuecomment-6583038848"
+kill_line_file = "kill-lines/2888-6583038848.md"
+kill_line_sha256 = "16743a4ca82ac29ea0091bd13660b58f4e8ba5a370ab15f5c077050c70ace451"
+kill_line_posted_at = "2026-11-02T16:57:35Z"
+read_at = "2026-11-02T16:58:28.953717+00:00"
+read_at_basis = "measured"
+read_at_evidence = "~/tradepartner-probes/composite/out.txt birth time 2026-11-02T11:58:28-0500 (16:58:28.953717Z), created by the run's output redirect; the desk read says 'The script's single run started at 16:58:28 UTC'"
+window_start = "1990-01-01"
+window_end = "2025-12-31"
+n_configurations = 127
+verdict = "fail"
+desk_read_path = "docs/research/2026-11-02-composite-weak-signals-desk-read.md"
+probe_path = "~/tradepartner-probes/composite/compute.py"
+probe_sha256 = "733bfe753ca29970fc5500c127234ec541ef3d7787396cad00225220d50476b9"
+inputs = [
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_DecilesVW.parquet", sha256 = "95409cb1014d6b20d5ddf0468e98baeb8fec68ef514bef0e777565eb884679a8" },
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_LiqScreen_ME_gt_NYSE20pct.parquet", sha256 = "fcd2ae4053d7262868f5531be051ab6039161f7422091651116cf4a6990f3734" },
+  { path = "~/tradepartner-probes/idea-queue/raw/SignalDoc.csv", sha256 = "0ceb11020c2138c2477b732948beaac2e67ccaad8428753e3a79af2bb5ea0178" },
+]
+date_seen = "2026-11-06"
+evidence = [
+  "https://github.com/josejuarez96/tradepartner/issues/2888#issuecomment-6583038848: frozen kill line, created 2026-11-02T16:57:35Z, never edited",
+  "https://github.com/josejuarez96/tradepartner/issues/2888#issuecomment-6583073976: verdict FAIL",
+  "~/tradepartner-probes/composite/compute.py: sha256 733bfe75...76b9, mtime 2026-11-02T11:58:21-0500 (16:58:21Z), before the run; it checks all three input pins",
+  "~/tradepartner-probes/composite/out.txt: 73 VW L/S selection statistics 1990-01..2008-12, 8 selected, 6 composite cells, 48 descriptive per-signal cells",
+  "~/tradepartner-probes/auditF/05-research.md: item 3, composite 16:57:35Z before 16:58:29Z",
+]
+note = "One launch. Configurations: 6 composite decision cells (2 files x 3 windows) + 48 descriptive per-signal cells (8 signals x 2 files x 3 windows) + 73 selection cells (each eligible signal's VW L/S mean and t over 1990-2008, printed) = 127; decision cells alone are 6. window_start is the selection window's first month. structure.py read no returns and is not a launch"
+
+# ---------------------------------------------------------------- cfp (#2946)
+
+[[exposure]]
+key = "cfp-launch-1"
+candidate_ref = "#2946"
+source = "open_data"
+issue_url = "https://github.com/josejuarez96/tradepartner/issues/2946"
+kill_line_url = "https://github.com/josejuarez96/tradepartner/issues/2946#issuecomment-6608203413"
+kill_line_file = "kill-lines/2946-6608203413.md"
+kill_line_sha256 = "3c82e4f081e66f07961a275eb7a864afdc88d31476db65e65adcdc08d21f4d1a"
+kill_line_posted_at = "2026-11-03T15:42:19Z"
+read_at = "2026-11-03T15:42:52.943359+00:00"
+read_at_basis = "measured"
+read_at_evidence = "~/tradepartner-probes/cfp/out.txt line 1, printed by the script before any read: 'RUN START 2026-11-03T15:42:52.943359+00:00'; out.txt birth 2026-11-03T10:42:52-0500 agrees"
+window_start = "2009-01-01"
+window_end = "2025-12-31"
+n_configurations = 6
+verdict = "fail"
+desk_read_path = "docs/research/2026-11-03-cfp-value-desk-read.md"
+probe_path = "~/tradepartner-probes/cfp/compute.py"
+probe_sha256 = "ab5c04172da81ad648f1e4f4bce9e931628af41bbebfb750915607a200bb77bf"
+inputs = [
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_DecilesVW.parquet", sha256 = "95409cb1014d6b20d5ddf0468e98baeb8fec68ef514bef0e777565eb884679a8" },
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_LiqScreen_ME_gt_NYSE20pct.parquet", sha256 = "fcd2ae4053d7262868f5531be051ab6039161f7422091651116cf4a6990f3734" },
+  { path = "~/tradepartner-probes/idea-queue/raw/SignalDoc.csv", sha256 = "0ceb11020c2138c2477b732948beaac2e67ccaad8428753e3a79af2bb5ea0178" },
+]
+date_seen = "2026-11-06"
+evidence = [
+  "https://github.com/josejuarez96/tradepartner/issues/2946#issuecomment-6608203413: frozen kill line, created 2026-11-03T15:42:19Z, never edited",
+  "https://github.com/josejuarez96/tradepartner/issues/2946#issuecomment-6608225924: verdict FAIL",
+  "~/tradepartner-probes/cfp/compute.py: sha256 ab5c0417...77bf, mtime 2026-11-03T10:42:48-0500 (15:42:48Z), before the run; it checks all three input pins",
+  "~/tradepartner-probes/cfp/out.txt: 6 cfp cells (2 files x 3 windows), all FAIL",
+  "~/tradepartner-probes/auditF/05-research.md: item 3, cfp 15:42:19Z before 15:42:52Z",
+]
+note = "One launch, read 2026-11-03, after the exposure CLI shipped (T357, 2026-11-02), yet unrecorded. Configurations: 6 cfp cells; the 200% turnover stress and cost-floor comparisons not counted. structure.py read no returns and is not a launch"
+
+# ---------------------------------------------------------------- pooled CZ long-leg composite (#3092)
+
+[[exposure]]
+key = "czcomp-launch-1"
+candidate_ref = "#3092"
+source = "open_data"
+issue_url = "https://github.com/josejuarez96/tradepartner/issues/3092"
+kill_line_url = "https://github.com/josejuarez96/tradepartner/issues/3092#issuecomment-6700519706"
+kill_line_file = "kill-lines/3092-6700519706.md"
+kill_line_sha256 = "b133bde3df8a81db5cef95ca90a052ec607d8f460c7f37694b2700e488c906ba"
+kill_line_posted_at = "2026-11-07T01:42:54Z"
+read_at = "2026-11-07T01:42:58.342755+00:00"
+read_at_basis = "measured"
+read_at_evidence = "~/tradepartner-probes/arch/czcomp/out.txt birth time 2026-11-06T20:42:58-0500 (01:42:58.342755Z), created by the real run's output redirect; mtime 01:43:08Z"
+window_start = "1926-04-30"
+window_end = "2025-12-31"
+n_configurations = 96
+verdict = "fail"
+desk_read_path = "docs/research/hypothesis-backlog.md"
+probe_path = "~/tradepartner-probes/arch/czcomp/compute.py"
+probe_sha256 = "1c93fcd466ba96926c859217c21d789934a9a73d5338e194eeb80b1e6370b609"
+inputs = [
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_DecilesVW.parquet", sha256 = "95409cb1014d6b20d5ddf0468e98baeb8fec68ef514bef0e777565eb884679a8" },
+  { path = "~/tradepartner-probes/cz-data/PredictorAltPorts_LiqScreen_ME_gt_NYSE20pct.parquet", sha256 = "fcd2ae4053d7262868f5531be051ab6039161f7422091651116cf4a6990f3734" },
+  { path = "~/tradepartner-probes/idea-queue/raw/SignalDoc.csv", sha256 = "0ceb11020c2138c2477b732948beaac2e67ccaad8428753e3a79af2bb5ea0178" },
+]
+date_seen = "2026-11-06"
+evidence = [
+  "https://github.com/josejuarez96/tradepartner/issues/3092#issuecomment-6700519706: step 3 pre-registration, created 2026-11-07T01:42:54Z, never edited; pool, the three input pins and compute.py's SHA-256 1c93fcd4...b609 in full; it adopts the kill line frozen in the issue body",
+  "kill-lines/3092-issue-body.md: the issue body (created 2026-11-07T01:32:53Z, lastEditedAt null), R4 section 4.3 kill line verbatim",
+  "https://github.com/josejuarez96/tradepartner/issues/3092#issuecomment-6700538447: step 3 result, KILL",
+  "~/tradepartner-probes/arch/czcomp/out.txt: one real launch, three RUN blocks (main, sens_common_signals, sens_min3ports), all KILL",
+  "~/tradepartner-probes/auditF/05-research.md: item 3, body 01:32:53Z, pre-registration 01:42:54Z, verdict 01:44:35Z",
+  "https://github.com/josejuarez96/tradepartner/issues/3110: tracks recording this exposure at the 11-09 sitting",
+]
+note = "One real launch (the 01:41:12Z --dry-run replaced every ret by seeded normals and is not a launch). Kill line URL: the pre-registration comment, which posts the kill line by reference plus the script hash; the kill-line text is in the issue body (copy kept beside it), created earlier and never edited, so the basis is the same either way. No docs/research note reports this launch alone: desk_read_path is the backlog (Source retired 2026-11-06 paragraph, ladder ledger row L-2); the report is ~/tradepartner-probes/arch/czcomp/report.md, outside git. Configurations: 4 arms x 2 legs (long, L/S) x 2 files x 3 windows (2000-2019 decides; 2020-2025, 2000-2025 reported) = 48 for main, plus 24 screened cells for each of the two sensitivity constructions (their VW cells equal main's) = 96; 2x cost, arm differences and gate-internal per-signal statistics not counted. window_start: arm 2's gate reads each pool signal's full history, earliest 1926-04-30 (DivYieldST, screened file; date column read 2026-11-06). Calibration launches (gatecal step 1, calib.py) built synthetic series from demeaned real legs and are not recorded here; see the T359 report"

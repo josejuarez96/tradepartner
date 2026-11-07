@@ -1,0 +1,411 @@
+"""Candidate 5 frozen cash operating profitability probe. Default: coverage only.
+
+Run a verdict only with --run. All return-bearing code is behind that flag.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import statistics
+import sys
+import zipfile
+from collections import Counter, defaultdict
+from datetime import date, datetime, UTC
+from functools import lru_cache
+from pathlib import Path
+
+import duckdb
+
+sys.path.insert(0, '/Users/josejuarez/Projects/tradepartner/src')
+from tradepartner.calendar import last_session_of_month, next_session, session_close, session_open
+from tradepartner.config import get_settings
+from tradepartner.universe import universe_as_of
+from tradepartner.store.asof import adjusted_prices_as_of, prices_as_of
+from tradepartner.store.benchmarks import benchmark_security_ids
+from tradepartner.store.classify import classifications_as_of
+
+# Frozen before any return or price-change read. Sources: docs/hypotheses/
+# b3-gross-profitability.md [profitability], [universe], and docs/specs/
+# data-foundation.md amendment 2026-10-30 #2670. The canonical working-capital
+# tags are used; the amendment does not approve broader proxies or unverified
+# issuer extensions as equivalent concepts.
+FROZEN = {
+    'candidate': '5: cash-based operating profitability, first-vintage XBRL',
+    'window_first_signal': '2020-08', 'window_last_signal': '2023-12',
+    'exam_starts': '2024-01-01',
+    'universe': 'B3 rule: ADR 0006 universe_as_of at close(T), cap-ranked top 1000; exclude SIC 6000-6999 from scoring; financials remain in comparison universe; see docs/hypotheses/b3-gross-profitability.md lines 93-115, 225-260',
+    'top_n_by_cap': 1000, 'exclude_sic_ranges_from_scoring': ((6000, 6999),),
+    'max_fact_age_days': 548,
+    'flow_tags': {
+        'revenue': ('us-gaap:Revenues', 'us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax', 'us-gaap:SalesRevenueNet', 'us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax', 'us-gaap:SalesRevenueGoodsNet', 'us-gaap:SalesRevenueServicesNet'),
+        'cogs': ('us-gaap:CostOfRevenue', 'us-gaap:CostOfGoodsAndServicesSold', 'us-gaap:CostOfGoodsSold', 'us-gaap:CostOfServices'),
+        'sga': ('us-gaap:SellingGeneralAndAdministrativeExpense',),
+        'rd': ('us-gaap:ResearchAndDevelopmentExpense',),
+    },
+    'balance_tags': {
+        'receivables': ('us-gaap:AccountsReceivableNetCurrent',),
+        'inventory': ('us-gaap:InventoryNet',),
+        'prepaids': ('us-gaap:PrepaidExpenseCurrent',),
+        'deferred_revenue': ('us-gaap:DeferredRevenueCurrent',),
+        'payables': ('us-gaap:AccountsPayableCurrent',),
+        'accruals': ('us-gaap:AccruedLiabilitiesCurrent',),
+        'assets': ('us-gaap:Assets',),
+    },
+    'formula': '(revenue - COGS - (SG&A - R&D) - delta receivables - delta inventory - delta prepaids + delta deferred revenue + delta payables + delta accruals) / lagged total assets',
+    'first_vintage': 'earliest filed for concept, unit and period; visible next XNYS session after filed',
+    'missing_values': 'require revenue, COGS, SG&A, current and lagged total assets; missing R&D is zero; each working-capital change is zero if either endpoint is missing; count every zero fill',
+    'feasibility_floor': 'at least 20 names in the top quintile in every signal month; otherwise INSUFFICIENT before any return read',
+    'period': 'latest complete fiscal quarter; use 3-month flow when filed, else current YTD minus earlier first-vintage YTD in same FY; current and prior balance ends about one quarter apart',
+    'quintile': 'top 20% of scored names, descending signal, security_id ascending tie break; ceil(0.20*n)',
+    'weighting': 'equal', 'rebalance': 'month-end close signal, next XNYS session open execution',
+    'entry_bar_gap': 'skip a selected name with no next-session open or no month mark; redistribute equally over executable selected names, with no rank replacement',
+    'cost_bps_per_side': 24.2, 'cost_basis': 'absolute traded notional, buys plus sells',
+    'delisting': 'sell delisted holding at last traded close; proceeds remain cash',
+    'benchmark': 'SPY total return: store prices_daily plus dividends/splits through adjusted_prices_as_of; fixed-symbol identity via store.benchmarks.benchmark_security_ids',
+    'comparison': 'equal-weighted universe_as_of members, same open execution and traded-notional costs',
+    'statistic': 'ordinary sample t = mean(monthly net excess)/(sample sd/sqrt(n))',
+    'pass': 'ALL: mean monthly net excess vs SPY > 0; t vs SPY >= 1.0; mean monthly net excess vs net EW universe > 0',
+    'stress': '2x per-side cost, report only',
+}
+
+ZIP = Path('/Users/josejuarez/Projects/tradepartner/data/edgar_cache/bulk/companyfacts.zip')
+FLOW = FROZEN['flow_tags']
+BAL = FROZEN['balance_tags']
+ALL_TAGS = {tag for tags in (*FLOW.values(), *BAL.values()) for tag in tags}
+
+
+def months():
+    y, m = map(int, FROZEN['window_first_signal'].split('-'))
+    last = tuple(map(int, FROZEN['window_last_signal'].split('-')))
+    while (y, m) <= last:
+        yield y, m
+        m += 1
+        if m == 13:
+            y, m = y + 1, 1
+
+
+def visible(fact, day):
+    try:
+        return fact['_available'] <= day
+    except (KeyError, ValueError):
+        return False
+
+
+@lru_cache(maxsize=None)
+def available_session(filed):
+    return next_session(date.fromisoformat(filed))
+
+
+def load_cik(z, names, cik):
+    path = f'CIK{int(cik):010d}.json'
+    if path not in names:
+        return {}
+    data = json.loads(z.read(path))['facts']
+    by_tag = {}
+    for taxonomy, items in data.items():
+        for tag, item in items.items():
+            key = taxonomy + ':' + tag
+            if key not in ALL_TAGS:
+                continue
+            first = {}
+            for row in item.get('units', {}).get('USD', []):
+                if row.get('form') not in ('10-Q', '10-K') or not isinstance(row.get('val'), (int, float)):
+                    continue
+                identity = (row.get('start'), row.get('end'))
+                if not identity[1] or not row.get('filed'):
+                    continue
+                if identity[1] < '2015-01-01' or row['filed'] > '2023-12-31':
+                    continue
+                old = first.get(identity)
+                if old is None or (row['filed'], row.get('accn', '')) < (old['filed'], old.get('accn', '')):
+                    first[identity] = row
+            for row in first.values():
+                row['_available'] = available_session(row['filed'])
+            by_tag[key] = list(first.values())
+    return by_tag
+
+
+def pick(rows, tags, day, end, start=None):
+    """Ordered same-concept tags; each one's earliest filed vintage only."""
+    for tag in tags:
+        choices = [r for r in rows.get(tag, ()) if r['end'] == end and r.get('start') == start and visible(r, day)]
+        if choices:
+            return min(choices, key=lambda r: (r['filed'], r.get('accn', ''))), tag
+    return None, None
+
+
+def balance(rows, key, day, end):
+    return pick(rows, BAL[key], day, end)
+
+
+def discrete_flow(rows, key, day, end, year, quarter, accession):
+    # Prefer a filed ~3-month duration. YTD subtraction only within one FY.
+    choices = []
+    for tag in FLOW[key]:
+        for row in rows.get(tag, ()):
+            if row.get('start') and row['end'] == end and row.get('accn') == accession and visible(row, day):
+                duration = (date.fromisoformat(end) - date.fromisoformat(row['start'])).days + 1
+                if 70 <= duration <= 110:
+                    choices.append((FLOW[key].index(tag), row['filed'], row, tag))
+    if choices:
+        _, _, row, tag = min(choices, key=lambda v: (v[0], v[1]))
+        return float(row['val']), tag
+    # Earlier first-vintage YTD is required for Q2-Q4; Q1 YTD is discrete.
+    current = []
+    for tag in FLOW[key]:
+        for row in rows.get(tag, ()):
+            if row.get('start') and row['end'] == end and row.get('accn') == accession and visible(row, day):
+                duration = (date.fromisoformat(end) - date.fromisoformat(row['start'])).days + 1
+                if 70 <= duration <= 380 and row.get('fy') == year:
+                    current.append((FLOW[key].index(tag), row['filed'], row, tag))
+    for _, _, row, tag in sorted(current, key=lambda v: (v[0], v[1])):
+        if quarter == 1:
+            return float(row['val']), tag
+        prior = []
+        for old in rows.get(tag, ()):
+            if old.get('start') == row['start'] and old['end'] < end and visible(old, day) and old.get('fy') == year:
+                duration = (date.fromisoformat(old['end']) - date.fromisoformat(old['start'])).days + 1
+                if 60 <= (date.fromisoformat(end) - date.fromisoformat(old['end'])).days <= 120 and duration < 380:
+                    prior.append(old)
+        if prior:
+            prev = max(prior, key=lambda r: r['end'])
+            return float(row['val']) - float(prev['val']), tag
+    return None, None
+
+
+def signal(rows, day):
+    """Return latest eligible quarterly signal, source tags and zero fills, else gaps."""
+    ends = sorted({r['end'] for tag in FLOW['revenue'] for r in rows.get(tag, ()) if r.get('start') and visible(r, day)}, reverse=True)
+    gaps = Counter()
+    for end in ends:
+        if not 0 <= (day - date.fromisoformat(end)).days <= FROZEN['max_fact_age_days']:
+            continue
+        rev_rows = [r for tag in FLOW['revenue'] for r in rows.get(tag, ()) if r['end'] == end and visible(r, day)]
+        if not rev_rows:
+            continue
+        anchor = min(rev_rows, key=lambda r: (r['filed'], r.get('accn', '')))
+        fy, fp = anchor.get('fy'), anchor.get('fp')
+        if fy is None or fp not in ('Q1', 'Q2', 'Q3', 'FY'):
+            continue
+        q = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'FY': 4}[fp]
+        prior_ends = sorted({r['end'] for tag in BAL['assets'] for r in rows.get(tag, ()) if r['end'] < end and visible(r, day)}, reverse=True)
+        prior = next((p for p in prior_ends if 60 <= (date.fromisoformat(end) - date.fromisoformat(p)).days <= 120), None)
+        if prior is None:
+            gaps['prior_balance'] += 1
+            continue
+        values, tags = {}, {}
+        for key in FLOW:
+            values[key], tags[key] = discrete_flow(rows, key, day, end, fy, q, anchor.get('accn'))
+        for key in BAL:
+            cur, ct = balance(rows, key, day, end)
+            old, ot = balance(rows, key, day, prior)
+            if cur is not None and cur.get('accn') != anchor.get('accn'):
+                cur = None
+            values[key] = None if cur is None or old is None else (float(cur['val']), float(old['val']))
+            tags[key] = ct if values[key] is not None else None
+        missing = [k for k in ('revenue', 'cogs', 'sga', 'assets') if values[k] is None]
+        if missing:
+            gaps.update(missing)
+            continue
+        if values['assets'][1] <= 0:
+            gaps['assets_nonpositive'] += 1
+            continue
+        zero_filled = set()
+        if values['rd'] is None:
+            values['rd'] = 0.0
+            zero_filled.add('rd')
+        delta = {}
+        for key in BAL:
+            if key == 'assets':
+                continue
+            if values[key] is None:
+                delta[key] = 0.0
+                zero_filled.add(key)
+            else:
+                delta[key] = values[key][0] - values[key][1]
+        numerator = (values['revenue'] - values['cogs'] - (values['sga'] - values['rd'])
+                     - delta['receivables'] - delta['inventory'] - delta['prepaids']
+                     + delta['deferred_revenue'] + delta['payables'] + delta['accruals'])
+        return numerator / values['assets'][1], tags, zero_filled, Counter()
+    return None, {}, set(), gaps or Counter({'no_quarter': 1})
+
+
+def coverage(conn, z):
+    names = set(z.namelist())
+    dates = [(last_session_of_month(y, m), y, m) for y, m in months()]
+    snapshot = []
+    ciks = set()
+    settings = get_settings()
+    assert settings.universe.top_n_by_cap == FROZEN['top_n_by_cap'], 'universe cap differs from pin'
+    for day, y, m in dates:
+        members = universe_as_of(conn, session_close(day), settings).members.to_dicts()
+        snapshot.append((day, members))
+        ciks.update(row['cik'] for row in members)
+    cache = {cik: load_cik(z, names, cik) for cik in sorted(ciks)}
+    counts, gaps, tag_counts, zero_counts, scored = [], Counter(), Counter(), Counter(), []
+    for day, members in snapshot:
+        ranks = []
+        classifications = {r['security_id']: r for r in classifications_as_of(conn, session_close(day)).to_dicts()}
+        for row in members:
+            # B3 excludes financials from scoring, not from the EW comparison.
+            sid = row['security_id']
+            sic = classifications.get(sid, {}).get('sic')
+            if sic is not None and 6000 <= sic <= 6999:
+                gaps['excluded_financial'] += 1
+                continue
+            if row['cik'] not in cache:
+                continue
+            val, tags, zero_filled, missing = signal(cache[row['cik']], day)
+            if val is None:
+                gaps.update(missing)
+            else:
+                ranks.append((val, sid))
+                if zero_filled:
+                    zero_counts['any'] += 1
+                    zero_counts.update(zero_filled)
+                for component, tag in tags.items():
+                    if tag is not None:
+                        tag_counts[(component, tag)] += 1
+        counts.append(len(ranks))
+        scored.append((day, members, ranks))
+    return counts, gaps, tag_counts, zero_counts, scored
+
+
+def print_coverage(counts, gaps, tag_counts, zero_counts, scored):
+    print(f"months_in_window={len(counts)} ({FROZEN['window_first_signal']}..{FROZEN['window_last_signal']})")
+    print(f'names_with_computable_signal_per_month min={min(counts)} median={statistics.median(counts)} max={max(counts)}')
+    print('per_month_coverage month universe_members scored_names top_quintile_size:')
+    for (day, members, _), count in zip(scored, counts):
+        print(f'  {day:%Y-%m} {len(members)} {count} {math.ceil(0.2 * count)}')
+    total = sum(counts)
+    print(f'scored_name_months={total}')
+    print(f'zero_fill_any={zero_counts["any"]}/{total} ({zero_counts["any"] / total:.1%})')
+    print('zero_fill_by_component (share of scored name-months):')
+    for component in ('rd', 'receivables', 'inventory', 'prepaids', 'deferred_revenue', 'payables', 'accruals'):
+        n = zero_counts[component]
+        print(f'  {component}: {n}/{total} ({n / total:.1%})')
+    print(f'top_quintile_feasibility_floor_20_each_month={"MET" if all(math.ceil(0.2 * n) >= 20 for n in counts) else "INSUFFICIENT"}')
+    print('component_tag_coverage (scored name-months):')
+    for component, tagset in {**FLOW, **BAL}.items():
+        for tag in tagset:
+            print(f'  {component} {tag}: {tag_counts[(component, tag)]}')
+    print('missing_component_attempts (latest eligible quarter scan):')
+    for component, n in sorted(gaps.items()):
+        print(f'  {component}: {n}')
+
+
+def marks(conn, when, ids, first):
+    frame = adjusted_prices_as_of(conn, when, sorted(ids), include_dividends=True,
+                                  traded_only=True, sessions_from=first)
+    return {(r['security_id'], r['session']): r for r in frame.to_dicts()}
+
+
+def execute_month(conn, spy, observations, previous, holdings, wealth, cost_bps, fraction=0.2):
+    """Monthly open rebalance, last-close delisting exits, close mark."""
+    signal_day, members, ranks = previous
+    month_day, _, _ = observations
+    trade_day = next_session(signal_day)
+    ids = {r['security_id'] for r in members} | set(holdings) | {spy}
+    byday = marks(conn, session_close(month_day), ids, signal_day)
+    ordered = sorted(ranks, key=lambda x: (-x[0], x[1]))
+    selected = [sid for _, sid in ordered[:math.ceil(fraction * len(ordered))]]
+    # adjusted prices include dividends and splits. A delisted name with no
+    # month-end bar exits at its last traded close; its residual stays cash.
+    open_price, close_price, last_bar_day = {}, {}, {}
+    for sid in ids:
+        rows = [(d, r) for (s, d), r in byday.items() if s == sid and trade_day <= d <= month_day]
+        first_bar = byday.get((sid, trade_day))
+        if first_bar:
+            open_price[sid] = first_bar['open']
+        if rows:
+            last_bar_day[sid], last_bar = max(rows, key=lambda x: x[0])
+            close_price[sid] = last_bar['close']
+    eligible = [sid for sid in selected if sid in open_price and sid in close_price]
+    target = {sid: 1 / len(eligible) for sid in eligible} if eligible else {}
+    # Existing notional is carried from previous close to this open. If an
+    # instrument vanished before the open, settle at its final close.
+    cash = wealth - sum(holdings.values())
+    old = {}
+    for sid, value in holdings.items():
+        prev = byday.get((sid, signal_day))
+        if prev and sid in open_price:
+            old[sid] = value * open_price[sid] / prev['close']
+        elif prev and sid in close_price:
+            cash += value * close_price[sid] / prev['close']
+        else:
+            raise RuntimeError(f'no last close for held {sid}')
+    pre = cash + sum(old.values())
+    desired = {sid: pre * w for sid, w in target.items()}
+    traded = sum(abs(desired.get(s, 0) - old.get(s, 0)) for s in set(desired) | set(old))
+    fee = traded * cost_bps / 10000
+    scale = (pre - fee) / pre
+    new = {s: v * scale for s, v in desired.items()}
+    end = pre - fee - sum(new.values())
+    end_holdings = {}
+    for sid, value in new.items():
+        marked = value * close_price[sid] / open_price[sid]
+        end += marked
+        if last_bar_day[sid] == month_day:
+            end_holdings[sid] = marked
+    return end, end_holdings, end / wealth - 1
+
+
+def verdict(conn, scored):
+    first, last = scored[0][0], scored[-1][0]
+    spy = benchmark_security_ids(conn, get_settings().benchmarks, start=first, through=last)['SPY']
+    # Three independent books; the EW comparison pays the same cost.
+    strategy = [(1.0, {}) for _ in range(2)]
+    universe = (1.0, {})
+    returns = [[], [], [], []]
+    for i in range(1, len(scored)):
+        day, members, _ = scored[i]
+        prev = scored[i-1]
+        strategy_new = []
+        for j, bps in enumerate((24.2, 48.4)):
+            w, h = strategy[j]
+            nw, nh, r = execute_month(conn, spy, (day, members, None), prev, h, w, bps)
+            strategy_new.append((nw, nh)); returns[j].append(r)
+        strategy = strategy_new
+        ew_prev = (prev[0], prev[1], [(0.0, r['security_id']) for r in prev[1]])
+        uw, uh = universe
+        nw, nh, r = execute_month(conn, spy, (day, members, None), ew_prev, uh, uw, 24.2, fraction=1.0)
+        universe = (nw, nh); returns[2].append(r)
+        # SPY total return from store adjusted close. Same monthly close cut.
+        p = marks(conn, session_close(day), {spy}, prev[0])
+        a, b = p.get((spy, prev[0])), p.get((spy, day))
+        if a is None or b is None:
+            raise RuntimeError(f'SPY missing {prev[0]} or {day}')
+        returns[3].append(b['close'] / a['close'] - 1)
+    def summary(book):
+        spy_ex = [a-b for a,b in zip(book, returns[3])]
+        ew_ex = [a-b for a,b in zip(book, returns[2])]
+        mean = statistics.mean(spy_ex)
+        sd = statistics.stdev(spy_ex)
+        t = mean / (sd / math.sqrt(len(spy_ex))) if sd else (math.inf if mean > 0 else -math.inf)
+        return mean, t, statistics.mean(ew_ex)
+    base, stress = summary(returns[0]), summary(returns[1])
+    print('monthly_returns=', len(returns[0]))
+    print('base mean_net_excess_spy=', base[0], 't=', base[1], 'mean_net_excess_ew=', base[2])
+    print('VERDICT=', 'PASS' if base[0] > 0 and base[1] >= 1 and base[2] > 0 else 'FAIL')
+    print('report_only_2x_cost mean_net_excess_spy=', stress[0], 't=', stress[1], 'mean_net_excess_ew=', stress[2])
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--store', required=True, type=Path)
+    parser.add_argument('--run', action='store_true', help='explicitly read prices and compute returns')
+    args = parser.parse_args()
+    if FROZEN['window_last_signal'] >= FROZEN['exam_starts'][:7]:
+        raise RuntimeError('window reaches historical exam interval')
+    with duckdb.connect(str(args.store), read_only=True) as conn, zipfile.ZipFile(ZIP) as z:
+        counts, gaps, tags, zero_counts, scored = coverage(conn, z)
+        print_coverage(counts, gaps, tags, zero_counts, scored)
+        if args.run:
+            if not all(math.ceil(0.2 * n) >= 20 for n in counts):
+                raise RuntimeError('INSUFFICIENT: top quintile has fewer than 20 names in at least one month; no returns read')
+            verdict(conn, scored)
+
+
+if __name__ == '__main__':
+    main()
