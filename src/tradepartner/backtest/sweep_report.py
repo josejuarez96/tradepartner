@@ -989,7 +989,7 @@ def _rules_text(rules: FamilyRules, forward: bool = False) -> str:
         f"{' (forward)' if forward else ''}; "
         f"fixed {json.dumps(rules.fixed_params, sort_keys=True)}; max holdout spends "
         f"{rules.max_family_holdout_spends}; max promotions {rules.max_family_promotions}; "
-        f"V floor {rules.min_sharpe_variance_annual}; lattice "
+        f"V floor (undefined V only) {lab_registry.family_v_floor(rules):.4f}; lattice "
         f"{json.dumps(rules.axis_lattice, sort_keys=True)}"
     )
 

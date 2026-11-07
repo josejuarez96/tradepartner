@@ -2178,19 +2178,24 @@ def _counted_pairs(
     """The number of distinct return series among the counted trials and, per
     distinct (canonical frozen set, first rebalance, data cutoff) pair, its latest
     trial id and base cost (V's pairs). A trial is the same series as an earlier one
-    only when it is an identical rerun: same pair, same `data_vintage` and same
-    `code_tree_sha256` (#3127). A rerun on new data or new code, or one missing either
-    stamp, is a new series (fail-closed)."""
+    only when it is an identical rerun: same pair, same `data_vintage`, same clean
+    `code_tree_sha256` and the same stored base-level outcome (`_outcome_digests`), so
+    a rerun whose returns moved where the vintage cannot see (a repair's deletions, an
+    imported release row) is still a new series (#3127). A rerun on new data or new
+    code, a dirty or unknown code tree, or a missing stamp or outcome is a new series
+    (fail-closed)."""
     if pending is not None:
         _check_trial_row(conn, pending)
     counted = conn.execute(
         "SELECT t.trial_id, h.params_json, t.start_session, t.data_cutoff, "
-        f"t.data_vintage, t.code_tree_sha256 {_COUNTED_FROM} ORDER BY t.trial_id",
+        f"t.data_vintage, t.code_tree_sha256, t.code_dirty {_COUNTED_FROM} "
+        "ORDER BY t.trial_id",
         [family, pending.trial_id if pending is not None else None],
     ).fetchall()
+    digests = _outcome_digests(conn, [int(row[0]) for row in counted])
     latest: dict[tuple[str, date, datetime | None], tuple[int, float]] = {}
     series: set[tuple[object, ...]] = set()
-    for trial_id, params_json, start, cutoff, vintage, code in counted:
+    for trial_id, params_json, start, cutoff, vintage, code, dirty in counted:
         params = json.loads(params_json)
         cadence = frozen_values(_Stored(params, family))[CADENCE_KEY]
         pair = (
@@ -2199,9 +2204,30 @@ def _counted_pairs(
             cutoff,
         )
         latest[pair] = (trial_id, float(params[BASE_COST_KEY]))
-        stamps = (vintage, code) if vintage is not None and code is not None else (trial_id,)
+        digest = digests.get(int(trial_id))
+        known = vintage is not None and code is not None and dirty is False and digest
+        stamps = (vintage, code, digest) if known else (trial_id,)
         series.add((*pair, *stamps))
     return len(series), latest
+
+
+#: The stored base-level `strategy` metrics an identical rerun must reproduce.
+_OUTCOME_METRICS: Final = ("n_periods", "sharpe_period", "sharpe_period_excess_spy")
+
+
+def _outcome_digests(conn: duckdb.DuckDBPyConnection, trial_ids: Sequence[int]) -> dict[int, str]:
+    """Each trial's base-level `strategy` outcome (`_OUTCOME_METRICS`, exact values) as
+    one string, in one query; a trial with none of those rows is absent."""
+    if not trial_ids:
+        return {}
+    rows = conn.execute(
+        "SELECT trial_id, string_agg(metric || '=' || CAST(value AS VARCHAR), ';' "
+        "ORDER BY metric) FROM trial_metrics WHERE trial_id IN (SELECT UNNEST($ids::BIGINT[])) "
+        "AND series = 'strategy' AND cost_level_kind = 'base' "
+        "AND metric IN (SELECT UNNEST($metrics::VARCHAR[])) GROUP BY trial_id",
+        {"ids": list(trial_ids), "metrics": list(_OUTCOME_METRICS)},
+    ).fetchall()
+    return {int(trial_id): str(digest) for trial_id, digest in rows}
 
 
 def count_counted_trials(

@@ -447,6 +447,16 @@ class TestResultRow:
         assert row["message"] == registry.STORE_CHANGED_MESSAGE
 
 
+@pytest.fixture
+def _clean_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A clean, known code vintage for every trial, wherever pytest's temp dir is: the
+    N tests below compare reruns, which are the same series only with both stamps
+    known and the tree clean (#3127)."""
+    monkeypatch.setattr(registry, "code_version", lambda _repo=None: ("abc", False))
+    monkeypatch.setattr(registry, "code_tree_sha256", lambda _repo=None: "c" * 64)
+
+
+@pytest.mark.usefixtures("_clean_code")
 class TestTrialCount:
     """N counts the distinct return series among `ok`, non-synthetic, in-sample trials
     of the family, this one included: an identical rerun (same pair, data vintage and
@@ -553,6 +563,7 @@ class TestTrialCount:
         assert row["dsr"] == pytest.approx(expected.dsr)
 
 
+@pytest.mark.usefixtures("_clean_code")
 class TestFamilyN:
     """`family_n` is the one place N is computed; `write_results` stores what it
     returns (strategy-lab plan, "One N function")."""
@@ -589,14 +600,41 @@ class TestFamilyN:
         write_results(conn, pending, _run(settings, pending), settings)
         assert family_n(conn, "momentum") == 2 == _result_row(conn, pending.trial_id)["n_trials"]
 
-    def test_an_identical_pending_rerun_adds_nothing(
-        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    @pytest.mark.parametrize(
+        ("column", "value"),
+        [
+            ("data_vintage", "TIMESTAMPTZ '2001-01-01 00:00:00+00'"),
+            ("code_tree_sha256", "NULL"),
+            ("code_dirty", "TRUE"),
+        ],
+        ids=["other-vintage", "unknown-code", "dirty"],
+    )
+    def test_a_rerun_with_another_or_unknown_stamp_is_a_new_series(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, column: str, value: str
     ) -> None:
         settings = _settings(tmp_path)
         _register(conn, settings)
         _trial(conn, settings, tmp_path)
-        pending = _open(conn, settings, tmp_path)
-        assert family_n(conn, "momentum", pending=pending) == 1
+        _trial(conn, settings, tmp_path)
+        assert family_n(conn, "momentum") == 1
+        conn.execute(f"UPDATE trials SET {column} = {value} WHERE trial_id = 1")
+        assert family_n(conn, "momentum") == 2
+
+    def test_a_rerun_whose_stored_outcome_moved_is_a_new_series(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """Same pair and stamps but another base-level outcome (a repair's deletions the
+        vintage cannot see): not an identical rerun."""
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        _trial(conn, settings, tmp_path)
+        _trial(conn, settings, tmp_path)
+        assert family_n(conn, "momentum") == 1
+        conn.execute(
+            "UPDATE trial_metrics SET value = value + 0.001 WHERE trial_id = 1 "
+            "AND metric = 'sharpe_period' AND series = 'strategy' AND cost_level_kind = 'base'"
+        )
+        assert family_n(conn, "momentum") == 2
 
 
 # --- research runs in N (research-registry spec req 9; T83b) ---------------------------
