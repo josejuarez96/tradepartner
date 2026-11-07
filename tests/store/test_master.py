@@ -1622,7 +1622,7 @@ class TestNewEquityAfterForm25:
             (cik, "NYSE", date(2023, 5, 1)),
         ]
 
-    def _gpor(self, *, registered: datetime) -> FixtureFilingSource:
+    def _gpor(self, *, registered: datetime, form: str = "25-NSE") -> FixtureFilingSource:
         # GPOR (#3056): 25-NSE on NASDAQ 2021-02-02 (effective 2021-02-12),
         # 8-A12B 2021-05-17 at emergence, the next cover page 2021-08-09
         # lists the new equity on NYSE only.
@@ -1639,7 +1639,7 @@ class TestNewEquityAfterForm25:
             delistings=[
                 DelistingFiling(
                     cik,
-                    "25-NSE",
+                    form,
                     "Common Stock",
                     "NASDAQ",
                     "25-gpr",
@@ -1669,6 +1669,17 @@ class TestNewEquityAfterForm25:
         cik = self.CIK
         build = build_master(
             self._gpor(registered=_at(2021, 2, 4)), _settings(), ingested_at=INGESTED_AT
+        )
+        assert build.successions == ()
+        assert {r["security_id"] for r in build.listings} == {cik}
+
+    def test_an_issuer_filed_form_25_on_another_exchange_is_a_transfer(self) -> None:
+        # quant-auditor on #3064: a voluntary transfer is filed by the issuer
+        # (`25`); an 8-A12B after its effective day (the transfer's own, or
+        # listed notes) never splits the company.
+        cik = self.CIK
+        build = build_master(
+            self._gpor(registered=_at(2021, 5, 17), form="25"), _settings(), ingested_at=INGESTED_AT
         )
         assert build.successions == ()
         assert {r["security_id"] for r in build.listings} == {cik}

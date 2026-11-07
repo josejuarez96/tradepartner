@@ -1026,6 +1026,13 @@ class ListingResolver:
         # superseded (started before it), never a later one.
         self._vacated: dict[str, list[TickerSpan]] = defaultdict(list)
         cut: set[TickerSpan] = set()  # spans ended at their own delisting
+        # #3056: per ticker, `(successor id, row day)` of every repair
+        # successor's row (`<cik>@<date>`), for rule 7's stopped-before-filing cut.
+        self._successor_rows: dict[str, list[tuple[str, date]]] = defaultdict(list)
+        for sid, rows_of in by_security.items():
+            if _SUCCESSOR_ID.fullmatch(sid):
+                for row_of in rows_of:
+                    self._successor_rows[row_of.ticker].append((sid, row_of.day))
         placeholder_spans: set[TickerSpan] = set()
         placeholder = same_day_listings = same_day_typos = kept_spans = unreadable = 0
         stopped_spans = accepted_spans = 0
@@ -1660,9 +1667,17 @@ class ListingResolver:
 
         def stopped_day(valid_from: date, listed: str, day: date) -> date:
             # #3056: a line that stopped before its Form 25 was filed ends
-            # the session after its last bar, never before the span starts.
+            # the session after its last bar, never before the span starts,
+            # but only when a successor of its company lists the ticker
+            # later (the prints after the gap are the new equity's): a
+            # halted line's own last prints stay on it.
             stop = evidence.stopped_at(security_id, valid_from, listed)
-            return day if stop is None else max(min(day, stop), next_session(start))
+            if stop is None or not any(
+                later > stop and _succeeds(other, security_id)
+                for other, later in self._successor_rows.get(ticker, ())
+            ):
+                return day
+            return max(min(day, stop), next_session(start))
 
         inside = [
             (stopped_day(valid_from, listed, day), True, valid_from < last)

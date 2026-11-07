@@ -1237,7 +1237,7 @@ class TestOwnDelisting:
 
     WW = "0000105319"
 
-    def _ww(self, last_bar: date | None) -> ListingResolver:
+    def _ww(self, last_bar: date | None, *, successor: bool = True) -> ListingResolver:
         # #3056: WW's old common last printed 2025-05-15, its 25-NSE was
         # filed 2025-07-03 (effective 07-13); the new equity printed under
         # WW from 07-07 and lists under its own id from 08-11.
@@ -1246,7 +1246,11 @@ class TestOwnDelisting:
         return ListingResolver(
             [
                 _listing(self.WW, "WW", listed, "Common Stock"),
-                _listing(f"{self.WW}@2025-08-11", "WW", date(2025, 8, 11), "Common Stock"),
+                *(
+                    [_listing(f"{self.WW}@2025-08-11", "WW", date(2025, 8, 11), "Common Stock")]
+                    if successor
+                    else []
+                ),
             ],
             _evidence(
                 [],
@@ -1281,6 +1285,15 @@ class TestOwnDelisting:
         # 07-04 a holiday): within the window, so no stop; no bar evidence
         # keeps the effective-day cut as before.
         resolver = self._ww(last_bar)
+        assert resolver.resolve("WW", date(2025, 7, 11)) == self.WW
+        assert resolver.resolve("WW", date(2025, 7, 14)) is None
+
+    def test_a_halted_line_with_no_successor_keeps_its_own_last_prints(self) -> None:
+        # quant-auditor on #3064: a halt longer than the window that lifts
+        # before the effective day (a crash after it) stays the old line's;
+        # only a later successor of its company shows the prints are not.
+        resolver = self._ww(date(2025, 5, 15), successor=False)
+        assert resolver.resolve("WW", date(2025, 7, 7)) == self.WW
         assert resolver.resolve("WW", date(2025, 7, 11)) == self.WW
         assert resolver.resolve("WW", date(2025, 7, 14)) is None
 

@@ -1781,16 +1781,20 @@ def test_a_line_trading_up_to_its_form_25_keeps_the_effective_day_cut(ww: Settin
 
 
 def test_the_stopped_before_filing_cut_reads_only_what_was_known(ww: Settings) -> None:
-    # No look-ahead (#3056): before the Form 25 is known nothing is cut;
+    # No look-ahead (#3056): nothing is cut before the Form 25 is known, nor
+    # before the successor's row is (07-10: the old line keeps the prints);
     # `filed_bars` reads only bars known at `at`, so a late-arriving bar
     # (known after `at`) never decides an earlier run's cut.
-    late = datetime(2025, 7, 20, 21, tzinfo=UTC)
+    late = datetime(2025, 9, 1, 21, tzinfo=UTC)
     with open_for_write(ww) as conn:
         insert_row(conn, "prices_daily", _bar(WW_OLD, date(2025, 7, 2), close=0.3, known=late))
     with duckdb.connect(ww.store.path, read_only=True) as conn:
         before = store_resolver(conn, WW_FILED - timedelta(seconds=1), ww)
         assert before.holds(WW_OLD, date(2025, 6, 2))
-        at = datetime(2025, 7, 10, 21, tzinfo=UTC)
+        assert store_resolver(conn, datetime(2025, 7, 10, 21, tzinfo=UTC), ww).holds(
+            WW_OLD, date(2025, 7, 7)
+        )
+        at = datetime(2025, 8, 12, 21, tzinfo=UTC)
         assert repair.filed_bars(conn, at) == {(WW_OLD, date(2025, 7, 3)): date(2025, 5, 15)}
         assert repair.filed_bars(conn, RUN) == {(WW_OLD, date(2025, 7, 3)): date(2025, 7, 2)}
         assert not store_resolver(conn, at, ww).holds(WW_OLD, date(2025, 7, 7))

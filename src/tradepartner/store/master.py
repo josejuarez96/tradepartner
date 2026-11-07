@@ -353,6 +353,9 @@ class _Stop:
     effective_on: date  # the day the delisting took effect
     reorg_start: date  # sessions of an 8-K12B or Form 15 that belong to it
     reorg_end: date
+    form: str = (
+        ""  # the Form 25's form (#3056: only an exchange's 25-NSE ends new equity elsewhere)
+    )
 
 
 #: Acceptances per marker form (`_MARKER_FORMS`) of one CIK.
@@ -384,9 +387,13 @@ def _new_equity_elsewhere(stop: _Stop, until: datetime, marks: _Marks) -> bool:
     """True when shares a cover page accepted at `until` lists only on
     another exchange than `stop`'s are new equity, not a transfer (#3056,
     GPOR): an 8-A12B accepted from the session after the delisting took
-    effect (`stop.effective_after`) to `until`, and no Form 15 in the
-    reorganisation window. A transfer registers its new exchange before
-    the old listing ends, so its 8-A12B is always earlier."""
+    effect (`stop.effective_after`) to `until`, no Form 15 in the
+    reorganisation window, and the stop an exchange's `25-NSE` (a strike:
+    GPOR's), never an issuer's own `25` (a voluntary withdrawal, how an
+    exchange transfer is filed), so an issuer's later 8-A12B (its own new
+    listing, a note registration) after a transfer never splits it."""
+    if not stop.form.startswith("25-NSE"):
+        return False
     return any(
         stop.effective_after <= session_of(at) and at <= until
         for form in _NEW_REGISTRATION_FORMS
@@ -665,6 +672,7 @@ def _stop(filing: DelistingFiling, settings: Settings, since: datetime | None) -
         effective,
         reorg_start,
         reorg_end,
+        filing.form,
     )
 
 
