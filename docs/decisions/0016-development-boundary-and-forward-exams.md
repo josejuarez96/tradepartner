@@ -211,7 +211,7 @@ The rest of point 8 stands. The reasons:
 | | Worst-case false-pass (four exams) | Slow: exam at IR 0.5 / 0.75 (60 bp) | Event: exam at IR 0.5 / 0.75 (60 bp) | Slow: programme at IR 0.5, 60 bp / 24 bp | Time to a pass |
 |---|---:|---:|---:|---:|---|
 | As written (12 months, 0.25% per leg) | 3.0% (the report's run); 4.3% (#3129, leg i) | 0.29 / 0.56% | 0.04 / 0.10% | 1.45% / 2.9% | 12 months (6 on futility) |
-| Group-sequential (A) | 4.9% | 0.84 / 2.43% | 0.03 / 0.11% | 3.2% / 12.1% | "a strong edge can still pass at 12; median exam 18 months; a pass needs up to 36" (see the correction below) |
+| Group-sequential (A) | 4.9% | 0.84 / 2.43% | 0.03 / 0.11% | 3.2% / 12.1% | a strong edge can still pass at 12; exam length mean 18 months, median 12 (the report says "median exam 18 months", corrected below); a pass needs up to 36 |
 
 **Correction to the report's "median exam 18 months".** In `exam_grid.json` (slow book, 60 bp, net IR 0.5, D4), 18.2 months is the **mean** exam length (`mean_months` 18.23). The median is 12: 46.4% of exams stop at month 6, 12.0% at 12, 8.1% at 24 and 33.5% at 36. Of the 0.84% that pass, about 71% pass at month 36 (`pass_hist`: 0.04% at 12, 0.20% at 24, 0.60% at 36).
 
