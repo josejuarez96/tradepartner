@@ -162,6 +162,28 @@ Purpose: store the pre-2020 name changes, then ask Alpaca again for the splits a
 
 - [ ] Name-change step: read `symbol_change_backdated` and `actions_unresolved` on each month's run row. Refetch step: the dry run's last line names the rows per type (`would add N dividend, M split`). Stop when splits outnumber the census's 61 + 26, or when an added split lands on a name with no matching raw price gap. Paste both summaries, the repair count and `health --check` on #3054. `repair-dividends` expects exactly STX's one row plus any duplicates the list already holds and the store still has.
 
+## 8. #3074: `actions-3074` (span refetch for actions with no rename)
+
+Purpose: tell vendor absence from late processing for the rows step 7 cannot reach, then store what Alpaca serves. Alpaca filters on `process_date`. A month request asks only `alpaca.actions_process_lag_days` (90) past the month, so a record Alpaca processed later is in no month's answer. `refetch-actions --span` asks once over the whole range for the named securities. It asks every symbol each one held and every process date up to today (`backfill.span_settings`). Timing is unchanged: a first-seen row is stamped at the close of the session before its ex-date.
+
+- [ ] Run it after step 7's release is closed. The ids are SPY (`BENCH:SPY`) plus the 319 securities of the #3053 measurement's "no later rename" and "old symbol known" groups. The list is a local file from the #3074 diagnosis (`spyacts3074-ids.txt`, comma-separated; the figures stay local). HTA (`0001360604`) is left out: its 26 "missing" dividends are old Healthcare Realty's, not HTA's (#3074 PR).
+
+  ```bash
+  uv run tradepartner refetch-actions --span --since 2016-01-04 --through <last committed backfill day> --release actions-3074 --security "$(cat <ids file>)" --dry-run
+  # only when the dry run lists rows to write:
+  uv run tradepartner store backup
+  uv run tradepartner decision data-release open --name actions-3074 --backup <actions-copy> --reason "#3074 span refetch, no-rename actions"
+  uv run tradepartner refetch-actions --span --since 2016-01-04 --through <last committed backfill day> --release actions-3074 --security "$(cat <ids file>)"
+  uv run tradepartner health --check
+  uv run tradepartner decision data-release close --name actions-3074 --from 2016-01-04 --to <last touched ex-date> --reason "#3074 added actions by type"
+  ```
+
+- [ ] Read the dry run before writing. It prints one `would write <tag> <security> <type> <ex-date> <amount> known_at=<stamp>` line per row, then the totals. The tag is `new`, `revision` (a stored identity with changed values, stamped at the run) or `collision` (a new id on a type and ex-date the security already holds live, which would apply the event twice). The census is at most 225 + 74 dividends and 70 + 26 splits. Check SPY first:
+  - **`new BENCH:SPY dividend 2016-03-18` and `2018-06-15` listed:** late processing. Write, and paste both lines on #3074.
+  - **Not listed:** Alpaca does not serve them. Do not enter them by hand; the fallback proposed on the #3074 PR is a separate, reviewed change.
+  - **Stop and do not write when:** any line is tagged `revision` or `collision`, or a `new` split lands on a name with no matching raw price gap. Paste the dry run on #3074 instead, and open no release. The dry run needs none.
+- [ ] Paste the run row message (its resolver summary counts the unresolved rows by symbol) and the summary line on #3074. Unresolved rows under a security's later symbol are evidence that Alpaca files history under the new symbol; they are never written.
+
 ## Restart and close
 
 - [ ] Confirm every opened release has an `after` row, `uv run tradepartner health --check` exits 0, and `uv run tradepartner health --coverage` has the reviewed final buckets. List every stale trial and replay only H1 and a kill-ladder rung-4 survivor per ADR 0023. Record delete-only affected sweep decisions under [named data releases](data-releases.md); each rerun counts in N.

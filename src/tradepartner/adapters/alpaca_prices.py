@@ -174,7 +174,15 @@ earliest span once placeholder spans are skipped) also *leads* to it,
 under the span's ticker, on sessions from that first session up to the
 span's start (`FirstSpanLead`), when the span is assigned (its rule-7 end
 does not matter: a delisted name is the case to fix), not contested and
-starts after the first session. A first span that is non-equity,
+starts after the first session. A class id (`<cik>:<class>`) gets its own
+`securities` row only at the cover page that first names its class, so
+its own first session is its first span's start; when it is its
+company's only equity id it leads from the earlier of its own and its
+company's first session (#3080, `_lead_floor`: BLNK's common, a class id
+because its warrants took the bare id, from its 2008 first filing, not
+2021-08-13). A company with any other equity id (the bare id under an
+earlier ticker, a sibling class, a repair successor) keeps the own
+floor. A first span that is non-equity,
 same-day, later-class, ambiguous (rule 4) or a claim means the earliest
 ticker evidence is in doubt: no lead. Any other security's span of the ticker, of any kind but
 placeholder, covering a session of the window means a reuse the master
@@ -1048,6 +1056,7 @@ class ListingResolver:
         self._by_ticker: dict[str, list[TickerSpan]] = defaultdict(list)
         self._by_security: dict[str, list[TickerSpan]] = defaultdict(list)
         self._history: dict[str, list[TickerSpan]] = defaultdict(list)  # no placeholders
+        self._equity_ids: set[str] = set()  # ids with an equity span (#3080)
         # Spans that hold no ticker but shadow other companies' older spans.
         self._blockers: dict[str, list[TickerSpan]] = defaultdict(list)
         # An assigned span ended at its own delisting (#819): from its end on,
@@ -1109,6 +1118,8 @@ class ListingResolver:
                     placeholder_spans.add(span)
                     continue
                 self._history[security_id].append(span)
+                if kinds == {EQUITY}:
+                    self._equity_ids.add(security_id)
                 if kinds != {EQUITY}:
                     kind = min(kinds - {EQUITY})
                     non_equity[kind] += index - first
@@ -1466,14 +1477,24 @@ class ListingResolver:
         only from `max(first session, H)`, and the refusal test runs over
         that window. Placeholder
         spans are passed over; an `ambiguous` first span (rule 4: a tie the
-        master refuses to assign) leads to nothing."""
+        master refuses to assign) leads to nothing. A class id that is its
+        company's only equity id leads from its company's first session
+        when that is earlier (`_lead_floor`, #3080)."""
         others: dict[str, list[TickerSpan]] = defaultdict(list)  # every non-placeholder span
         for history in self._history.values():
             for other in history:
                 others[other.ticker].append(other)
+        company_first: dict[str, date] = {}
+        for sid, day in first_sessions.items():
+            company = _company(sid)
+            if company not in company_first or day < company_first[company]:
+                company_first[company] = day
+        equity_of: Counter[str] = Counter(_issuer(sid) for sid in self._equity_ids)
         refused = clipped = 0
         for security_id, own in self._by_security.items():
-            first_session = first_sessions.get(security_id)
+            first_session = _lead_floor(
+                security_id, first_sessions, company_first, equity_of, self._equity_ids
+            )
             first = next((s for s in own if s not in placeholder_spans), None)
             if (
                 first_session is None
@@ -2114,6 +2135,43 @@ def _succeeds(successor: str, security_id: str) -> bool:
         return _company(security_id) == match[1]
     mine = (match[2], int(match[3] or 1))
     return older[1] == match[1] and (older[2], int(older[3] or 1)) < mine
+
+
+def _lead_floor(
+    security_id: str,
+    first_sessions: Mapping[str, date],
+    company_first: Mapping[str, date],
+    equity_of: Mapping[str, int],
+    equity_ids: Collection[str],
+) -> date | None:
+    """The first session a first-span lead (#974) may reach back to: the
+    security's own, or, for a class id (`<cik>:<class>`) that is its
+    company's only equity id (`equity_of`: ids with an equity span per
+    `_issuer`), the earlier of its own and its company's (`company_first`,
+    #3080). A class id's own `securities` row starts at the first cover page
+    naming its class (iXBRL cover tagging, 2019 to 2021 by filer size), so
+    its own first session is its first span's start and the lead's window
+    was empty (BLNK's common from 2021-08-13, its company filing from
+    2008). Any other equity id of the same issuer (the bare id under an
+    earlier ticker, a sibling class, a repair successor) keeps the own
+    floor: leading there could copy that id's history onto a second id.
+    `first_sessions` holds only rows known at the run, so the company's
+    floor is never later knowledge."""
+    own = first_sessions.get(security_id)
+    company = _company(security_id)
+    if own is None or company == security_id or company not in company_first:
+        return own  # no own row known at the run: no lead, as before #3080
+    if security_id not in equity_ids or equity_of.get(_issuer(security_id), 0) != 1:
+        return own  # not equity itself, or another equity id of the issuer
+    return min(own, company_first[company])
+
+
+def _issuer(security_id: str) -> str:
+    """The CIK every id of one issuer shares (`_same_issuer`): `<cik>`,
+    `<cik>:<class>` and a repair successor `<cik>@<date>`; any other id is
+    its own."""
+    match = _SUCCESSOR_ID.fullmatch(security_id)
+    return match[1] if match is not None else _company(security_id)
 
 
 def _same_issuer(one: str, other: str) -> bool:
