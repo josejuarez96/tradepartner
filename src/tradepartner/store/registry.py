@@ -1786,6 +1786,12 @@ def write_development_boundary(
 _NEW_YORK: Final = ZoneInfo("America/New_York")
 
 
+def registration_day(at: datetime) -> date:
+    """The New York calendar day of a registration stamp `at` (tz-aware): the day
+    `holdout.start` is compared with (ADR 0016 point 4, #3154)."""
+    return at.astimezone(_NEW_YORK).date()
+
+
 def family_registered_on(conn: duckdb.DuckDBPyConnection, family: str) -> date | None:
     """The New York day `family` was first registered (its earliest `hypotheses`
     row), or None for a family with no registration: the day a holdout is forward
@@ -1796,7 +1802,7 @@ def family_registered_on(conn: duckdb.DuckDBPyConnection, family: str) -> date |
         "SELECT MIN(registered_at) FROM hypotheses WHERE family = ?", [family]
     ).fetchone()
     first = row[0] if row is not None else None
-    return None if first is None else first.astimezone(_NEW_YORK).date()
+    return None if first is None else registration_day(first)
 
 
 def _release_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime | None:

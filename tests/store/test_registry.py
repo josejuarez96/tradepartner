@@ -2459,6 +2459,13 @@ def test_family_registered_on_is_the_first_registration_day(
     assert registry.family_registered_on(conn, "momentum") == date(2026, 9, 1)
 
 
+def test_registration_day_is_the_new_york_calendar_day() -> None:
+    """#3154: DST ends 2026-11-01; both sides of it map to New York's day."""
+    assert registry.registration_day(datetime(2026, 11, 1, 3, 59, tzinfo=UTC)) == date(2026, 10, 31)
+    assert registry.registration_day(datetime(2026, 11, 2, 4, 59, tzinfo=UTC)) == date(2026, 11, 1)
+    assert registry.registration_day(datetime(2026, 11, 2, 5, 0, tzinfo=UTC)) == date(2026, 11, 2)
+
+
 @pytest.mark.parametrize(
     ("registered_at", "day"),
     [
