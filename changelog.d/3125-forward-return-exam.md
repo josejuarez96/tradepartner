@@ -1,0 +1,3 @@
+- ADR 0016 amended (#3125, #3128): no live choice until a pre-registered 12-month forward return exam passes (alpha 0.25%/leg, skew guard, 4-exam budget, <5% false pass for four); plan T381, T381a; T163b refuses
+### Changed
+- ADR 0016 amendment 2026-11-06: the owner's live choice needs a passed forward return exam (12 monthly net excess returns, two one-sided t legs at a nominal 0.25%, month-6 futility kill, skew guard -0.85, four-exam budget; worst-case false pass 4.33% for four exams); the point-8 historical exam does not qualify until a return rule sized for #3128's rung-2 overlap; plan tasks T381 and T381a, T163b refuses a book without a passed exam
