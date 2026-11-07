@@ -1233,29 +1233,31 @@ def stored_rename_changes(
 
 def _latest_listing_rows(
     conn: duckdb.DuckDBPyConnection, at: datetime, security_ids: Collection[str]
-) -> dict[str, list[tuple[date, str, str]]]:
-    """`(valid_from, ticker, exchange)` of each live listing row of `security_ids`
+) -> dict[str, list[tuple[date, datetime, str, str]]]:
+    """`(valid_from, known_at, ticker, exchange)` of each live listing row of `security_ids`
     known at `at`, by security."""
-    out: dict[str, list[tuple[date, str, str]]] = defaultdict(list)
+    out: dict[str, list[tuple[date, datetime, str, str]]] = defaultdict(list)
     if not security_ids:
         return out
-    for sid, valid_from, ticker, exchange in conn.execute(
-        "SELECT security_id, valid_from, ticker, exchange FROM listings "
+    for sid, valid_from, known_at, ticker, exchange in conn.execute(
+        "SELECT security_id, valid_from, known_at, ticker, exchange FROM listings "
         "WHERE known_at <= ? AND list_contains(?, security_id) "
         "QUALIFY NOT retracted AND row_number() OVER (PARTITION BY security_id, ticker, "
         "exchange, valid_from ORDER BY known_at DESC) = 1",
         [at, sorted(security_ids)],
     ).fetchall():
-        out[sid].append((valid_from, ticker, exchange))
+        out[sid].append((valid_from, known_at, ticker, exchange))
     return out
 
 
-def latest_in_force(rows: Sequence[tuple[date, str, str]], session: date) -> tuple[str, str] | None:
+def latest_in_force(
+    rows: Sequence[tuple[date, datetime, str, str]], session: date
+) -> tuple[str, str] | None:
     """The `(ticker, exchange)` of the latest row starting on or before `session`."""
     in_force = [r for r in rows if r[0] <= session]
     if not in_force:
         return None
-    _, ticker, exchange = max(in_force)
+    *_, ticker, exchange = max(in_force, key=lambda r: (r[0], r[1]))
     return ticker, exchange
 
 

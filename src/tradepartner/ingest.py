@@ -2535,6 +2535,16 @@ def _index_touch_state(
                     [previous_at, now],
                 ).fetchall()
             )
+            # A name change (#3057) that became known since the last run: its
+            # CIK's new-ticker listing row is derived from it, so rebuild it.
+            newly_known.update(
+                security_cik(security_id)
+                for (security_id,) in conn.execute(
+                    "SELECT DISTINCT security_id FROM symbol_changes "
+                    "WHERE known_at > ? AND known_at <= ?",
+                    [previous_at, now],
+                ).fetchall()
+            )
         if new_periods and starts:
             first_new = min(edgar_source._fsn_period_start(period) for period in new_periods)
             settled.update(
