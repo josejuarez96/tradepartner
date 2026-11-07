@@ -919,7 +919,11 @@ def ready(
             if r.git_ok("cat-file", "-e", f"{main_ref}:{EXAM_LEDGER}")
             else None
         )
-        ledger_branch = None if EXAM_LEDGER in deleted else r.read(EXAM_LEDGER)
+        # --no-renames: a renamed ledger is a deletion at its old path, as in `touched`.
+        gone = r.git(
+            "diff", "--no-renames", "--name-only", "--diff-filter=D", f"{main_ref}...HEAD"
+        ).splitlines()
+        ledger_branch = None if EXAM_LEDGER in gone else r.read(EXAM_LEDGER)
         if refusal := exam_ledger_refusal(ledger_main, ledger_branch):
             raise ReadyError(f"{EXAM_LEDGER}: {refusal} (ADR 0016 rule 3, #3147)")
         assert ledger_branch is not None  # a deletion is refused above

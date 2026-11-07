@@ -55,6 +55,9 @@ CLASS_A_PREFIXES = (
 #: amendment 2026-11-07, rule 3; #3147). CLAUDE.md rule 1 is to be amended by the owner
 #: to match.
 CLASS_B_PATHS = ("src/tradepartner/config_backtest.py", ready_pr.EXAM_LEDGER)
+#: Files that never ride a train, even with `owner-ok`: the exam ledger lands only by
+#: the owner's own merge, "never in an orchestrator train" (ADR 0016 rule 3; #3147).
+NEVER_TRAIN_PATHS = (ready_pr.EXAM_LEDGER,)
 #: Every train comment's first line starts with this.
 COMMENT_PREFIX = "merge-train:"
 OUTCOMES = (
@@ -256,6 +259,8 @@ def eligibility(
     if pr.unresolved_threads:
         plural = "" if pr.unresolved_threads == 1 else "s"
         return f"(j) {pr.unresolved_threads} unresolved review thread{plural}"
+    if never := [p for p in diff_paths if p in NEVER_TRAIN_PATHS]:
+        return f"(k) {never[0]} never rides a train, owner-ok or not (ADR 0016 rule 3)"
     class_b = [p for p in diff_paths if p in CLASS_B_PATHS or not p.startswith(CLASS_A_PREFIXES)]
     if class_b and "owner-ok" not in labels:
         return f"(k) class B ({class_b[0]}): needs the owner-ok label (the owner's word)"
