@@ -120,6 +120,7 @@ from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Final, Literal
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pyarrow as pa
@@ -1781,15 +1782,21 @@ def write_development_boundary(
     )
 
 
+#: The exchange calendar's zone, in which `holdout.start` dates are written.
+_NEW_YORK: Final = ZoneInfo("America/New_York")
+
+
 def family_registered_on(conn: duckdb.DuckDBPyConnection, family: str) -> date | None:
-    """The UTC day `family` was first registered (its earliest `hypotheses` row), or
-    None for a family with no registration: the day a holdout is forward from (ADR
-    0016 point 4, `holdout.Frozen.registered_on`)."""
+    """The New York day `family` was first registered (its earliest `hypotheses`
+    row), or None for a family with no registration: the day a holdout is forward
+    from (ADR 0016 point 4, `holdout.Frozen.registered_on`). New York's, not UTC's,
+    because `holdout.start` is a New York calendar date (#3154): a registration at
+    21:00 ET is on that day, so a `holdout.start` the next day is forward."""
     row = conn.execute(
         "SELECT MIN(registered_at) FROM hypotheses WHERE family = ?", [family]
     ).fetchone()
     first = row[0] if row is not None else None
-    return None if first is None else first.astimezone(UTC).date()
+    return None if first is None else first.astimezone(_NEW_YORK).date()
 
 
 def _release_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime | None:
