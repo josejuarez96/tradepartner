@@ -146,6 +146,24 @@ CASES = [
         facts=SHARES_MOVE,
         admitted={"SEC_SPLIT_BETWEEN"},
     ),
+    # #3055: a post-split count dated before the ex-date and filed after it. Off, rule 8
+    # splits it again (45.9M shares) and the name out-ranks the dual-class company; on,
+    # it is read as already split (15.3M).
+    Case(
+        "shares_split_dating",
+        True,
+        admitted={"SEC_DUAL_A", "SEC_DUAL_B"},
+        removed={"SEC_SPLIT_BETWEEN": (8, "top_n_by_cap")},
+        base={"top_n_by_cap": 1},
+        facts=(
+            (
+                "SEC_SPLIT_BETWEEN",
+                date(2019, 1, 4),
+                15_300_000.0,
+                datetime(2019, 2, 5, 21, 0, tzinfo=UTC),
+            ),
+        ),
+    ),
     Case(
         "accepted_price_jumps",
         ["SEC_SPLIT_BETWEEN@2019-04-05"],

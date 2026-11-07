@@ -1465,6 +1465,63 @@ def test_the_backfill_fetches_a_led_id_in_the_months_its_lead_covers(settings: S
     assert all(known == bar_known_at(s) for s, known in rows)  # no look-ahead
 
 
+CLASS_LED = "0000000032"  # first filing 2018-03-05; cover page 2019-06-20 names two classes
+
+
+def _with_class_first_span() -> Any:
+    """`_filings` plus CLASS_LED, whose first ticker-bearing cover page
+    names its warrants (CLSYW) before its common (CLSY), the BLNK shape: the
+    warrants take the bare id and the common is a class id whose own first
+    `securities` row is that cover page (#3080)."""
+    first, accession = f"{CLASS_LED}-18-000001", f"{CLASS_LED}-19-000001"
+    cover = _at(2019, 6, 20)
+    return _filings(
+        extra_index=[
+            FilingIndexEntry(CLASS_LED, "Class Co", "10-K", first, _at(2018, 3, 5)),
+            FilingIndexEntry(CLASS_LED, "Class Co", "10-Q", accession, cover),
+        ],
+        extra_headers=[FilingHeader(CLASS_LED, accession, "10-Q", 3571, cover)],
+        extra_covers=[
+            CoverPage(
+                CLASS_LED,
+                accession,
+                cover,
+                (
+                    CoverListing("Common Stock Purchase Warrants", "CLSYW", "NYSE"),
+                    CoverListing("Common Stock", "CLSY", "NYSE"),
+                ),
+            )
+        ],
+    )
+
+
+def test_the_backfill_fetches_an_only_class_from_its_companys_first_filing(
+    settings: Settings,
+) -> None:
+    # #3080: the common's class id leads from its company's first filing,
+    # not from the cover page that first named its class.
+    prices = _History()
+    assert _backfill(_loose(settings), prices, filings=_with_class_first_span()).ok
+    ids = {
+        r[0]: r[1]
+        for r in _read(
+            settings,
+            "SELECT security_id, ticker FROM listings "
+            f"WHERE security_id LIKE '{CLASS_LED}%' AND ticker = 'CLSY'",
+        )
+    }
+    assert len(ids) == 1
+    (common,) = ids
+    assert common.startswith(f"{CLASS_LED}:")
+    rows = _read(
+        settings,
+        f"SELECT session, known_at FROM prices_daily WHERE security_id = '{common}' "
+        "ORDER BY session",
+    )
+    assert [r[0] for r in rows] == _sessions(SINCE, JUNE_WINDOW[1])
+    assert all(known == bar_known_at(s) for s, known in rows)  # no look-ahead
+
+
 def test_a_dry_run_lists_a_led_ids_empty_months_and_its_partial_month(
     settings: Settings,
 ) -> None:

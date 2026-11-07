@@ -134,7 +134,7 @@ import uuid
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -1283,12 +1283,17 @@ class RefetchRefused(RuntimeError):
 
 @dataclass(frozen=True)
 class ActionsRefetch:
-    """What `refetch_actions` added (or, dry, would add) per month."""
+    """What `refetch_actions` added (or, dry, would add) per month, or over
+    its one span (#3074)."""
 
     runs: tuple[SourceRun, ...]
     dry_run: bool
     #: Rows added (would be added) by action type, over every month run.
     added: tuple[tuple[str, int], ...] = ()
+    #: Each row written (dry: that would be), `"<security> <type> <ex-date>
+    #: <amount>"`, sorted: what the sitting reviews before the real run (#3074).
+    rows: tuple[str, ...] = ()
+    span: bool = False
 
     @property
     def ok(self) -> bool:
@@ -1299,7 +1304,25 @@ class ActionsRefetch:
         """One line for the terminal."""
         verb = "would add" if self.dry_run else "added"
         counts = ", ".join(f"{n} {kind}" for kind, n in self.added) or "nothing"
-        return f"actions refetch over {len(self.runs)} month(s): {verb} {counts}"
+        unit = "span" if self.span else "month(s)"
+        return f"actions refetch over {len(self.runs)} {unit}: {verb} {counts}"
+
+
+def span_settings(settings: Settings, *, through: date, today: date) -> Settings:
+    """`settings` with `alpaca.actions_process_lag_days` widened so a request
+    for ex-dates up to `through` also asks every `process_date` up to `today`
+    (#3074): never narrower than the configured lag. Alpaca filters on
+    `process_date` (#101), so a record processed after `through` plus the
+    configured lag (re-processed or loaded late) is in no month's answer;
+    `refetch_actions(span=True)` asks with these settings. The lag only
+    widens the request; the parse keeps splits and dividends by ex-date and
+    stamps them by the first-seen proxy of the ex-date, as before."""
+    alpaca = settings.alpaca
+    lag = max(alpaca.actions_process_lag_days, (today - through).days)
+    if lag == alpaca.actions_process_lag_days:
+        return settings
+    wide = alpaca.model_copy(update={"actions_process_lag_days": lag})
+    return settings.model_copy(update={"alpaca": wide})
 
 
 def refetch_actions(
@@ -1312,12 +1335,21 @@ def refetch_actions(
     clock: Callable[[], datetime] = utc_now,
     dry_run: bool = False,
     securities: Collection[str] | None = None,
+    span: bool = False,
 ) -> ActionsRefetch:
     """Ask the source again for the splits and dividends of the committed
     months `since..through` (#3054), with no bars: a month the backfill
     resumed past keeps the actions its first fetch got, so an action the
     resolver of the day missed (a pre-rename symbol it never asked, before
     the alias) never arrives.
+
+    `span` (#3074) asks once for the whole `since..through` instead of per
+    month, for the named `securities` only (required: refused before any
+    fetch without them), so a source built with `span_settings` (a
+    process-date window reaching the run's day) answers each security's
+    every symbol over the span in one request rather than the whole history
+    once per month. Its run row's cursor names `span`. Writes, timing and the
+    release rule are the month mode's.
 
     Per calendar month: the store's resolver and the window names at the
     clock (`_window_names`, the backfill's own fetch list; only `securities`
@@ -1339,14 +1371,22 @@ def refetch_actions(
     only = None if securities is None else frozenset(securities)
     if only is not None and not only:
         raise ValueError("securities, when given, must name at least one id")
+    if span and only is None:
+        raise ValueError("a span needs --security: it asks the whole history in one request")
     totals: Counter[str] = Counter()
+    written: list[str] = []
     runs: list[SourceRun] = []
-    for window in month_windows(since, through):
-        run = _refetch_month(settings, prices, since, window, release, clock, dry_run, only, totals)
+    windows = [(since, through)] if span else month_windows(since, through)
+    for window in windows:
+        run = _refetch_month(
+            settings, prices, since, window, release, clock, dry_run, only, totals, written, span
+        )
         runs.append(run)
         if run.status != FILLED:
             break
-    return ActionsRefetch(tuple(runs), dry_run, tuple(sorted(totals.items())))
+    return ActionsRefetch(
+        tuple(runs), dry_run, tuple(sorted(totals.items())), tuple(sorted(written)), span
+    )
 
 
 def _refetch_month(
@@ -1359,8 +1399,11 @@ def _refetch_month(
     dry_run: bool,
     only: frozenset[str] | None,
     totals: Counter[str],
+    written: list[str],
+    span: bool = False,
 ) -> SourceRun:
-    """One month of `refetch_actions`; adds the rows it moved to `totals`."""
+    """One month (or the one span) of `refetch_actions`; adds the rows it
+    moved to `totals` and names each row written in `written`."""
     from tradepartner.repair import release_refusal
 
     prepared: dict[str, Any] = {}
@@ -1398,6 +1441,7 @@ def _refetch_month(
         )
         moved = _action_counts(conn) - before
         totals.update(moved)
+        written.extend(_rows_written(conn, stamp))
         by_type = ", ".join(f"{kind}={n}" for kind, n in sorted(moved.items())) or "none"
         extra = "".join(f"; {key}={value}" for key, value in sorted(stats.items()))
         message = (
@@ -1414,12 +1458,60 @@ def _refetch_month(
         settings,
         started,
         clock,
-        f"{ACTIONS_REFETCH};since={since};through={window[1]}",
+        f"{ACTIONS_REFETCH};{'span;' if span else ''}since={since};through={window[1]}",
         dry_run,
         mode=ACTIONS_REFETCH,
         prepare=prepare,
         success_status=FILLED,
     )
+
+
+def _rows_written(conn: duckdb.DuckDBPyConnection, stamp: datetime) -> list[str]:
+    """The `corporate_actions` rows this write stamped at `stamp`, one line
+    each: `"<tag> <security> <type> <ex-date> <amount> known_at=<stamp>"`
+    with the exact stored amount (#3074 review). The tag is `revision` when
+    the row's identity (#108: the source id, else security, type and
+    ex-date) was stored before; `collision` when it is new but another live
+    identity of the security already holds that type and ex-date (a source
+    re-issuing an event under a new id would apply it twice); else `new`."""
+    rows = conn.execute(
+        """
+        WITH ident AS (
+            SELECT *, CASE WHEN coalesce(source_action_id, '') <> '' THEN source_action_id
+                      ELSE action_type || '|' || CAST(ex_date AS VARCHAR) END AS key
+            FROM corporate_actions
+        ),
+        latest AS (
+            SELECT * FROM ident
+            QUALIFY row_number() OVER (
+                PARTITION BY security_id, key ORDER BY ingested_at DESC, known_at DESC
+            ) = 1
+        )
+        SELECT w.security_id, w.action_type, w.ex_date, w.ratio_or_amount, w.cancelled,
+               w.known_at,
+               EXISTS (
+                   SELECT 1 FROM ident o
+                   WHERE o.security_id = w.security_id AND o.key = w.key
+                     AND o.ingested_at < w.ingested_at
+               ) AS revision,
+               EXISTS (
+                   SELECT 1 FROM latest l
+                   WHERE l.security_id = w.security_id AND l.action_type = w.action_type
+                     AND l.ex_date = w.ex_date AND l.key <> w.key AND NOT l.cancelled
+               ) AS collision
+        FROM ident w WHERE w.ingested_at = ?
+        ORDER BY 1, 2, 3, 6
+        """,
+        [stamp],
+    ).fetchall()
+    lines = []
+    for sid, kind, ex, amount, cancelled, known_at, revision, collision in rows:
+        tag = "revision" if revision else "collision" if collision else "new"
+        lines.append(
+            f"{tag} {sid} {kind} {ex} {amount!r}{' cancelled' if cancelled else ''} "
+            f"known_at={known_at.astimezone(UTC).isoformat()}"
+        )
+    return lines
 
 
 def _action_counts(conn: duckdb.DuckDBPyConnection) -> Counter[str]:

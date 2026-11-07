@@ -84,7 +84,7 @@ from __future__ import annotations
 import csv
 import functools
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
@@ -113,10 +113,17 @@ from tradepartner.store.asof import (
     live_chains,
     symbol_changes_as_of,
 )
-from tradepartner.store.db import open_for_write, utc_now
+from tradepartner.store.db import insert_row, open_for_write, utc_now
 from tradepartner.store.delistings import delistings_as_of, listing_ends_as_of
 from tradepartner.store.dividend_reviews import DUPLICATE, ReviewedGroup, reviewed_groups
-from tradepartner.store.master import first_session, session_of
+from tradepartner.store.master import (
+    RenameRefusal,
+    derive_rename_listings,
+    first_session,
+    session_of,
+    stored_rename_changes,
+    stored_snapshot_history,
+)
 from tradepartner.store.registry import open_release
 from tradepartner.store.restamp_precheck import (
     crossed_instants,
@@ -1493,4 +1500,120 @@ def delete_master_rows(
         )
     run = SourceRun("edgar", REPAIRED, 0, "", result.summary())
     _write_run(conn, uuid.uuid4().hex, started, clock(), run, REPAIR)
+    return result
+
+
+@dataclass(frozen=True)
+class RenameListingsRepaired:
+    """What `repair_rename_listings` found and, unless `dry_run`, wrote (#3057)."""
+
+    #: Stored name changes judged.
+    changes: int
+    #: Listing rows added: `(security_id, ticker, exchange, valid_from, known_at)`.
+    rows: tuple[tuple[str, str, str, date, datetime], ...]
+    refusals: tuple[RenameRefusal, ...]
+    dry_run: bool
+
+    def summary(self) -> str:
+        """One line for the run row and the terminal."""
+        verb = "would add" if self.dry_run else "added"
+        reasons = Counter(r.reason for r in self.refusals)
+        refused = ", ".join(f"{why} {n}" for why, n in sorted(reasons.items())) or "none"
+        return (
+            f"{verb} {len(self.rows)} new-ticker listing rows of {self.changes} name changes; "
+            f"refused: {refused}"
+        )
+
+    def lines(self) -> list[str]:
+        """One line per row and per refusal, for the dry run's review."""
+        out = [
+            f"  + {sid} {ticker} {exchange} from {valid_from} known {known_at.isoformat()}"
+            for sid, ticker, exchange, valid_from, known_at in self.rows
+        ]
+        out += [
+            f"  - {r.security_id} {r.old_symbol}->{r.new_symbol}: {r.reason}" for r in self.refusals
+        ]
+        return out
+
+
+def repair_rename_listings(
+    settings: Settings,
+    *,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+    expect: int | None = None,
+    release: str | None = None,
+) -> RenameListingsRepaired:
+    """Add the new-ticker `listings` rows the stored `symbol_changes` imply
+    (`store.master.derive_rename_listings`, #3057: PKI -> RVTY, CHK -> EXE),
+    one `snapshot` row each, in one transaction, and record the run; with
+    `dry_run`, derive them on a read-only connection and change nothing.
+
+    A real run writes only the dry run's row count (`expect`) and only inside
+    the open data release `release`; anything else raises `RepairRefused`
+    before a row is written. The rows are those the nightly EDGAR master
+    derives itself, so a later run adds nothing to them."""
+    if not dry_run and expect is None:
+        raise ValueError("a repair writes only the count of a dry run: pass expect")
+    if not dry_run and release is None:
+        raise ValueError("a repair writes only inside a named data release: pass release")
+    started = ensure_tz_aware_utc(clock(), field_name="clock()")
+    opened: AbstractContextManager[duckdb.DuckDBPyConnection] = (
+        _read(settings) if dry_run else open_for_write(settings)
+    )
+    with opened as conn:
+        if release is not None and not dry_run and (why := release_refusal(conn, release)):
+            raise RepairRefused(f"{why}; nothing written")
+        changes = stored_rename_changes(conn, started)
+        live = conn.execute(
+            "SELECT security_id, ticker, exchange, valid_from, known_at FROM listings "
+            "QUALIFY NOT retracted AND row_number() OVER (PARTITION BY security_id, ticker, "
+            "exchange, valid_from ORDER BY known_at DESC) = 1"
+        ).fetchall()
+        stored = [
+            {
+                "security_id": sid,
+                "ticker": ticker,
+                "exchange": exchange,
+                "valid_from": valid_from,
+                "known_at": known_at,
+            }
+            for sid, ticker, exchange, valid_from, known_at in live
+        ]
+        derived, refusals = derive_rename_listings(
+            stored, stored_snapshot_history(conn, started), changes, ingested_at=started
+        )
+        result = RenameListingsRepaired(
+            changes=len(changes),
+            rows=tuple(
+                (r.security_id, r.ticker, r.exchange, r.valid_from, r.known_at) for r in derived
+            ),
+            refusals=refusals,
+            dry_run=dry_run,
+        )
+        if not dry_run:
+            if len(derived) != expect:
+                raise RepairRefused(
+                    f"found {len(derived)} rows, not the expected {expect}; "
+                    "nothing written, run --dry-run again"
+                )
+            for rename in derived:
+                insert_row(
+                    conn,
+                    "listings",
+                    {
+                        "security_id": rename.security_id,
+                        "ticker": rename.ticker,
+                        "exchange": rename.exchange,
+                        "class_title": None,
+                        "valid_from": rename.valid_from,
+                        "known_at": rename.known_at,
+                        "ingested_at": started,
+                        "source": "edgar",
+                        "provenance": "snapshot",
+                    },
+                )
+            message = f"{result.summary()}; release {release}"
+            run = SourceRun("edgar", REPAIRED, 0, "", message)
+            _write_run(conn, uuid.uuid4().hex, started, clock(), run, REPAIR)
     return result

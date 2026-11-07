@@ -59,8 +59,13 @@ _METHODS = (
     "survivorship_gap",
     "dropped_dividends",
     "late_dividends",
+    "late_splits",
     "static_listing_count",
 )
+
+
+#: The reads whose read time is their second argument (`t_prev`, `t`).
+_WINDOW_READS = ("late_dividends", "late_splits")
 
 
 def _frozen() -> Settings:
@@ -107,7 +112,7 @@ def store(fixture_store_path: Path) -> Path:
 
 
 class Calls(list[tuple[str, Any]]):
-    """`(method, t)` per provider call (`t` the read time, `late_dividends`' second
+    """`(method, t)` per provider call (`t` the read time, a window read's second
     argument); `("__init__", None)` per construction. `inserted` is set once the
     mid-run write has happened."""
 
@@ -132,7 +137,7 @@ def _spy(
 
     def wrap(name: str) -> Any:
         def method(self: StoreProvider, *args: Any, **kwargs: Any) -> Any:
-            calls.append((name, args[1] if name == "late_dividends" else args[0]))
+            calls.append((name, args[1] if name in _WINDOW_READS else args[0]))
             if name == fail:
                 raise RuntimeError(fail_message)
             if name == "adjusted_prices" and write_to is not None and not calls.inserted:
@@ -761,6 +766,7 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
                 "adjust.apply_spin_offs",
                 "strategy.hold_top_fraction",
                 "backtest.delisting_failure_return",
+                "universe.shares_split_dating",
                 "portfolio.",
                 "costs.borrow",
             )
@@ -879,6 +885,7 @@ def _register_more(
             "adjust.apply_spin_offs",
             "strategy.hold_top_fraction",
             "backtest.delisting_failure_return",
+            "universe.shares_split_dating",
             "portfolio.",
             "costs.borrow",
         )

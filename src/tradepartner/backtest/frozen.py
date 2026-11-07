@@ -118,6 +118,9 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     # req 2). A post-registration key (`POST_REGISTRATION_BACKTEST_KEYS`): at `none` no
     # stored canonical set or fingerprint moves; another value is a new fingerprint.
     ("backtest.delisting_failure_return", "none", 45),
+    # #3055: rule 7's split dating (a post-split count dated before the ex-date). `false`
+    # is today's rule, so no stored canonical set or fingerprint moves.
+    ("universe.shares_split_dating", False, 46),
     # #3076 (#3053 item 6): rule 1's issuer-class exclusion. `[]` is the rule before it,
     # so no stored canonical set or fingerprint moves; the live default excludes BDCs,
     # MLPs and foreign filers, so a new registration that leaves the key out freezes that
