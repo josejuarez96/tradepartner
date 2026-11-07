@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
 from tradepartner.adapters.openfigi_raw import map_tickers
 from tradepartner.config import OpenfigiConfig
@@ -46,7 +47,7 @@ def test_keyless_batches_and_paces(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_keyed_limits_and_secret_free_error(monkeypatch: pytest.MonkeyPatch) -> None:
     secret = "synthetic-short-key"
-    monkeypatch.setenv("OPENFIGI_API_KEY", secret)
+    monkeypatch.delenv("OPENFIGI_API_KEY", raising=False)
     assert OpenfigiConfig().limits(keyed=True) == (25, 6, 100)
     assert OpenfigiConfig().limits(keyed=False) == (25, 60, 5)
 
@@ -59,12 +60,17 @@ def test_keyed_limits_and_secret_free_error(monkeypatch: pytest.MonkeyPatch) -> 
         httpx.Client(transport=httpx.MockTransport(fail)) as client,
         pytest.raises(RuntimeError) as caught,
     ):
-        map_tickers([f"T{i}" for i in range(100)], OpenfigiConfig(enabled=True), client=client)
+        map_tickers(
+            [f"T{i}" for i in range(100)],
+            OpenfigiConfig(enabled=True),
+            api_key=SecretStr(f"  {secret} "),
+            client=client,
+        )
     assert secret not in str(caught.value)
 
 
 def test_keyed_request_window(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OPENFIGI_API_KEY", "synthetic-key")
+    monkeypatch.delenv("OPENFIGI_API_KEY", raising=False)
     now = [0.0]
     starts = []
 
@@ -83,6 +89,7 @@ def test_keyed_request_window(monkeypatch: pytest.MonkeyPatch) -> None:
         map_tickers(
             [f"T{i}" for i in range(2501)],
             OpenfigiConfig(enabled=True),
+            api_key=SecretStr("synthetic-key"),
             client=client,
             clock=tick,
             monotonic=lambda: now[0],
@@ -130,3 +137,17 @@ def test_clock_must_be_utc_aware(bad: datetime) -> None:
         pytest.raises(ValueError, match="UTC-aware"),
     ):
         map_tickers(["VZ"], OpenfigiConfig(enabled=True), client=client, clock=lambda: bad)
+
+
+def test_the_key_comes_only_from_the_argument(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#3153: the key is `Settings.openfigi_api_key`, passed in; the process
+    environment alone is not read (Settings reads it, and `.env`, for the caller)."""
+    monkeypatch.setenv("OPENFIGI_API_KEY", "env-only-key")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert "X-OPENFIGI-APIKEY" not in request.headers
+        return httpx.Response(200, json=[{}])
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        map_tickers(["VZ"], OpenfigiConfig(enabled=True), client=client)
+        map_tickers(["VZ"], OpenfigiConfig(enabled=True), api_key=SecretStr("  "), client=client)

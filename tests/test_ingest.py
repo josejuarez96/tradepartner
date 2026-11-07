@@ -28,6 +28,7 @@ from typing import Any
 import duckdb
 import httpx
 import pytest
+from pydantic import SecretStr
 
 from tradepartner import ingest as ingest_module
 from tradepartner.adapters.alpaca_raw import AssetsFetch
@@ -381,11 +382,13 @@ def test_openfigi_history_window_anchors_to_last_completed_session(settings: Set
         )
 
     seen: list[list[str]] = []
+    keys: list[object] = []
 
     def fake_mapping(
-        tickers: list[str], _config: object, **_kwargs: object
+        tickers: list[str], _config: object, **kwargs: object
     ) -> list[tuple[list[object], datetime, datetime]]:
         seen.append(tickers)
+        keys.append(kwargs.get("api_key"))
         sent = datetime(2026, 10, 28, 1, tzinfo=UTC)
         return [
             (
@@ -396,7 +399,11 @@ def test_openfigi_history_window_anchors_to_last_completed_session(settings: Set
             for i in range(len(tickers))
         ]
 
+    # #3153: the key is the one `Settings` read (shell or `.env`), passed through.
+    key = SecretStr("figi-synthetic-key")
+    enabled = enabled.model_copy(update={"openfigi_api_key": key})
     result = ingest_module.ingest_openfigi(enabled, clock=lambda: now, mapping=fake_mapping)
+    assert keys == [key]
     # Both securities should be mapped because the history window correctly starts
     # at 2025-10-27 (last completed session - 12 months), which includes S_BOUNDARY's bar.
     assert seen == [["BOUND", "LATER"]]
