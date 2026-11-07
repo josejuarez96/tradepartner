@@ -1682,8 +1682,9 @@ def _lag(
     (none counting as 0) is below the journaled fills by more than the
     quantity tolerance, is also `bad_reading` (#3152): the collector withholds
     its terminal event, so without this nothing names the order and its
-    decision stays in flight. A non-finite `filled_quantity` is `bad_reading`
-    before either test (#3162)."""
+    decision stays in flight. A non-finite `filled_quantity` (#3162) or
+    `filled_avg_price` (#3169) is `bad_reading` before either test: collect
+    withholds its terminal event even when every share is journaled."""
     reading, order = item.reading, item.order
     if reading is None:
         return None
@@ -1693,6 +1694,14 @@ def _lag(
         return Mismatch(
             "bad_reading",
             f"broker filled_quantity {reading.filled_quantity} is not a finite number "
+            f"({reading.status.value})",
+            security_id=order.security_id,
+            client_order_id=order.client_order_id,
+        )
+    if reading.filled_avg_price is not None and not math.isfinite(reading.filled_avg_price):
+        return Mismatch(
+            "bad_reading",
+            f"broker filled_avg_price {reading.filled_avg_price} is not a finite number "
             f"({reading.status.value})",
             security_id=order.security_id,
             client_order_id=order.client_order_id,

@@ -10,9 +10,10 @@ through `stop_step` (T63f).
 takes the book (default `paper.book_id`), its broker is that book's, and it
 takes that book's run lock and reads that book's open window only.
 `every_book_run` is `paper run` with no `--book`: every book with an open window
-(`open_books`), in token order, each its own run under its own lock with its
-own `paper_runs` row; a crash in one book's run is that book's entry and never
-stops the next. With one book (`main`, H1's) both are the run before books.
+(`open_books`), in `run_order` (`month_end`, then `week_end`, then `daily`, ties
+by token), each its own run under its own lock with its own `paper_runs` row;
+a crash in one book's run is that book's entry and never stops the next. With
+one book (`main`, H1's) both are the run before books.
 
 **Entry.** The session is the clock's New York date. The run lock (T59) is
 taken first: a second instance writes a `locked` alert with no run id (its
@@ -358,6 +359,7 @@ __all__ = [
     "exits_step",
     "invoked_by",
     "open_books",
+    "run_order",
     "stop_session",
     "stop_step",
     "submit_window",
@@ -1182,12 +1184,54 @@ def open_books(
             require_journal(conn)
         except JournalNotInitialised:
             return ()
-        rows = conn.execute(
-            "SELECT DISTINCT book_id FROM paper_windows WHERE window_id NOT IN "
-            "(SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))",
-            [list(CLOSING_STOP_STATES)],
-        ).fetchall()
+        return _open_book_ids(conn)
+
+
+def _open_book_ids(conn: duckdb.DuckDBPyConnection) -> tuple[str, ...]:
+    rows = conn.execute(
+        "SELECT DISTINCT book_id FROM paper_windows WHERE window_id NOT IN "
+        "(SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))",
+        [list(CLOSING_STOP_STATES)],
+    ).fetchall()
     return tuple(sorted(str(row[0]) for row in rows))
+
+
+#: `run_order`'s rank per cadence (spec amendment 2026-11-07, #3118 item 6): the
+#: slower books first, so `main`'s buys do not wait behind `daily`'s run (#2886).
+_CADENCE_RUN_RANK: dict[Cadence, int] = {"month_end": 0, "week_end": 1, "daily": 2}
+#: The rank of a book whose cadence cannot be read: after every readable book.
+_UNREADABLE_RANK = len(_CADENCE_RUN_RANK)
+
+
+def run_order(
+    settings: Settings, *, on_wait: Callable[[str], None] | None = None
+) -> tuple[str, ...]:
+    """`open_books` in the order `every_book_run` runs them (spec amendment
+    2026-11-07, #3118 item 6): by the open window's frozen cadence, `month_end`,
+    then `week_end`, then `daily`, ties by token. A book with any error reading its
+    cadence (two open windows, a window naming no hypothesis, a cadence outside
+    `Cadence`, malformed stored params) goes last, ties by token, and is still
+    listed: its own run then fails closed on the same read, and no other book is
+    held back by it. Only the listing's own errors propagate. One short
+    read-only connection; empty on a store with no journal."""
+    with open_read_only(settings, retry=True, on_wait=on_wait) as conn:
+        try:
+            require_journal(conn)
+        except JournalNotInitialised:
+            return ()
+        books = _open_book_ids(conn)
+        ranks = {book: _run_rank(conn, book) for book in books}
+    return tuple(sorted(books, key=lambda book: (ranks[book], book)))
+
+
+def _run_rank(conn: duckdb.DuckDBPyConnection, book: str) -> int:
+    try:
+        window = open_window(conn, book)
+        if window is None:
+            return _UNREADABLE_RANK
+        return _CADENCE_RUN_RANK[window_cadence(conn, window)]
+    except Exception:  # any read error: the book's own run fails closed on it
+        return _UNREADABLE_RANK
 
 
 def every_book_run(
@@ -1199,7 +1243,8 @@ def every_book_run(
     sleep: Callable[[float], None] = time.sleep,
 ) -> tuple[BookRun, ...]:
     """`paper run` with no `--book` (ADR 0017 B.3): `tracking_run` for every
-    book of `open_books`, in token order, each with its own broker
+    book of `open_books`, in `run_order` (by cadence, `month_end` first, ties by
+    token; spec amendment 2026-11-07 item 6), each with its own broker
     (`broker_for(book)`, built inside that book's turn), its own run lock and its
     own `paper_runs` row. With no open book it is `paper.book_id`'s run alone,
     which writes its `no_window` alert as before books. A book whose broker
@@ -1210,7 +1255,7 @@ def every_book_run(
     `halted` result, or an unfinished row its next run closes `crashed`). Only
     `KeyboardInterrupt` stops the loop. The listing's own errors propagate
     before any book runs."""
-    books = open_books(settings) or (resolve_book(settings, None),)
+    books = run_order(settings) or (resolve_book(settings, None),)
     results: list[BookRun] = []
     for book in books:
         try:

@@ -60,6 +60,7 @@ from tradepartner.execution.run import (
     every_book_run,
     invoked_by,
     open_books,
+    run_order,
     tracking_run,
 )
 from tradepartner.execution.wrapper import Verdict, classify
@@ -118,9 +119,12 @@ def _frozen_json(frozen: RiskConfig) -> str:
     return json.dumps(values, sort_keys=True)
 
 
-def registered_hypothesis(settings: Settings, slug: str = "h-run-core-mark") -> int:
+def registered_hypothesis(
+    settings: Settings, slug: str = "h-run-core-mark", *, cadence: str = "month_end"
+) -> int:
     """The id of a momentum hypothesis registered on `settings`'s store (registered on
-    first use): the run reads its window's cadence from it (ADR 0015 seam 4)."""
+    first use) at `cadence`: the run reads its window's cadence from it (ADR 0015
+    seam 4)."""
     with open_for_write(settings) as conn:
         try:
             return registry.get_hypothesis(conn, slug).hypothesis_id
@@ -129,6 +133,7 @@ def registered_hypothesis(settings: Settings, slug: str = "h-run-core-mark") -> 
         params = Settings(
             _env_file=None,
             holdout={"start": HOLDOUT_START.isoformat(), "end": HOLDOUT_END.isoformat()},
+            schedule={"rebalance_cadence": cadence},
         )
         return registry.register_hypothesis(
             conn,
@@ -2296,6 +2301,88 @@ def test_a_book_whose_broker_fails_or_whose_run_exits_does_not_stop_the_next(
     code = 1 if fault == "broker" else run_module.WRITE_FAILED_EXIT_CODE
     assert (alpha.status, alpha.exit_code, alpha.outcome) == ("crashed", code, None)
     assert (beta.status, beta.exit_code) == ("ok", 0)
+
+
+def _cadence_books(env: Env) -> None:
+    """Books `daily` (daily cadence), `weekly` (week_end), `main` and `alpha` (both
+    month_end), opened in that order: token order would run `alpha`, `daily`,
+    `main`, `weekly`."""
+    daily = registered_hypothesis(env.settings, "h-run-core-daily", cadence="daily")
+    weekly = registered_hypothesis(env.settings, "h-run-core-weekly", cadence="week_end")
+    env.window(book_id="daily", account_id="PD", hypothesis_id=daily)
+    env.window(book_id="weekly", account_id="PW", hypothesis_id=weekly)
+    env.window(book_id="main", account_id="PM")
+    env.window(book_id="alpha", account_id="PA")
+
+
+def test_run_order_puts_month_end_then_week_end_then_daily_ties_by_token(env: Env) -> None:
+    """Spec amendment 2026-11-07 (#3118) item 6: `main`'s buys no longer wait behind
+    `daily`'s run (#2886)."""
+    assert run_order(env.settings) == ()
+    _cadence_books(env)
+    assert run_order(env.settings) == ("alpha", "main", "weekly", "daily")
+    # the listing `paper kill --all` reads stays in token order
+    assert open_books(env.settings) == ("alpha", "daily", "main", "weekly")
+
+
+def test_a_book_whose_cadence_cannot_be_read_runs_last_and_blocks_no_other(env: Env) -> None:
+    """A window naming no hypothesis, or a book with two open windows, sorts after
+    every readable book (ties by token); its own run then fails closed."""
+    daily = registered_hypothesis(env.settings, "h-run-core-daily", cadence="daily")
+    env.window(book_id="aaa", account_id="P1", hypothesis_id=987654)
+    env.window(book_id="bbb", account_id="P2")
+    env.window(book_id="bbb", account_id="P2")
+    env.window(book_id="daily", account_id="PD", hypothesis_id=daily)
+    env.window(book_id="main", account_id="PM")
+    assert run_order(env.settings) == ("main", "daily", "aaa", "bbb")
+
+
+@pytest.mark.parametrize("error", [KeyError, TypeError])
+def test_any_error_reading_a_cadence_ranks_that_book_last_and_still_runs_the_rest(
+    monkeypatch: pytest.MonkeyPatch, env: Env, error: type[Exception]
+) -> None:
+    """A dropped family (`KeyError`) or params that are not an object (`TypeError`)
+    in one book's registration never stops `main` (safety review of #3173)."""
+    _cadence_books(env)
+    real = run_module.window_cadence
+
+    def failing(conn: Any, window: Any) -> Any:
+        if window.book_id == "alpha":
+            raise error("scripted: unreadable registration")
+        return real(conn, window)
+
+    monkeypatch.setattr(run_module, "window_cadence", failing)
+    assert run_order(env.settings) == ("main", "weekly", "daily", "alpha")
+
+
+def test_every_book_run_runs_main_before_daily_and_a_crash_in_main_still_runs_daily(
+    monkeypatch: pytest.MonkeyPatch, env: Env
+) -> None:
+    _cadence_books(env)
+    ran: list[str] = []
+
+    def recording(*args: Any, **kwargs: Any) -> RunOutcome:
+        ran.append(kwargs["book_id"])
+        if kwargs["book_id"] == "alpha":
+            raise RuntimeError("scripted crash in the first book")
+        return RunOutcome("ok")
+
+    monkeypatch.setattr(run_module, "tracking_run", recording)
+    built: list[str] = []
+
+    def broker_for(book: str) -> FakeBroker:
+        built.append(book)
+        return env.fake
+
+    runs = every_book_run(env.settings, env.connect, broker_for, env.clock)
+
+    assert ran == built == ["alpha", "main", "weekly", "daily"]
+    assert [(r.book_id, r.status) for r in runs] == [
+        ("alpha", "crashed"),
+        ("main", "ok"),
+        ("weekly", "ok"),
+        ("daily", "ok"),
+    ]
 
 
 def test_locked_and_no_window_alerts_carry_the_book(env: Env) -> None:
