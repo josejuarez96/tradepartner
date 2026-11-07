@@ -1584,6 +1584,29 @@ def rebalance_events_for(
     return _select(conn, RebalanceEventRow, _RUN_IN_WINDOW, [window_id])
 
 
+def rebalances_with_fills(conn: duckdb.DuckDBPyConnection, window_id: int) -> frozenset[date]:
+    """The window's rebalance sessions T_i with at least one live fill on an order of
+    one of T_i's decisions: the rebalances that have started trading (#3131). A
+    pending one of these is part-executed, so its catch-up runs until F_{i+1}
+    rather than lapsing after `paper.max_catch_up_sessions`.
+
+    One SQL read with no integrity checks of its own, so the run may call it
+    before its run row exists (`run._locked_run`); `fills_for` and `orders_for`,
+    read inside the run, still raise on a bad journal there. Forced exits (no
+    rebalance session) are left out."""
+    require_journal(conn)
+    rows = conn.execute(
+        "SELECT DISTINCT d.rebalance_session FROM fills f "
+        "JOIN orders o USING (client_order_id) "
+        "JOIN decisions d ON d.decision_id = o.decision_id "
+        "JOIN paper_runs r ON r.run_id = o.run_id "
+        "WHERE f.superseded_by IS NULL AND r.window_id = ? "
+        "AND d.rebalance_session IS NOT NULL",
+        [window_id],
+    ).fetchall()
+    return frozenset(row[0] for row in rows)
+
+
 def plans_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[PaperPlanRow]:
     """The window's `paper_plans` rows once intersection fields exist."""
     require_journal(conn)  # a store with no journal says so before its version
