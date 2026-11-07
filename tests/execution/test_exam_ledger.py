@@ -19,7 +19,9 @@ from tradepartner.execution.exam_ledger import (
     StoreExamWindow,
     check_append_only,
     check_exam_start,
+    latest_campaign_ks,
     load_ledger,
+    passed_families,
     passed_window_ids,
 )
 
@@ -261,6 +263,20 @@ def test_campaign_k_minus_one_and_seven_load() -> None:
         _text(_entry(1, campaign_k=-1, outcome="not_started"), _entry(2, campaign_k=7))
     )
     assert [e.campaign_k for e in ledger.entries] == [-1, 7]
+
+
+def test_latest_campaign_ks_reads_each_familys_latest_entry_and_drops_minus_one() -> None:
+    """The lab status diagnostics as plain data: a later -1 hides an earlier k; no
+    `passed` entry means no passed family (#3146, plan T381a)."""
+    ledger = load_ledger(
+        _text(
+            _entry(1, campaign_k=7, outcome="not_started"),
+            _entry(2, campaign_k=-1, outcome="not_started"),
+            _entry(3, family="value", campaign_k=3, outcome="not_started"),
+        )
+    )
+    assert latest_campaign_ks(ledger) == {"value": 3}
+    assert passed_families(ledger) == frozenset()
 
 
 @pytest.mark.parametrize("budget", ["0", "-1", "4.0", '"4"', "true"])

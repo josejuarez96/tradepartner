@@ -1024,13 +1024,16 @@ def test_lab_status_prints_campaign_k_and_the_edge_label_without_changing_n_or_d
     family's numbers are the same with or without a ledger (a diagnostic only)."""
 
     def status(ledger: exam_ledger.ExamLedger | None) -> sweep_report.LabStatus:
+        # The caller (cli `lab status`) turns the ledger into plain data: backtest code
+        # imports no execution module. None stands for an unreadable ledger.
         return sweep_report.lab_status(
             world[0].conn,
             settings,
             now=datetime(2026, 10, 7, tzinfo=UTC),
             system_tz=ZoneInfo("America/New_York"),
             code_vintage=CODE,
-            ledger=ledger,
+            exam_passed=None if ledger is None else exam_ledger.passed_families(ledger),
+            campaign_ks=None if ledger is None else exam_ledger.latest_campaign_ks(ledger),
         )
 
     first = "momentum"

@@ -116,6 +116,18 @@ class ExamLedger:
     text: str
 
 
+def passed_families(ledger: ExamLedger) -> frozenset[str]:
+    """The families with a ledger entry marked `passed` (ADR 0016 #3146 rule 2(b))."""
+    return frozenset(e.family for e in ledger.entries if e.outcome == PASSED)
+
+
+def latest_campaign_ks(ledger: ExamLedger) -> dict[str, int]:
+    """Each family's latest entry's `campaign_k`, leaving out a family whose latest
+    entry records -1 (not recorded). A diagnostic only (#3146)."""
+    latest = {e.family: e.campaign_k for e in ledger.entries}
+    return {family: k for family, k in latest.items() if k != -1}
+
+
 @dataclass(frozen=True)
 class StoreExamWindow:
     """One exam window of the store (rule 1), as the edge reads it from

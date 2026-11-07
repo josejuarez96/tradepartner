@@ -495,6 +495,7 @@ from tradepartner.corpus import departure_fetch
 from tradepartner.diskfloor import ingest_floor_refusal, low_disk_warning
 from tradepartner.execution import (
     book_stats,
+    exam_ledger,
     lots_reconcile,
     ops,
     paper_message,
@@ -4714,13 +4715,15 @@ def make_app(
         if (missing := _store_missing(s)) is not None:
             raise missing
         try:
+            ledger = window.committed_ledger(window.read_ledger_texts(fetch=False))
             with open_read_only(s) as conn:
                 schema.init_schema(conn)  # read-only: checks the version, never migrates
                 status = sweep_report.lab_status(
                     conn,
                     s,
                     now=clock(),
-                    ledger=window.committed_ledger(window.read_ledger_texts(fetch=False)),
+                    exam_passed=None if ledger is None else exam_ledger.passed_families(ledger),
+                    campaign_ks=None if ledger is None else exam_ledger.latest_campaign_ks(ledger),
                 )
         except StoreLockedError as exc:
             raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None

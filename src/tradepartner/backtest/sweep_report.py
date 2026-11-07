@@ -70,7 +70,6 @@ from tradepartner.backtest.metrics import (
 )
 from tradepartner.backtest.quiet import system_timezone_matches
 from tradepartner.config import Settings
-from tradepartner.execution.exam_ledger import PASSED, ExamLedger
 from tradepartner.store import lab_queries, lab_registry, registry
 from tradepartner.store.db import utc_now
 from tradepartner.store.lab_registry import (
@@ -973,12 +972,16 @@ def lab_status(
     now: datetime | None = None,
     system_tz: tzinfo | None = None,
     code_vintage: str | None = None,
-    ledger: ExamLedger | None = None,
+    exam_passed: frozenset[str] | None = None,
+    campaign_ks: Mapping[str, int] | None = None,
 ) -> LabStatus:
     """`lab status` (module docstring). `now`, `system_tz` and `code_vintage` stand in
     for the clock, the machine's zone and the checkout's code vintage (a test passes
-    them). `ledger` is `origin/main`'s copy of the exam ledger (None when it cannot
-    be read): a family's pass and campaign k are read from it only (plan T381a).
+    them). `exam_passed` (the families with a `passed` entry) and `campaign_ks` (each
+    family's latest recorded campaign k) come from `origin/main`'s copy of the exam
+    ledger, as plain data the caller reads (backtest code imports no execution module);
+    None when the ledger cannot be read. A family's pass and campaign k are read from
+    them only (plan T381a).
     Raises `LabNotInitialised` on a store without the lab tables."""
     require_lab(conn)
     vintage = code_vintage if code_vintage is not None else registry.code_tree_sha256()
@@ -1011,8 +1014,8 @@ def lab_status(
                 declared_count=len(states.declared),
                 rules=rules,
                 forward=rules is not None and first is not None and rules.holdout_start > first,
-                exam_passed=_family_passed(ledger, family),
-                campaign_k=_campaign_k(ledger, family),
+                exam_passed=exam_passed is not None and family in exam_passed,
+                campaign_k=None if campaign_ks is None else campaign_ks.get(family),
             )
         )
         for sweep_id, variant_states in sorted(states.by_sweep.items()):
@@ -1054,21 +1057,6 @@ def lab_status(
             "plists in the system zone, so the quiet intervals are off"
         ),
     )
-
-
-def _family_passed(ledger: ExamLedger | None, family: str) -> bool:
-    """Whether `family` has a ledger entry marked `passed`."""
-    return ledger is not None and any(
-        e.family == family and e.outcome == PASSED for e in ledger.entries
-    )
-
-
-def _campaign_k(ledger: ExamLedger | None, family: str) -> int | None:
-    """The family's latest ledger entry's `campaign_k`, None when none or -1."""
-    entries = [e for e in (ledger.entries if ledger is not None else ()) if e.family == family]
-    if not entries or entries[-1].campaign_k == -1:
-        return None
-    return entries[-1].campaign_k
 
 
 def _exam_text(f: FamilyStatus) -> str:
