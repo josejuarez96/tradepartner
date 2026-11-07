@@ -225,12 +225,14 @@ def next_trial_cost(
     basis: Basis,
     added: int = 1,
     floor: float = 0.0,
+    undefined_floor: float | None = None,
 ) -> NextTrialCost:
     """The SR\\* `family` has now and the SR\\* `added` more counted trials would give.
     N is `family_n` (the one N function); V is `family_sharpes(conn, family).variance(basis)`
-    at today's trials; a None V (fewer than two pairs) is `floor` when `floor` is above
-    zero, exactly as `lab.run_sweep`'s close replaces it (a defined V is never floored,
-    #3127). Unfloored, a None V (fewer
+    at today's trials, floored at `floor` when `floor` is above zero; a None V (fewer
+    than two pairs) is `undefined_floor` when given, else `floor`, exactly as
+    `lab.run_sweep`'s close does through `lab_registry.floored_variance` (#3127).
+    Unfloored, a None V (fewer
     than two pairs) gives 0 for both and `note` says so. `expected_max_sharpe` is never
     called with fewer than one trial (a family with no counted trial has SR\\* 0 now).
     Read-only."""
@@ -242,16 +244,19 @@ def next_trial_cost(
     n_next = n_now + added
     variance = registry.family_sharpes(conn, family).variance(basis)
     note: str | None = None
-    if variance is None and floor <= 0:
+    if undefined_floor is not None and (not math.isfinite(undefined_floor) or undefined_floor < 0):
+        raise ValueError(f"undefined_floor must be finite and non-negative, got {undefined_floor}")
+    stand_in = undefined_floor if undefined_floor is not None else floor
+    if variance is None and stand_in <= 0:
         note = "V is unknown (fewer than two pairs) and no floor applies: SR* is 0"
         used: float | None = None
     else:
-        used = variance if variance is not None else floor
+        used = max(variance, floor) if variance is not None else stand_in
 
     def at(n: int) -> float:
         return expected_max_sharpe(n, used) if used is not None and n >= 1 else 0.0
 
-    floored = floor > 0 and variance is None
+    floored = (variance is None and stand_in > 0) or (variance is not None and variance < floor)
     return NextTrialCost(
         n_now=n_now,
         n_next=n_next,

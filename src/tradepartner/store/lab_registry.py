@@ -26,7 +26,8 @@ loosens a registered family or sweep (spec req 1, Definitions > Family rules).
 
 **SR\\* values.** `close_sweep_run` stores the `n_trials_at_end` and
 `sr_star_annual_at_end` its caller computed (the runner, T107, from
-`results.family_n` and `family_sharpes`, a V undefined with fewer than two pairs replaced by
+`results.family_n` and `family_sharpes`, through `floored_variance`: a defined V floored at the
+rules' `min_sharpe_variance_annual`, an undefined one replaced by
 `family_v_floor`, #3127); `family_sr_star_high_water_mark` takes today's
 N and annual V the same way, as arguments, and applies that floor itself. This module
 computes no annual V.
@@ -627,17 +628,26 @@ def first_session(conn: duckdb.DuckDBPyConnection) -> date | None:
 
 
 def family_v_floor(rules: FamilyRules) -> float:
-    """The V that stands in for an undefined V (fewer than two distinct return series;
-    strategy-lab spec, amendment 2026-11-06, #3127): the larger of the stored
+    """The V that stands in for an undefined V (fewer than two pairs; strategy-lab
+    spec, amendment 2026-11-06, #3127): the larger of the stored
     `min_sharpe_variance_annual` and the null variance of an annual Sharpe over the
     family window, ppy / T with ppy = 12 and T the window's XNYS month-end periods
-    (40 for momentum's 2020-08-31 .. 2023-12-29, so 0.30). A defined V is never
-    floored: it already carries the family's correlation."""
+    (40 for momentum's 2020-08-31 .. 2023-12-29, so 0.30). A defined V keeps the
+    stored floor (`floored_variance`)."""
     sessions = rebalance_sessions(
         rules.in_sample_start, rules.holdout_start - timedelta(days=1), "month_end"
     )
     periods = max(len(sessions) - 1, 1)
     return max(rules.min_sharpe_variance_annual, MONTHS_PER_YEAR / periods)
+
+
+def floored_variance(rules: FamilyRules, variance: float | None) -> float:
+    """The V every SR\\* mark uses (#3127): a defined V floored at the stored
+    `min_sharpe_variance_annual`, as before; an undefined one (fewer than two pairs)
+    is `family_v_floor(rules)`."""
+    if variance is None:
+        return family_v_floor(rules)
+    return max(variance, rules.min_sharpe_variance_annual)
 
 
 def family_sr_star_high_water_mark(
@@ -651,7 +661,8 @@ def family_sr_star_high_water_mark(
     of every `sweep_runs.sr_star_annual_at_end` of every sweep in the family,
     the parent's mark seeded into the rules (`sr_star_seed_annual`), and today's
     value, `expected_max_sharpe(n_trials_today, V)` with a None V (fewer than two
-    pairs) replaced by `family_v_floor(rules)`; a defined V is used as it is (#3127).
+    pairs) replaced by `family_v_floor(rules)` and a defined V floored at the stored
+    `min_sharpe_variance_annual` (`floored_variance`, #3127).
     Today's value is 0 with no counted trial. Refuses a family with no rules
     and a non-finite V."""
     require_lab(conn)
@@ -660,11 +671,7 @@ def family_sr_star_high_water_mark(
         raise LabRegistryError(f"family {family!r} has no family rules")
     if sharpe_variance_annual_today is not None and not math.isfinite(sharpe_variance_annual_today):
         raise LabRegistryError(f"today's annual V is not finite: {sharpe_variance_annual_today}")
-    variance = (
-        sharpe_variance_annual_today
-        if sharpe_variance_annual_today is not None
-        else family_v_floor(rules)
-    )
+    variance = floored_variance(rules, sharpe_variance_annual_today)
     marks = [expected_max_sharpe(n_trials_today, variance) if n_trials_today >= 1 else 0.0]
     if rules.sr_star_seed_annual is not None:
         marks.append(rules.sr_star_seed_annual)

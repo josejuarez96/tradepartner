@@ -356,8 +356,8 @@ def _rules_line(rules: FamilyRules | None) -> str:
     fixed = ", ".join(f"{key}={value}" for key, value in sorted(rules.fixed_params.items()))
     return (
         f"Family rules: holdout {rules.holdout_start} to {rules.holdout_end}; in-sample from "
-        f"{rules.in_sample_start}; V floor (undefined V only) "
-        f"{lab_registry.family_v_floor(rules):.4f}; fixed {fixed}."
+        f"{rules.in_sample_start}; V floor {rules.min_sharpe_variance_annual} "
+        f"({lab_registry.family_v_floor(rules):.4f} for an undefined V); fixed {fixed}."
     )
 
 

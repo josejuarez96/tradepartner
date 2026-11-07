@@ -461,30 +461,30 @@ def test_high_water_mark_is_the_maximum_of_runs_parent_and_today_with_the_v_floo
     lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
     h1 = _register(lab_store, settings)
-    rules = _rules(lab_store, settings, h1.hypothesis_id, seed=0.3)
-    # The floor stands in for an undefined V only: the window's null variance, 12 / 40
-    # monthly periods (#3127), above the stored `min_sharpe_variance_annual`.
-    floor = lab_registry.family_v_floor(rules)
-    assert floor == pytest.approx(12 / 40)
-    assert floor > settings.lab.min_sharpe_variance_annual
+    floor = settings.lab.min_sharpe_variance_annual
+    _rules(lab_store, settings, h1.hypothesis_id, seed=0.25)
     mark = lab_registry.family_sr_star_high_water_mark
-    # An undefined V (fewer than two pairs) is computed at the floor.
+    # Today's value with V below the floor is computed at the floor.
     today = expected_max_sharpe(50, floor)
-    assert today > 0.3
-    assert mark(lab_store, "momentum", n_trials_today=50, sharpe_variance_annual_today=None) == (
+    assert today > 0.25
+    assert mark(lab_store, "momentum", n_trials_today=50, sharpe_variance_annual_today=0.0001) == (
         pytest.approx(today)
     )
-    # A defined V is used as given, however small: the seed then wins.
-    assert expected_max_sharpe(50, 0.0001) < 0.3
-    assert (
-        mark(lab_store, "momentum", n_trials_today=50, sharpe_variance_annual_today=0.0001) == 0.3
+    # An undefined V (fewer than two pairs) is the window's null variance instead,
+    # 12 / 40 monthly periods, above the stored floor (#3127).
+    rules = lab_registry.family_rules(lab_store, "momentum")
+    assert rules is not None
+    assert lab_registry.family_v_floor(rules) == pytest.approx(12 / 40)
+    assert mark(lab_store, "momentum", n_trials_today=50, sharpe_variance_annual_today=None) == (
+        pytest.approx(expected_max_sharpe(50, 12 / 40))
     )
+    # Above the floor, today's V is used as given.
     assert mark(lab_store, "momentum", n_trials_today=50, sharpe_variance_annual_today=1.0) == (
         pytest.approx(expected_max_sharpe(50, 1.0))
     )
-    # The parent's seed wins over a small today (SR*(2, 0.30) is about 0.285).
-    assert mark(lab_store, "momentum", n_trials_today=2, sharpe_variance_annual_today=None) == 0.3
-    assert mark(lab_store, "momentum", n_trials_today=0, sharpe_variance_annual_today=None) == 0.3
+    # The parent's seed wins over a small today.
+    assert mark(lab_store, "momentum", n_trials_today=2, sharpe_variance_annual_today=0.01) == 0.25
+    assert mark(lab_store, "momentum", n_trials_today=0, sharpe_variance_annual_today=None) == 0.25
     # Every sweep_runs row of every sweep in the family; open rows and other families ignored.
     first = _sweep(lab_store, settings, "a")
     second = _sweep(lab_store, settings, "b")
@@ -857,7 +857,7 @@ def _public_functions() -> set[str]:
 
 
 #: Public functions of a `FamilyRules` row that take no connection (#3127).
-_PURE = frozenset({"family_v_floor"})
+_PURE = frozenset({"family_v_floor", "floored_variance"})
 
 
 def test_every_public_function_is_covered_by_the_not_initialised_case() -> None:

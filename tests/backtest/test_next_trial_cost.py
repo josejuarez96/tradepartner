@@ -120,18 +120,20 @@ def test_added_moves_n_next_and_the_next_sr_star(
     assert cost.sr_star_next == pytest.approx(metrics.expected_max_sharpe(10, v))
 
 
-def test_a_defined_v_is_never_floored_as_the_sweep_close_does(
+def test_floor_lifts_a_small_v_as_the_sweep_close_does(
     lab_store: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
-    """#3127: a defined V (two or more pairs) already carries the family's correlation,
-    so a floor above it changes nothing; only an undefined V is replaced."""
     _family(lab_store, settings, [0.5, 0.52, 0.51])
     v = statistics.variance([0.25, 0.26, 0.255])
     assert v < FLOOR
     cost = results.next_trial_cost(lab_store, "momentum", basis="excess_spy", floor=FLOOR)
-    assert cost.floored is False
-    assert cost.variance_used == pytest.approx(v)
-    assert cost.sr_star_now == pytest.approx(metrics.expected_max_sharpe(3, v))
+    assert cost.floored is True
+    assert cost.variance_used == FLOOR
+    assert cost.sr_star_now == pytest.approx(metrics.expected_max_sharpe(3, FLOOR))
+    # A floor below V changes nothing and is not reported as applied.
+    low = results.next_trial_cost(lab_store, "momentum", basis="excess_spy", floor=v / 10)
+    assert low.floored is False
+    assert low.sr_star_now == pytest.approx(metrics.expected_max_sharpe(3, v))
 
 
 class _Clock:
@@ -205,10 +207,10 @@ def test_sr_star_now_equals_what_the_real_sweep_close_stores_at_todays_n(
         [run_id],
     ).fetchall()
     cost = results.next_trial_cost(
-        lab_store, "momentum", basis="excess_spy", floor=lab_registry.family_v_floor(rules)
+        lab_store, "momentum", basis="excess_spy", floor=rules.min_sharpe_variance_annual
     )
     assert n_end == cost.n_now == 3
-    assert cost.floored is False  # V is defined (3 pairs), so it is used as it is (#3127)
+    assert cost.floored is True
     assert stored > 0
     assert cost.sr_star_now == pytest.approx(stored)
 
