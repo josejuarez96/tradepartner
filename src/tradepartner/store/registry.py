@@ -2227,7 +2227,7 @@ def _outcome_digests(conn: duckdb.DuckDBPyConnection, trial_ids: Sequence[int]) 
         "AND metric IN (SELECT UNNEST($metrics::VARCHAR[])) GROUP BY trial_id",
         {"ids": list(trial_ids), "metrics": list(_OUTCOME_METRICS)},
     ).fetchall()
-    return {int(trial_id): str(digest) for trial_id, digest in rows}
+    return {int(trial_id): str(digest) for trial_id, digest in rows if digest is not None}
 
 
 def count_counted_trials(

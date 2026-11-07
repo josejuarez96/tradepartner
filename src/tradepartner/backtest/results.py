@@ -175,8 +175,10 @@ def family_n_split(
     conn: duckdb.DuckDBPyConnection, family: str, *, pending: TrialHandle | None = None
 ) -> FamilyN:
     """`family`'s N in its three parts (module docstring, "Research runs raise N"):
-    its `ok`, non-synthetic, in-sample trials, reruns and every variant's included
-    (backtest spec req 8; strategy-lab spec req 3), with `pending` counted as
+    its distinct return series among the `ok`, non-synthetic, in-sample trials, every
+    variant's included and an identical rerun once (`registry.count_counted_trials`;
+    backtest spec req 8; strategy-lab spec req 3 and amendment 2026-11-06), with
+    `pending` counted as
     `registry.family_sharpes` does; `research.family_run_count`, None when the
     store has no research tables; and `research.family_exposure_count`, None when
     it has no `research_exposures` table."""
@@ -246,7 +248,7 @@ def next_trial_cost(
     note: str | None = None
     if undefined_floor is not None and (not math.isfinite(undefined_floor) or undefined_floor < 0):
         raise ValueError(f"undefined_floor must be finite and non-negative, got {undefined_floor}")
-    stand_in = undefined_floor if undefined_floor is not None else floor
+    stand_in = max(undefined_floor, floor) if undefined_floor is not None else floor
     if variance is None and stand_in <= 0:
         note = "V is unknown (fewer than two pairs) and no floor applies: SR* is 0"
         used: float | None = None
