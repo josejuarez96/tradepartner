@@ -52,6 +52,8 @@ Record `pass` or `deferred: <item and reason>` (an item met in part counts as fa
 
 ### 5. Test
 
+**Rung 2 (from 2026-11-06, #3092).** A rung-2 read on open data is the calibrated long-leg test of [ADR 0023's amendment of that date](../decisions/0023-break-first-fast-books-paper-exam.md#amendment-2026-11-06-3092-a-calibrated-rung-2): the long leg's t over 2009-01 to 2025-12, averaged across the two pinned Chen–Zimmermann files, ≥ 2.22, no mean floor, one window. It replaces the both-legs, three-window, mean-floor reads of #2675, #2828 and #2946, and the ladder ledger's L4 window. The threshold is re-calibrated when the amendment's trigger says so.
+
 Unchanged: every run is a trial; the holdout is spent once; results are reported beside SPY and MTUM; deflated Sharpe uses the family's trial count. Which data a run may read is [ADR 0016](../decisions/0016-development-boundary-and-forward-exams.md)'s rule; the principles are under [Zones](#zones).
 
 ### 6. Result → register
@@ -103,3 +105,4 @@ The owner's line: research freedom in development, evidence discipline in valida
 | 2026-10-18 | Rewritten for length, meaning unchanged; the loop as a numbered list; the 10-08 track snapshot points at STATUS | #1752 |
 | 2026-10-27 | Stage 4a: the feasibility check before an experiment file; ledger gains `feasibility` and `decision` | #2409 |
 | 2026-10-30 | Registration defaults: the $200M dollar-volume floor for daily and weekly books | #2667 |
+| 2026-11-06 | Stage 5: rung 2 is the calibrated long-leg test (ADR 0023 amendment) | #3092 |
