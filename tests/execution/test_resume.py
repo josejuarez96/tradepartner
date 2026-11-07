@@ -22,7 +22,7 @@ from tradepartner.execution import reconcile_run, switch
 from tradepartner.execution import resume as resume_module
 from tradepartner.execution.collect import collect
 from tradepartner.execution.lock import LockHeld, run_lock
-from tradepartner.execution.reconcile_run import reconcile_now
+from tradepartner.execution.reconcile_run import StatedBeforeTrueUp, reconcile_now
 from tradepartner.execution.resume import NO_WINDOW, REFUSED, RELEASED, resume
 from tradepartner.store import registry
 from tradepartner.store.db import open_for_write, open_read_only
@@ -268,10 +268,14 @@ def _resume(
 
 
 def _collect(
-    settings: Settings, fake: FakeBroker, clock: FixedClock, orders: list[OrderRow]
+    settings: Settings,
+    fake: FakeBroker,
+    clock: FixedClock,
+    orders: list[OrderRow],
+    run_id: int = 1,
 ) -> Any:
     return collect(
-        fake, lambda: open_for_write(settings), orders, clock, "run", 1, FROZEN, settings
+        fake, lambda: open_for_write(settings), orders, clock, "run", run_id, FROZEN, settings
     )
 
 
@@ -326,7 +330,7 @@ def _lagging_third_fill(
     order = _order(settings, fake, run_id, coid, 2.0 + last, DAY1 - timedelta(hours=1))
     fake.apply(coid, PartialFill(1.0, 100.0))
     fake.apply(coid, PartialFill(1.0, 101.0))
-    _collect(settings, fake, clock, [order])
+    _collect(settings, fake, clock, [order], run_id)
     fake.lag_fills(None)
     fake.apply(coid, PartialFill(last, 102.0))
     first = reconcile_now(
@@ -502,6 +506,99 @@ def test_clock_step_back_rechecks_an_earlier_refused_invocation(
         assert not any(
             event.state == "released" for event in kill_switch_events_for(conn, window.window_id)
         )
+
+
+@pytest.mark.parametrize("price, expected", [(200.0, REFUSED), (100.0, RELEASED)])
+def test_a_run_fill_whose_band_engagement_was_never_written_is_rejudged(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+    price: float,
+    expected: str,
+) -> None:
+    """#3027: a halt read journals a run-writer fill outside the band, then its
+    `engaged` write fails and the process exits. The run has no result row and no
+    band engagement exists, so only a rejudge of the run's own fills can refuse."""
+    started = DAY1 - timedelta(hours=1)
+    run_id = _run(journal_settings, window, started, finished=False)
+    order = _order(journal_settings, fake, run_id, "tp-halt-read", 2.0, started)
+    fake.apply("tp-halt-read", FillAt(price))
+    # The halt read's collection: writer `run`, the halted run's id.
+    collect(
+        fake,
+        lambda: open_for_write(journal_settings),
+        [order],
+        fixed_clock,
+        "run",
+        run_id,
+        FROZEN,
+        journal_settings,
+    )
+    assert _all_fills(journal_settings, "tp-halt-read")
+    sessions: list[date] = []
+
+    def prices(_conn: object, session: date, names: object, _actions: object) -> dict[str, float]:
+        sessions.append(session)
+        return {SPY: PRICE}
+
+    monkeypatch.setattr(resume_module, "reference_prices", prices)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == expected, outcome.reasons
+    assert started.date() in sessions
+    if expected == REFUSED:
+        assert any("fill_price_outside_band" in reason for reason in outcome.reasons)
+        assert any("tp-halt-read" in reason for reason in outcome.reasons)
+        assert _engaged(journal_settings, window)
+        again = _resume(journal_settings, fake, fixed_clock)
+        assert again.status == REFUSED
+        assert _engaged(journal_settings, window)
+
+
+def test_a_run_band_halt_reason_with_its_fault_type_prefix_refuses_a_resume(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3028: a run's halt path engages with its headline, `SystemFaultError:
+    fill_price_outside_band: ...`; the prior-fault check must not need the token
+    at the start of the reason."""
+    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
+    started = DAY1 - timedelta(hours=1)
+    run_id = _run(journal_settings, window, started, finished=False)
+    _append(
+        journal_settings,
+        PaperRunResultRow(
+            run_id=run_id,
+            finished_at=started,
+            status="halted",
+            fault_type="SystemFaultError",
+            message="SystemFaultError: fill_price_outside_band: tp-x 200 vs 100",
+            clock_fault=False,
+            known_at=started,
+            ingested_at=started,
+        ),
+    )
+    switch.engage(
+        journal_settings,
+        fixed_clock,
+        window_id=window.window_id,  # type: ignore[arg-type]
+        source="fault",
+        fault_type="SystemFaultError",
+        reason="SystemFaultError: fill_price_outside_band: tp-x 200 vs 100",
+        run_id=run_id,
+    )
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED, outcome.reasons
+    assert any("prior SystemFaultError: fill_price_outside_band" in r for r in outcome.reasons)
+    assert _engaged(journal_settings, window)
 
 
 def test_resume_reports_a_new_fill_without_a_reference_price(
@@ -1967,7 +2064,10 @@ def test_with_the_flag_the_lag_bound_still_refuses(
     fake: SkewedFake,
     window: PaperWindowRow,
     fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The fake fills at 100: the faulted run's fills are rejudged against the band (#3027).
+    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
     run_id = _halted_with_rejections(journal_settings, fake, fixed_clock, window)
     fixed_clock.now = DAY1
     _lagging_third_fill(journal_settings, fake, window, fixed_clock, "tp-lag")
@@ -2020,9 +2120,12 @@ def test_with_the_flag_a_run_with_a_verdict_and_a_lagging_order_is_still_refused
     journal_settings: Settings,
     fake: SkewedFake,
     fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """One halted run carries both a rejection-cap verdict and an order past the
     lag bound: the flag accepts the verdict and the lag still refuses."""
+    # The fake fills at 100: the faulted run's fills are rejudged against the band (#3027).
+    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
     capped = RiskConfig(max_rejections_per_run=1)
     window = _open_window(journal_settings, capped)
     at = DAY1 - timedelta(hours=1)
@@ -2150,12 +2253,15 @@ def test_a_skewed_clock_clamps_the_resume_acceptances_stamp_to_the_floor(
     window: PaperWindowRow,
     fixed_clock: FixedClock,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A rejection-cap verdict `--accept-rejections` clears, with a lagging
     order still refusing afterwards (reusing the existing
     `test_with_the_flag_the_lag_bound_still_refuses` setup): the clock steps
     back right before the `resume_acceptances` row, so its `known_at` is
     clamped to the invocation's own first reading instead of preceding it."""
+    # The fake fills at 100: the faulted run's fills are rejudged against the band (#3027).
+    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
     fixed_clock.now = DAY1
     run_id = _halted_with_rejections(journal_settings, fake, fixed_clock, window)
     fixed_clock.now = DAY1
@@ -2529,3 +2635,34 @@ def test_two_books_resuming_at_once_both_release(
     assert b_outcome.resume_id > outcome.resume_id
     assert not _engaged(journal_settings, window)
     assert not _engaged(journal_settings, b_window)
+
+
+def test_a_resume_stated_before_a_true_up_refuses_with_the_reason(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3018: `reconcile_now` refuses a ledger stated before a true-up's
+    session. A resume states `command_session(now)`, so this needs a clock that
+    went back past a true-up; it then reports REFUSED with the reason (not a
+    traceback or a halt), writes no reconciliation and leaves the switch engaged."""
+    _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+
+    def refuse(*args: object, **kwargs: object) -> object:
+        raise StatedBeforeTrueUp(
+            "a true-up is stated for 2026-10-02, after 2026-10-01: reconcile 2026-10-02 or later"
+        )
+
+    monkeypatch.setattr(resume_module, "reconcile_now", refuse)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert outcome.reasons == (
+        "reconciliation refused: a true-up is stated for 2026-10-02, after 2026-10-01: "
+        "reconcile 2026-10-02 or later",
+    )
+    assert outcome.reconciliation_id is None and outcome.released_event_id is None
+    assert _engaged(journal_settings, window)

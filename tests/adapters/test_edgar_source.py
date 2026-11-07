@@ -600,6 +600,38 @@ def test_incremental_pending_and_acceptance_time(
     assert not later.pending
 
 
+def test_incremental_unstampable_quarter_is_the_first_filed_on_quarter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#3041: the quarter that decides an unstampable accession is its first
+    listing's filed_on quarter (T323a), fresh or pending, never the quarter of
+    a pending row's listed_on, which a settled form.idx's Last-Modified puts a
+    quarter late. A rebuild and an incremental store then decide alike."""
+    from tradepartner.adapters.filings import PendingIndexRow
+
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    # Pending from 2025 Q4's form.idx, listed at its Last-Modified in 2026 Q1.
+    late = PendingIndexRow(
+        APPLE, "0000320193-25-000009", "8-K", "Company", date(2025, 12, 23), date(2026, 1, 12)
+    )
+    # A fresh first listing in a 2026 Q2 daily file, filed in Q1.
+    file = _incremental_file(date(2026, 4, 1))
+    fresh = _incremental_row(APPLE, "0000320193-26-000009", "10-K", date(2026, 3, 31))
+    monkeypatch.setattr(source, "_incremental_daily_rows", lambda _file: (fresh,))
+    asked: dict[str, tuple[int, int]] = {}
+
+    def stamps(
+        rows: dict[str, dict[str, tuple[UnstampedFiling, tuple[int, int]]]],
+    ) -> dict[tuple[str, str], datetime | None]:
+        asked.update({a: q for by_cik in rows.values() for a, (_, q) in by_cik.items()})
+        return {}
+
+    monkeypatch.setattr(source, "_incremental_stamps", stamps)
+    result = source.incremental_index(_incremental_state(pending=(late,), files=(file,)))
+    assert asked == {late.accession: (2025, 4), fresh.accession: (2026, 1)}
+    assert {r.accession for r in result.pending} == {late.accession, fresh.accession}
+
+
 def test_incremental_keeps_exchange_only_and_filer_13d(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
