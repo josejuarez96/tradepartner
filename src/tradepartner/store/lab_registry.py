@@ -26,10 +26,16 @@ loosens a registered family or sweep (spec req 1, Definitions > Family rules).
 
 **SR\\* values.** `close_sweep_run` stores the `n_trials_at_end` and
 `sr_star_annual_at_end` its caller computed (the runner, T107, from
-`results.family_n` and `family_sharpes` with V floored at the family rules'
-`min_sharpe_variance_annual`); `family_sr_star_high_water_mark` takes today's
-N and annual V the same way, as arguments, and floors V itself. This module
-computes no annual V.
+`results.family_n` and `family_sharpes` with V floored at `family_v_floor`: the family rules'
+`min_sharpe_variance_annual` or the window's null variance, whichever is larger,
+#3127); `family_sr_star_high_water_mark` takes today's N and annual V the same
+way, as arguments, and floors V itself. This module computes no annual V.
+
+**Root families (#3126).** `write_family_rules` refuses a root family whose
+`config_backtest.FAMILIES` signal inputs overlap those of another family with a
+hypothesis registered at that instant, unless an owner `family_root` decision
+made by then names every overlapping family; `linked_families` is what that
+family's N then counts (`results.family_n_split`).
 """
 
 from __future__ import annotations
@@ -39,7 +45,7 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Final
@@ -47,14 +53,17 @@ from typing import Any, Final
 import duckdb
 
 import tradepartner.backtest.frozen as _frozen
+import tradepartner.config_backtest as _config_backtest
 from tradepartner.backtest.frozen import FROZEN_KEY_DEFAULTS, frozen_values, is_default
 from tradepartner.backtest.holdout import Frozen, default_in_sample_window
-from tradepartner.backtest.metrics import expected_max_sharpe
+from tradepartner.backtest.metrics import expected_max_sharpe, null_sharpe_variance_annual
+from tradepartner.backtest.schedule import MONTHS_PER_YEAR, rebalance_sessions
 from tradepartner.config import FORBIDDEN_AXIS_PREFIXES, Settings, get_settings
 from tradepartner.store.db import insert_row, utc_now
 from tradepartner.store.lab_schema import require_lab
 from tradepartner.store.registry import (
     BASE_COST_KEY,
+    ORACLE_FAMILY,
     UNREAD,
     HypothesisRecord,
     RegistryError,
@@ -274,11 +283,16 @@ def write_family_rules(
     """Write the family's one rules row at its first registration, copying the
     caps, `min_sharpe_variance_annual` and `axis_lattice` from `settings`, and
     return it. Refuses a family that already has its row: the rules are fixed
-    once, and a later config change never reaches them."""
+    once, and a later config change never reaches them. A root family's row
+    (`parent_family` None, `oracle` aside) is refused by `check_root_family` at the
+    row's own `registered_at` instant (#3126) before anything is written."""
     require_lab(conn)
     settings = settings if settings is not None else get_settings()
     if family_rules(conn, family) is not None:
         raise LabRegistryError(f"family {family!r} already has its family rules")
+    now = utc_now()
+    if parent_family is None and family != ORACLE_FAMILY:
+        check_root_family(conn, family, as_of=now)
     get_hypothesis_by_id(conn, first_hypothesis_id)
     fixed_json, fixed_hash = _json_sha256(fixed_params)
     lab = settings.lab
@@ -299,12 +313,187 @@ def write_family_rules(
             "min_sharpe_variance_annual": lab.min_sharpe_variance_annual,
             "axis_lattice_json": canonical_params_json(lab.axis_lattice),
             "sr_star_seed_annual": sr_star_seed_annual,
-            "registered_at": utc_now(),
+            "registered_at": now,
         },
     )
     rules = family_rules(conn, family)
     assert rules is not None
     return rules
+
+
+# --- root families (#3126) and the window V floor (#3127) --------------------------
+
+#: The `owner_decisions.kind` of the owner's approval of a root family whose signal
+#: inputs overlap another family's (`lab_schema.FAMILY_ROOT_DECISION_KINDS`).
+FAMILY_ROOT_KIND: Final = "family_root"
+
+
+class RootFamilyRefused(LabRegistryError):
+    """A root family's first rules row refused by the signal-input check (strategy-lab
+    spec, amendment 2026-11-06, #3126)."""
+
+
+@dataclass(frozen=True)
+class FamilyRootApproval:
+    """One `owner_decisions` row of kind `family_root`: the owner's approval of
+    `family` as a root although its signal inputs overlap `overlapping_families`'."""
+
+    decision_id: int
+    family: str
+    overlapping_families: tuple[str, ...]
+    made_at: datetime
+
+
+def family_signal_inputs(family: str) -> frozenset[str]:
+    """`family`'s `signal_inputs` in `config_backtest.FAMILIES`, read at call time;
+    empty for a name with no entry."""
+    spec = _config_backtest.FAMILIES.get(family)  # type: ignore[call-overload]
+    return frozenset(spec.signal_inputs) if spec is not None else frozenset()
+
+
+def family_root_approval(
+    conn: duckdb.DuckDBPyConnection, family: str, *, as_of: datetime
+) -> FamilyRootApproval | None:
+    """The latest `family_root` decision for `family` made at or before `as_of`, or
+    None. Reads only rows known at `as_of`."""
+    require_lab(conn)
+    rows = conn.execute(
+        "SELECT decision_id, made_at, values_json FROM owner_decisions "
+        "WHERE kind = ? AND made_at <= ? ORDER BY made_at DESC, decision_id DESC",
+        [FAMILY_ROOT_KIND, as_of],
+    ).fetchall()
+    for decision_id, made_at, values_json in rows:
+        values = json.loads(values_json)
+        if values.get("family") == family:
+            return FamilyRootApproval(
+                decision_id=int(decision_id),
+                family=family,
+                overlapping_families=tuple(str(f) for f in values["overlapping_families"]),
+                made_at=made_at,
+            )
+    return None
+
+
+def signal_input_overlaps(
+    conn: duckdb.DuckDBPyConnection, family: str, *, as_of: datetime
+) -> dict[str, tuple[str, ...]]:
+    """Every other non-`oracle` family with a `hypotheses` row registered at or before
+    `as_of` whose signal inputs share a table with `family`'s, mapped to the shared
+    tables (sorted). A family with no `FAMILIES` entry has unknown inputs and counts as
+    overlapping (fail-closed). Reads only rows known at `as_of`."""
+    require_lab(conn)
+    ours = family_signal_inputs(family)
+    others = conn.execute(
+        "SELECT DISTINCT family FROM hypotheses WHERE family <> ? AND family <> ? "
+        "AND registered_at <= ? ORDER BY family",
+        [family, ORACLE_FAMILY, as_of],
+    ).fetchall()
+    found: dict[str, tuple[str, ...]] = {}
+    for (other,) in others:
+        if other not in _config_backtest.FAMILIES:
+            found[str(other)] = ("unknown signal inputs",)
+            continue
+        shared = ours & family_signal_inputs(str(other))
+        if shared:
+            found[str(other)] = tuple(sorted(shared))
+    return found
+
+
+def root_family_refusal(
+    conn: duckdb.DuckDBPyConnection, family: str, *, as_of: datetime
+) -> str | None:
+    """Why `family` may not be registered as a root at `as_of`, or None (strategy-lab
+    spec, amendment 2026-11-06, #3126): it names no signal inputs; or its inputs overlap
+    another family's (`signal_input_overlaps`) and no `family_root` decision made at or
+    before `as_of` names every overlapping family. Reads only rows known at `as_of`."""
+    require_lab(conn)
+    if not family_signal_inputs(family):
+        return (
+            f"root family {family!r} names no signal inputs "
+            "(config_backtest.FAMILIES signal_inputs)"
+        )
+    overlaps = signal_input_overlaps(conn, family, as_of=as_of)
+    if not overlaps:
+        return None
+    named = "; ".join(f"{other!r} ({', '.join(tables)})" for other, tables in overlaps.items())
+    approval = family_root_approval(conn, family, as_of=as_of)
+    if approval is None:
+        return (
+            f"root family {family!r}'s signal inputs overlap family {named}: register it "
+            "as a child, or record an owner `family_root` decision naming every "
+            "overlapping family (its N then counts their trials)"
+        )
+    missing = sorted(set(overlaps) - set(approval.overlapping_families))
+    if missing:
+        return (
+            f"the family_root decision {approval.decision_id} for {family!r} does not name "
+            f"overlapping families {missing} (overlaps: {named})"
+        )
+    return None
+
+
+def check_root_family(conn: duckdb.DuckDBPyConnection, family: str, *, as_of: datetime) -> None:
+    """Raise `RootFamilyRefused` with `root_family_refusal`'s reason, if any."""
+    reason = root_family_refusal(conn, family, as_of=as_of)
+    if reason is not None:
+        raise RootFamilyRefused(reason)
+
+
+def linked_families(conn: duckdb.DuckDBPyConnection, family: str) -> tuple[str, ...]:
+    """The families whose N `family`'s N counts (#3126): those its `family_root`
+    approval names, read as known when its rules row was written, so a decision made
+    later links nothing and moves no registered family's N. Empty for a family without
+    rules, a child, or a root registered with no approval."""
+    require_lab(conn)
+    rules = family_rules(conn, family)
+    if rules is None or rules.parent_family is not None:
+        return ()
+    approval = family_root_approval(conn, family, as_of=rules.registered_at)
+    return approval.overlapping_families if approval is not None else ()
+
+
+def family_window_periods(rules: FamilyRules) -> int:
+    """The monthly periods of `rules`' in-sample window: the XNYS month-end sessions
+    from `in_sample_start` to the last one strictly before `holdout_start`
+    (`schedule.rebalance_sessions`), less one (40 for momentum's 2020-08-31 ..
+    2023-12-29). Refuses a window with fewer than two month-end sessions."""
+    sessions = rebalance_sessions(
+        rules.in_sample_start, rules.holdout_start - timedelta(days=1), "month_end"
+    )
+    if len(sessions) < 2:
+        raise LabRegistryError(
+            f"family {rules.family!r}'s window [{rules.in_sample_start}, "
+            f"{rules.holdout_start}) has fewer than two month-end sessions"
+        )
+    return len(sessions) - 1
+
+
+def family_v_floor(rules: FamilyRules, settings: Settings | None = None) -> float:
+    """The V floor of `rules`' family (#3127): the larger of the stored
+    `min_sharpe_variance_annual` and the null variance of an annual Sharpe over the
+    window's monthly periods (`metrics.null_sharpe_variance_annual` at
+    `lab.v_floor_null_sharpe_annual`, which only raises it). Every V floor reads it."""
+    settings = settings if settings is not None else get_settings()
+    null = null_sharpe_variance_annual(
+        family_window_periods(rules),
+        MONTHS_PER_YEAR,
+        settings.lab.v_floor_null_sharpe_annual,
+    )
+    return max(rules.min_sharpe_variance_annual, null)
+
+
+def family_v_floor_text(rules: FamilyRules, settings: Settings | None = None) -> str:
+    """`family_v_floor` for display: the floor, then the stored floor and the window's
+    null variance it is the larger of."""
+    settings = settings if settings is not None else get_settings()
+    periods = family_window_periods(rules)
+    null = null_sharpe_variance_annual(
+        periods, MONTHS_PER_YEAR, settings.lab.v_floor_null_sharpe_annual
+    )
+    return (
+        f"{max(rules.min_sharpe_variance_annual, null):.4f} (stored "
+        f"{rules.min_sharpe_variance_annual}, window null {null:.4f} over {periods} months)"
+    )
 
 
 # --- sweeps ------------------------------------------------------------------
@@ -631,12 +820,13 @@ def family_sr_star_high_water_mark(
     *,
     n_trials_today: int,
     sharpe_variance_annual_today: float | None,
+    settings: Settings | None = None,
 ) -> float:
     """The family's SR\\*_annual high-water mark (spec, Definitions): the maximum
     of every `sweep_runs.sr_star_annual_at_end` of every sweep in the family,
     the parent's mark seeded into the rules (`sr_star_seed_annual`), and today's
-    value, `expected_max_sharpe(n_trials_today, V)` with V floored at the rules'
-    `min_sharpe_variance_annual` (a None V, fewer than two pairs, is the floor).
+    value, `expected_max_sharpe(n_trials_today, V)` with V floored at
+    `family_v_floor(rules, settings)` (a None V, fewer than two pairs, is the floor).
     Today's value is 0 with no counted trial. Refuses a family with no rules
     and a non-finite V."""
     require_lab(conn)
@@ -645,7 +835,7 @@ def family_sr_star_high_water_mark(
         raise LabRegistryError(f"family {family!r} has no family rules")
     if sharpe_variance_annual_today is not None and not math.isfinite(sharpe_variance_annual_today):
         raise LabRegistryError(f"today's annual V is not finite: {sharpe_variance_annual_today}")
-    variance = max(sharpe_variance_annual_today or 0.0, rules.min_sharpe_variance_annual)
+    variance = max(sharpe_variance_annual_today or 0.0, family_v_floor(rules, settings))
     marks = [expected_max_sharpe(n_trials_today, variance) if n_trials_today >= 1 else 0.0]
     if rules.sr_star_seed_annual is not None:
         marks.append(rules.sr_star_seed_annual)

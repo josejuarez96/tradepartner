@@ -982,14 +982,14 @@ def lab_status(
     )
 
 
-def _rules_text(rules: FamilyRules, forward: bool = False) -> str:
+def _rules_text(rules: FamilyRules, forward: bool = False, settings: Settings | None = None) -> str:
     return (
         f"rules: parent {rules.parent_family or 'none (root)'}; in_sample_start "
         f"{rules.in_sample_start}; holdout {rules.holdout_start}..{rules.holdout_end}"
         f"{' (forward)' if forward else ''}; "
         f"fixed {json.dumps(rules.fixed_params, sort_keys=True)}; max holdout spends "
         f"{rules.max_family_holdout_spends}; max promotions {rules.max_family_promotions}; "
-        f"V floor {rules.min_sharpe_variance_annual}; lattice "
+        f"V floor {lab_registry.family_v_floor_text(rules, settings)}; lattice "
         f"{json.dumps(rules.axis_lattice, sort_keys=True)}"
     )
 

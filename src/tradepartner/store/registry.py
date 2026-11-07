@@ -133,7 +133,7 @@ from tradepartner.calendar import (
     session_close,
 )
 from tradepartner.config import ENGINE_FAMILIES, Cadence, Settings, get_settings
-from tradepartner.config_backtest import DelistingFailureReturn
+from tradepartner.config_backtest import FAMILY_PARENTS, DelistingFailureReturn
 from tradepartner.config_edgar import PRE_2826_STATEMENT_FACTS
 from tradepartner.store.benchmarks import CHECK_ONLY_IDS
 from tradepartner.store.db import configure_connection, insert_row, utc_now
@@ -152,8 +152,10 @@ TrialKind = Literal["in_sample", "holdout", "tracking"]
 
 #: `owner_decisions.kind` values `record_decision` writes: the Phase 3 three, then
 #: version 18's two (#1319, T140b; `lab_schema.RELEASE_DECISION_KINDS`) and version
-#: 20's two (#1388, T157; `lab_schema.SHAKEDOWN_DECISION_KINDS`). The lab's
-#: `promotion` and `sweep_retired` are written by `store.lab_registry`.
+#: 20's two (#1388, T157; `lab_schema.SHAKEDOWN_DECISION_KINDS`), version 22's
+#: `operations_book` and version 48's `family_root` (#3126;
+#: `lab_schema.FAMILY_ROOT_DECISION_KINDS`). The lab's `promotion` and
+#: `sweep_retired` are written by `store.lab_registry`.
 DecisionKind = Literal[
     "gap_signoff",
     "gap_override",
@@ -163,6 +165,7 @@ DecisionKind = Literal[
     "shakedown_span",
     "shakedown_note",
     "operations_book",
+    "family_root",
 ]
 Basis = Literal["raw", "excess_spy"]
 
@@ -1342,7 +1345,10 @@ def record_decision(
     `values` must be exactly `sessions` and `order_sessions`, whole numbers with
     1 <= order_sessions <= sessions (`ValueError` otherwise); a `shakedown_note`
     row's exactly `alert_id`, naming an existing `alerts` row
-    (`ShakedownRefused` for an unknown one; ADR 0017 part E)."""
+    (`ShakedownRefused` for an unknown one; ADR 0017 part E). A `family_root` row's
+    `values` must be exactly `family` (a root in `FAMILY_PARENTS`) and
+    `overlapping_families` (a non-empty list of other known families, each once;
+    `ValueError` otherwise; strategy-lab spec, amendment 2026-11-06, #3126)."""
     if kind == DATA_RELEASE_KIND:
         raise ValueError("a data_release row is written by the release writers only")
     if kind == DEVELOPMENT_BOUNDARY_KIND:
@@ -1351,6 +1357,8 @@ def record_decision(
         _check_span_values(values)
     if kind == SHAKEDOWN_NOTE_KIND:
         _check_note_values(conn, values)
+    if kind == FAMILY_ROOT_KIND:
+        _check_family_root_values(values)
     return _insert_decision(
         conn,
         kind=kind,
@@ -1636,6 +1644,8 @@ def boundary_date(conn: duckdb.DuckDBPyConnection) -> date | None:
 
 SHAKEDOWN_SPAN_KIND: Final = "shakedown_span"
 SHAKEDOWN_NOTE_KIND: Final = "shakedown_note"
+#: The owner's approval of a root family whose signal inputs overlap another's (#3126).
+FAMILY_ROOT_KIND: Final = "family_root"
 _SPAN_KEYS: Final = ("sessions", "order_sessions")
 _NOTE_KEYS: Final = ("alert_id",)
 
@@ -1676,6 +1686,33 @@ def _check_span_values(values: Mapping[str, Any]) -> None:
             f"order_sessions must be at least 1 and at most sessions "
             f"(got sessions={sessions}, order_sessions={order_sessions})"
         )
+
+
+def _check_family_root_values(values: Mapping[str, Any]) -> None:
+    """A `family_root` row's `values` (#3126): exactly `family`, a root family in
+    `FAMILY_PARENTS`, and `overlapping_families`, a non-empty list of other families
+    known to `FAMILY_PARENTS` (so never `oracle`), each named once."""
+    if set(values) != {"family", "overlapping_families"}:
+        raise ValueError(
+            "a family_root decision's values must be exactly family and "
+            f"overlapping_families, got {sorted(values)}"
+        )
+    family = values["family"]
+    overlapping = values["overlapping_families"]
+    parents: dict[str, str | None] = {str(f): p for f, p in FAMILY_PARENTS.items()}
+    if not isinstance(family, str) or family not in parents:
+        raise ValueError(f"family_root: unknown family {family!r}")
+    if parents[family] is not None:
+        raise ValueError(f"family_root: family {family!r} is not a root ({parents[family]!r})")
+    if not isinstance(overlapping, list) or not overlapping:
+        raise ValueError("family_root: overlapping_families must be a non-empty list")
+    for other in overlapping:
+        if not isinstance(other, str) or other not in parents:
+            raise ValueError(f"family_root: unknown overlapping family {other!r}")
+        if other == family:
+            raise ValueError(f"family_root: {family!r} cannot overlap itself")
+    if len(set(overlapping)) != len(overlapping):
+        raise ValueError("family_root: an overlapping family is named twice")
 
 
 def _check_note_values(conn: duckdb.DuckDBPyConnection, values: Mapping[str, Any]) -> None:

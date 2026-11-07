@@ -1342,6 +1342,7 @@ def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_ro
         assert {table for table in shape_before if shape_after[table] != shape_before[table]} == {
             "listings",
             "classifications",
+            "owner_decisions",  # version 48 widens its kind CHECK (#3126)
             "trial_metrics",
             "trial_results",
         }
@@ -2394,7 +2395,7 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
     (T172b) is version 28; #1813's skip reasons (T202a) are version 29;
     #821's `successor_chains` (T187) is version 30."""
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RESUME_BOOK_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_FAMILY_ROOT_VERSION + 1
 
 
 def test_version_42_adds_snapshot_sightings_to_a_version_41_store() -> None:
@@ -2413,9 +2414,9 @@ def test_version_42_adds_snapshot_sightings_to_a_version_41_store() -> None:
         schema.init_schema(conn)
         assert "snapshot_sightings" in _shape(conn)
         assert max(_versions(conn)) == schema.CURRENT_SCHEMA_VERSION
-        assert _versions(conn) == [41, 42, 43, 44, 45, 46, 47]
+        assert _versions(conn) == [41, 42, 43, 44, 45, 46, 47, 48]
         schema.init_schema(conn)
-        assert _versions(conn) == [41, 42, 43, 44, 45, 46, 47]
+        assert _versions(conn) == [41, 42, 43, 44, 45, 46, 47, 48]
     finally:
         conn.close()
 

@@ -234,6 +234,12 @@ class PortfolioConfig(_ClosedConfig):
 #   may report, read by `backtest/strategies.py` and the generic `Plan` fields.
 # * `benchmark`: an additive comparison benchmark (`backtest/results.py`); SPY and MTUM
 #   stay mandatory for every family (charter, ADR 0005). `None` adds none.
+# * `signal_inputs`: the store fact tables the family's signal reads (the universe, the
+#   benchmarks and the return series every family reads are not signal inputs). A root
+#   family's first `family_rules` row is refused while these overlap the inputs of
+#   another family with a registered hypothesis, unless an owner `family_root` decision
+#   approves it, and that family's N then counts the overlapping families' trials
+#   (`store/lab_registry.py`; strategy-lab spec, amendment 2026-11-06, #3126).
 # * `sweepable_keys`: the family's own `strategy.*`/`profitability.*` keys that may be
 #   swept; `_DEFAULT_SWEEPABLE_KEYS` and `ALLOWED_AXIS_PREFIXES` derive from them.
 #
@@ -268,6 +274,20 @@ class SpinoffConfig(BaseModel):
     model_config = _PHASE3_MODEL_CONFIG
 
 
+#: The store fact tables a family's signal may name as its inputs (`FamilySpec.signal_inputs`;
+#: a test pins each to `schema.TABLE_NAMES`).
+SignalInput = Literal[
+    "prices_daily",
+    "statement_facts",
+    "classifications",
+    "corporate_actions",
+    "filing_events",
+    "filing_index",
+    "sec_filing_events",
+    "sec_form4_transactions",
+]
+
+
 @dataclass(frozen=True)
 class FamilySpec:
     """One hypothesis family's registration (ADR 0014 point 2)."""
@@ -280,6 +300,7 @@ class FamilySpec:
     exclusion_reasons: tuple[str, ...]
     count_names: tuple[str, ...]
     benchmark: str | None
+    signal_inputs: tuple[SignalInput, ...]
     sweepable_keys: tuple[str, ...]
 
 
@@ -302,6 +323,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
             "n_retained",
         ),
         benchmark="MTUM",
+        signal_inputs=("prices_daily",),
         sweepable_keys=(
             "strategy.formation_months",
             "strategy.skip_months",
@@ -321,6 +343,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         exclusion_reasons=("no_history", "no_t0_bar"),
         count_names=("n_excluded_no_history",),
         benchmark="MTUM",
+        signal_inputs=("prices_daily",),
         sweepable_keys=(),
     ),
     "profitability": FamilySpec(
@@ -342,6 +365,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
             "n_derived",
         ),
         benchmark="MTUM",
+        signal_inputs=("statement_facts", "classifications"),
         sweepable_keys=(),
     ),
     "combined": FamilySpec(
@@ -379,6 +403,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
             "n_combined",
         ),
         benchmark="MTUM",
+        signal_inputs=("prices_daily", "statement_facts", "classifications"),
         sweepable_keys=(),
     ),
     "filing_delay": FamilySpec(
@@ -396,6 +421,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         exclusion_reasons=(),
         count_names=(),
         benchmark=None,
+        signal_inputs=("statement_facts",),
         sweepable_keys=(),
     ),
     "spinoff": FamilySpec(
@@ -411,6 +437,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         exclusion_reasons=(),
         count_names=(),
         benchmark=None,
+        signal_inputs=("corporate_actions",),
         sweepable_keys=(),
     ),
 }
@@ -428,6 +455,11 @@ _HYPOTHESIS_FAMILIES: tuple[HypothesisFamily, ...] = tuple(FAMILIES)
 # holdout or reached its spend cap (`store/registry.py`).
 FAMILY_PARENTS: dict[HypothesisFamily, HypothesisFamily | None] = {
     family: spec.parent for family, spec in FAMILIES.items() if family != "oracle"
+}
+
+# Each family's signal inputs (`FamilySpec.signal_inputs`), as frozensets.
+FAMILY_SIGNAL_INPUTS: dict[HypothesisFamily, frozenset[str]] = {
+    family: frozenset(spec.signal_inputs) for family, spec in FAMILIES.items()
 }
 
 # Each family's own signal section (first of its listed sections). `oracle` reads

@@ -98,7 +98,7 @@ from tradepartner.backtest.riskfree import constant_period_returns, period_risk_
 from tradepartner.backtest.schedule import periods_per_year, rebalance_sessions
 from tradepartner.calendar import session_close
 from tradepartner.config import FAMILIES, Cadence, HypothesisFamily, Settings
-from tradepartner.store import registry, research, schema
+from tradepartner.store import lab_registry, lab_schema, registry, research, schema
 from tradepartner.store.registry import (
     Basis,
     EquityRow,
@@ -153,12 +153,14 @@ class FamilyN:
     trials: int
     research: int | None
     exposures: int | None = None
+    linked: int = 0
 
     @property
     def total(self) -> int:
         """N: the backtest trials plus the research runs' and the exposures'
-        configurations."""
-        return self.trials + (self.research or 0) + (self.exposures or 0)
+        configurations, plus `linked`: the own N of every family an approved root's
+        `family_root` decision names, transitively (#3126)."""
+        return self.trials + (self.research or 0) + (self.exposures or 0) + self.linked
 
 
 @dataclass(frozen=True)
@@ -171,15 +173,10 @@ class _StatisticsWithResearch(ResultStatistics):
     n_exposure: int | None = None
 
 
-def family_n_split(
+def _own_n_split(
     conn: duckdb.DuckDBPyConnection, family: str, *, pending: TrialHandle | None = None
 ) -> FamilyN:
-    """`family`'s N in its three parts (module docstring, "Research runs raise N"):
-    its `ok`, non-synthetic, in-sample trials, reruns and every variant's included
-    (backtest spec req 8; strategy-lab spec req 3), with `pending` counted as
-    `registry.family_sharpes` does; `research.family_run_count`, None when the
-    store has no research tables; and `research.family_exposure_count`, None when
-    it has no `research_exposures` table."""
+    """`family`'s own N parts (trials, research, exposures), no linked families."""
     trials = registry.count_counted_trials(conn, family, pending)
     try:
         runs: int | None = research.family_run_count(conn, family)
@@ -190,6 +187,38 @@ def family_n_split(
     except schema.ResearchNotInitialised:  # `ExposuresNotInitialised` is a subclass
         exposures = None
     return FamilyN(trials=trials, research=runs, exposures=exposures)
+
+
+def _linked_closure(conn: duckdb.DuckDBPyConnection, family: str) -> tuple[str, ...]:
+    """Every family `family`'s N counts besides its own (`lab_registry.linked_families`,
+    followed transitively, `family` itself left out); empty on a store without the lab."""
+    try:
+        seen: list[str] = []
+        frontier = list(lab_registry.linked_families(conn, family))
+        while frontier:
+            other = frontier.pop(0)
+            if other == family or other in seen:
+                continue
+            seen.append(other)
+            frontier.extend(lab_registry.linked_families(conn, other))
+    except lab_schema.LabNotInitialised:
+        return ()
+    return tuple(seen)
+
+
+def family_n_split(
+    conn: duckdb.DuckDBPyConnection, family: str, *, pending: TrialHandle | None = None
+) -> FamilyN:
+    """`family`'s N in its three parts (module docstring, "Research runs raise N"):
+    its `ok`, non-synthetic, in-sample trials, reruns and every variant's included
+    (backtest spec req 8; strategy-lab spec req 3), with `pending` counted as
+    `registry.family_sharpes` does; `research.family_run_count`, None when the
+    store has no research tables; and `research.family_exposure_count`, None when
+    it has no `research_exposures` table; and `linked`, the own N of every family
+    `_linked_closure` names (a root approved by a `family_root` decision, #3126)."""
+    own = _own_n_split(conn, family, pending=pending)
+    linked = sum(_own_n_split(conn, other).total for other in _linked_closure(conn, family))
+    return FamilyN(trials=own.trials, research=own.research, exposures=own.exposures, linked=linked)
 
 
 def family_n(

@@ -126,7 +126,7 @@ def _on_run(
                 return
             k = len(plan.variants)
             rules = lab_registry.family_rules(store, sweep.family)
-            floor = rules.min_sharpe_variance_annual if rules else 0.0
+            floor = lab_registry.family_v_floor(rules) if rules else 0.0
             excess = results.next_trial_cost(
                 store, sweep.family, basis="excess_spy", added=k, floor=floor
             )
@@ -373,7 +373,7 @@ def _on_hypothesis_run(
                 )
                 return
             rules = lab_registry.family_rules(store, hypothesis.family)
-            floor = rules.min_sharpe_variance_annual if rules else 0.0
+            floor = lab_registry.family_v_floor(rules) if rules else 0.0
             excess = results.next_trial_cost(
                 store, hypothesis.family, basis="excess_spy", added=1, floor=floor
             )
@@ -703,7 +703,7 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
                         st.caption(f"Run waits for the quiet schedule; opens {opening}.")
                     else:
                         rules = lab_registry.family_rules(conn, hypothesis.family)
-                        floor = rules.min_sharpe_variance_annual if rules else 0.0
+                        floor = lab_registry.family_v_floor(rules) if rules else 0.0
                         excess = results.next_trial_cost(
                             conn, hypothesis.family, basis="excess_spy", added=1, floor=floor
                         )
@@ -741,7 +741,7 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
                 st.caption("No variants are awaiting a plain run.")
                 continue
             rules = lab_registry.family_rules(conn, sweep.family)
-            floor = rules.min_sharpe_variance_annual if rules else 0.0
+            floor = lab_registry.family_v_floor(rules) if rules else 0.0
             excess = results.next_trial_cost(
                 conn, sweep.family, basis="excess_spy", added=k, floor=floor
             )

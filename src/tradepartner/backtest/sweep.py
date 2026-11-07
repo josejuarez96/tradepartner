@@ -85,6 +85,7 @@ from tradepartner.backtest.schedule import rebalance_sessions
 from tradepartner.backtest.signals import check_anchor_feasible
 from tradepartner.config import FORBIDDEN_AXIS_PREFIXES, Settings, get_settings
 from tradepartner.store import lab_registry, registry
+from tradepartner.store.db import utc_now
 from tradepartner.store.lab_schema import require_lab
 
 __all__ = [
@@ -681,6 +682,13 @@ class NewFamilyError(SweepRegistrationError):
     a holdout spend nor a reached spend cap (or no rules at all)."""
 
 
+class RootFamilyOverlapError(NewFamilyError):
+    """A new root family whose signal inputs overlap another registered family's
+    without an owner `family_root` decision naming it, or that names no inputs
+    (`lab_registry.root_family_refusal`; strategy-lab spec, amendment 2026-11-06,
+    #3126)."""
+
+
 class FamilyRuleError(SweepRegistrationError):
     """Req 1(a): the file's holdout, `in_sample_start` or a forbidden-prefix value
     differs from the family rules (`costs.per_side_bps` may only rise)."""
@@ -897,7 +905,9 @@ def _new_family_seed(
     written, and its `(parent_family, sr_star_seed_annual)`: the parent from
     `config.FAMILY_PARENTS` (read at call time) and, for a child, the parent's SR*
     high-water mark today (N from `results.family_n`, V on the excess basis from
-    `registry.family_sharpes`, floored by the parent's rules); a root's seed is None."""
+    `registry.family_sharpes`, floored by the parent's rules); a root's seed is None.
+    A root is refused by `lab_registry.root_family_refusal` (#3126) as of now;
+    `write_family_rules` repeats the check at its own instant."""
     parents: dict[str, str | None] = {
         str(family): parent for family, parent in config.FAMILY_PARENTS.items()
     }
@@ -924,6 +934,10 @@ def _new_family_seed(
                 f"family {other!r}'s [{start}, {end}]"
             )
     if parent is None:
+        if file.family != registry.ORACLE_FAMILY:
+            reason = lab_registry.root_family_refusal(conn, file.family, as_of=utc_now())
+            if reason is not None:
+                raise RootFamilyOverlapError(f"{path}: {reason}")
         return None, None
     parent_rules = lab_registry.family_rules(conn, parent)
     if parent_rules is None:

@@ -18,7 +18,7 @@ import re
 from collections.abc import Callable
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import duckdb
 import pytest
@@ -461,12 +461,16 @@ def test_high_water_mark_is_the_maximum_of_runs_parent_and_today_with_the_v_floo
     lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
     h1 = _register(lab_store, settings)
-    floor = settings.lab.min_sharpe_variance_annual
-    _rules(lab_store, settings, h1.hypothesis_id, seed=0.25)
+    rules = _rules(lab_store, settings, h1.hypothesis_id, seed=0.3)
+    # The floor is the window's null variance (40 monthly periods: 12 / 40), above the
+    # stored `min_sharpe_variance_annual` (#3127).
+    floor = lab_registry.family_v_floor(rules, settings)
+    assert floor == pytest.approx(12 / 40)
+    assert floor > settings.lab.min_sharpe_variance_annual
     mark = lab_registry.family_sr_star_high_water_mark
     # Today's value with V below the floor is computed at the floor.
     today = expected_max_sharpe(50, floor)
-    assert today > 0.25
+    assert today > 0.3
     assert mark(lab_store, "momentum", n_trials_today=50, sharpe_variance_annual_today=0.0001) == (
         pytest.approx(today)
     )
@@ -477,9 +481,9 @@ def test_high_water_mark_is_the_maximum_of_runs_parent_and_today_with_the_v_floo
     assert mark(lab_store, "momentum", n_trials_today=50, sharpe_variance_annual_today=1.0) == (
         pytest.approx(expected_max_sharpe(50, 1.0))
     )
-    # The parent's seed wins over a small today.
-    assert mark(lab_store, "momentum", n_trials_today=2, sharpe_variance_annual_today=None) == 0.25
-    assert mark(lab_store, "momentum", n_trials_today=0, sharpe_variance_annual_today=None) == 0.25
+    # The parent's seed wins over a small today (SR*(2, 0.30) is about 0.285).
+    assert mark(lab_store, "momentum", n_trials_today=2, sharpe_variance_annual_today=None) == 0.3
+    assert mark(lab_store, "momentum", n_trials_today=0, sharpe_variance_annual_today=None) == 0.3
     # Every sweep_runs row of every sweep in the family; open rows and other families ignored.
     first = _sweep(lab_store, settings, "a")
     second = _sweep(lab_store, settings, "b")
@@ -838,7 +842,26 @@ _CALLS: dict[str, Callable[[duckdb.DuckDBPyConnection], object]] = {
     "grandfathered_fingerprints": lab_registry.grandfathered_fingerprints,
     "grandfathered_members": lab_registry.grandfathered_members,
     "registry_size_bytes": lab_registry.registry_size_bytes,
+    "family_root_approval": lambda c: lab_registry.family_root_approval(
+        c, "profitability", as_of=datetime(2026, 1, 1, tzinfo=UTC)
+    ),
+    "signal_input_overlaps": lambda c: lab_registry.signal_input_overlaps(
+        c, "profitability", as_of=datetime(2026, 1, 1, tzinfo=UTC)
+    ),
+    "root_family_refusal": lambda c: lab_registry.root_family_refusal(
+        c, "profitability", as_of=datetime(2026, 1, 1, tzinfo=UTC)
+    ),
+    "check_root_family": lambda c: lab_registry.check_root_family(
+        c, "profitability", as_of=datetime(2026, 1, 1, tzinfo=UTC)
+    ),
+    "linked_families": lambda c: lab_registry.linked_families(c, "profitability"),
 }
+
+#: Public functions of a `FamilyRules` row or a family name that take no connection,
+#: so there is no store to refuse (#3126, #3127).
+_PURE: Final = frozenset(
+    {"family_signal_inputs", "family_window_periods", "family_v_floor", "family_v_floor_text"}
+)
 
 
 def _public_functions() -> set[str]:
@@ -852,7 +875,10 @@ def _public_functions() -> set[str]:
 
 
 def test_every_public_function_is_covered_by_the_not_initialised_case() -> None:
-    assert set(_CALLS) == _public_functions()
+    assert set(_CALLS) | _PURE == _public_functions()
+    assert not set(_CALLS) & _PURE
+    for name in _PURE:
+        assert "conn" not in inspect.signature(getattr(lab_registry, name)).parameters
 
 
 @pytest.mark.parametrize("name", sorted(_CALLS))

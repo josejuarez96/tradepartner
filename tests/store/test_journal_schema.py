@@ -169,7 +169,7 @@ def test_the_three_name_tuples_are_pairwise_disjoint() -> None:
 
 
 def test_current_schema_version_is_31() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RESUME_BOOK_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_FAMILY_ROOT_VERSION + 1
     assert schema._PRE_FEE_ACTIVITIES_VERSION == 24
     assert schema._PRE_FILING_NAME_VERSION == 25
     assert schema._PRE_CASH_IN_LIEU_VERSION == 26
@@ -1015,7 +1015,7 @@ def test_the_short_reasons_are_appended_last_and_the_version_is_the_next() -> No
         )
         assert (table, "reason") in schema.NULLABLE_JOURNAL_ENUMS
     assert schema._PRE_SHORT_REASONS_VERSION >= schema._PRE_PENDING_UNRESOLVED_VERSION + 1
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RESUME_BOOK_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_FAMILY_ROOT_VERSION + 1
 
 
 def test_the_schema_docstring_names_the_short_reasons_version() -> None:
@@ -2815,6 +2815,6 @@ def test_version_47_adds_a_null_resume_book_and_keeps_every_resume() -> None:
             ("main",),
         ]
         [version] = conn.execute("SELECT max(version) FROM schema_version").fetchone()
-        assert version == schema.CURRENT_SCHEMA_VERSION == 47
+        assert version == schema.CURRENT_SCHEMA_VERSION == 48
     finally:
         conn.close()

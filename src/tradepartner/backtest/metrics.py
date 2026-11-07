@@ -370,6 +370,24 @@ def series_metrics(
     return out
 
 
+def null_sharpe_variance_annual(
+    n_periods: int, periods_per_year: int, sharpe_annual: float = 0.0
+) -> float:
+    """The sampling variance of an annualised Sharpe estimated over `n_periods` periods
+    at `periods_per_year` (Lo 2002, iid): ppy / T * (1 + SR_p^2 / 2), with the per-period
+    SR_p = `sharpe_annual` / sqrt(ppy). At `sharpe_annual` = 0 (the null) it is ppy / T,
+    0.30 over 40 months: the V floor of a family whose window has `n_periods` periods
+    (strategy-lab spec, amendment 2026-11-06, #3127)."""
+    if n_periods < 1:
+        raise ValueError(f"n_periods must be at least 1, got {n_periods}")
+    if periods_per_year < 1:
+        raise ValueError(f"periods_per_year must be positive, got {periods_per_year}")
+    if not math.isfinite(sharpe_annual) or sharpe_annual < 0:
+        raise ValueError(f"sharpe_annual must be finite and non-negative, got {sharpe_annual}")
+    sharpe_period = sharpe_annual / math.sqrt(periods_per_year)
+    return periods_per_year / n_periods * (1 + sharpe_period**2 / 2)
+
+
 def expected_max_sharpe(n_trials: int, variance: float) -> float:
     """SR*: the expected maximum Sharpe of `n_trials` unskilled trials (spec req 8).
 

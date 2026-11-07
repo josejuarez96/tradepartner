@@ -306,7 +306,8 @@ def test_rebuild_keeps_a_value_another_version_added() -> None:
     conn.execute(
         "CREATE TABLE owner_decisions (decision_id BIGINT PRIMARY KEY, kind VARCHAR NOT "
         "NULL, CHECK (kind IN ('gap_signoff', 'promotion', 'sweep_retired', 'data_release', "
-        "'development_boundary', 'shakedown_span', 'shakedown_note', 'operations_book')))"
+        "'development_boundary', 'shakedown_span', 'shakedown_note', 'operations_book', "
+        "'family_root')))"
     )
     conn.execute("INSERT INTO trial_results VALUES (1, ?, 'other_plan')", [AT])
     owner_ddl = conn.execute(
@@ -507,7 +508,11 @@ def test_migrating_a_version_19_store_keeps_every_row(lab: bool) -> None:
     assert {t: _columns(conn, t) for t in before} == columns_before
     added = ", ".join(
         f"'{k}'"
-        for k in (*lab_schema.SHAKEDOWN_DECISION_KINDS, *lab_schema.OPERATIONS_DECISION_KINDS)
+        for k in (
+            *lab_schema.SHAKEDOWN_DECISION_KINDS,
+            *lab_schema.OPERATIONS_DECISION_KINDS,
+            *lab_schema.FAMILY_ROOT_DECISION_KINDS,
+        )
     )
     assert _kind_check(conn) == check_before.replace("'))));", f"', {added}))));")
     assert _versions(conn) == list(range(19, schema.CURRENT_SCHEMA_VERSION + 1))
@@ -582,7 +587,7 @@ def test_read_only_open_of_a_version_19_store_passes_and_has_no_span(tmp_path: P
 
 def test_a_fresh_store_allows_the_shakedown_kinds_and_the_lab_keeps_them() -> None:
     conn = _fresh_store()
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RESUME_BOOK_VERSION + 1 and _versions(
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_FAMILY_ROOT_VERSION + 1 and _versions(
         conn
     ) == [schema.CURRENT_SCHEMA_VERSION]
     for decision_id, kind in enumerate(lab_schema.SHAKEDOWN_DECISION_KINDS, start=1):
@@ -593,7 +598,7 @@ def test_a_fresh_store_allows_the_shakedown_kinds_and_the_lab_keeps_them() -> No
     lab_schema.apply_lab_schema(conn)
     _, values = lab_schema._current_enum(conn, "owner_decisions", "kind")
     assert all(f"'{k}'" in values for k in lab_schema.SHAKEDOWN_DECISION_KINDS)
-    assert lab_schema.LAB_DECISION_KINDS[-3:-1] == lab_schema.SHAKEDOWN_DECISION_KINDS
+    assert lab_schema.LAB_DECISION_KINDS[-4:-2] == lab_schema.SHAKEDOWN_DECISION_KINDS
     assert [r[2] for r in _rows_in_order(conn, "owner_decisions")] == list(
         lab_schema.SHAKEDOWN_DECISION_KINDS
     )
@@ -629,7 +634,7 @@ def _v21(lab: bool) -> duckdb.DuckDBPyConnection:
 def test_migrating_a_version_21_store_keeps_every_row(lab: bool) -> None:
     """The migration from 21 is additive, as version 20's was: every row of every
     table kept in insertion order and byte-identical, every kind kept; only the
-    `kind` CHECK widens, by exactly `operations_book`."""
+    `kind` CHECK widens, by exactly `operations_book` and version 48's `family_root`."""
     conn = _v21(lab)
     before = _rows_but_versions(conn)
     check_before = _kind_check(conn)
@@ -637,7 +642,9 @@ def test_migrating_a_version_21_store_keeps_every_row(lab: bool) -> None:
     schema.init_schema(conn)
     assert _rows_but_versions(conn) == before
     assert {t: _columns(conn, t) for t in before} == columns_before
-    assert _kind_check(conn) == check_before.replace("'))));", "', 'operations_book'))));")
+    assert _kind_check(conn) == check_before.replace(
+        "'))));", "', 'operations_book', 'family_root'))));"
+    )
     assert _versions(conn) == list(range(21, schema.CURRENT_SCHEMA_VERSION + 1))
     assert lab_schema.is_lab_initialised(conn) == lab
     conn.execute(
@@ -706,7 +713,10 @@ def test_a_fresh_store_allows_the_operations_kind_and_the_lab_keeps_it() -> None
     lab_schema.apply_lab_schema(conn)
     _, values = lab_schema._current_enum(conn, "owner_decisions", "kind")
     assert "'operations_book'" in values
-    assert lab_schema.LAB_DECISION_KINDS[-1:] == lab_schema.OPERATIONS_DECISION_KINDS
+    assert lab_schema.LAB_DECISION_KINDS[-2:] == (
+        *lab_schema.OPERATIONS_DECISION_KINDS,
+        *lab_schema.FAMILY_ROOT_DECISION_KINDS,
+    )
     assert [r[2] for r in _rows_in_order(conn, "owner_decisions")] == ["operations_book"]
 
 
