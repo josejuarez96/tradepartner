@@ -465,7 +465,9 @@ def test_a_plain_run_runs_every_variant_then_nothing_then_rerun_runs_all(
     third = lab.run_sweep(SLUG, rerun=True, clock=clock)
     assert (third.n_planned, third.n_ok) == (4, 4)
     assert third.completed
-    assert _n(store) == n_before + 8
+    # An identical rerun (same pairs, data vintage and code tree) is not a new return
+    # series, so it adds nothing to N (#3127, strategy-lab spec amendment 2026-11-06).
+    assert _n(store) == n_before + 4
     with _read(store) as conn:
         assert len(registry.family_sharpes(conn, "momentum").excess_spy) == 5
 
