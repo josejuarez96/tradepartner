@@ -1251,6 +1251,8 @@ def test_tests_needed_only_for_code_tests_scripts_and_deps() -> None:
         [".github/pull_request_template.md"],
         [".python-version"],
         ["docs/STATUS.md", "src/tradepartner/x.py"],
+        # the dashboard's config, mirrored by tests/dashboard/test_health_page.py (#3222)
+        [".streamlit/config.toml"],
     ):
         assert ready_pr.tests_needed(code), code
     for docs in (
@@ -1260,6 +1262,20 @@ def test_tests_needed_only_for_code_tests_scripts_and_deps() -> None:
         ["docs/src/notes.md", "srcfile.txt", "pyproject.toml.bak", "sub/uv.lock"],
     ):
         assert not ready_pr.tests_needed(docs), docs
+
+
+def test_every_dashboard_path_triggers_pytest() -> None:
+    """A diff that needs tests/dashboard (ci_tested_tree's scope, #3221) must run pytest at
+    all: otherwise a `.streamlit/`-only PR skips every shard and main catches it (#3222)."""
+    path = Path(__file__).resolve().parents[1] / "scripts" / "ci_tested_tree.py"
+    spec = importlib.util.spec_from_file_location("ci_tested_tree_for_ready_pr", path)
+    assert spec is not None and spec.loader is not None
+    tree = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tree)
+    for prefix in tree.DASHBOARD_TEST_PREFIXES:
+        paths = [f"{prefix}config.toml"]
+        assert tree.dashboard_tests_needed(paths), prefix
+        assert ready_pr.tests_needed(paths), prefix
 
 
 BUDGET = "tests/test_docs_budget.py"

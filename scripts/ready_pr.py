@@ -229,8 +229,9 @@ TREE_SCAN_TESTS: dict[str, tuple[str, ...]] = {
     "src/tradepartner/backtest/": ("tests/backtest/test_store_provider.py",),
 }
 # A diff touching any of these runs pytest, locally and in CI on a PR; anything else skips it
-# (pushes to main always run the full suite).
-TEST_TRIGGER_PREFIXES = ("src/", "tests/", "scripts/", ".github/")
+# (pushes to main always run the full suite). `.streamlit/` is the dashboard's config, which
+# its tests read (#3222); ci_tested_tree.py's DASHBOARD_TEST_PREFIXES also lists it.
+TEST_TRIGGER_PREFIXES = ("src/", "tests/", "scripts/", ".github/", ".streamlit/")
 TEST_TRIGGER_FILES = ("pyproject.toml", "uv.lock", ".python-version")
 # A CI run with the full suite takes 24-34 min; a shorter default loops (each timeout
 # re-merges main and starts a new run).
@@ -742,7 +743,7 @@ def exam_ledger_budget_change(main_text: str | None, branch_text: str) -> str | 
 
 
 def tests_needed(paths: Sequence[str]) -> bool:
-    """Whether the diff can make pytest fail: it touches code, tests, scripts or deps."""
+    """Whether the diff can make pytest fail: it touches code, tests, CI, deps or config."""
     return any(p.startswith(TEST_TRIGGER_PREFIXES) or p in TEST_TRIGGER_FILES for p in paths)
 
 
