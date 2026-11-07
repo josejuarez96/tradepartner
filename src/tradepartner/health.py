@@ -90,6 +90,11 @@ here is this module's and is stated once:
   from `universe.accepted_shares_facts`. Universe rules 7 and 8 use the last
   accepted fact instead of an unaccepted one. `jumps_before` keeps only
   facts with an `as_of_date` before it.
+- **Shares cap jumps** (`shares_cap_jumps`, #3055): `universe.shares_cap_jumps`
+  at `t`, each shares fact whose implied cap (value x the raw close at its
+  `as_of_date`) is out of line with its neighbours by more than
+  `health.shares_cap_jump_ratio` (a halved, mis-dated or mis-scaled count).
+  Report only, no integrity rule; `jumps_before` keeps only facts before it.
 - **Accepted same-day pairs** (`accepted_same_day_pairs`, #855): every
   same-start pair of different tickers that `non_overlapping_listings` would
   fail but the owner accepted in `universe.accepted_same_day_pairs`
@@ -527,7 +532,12 @@ from tradepartner.store.schema import (
     has_retracted,
 )
 from tradepartner.timeutil import ensure_tz_aware_utc
-from tradepartner.universe import shares_as_of, universe_as_of
+from tradepartner.universe import (
+    SHARES_CAP_JUMP_SCHEMA,
+    shares_as_of,
+    shares_cap_jumps,
+    universe_as_of,
+)
 
 STATIC = "snapshot_static"
 #: The classification ingest's staleness check counts, with benchmarks.
@@ -959,6 +969,16 @@ class SharesOutliers:
     def pending(self) -> pl.DataFrame:
         """The out-of-line facts the owner has not accepted."""
         return self.frame.filter(~pl.col("accepted"))
+
+
+@dataclass(frozen=True, eq=False)
+class SharesCapJumps:
+    """The shares cap-jump review list at `t` (#3055, `universe.shares_cap_jumps`),
+    one row per fact whose implied cap is out of line, only `as_of_date`s before
+    `before` when it is set. Report only: no integrity rule reads it."""
+
+    frame: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=SHARES_CAP_JUMP_SCHEMA))
+    before: date | None = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -2079,6 +2099,8 @@ class HealthReport:
     incremental_edgar: IncrementalEdgar = field(default_factory=lambda: IncrementalEdgar({}))
     #: The latest Form 4 writer run's rule 5 comparison (T351); `None` before one ran.
     form4_compare: Form4Compare | None = None
+    #: The shares cap-jump review list (#3055).
+    shares_cap_jumps: SharesCapJumps = field(default_factory=SharesCapJumps)
     #: Bar gaps with a close jump on one id (#3056); report-only.
     spliced: SplicedSeries = field(
         default_factory=lambda: SplicedSeries(pl.DataFrame([], schema=_SPLICED_SCHEMA))
@@ -2228,6 +2250,7 @@ def health_report(
         price_jumps=_price_jumps(conn, t, settings, jumps_before),
         spliced=spliced_series(conn, t, settings),
         shares_outliers=_shares_outliers(conn, t, settings, jumps_before),
+        shares_cap_jumps=_shares_cap_jumps(conn, t, settings, jumps_before),
         accepted_same_day_pairs=AcceptedSameDayPairs(accepted_pairs),
         settings={
             "liquidity_rule_enabled": settings.universe.liquidity_rule_enabled,
@@ -2330,6 +2353,15 @@ def _shares_outliers(
     if before is not None:
         frame = frame.filter(pl.col("as_of_date") < before)
     return SharesOutliers(frame, before)
+
+
+def _shares_cap_jumps(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings, before: date | None
+) -> SharesCapJumps:
+    frame = shares_cap_jumps(conn, t, settings)
+    if before is not None:
+        frame = frame.filter(pl.col("as_of_date") < before)
+    return SharesCapJumps(frame, before)
 
 
 #: `statement_<name>: <N>` (T77b's run-message convention, not yet built:

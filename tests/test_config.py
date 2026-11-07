@@ -3146,7 +3146,8 @@ def test_a_window_frozen_with_a_bad_short_key_is_refused(key: str, value: float)
 # --- the known-answer index check (#1598, T243) ---------------------------------
 
 
-def test_index_check_defaults_are_the_amendments_eight_keys() -> None:
+def test_index_check_defaults_are_the_amendments_eight_keys_plus_close_gap() -> None:
+    """The T243 amendment's eight keys, plus `max_close_gap` (#3077) for `close-gap`."""
     cfg = Settings(_env_file=None).index_check
     assert cfg.model_dump() == {
         "start_month": "2019-08",
@@ -3157,6 +3158,7 @@ def test_index_check_defaults_are_the_amendments_eight_keys() -> None:
         "worst_months": 10,
         "names_per_month": 5,
         "extreme_name_return": 0.60,
+        "max_close_gap": 0.005,
     }
 
 

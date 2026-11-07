@@ -48,6 +48,16 @@ that decided the exit: the value sold is the close already marked. It pays
 session on and the proceeds sit in cash.
 Exit notional and costs are added to the row's `turnover` and `cost_paid`.
 
+**Late splits** (#3096): a split first known after its ex-date, or re-dated or
+cancelled by the vendor, was marked by the earlier steps with the splits their reads
+knew, so a carried value booked the raw jump. Step i reads `late_splits(t_prev, t)` for
+every name ever held and the benchmarks and, before it carries, re-bases each position
+held across the ex-date by the ratio (shares x ratio on the ex-date, the broker's book):
+`n_late_splits` counts them on the rebalance row, written only when non-zero. The rows
+already written are not restated (req 2). When a fill or an exit since the ex-date has
+already traded on the unrepaired value, no re-base is tradable and the trial is refused
+(`_rebase_late_splits`). A split known in time never reaches this path.
+
 **Hold mode and the band** (backtest spec amendment #1731, T209b): under
 `strategy.weighting = "hold"` each cost level's book keeps the plan index at which every
 held name entered (`_Book.entries`) and `portfolio.hold_membership` decides, at each fill,
@@ -741,6 +751,55 @@ def _held_before(book: _Book, sid: str, ex_date: date) -> bool:
     return previous_session(ex_date) in book.held_on.get(sid, set())
 
 
+def _rebase_late_splits(book: _Book, late: pl.DataFrame, signed: bool) -> int:
+    """Re-base `book` for the splits the step's read knows differently from the last
+    one, on ex-dates already marked (#3096), and return how many apply to a name held
+    across its ex-date (`n_late_splits`).
+
+    Each earlier step marked the ex-date with the splits its own read knew, so a value
+    carried across it booked the raw jump (or a phantom split's move) as return. The
+    broker's book is the truth: the share count changed on the ex-date and the value
+    did not. So a position still held since before the ex-date, with no fill since and a
+    mark at or after it, is multiplied by `ratio` (shares x ratio, the jump cancels).
+    A position whose last mark precedes the ex-date booked nothing; this step's frame
+    prices it from that mark, so only the count moves. Otherwise a fill or an exit has
+    already traded on the unrepaired value (or, in a signed book, a drift-cover test has
+    weighed it), no re-base can make the book tradable, and the trial is refused with a
+    `ValueError` naming the split. A name no longer held is refused even when its exit
+    was at a mark before the ex-date (a stale exit that booked nothing): the book keeps
+    no history to tell, so it fails closed. At `daily` cadence the last fill is T_i, at
+    or after every such ex-date, so every booked late split refuses. A benchmark has
+    no fill after F_0, so its value is re-based whenever its mark crossed an ex-date
+    after F_0; it adds nothing to the count, which is the strategy's."""
+    fills = [row.fill_session for row in book.rebalances]
+    n_late = 0
+    for sid, ex, ratio in late.select("security_id", "ex_date", "ratio").iter_rows():
+        for holding in book.benchmarks.values():
+            marked = holding.marked_at
+            if holding.security_id == sid and marked is not None and fills[0] < ex <= marked:
+                holding.value *= ratio
+        if not _held_before(book, sid, ex):
+            continue
+        n_late += 1
+        marked = book.marked_at.get(sid)
+        if sid in book.positions and marked is not None and marked < ex:
+            continue
+        if sid not in book.positions or signed or fills[-1] >= ex:
+            raise ValueError(
+                f"late split on {sid} ex {ex.isoformat()} (ratio {ratio}): first known after "
+                "a fill or exit already used the unrepaired value, so the book cannot be "
+                "re-based to the tradable one (#3096); the trial is refused"
+            )
+        book.positions[sid] *= ratio
+    return n_late
+
+
+def _late_split_ids(ever_held: Sequence[str], benchmarks: Mapping[str, str]) -> tuple[str, ...]:
+    """The `late_splits` read's ids: every name the variant ever held and the
+    benchmarks (#3096)."""
+    return tuple(sorted({*ever_held, *benchmarks.values()}))
+
+
 def _spin_off_path(sid: str, mapping: Mapping[str, str]) -> tuple[str, ...]:
     """IDs from a parent through its live successors, stopping before a cycle."""
     path: list[str] = []
@@ -918,6 +977,7 @@ def _step(
     spin_offs: tuple[pl.DataFrame, pl.DataFrame] | None = None,
     chains: Sequence[tuple[str, str]] = (),
     decision_frames: Mapping[date, pl.DataFrame] | None = None,
+    late_splits: pl.DataFrame | None = None,
 ) -> None:
     """Carry, fill, value and exit one cost level through the period (T_i, T_{i+1}].
 
@@ -933,8 +993,13 @@ def _step(
     pays the borrow fee (the carry window to the fill included) and accrues `rf(s)` on
     free cash only, and an equity that is not positive ends the run with a `ValueError`
     naming the session. A drift cover remains pending through missing bars until its
-    next fill bar or the ordinary stale exit."""
+    next fill bar or the ordinary stale exit.
+
+    `late_splits` is the step's `late_splits(t_prev, t)` read (#3096): before anything is
+    carried, `_rebase_late_splits` re-bases the positions and benchmarks it applies to
+    and the row counts them as `n_late_splits` (written only when non-zero)."""
     signed = params.portfolio.side == "long_short"
+    n_late_splits = 0 if late_splits is None else _rebase_late_splits(book, late_splits, signed)
     fill_price = params.execution.fill_price
     carried = carry_to_fill(
         book.positions,
@@ -1192,6 +1257,9 @@ def _step(
     if spin_offs is not None:
         counts = dict(counts)
         counts.update(_spin_off_counts(book, plan.session, end, spin_offs, chains))
+    if n_late_splits:
+        counts = dict(counts)
+        counts["n_late_splits"] = n_late_splits
 
     book.cash = cash
     previous_positions = set(book.positions)
@@ -1397,7 +1465,7 @@ def _keyed_call(provider: DataProvider, key: _Key, ids: list[str], bound: date |
         if bound is None:
             return provider.adjusted_prices(t, ids, include_dividends)
         return provider.adjusted_prices(t, ids, include_dividends, sessions_from=bound)
-    if method == "late_dividends" or method == "late_spin_offs":
+    if method in ("late_dividends", "late_splits", "late_spin_offs"):
         return cast(Callable[[datetime, datetime, list[str]], object], getattr(provider, method))(
             t, cast(datetime, args[1]), ids
         )
@@ -1556,6 +1624,9 @@ class _SharedReads:
     def late_dividends(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         return cast(pl.DataFrame, self._read(("late_dividends", t_prev, t), ids))
 
+    def late_splits(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return cast(pl.DataFrame, self._read(("late_splits", t_prev, t), ids))
+
     def unvalued_spin_offs(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         return cast(pl.DataFrame, self._read(("unvalued_spin_offs", t), ids))
 
@@ -1661,6 +1732,9 @@ class _Requests:
 
     def late_dividends(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         return self._ask(("late_dividends", t_prev, t), ids)
+
+    def late_splits(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return self._ask(("late_splits", t_prev, t), ids)
 
     def unvalued_spin_offs(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         return self._ask(("unvalued_spin_offs", t), ids)
@@ -2022,6 +2096,10 @@ def _run_group(
         view.share(("listing_ends", t), [(ids, None) for ids, _, _ in own])
         view.share(("dropped_dividends", t), [(ids, None) for ids, _, _ in own])
         view.share(("late_dividends", t_prev, t), [(held, None) for _, _, held in own])
+        view.share(
+            ("late_splits", t_prev, t),
+            [(_late_split_ids(held, benchmarks), None) for _, _, held in own],
+        )
         # A spin-off read happens only under the opt-in key (#1894, item 3), so a group
         # with no `adjust.apply_spin_offs = true` variant makes none and stays byte-identical.
         if any(variant.settings.adjust.apply_spin_offs for variant in group):
@@ -2198,6 +2276,7 @@ def _variant_step(
     ended = _ended(view.listing_ends(t, ids), step_end)
     dropped = view.dropped_dividends(t, ids)
     late = view.late_dividends(t_prev, t, ever_held)
+    late_splits = view.late_splits(t_prev, t, _late_split_ids(ever_held, benchmarks))
     spin_offs: tuple[pl.DataFrame, pl.DataFrame] | None = None
     if params.adjust.apply_spin_offs:
         # The late reader selects raw `source_action_id` parents. Keep the
@@ -2244,6 +2323,7 @@ def _variant_step(
             spin_offs,
             chains,
             decisions,
+            late_splits,
         )
         if book.series == STRATEGY_SERIES:
             _benchmark_step(book, plan, step_end, frame, raw, params)

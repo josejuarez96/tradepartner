@@ -972,15 +972,26 @@ def test_a_cached_delisting_makes_no_request(tmp_path: Path) -> None:
     assert router.urls[before:] == []
 
 
+def _document_payload(
+    cik: int, accession: str, accepted: str, *, form: str, document: str
+) -> dict[str, object]:
+    """As `_xml_payload`, with the `primaryDocument` given (#3084)."""
+    payload = _xml_payload(cik, accession, accepted, form=form)
+    payload["filings"]["recent"]["primaryDocument"] = [document]  # type: ignore[index]
+    return payload
+
+
 def test_a_pre_xml_form_25_is_not_downloaded_and_is_counted(tmp_path: Path) -> None:
-    """`_index_payload`'s recorded documents are all `doc.htm`: not XML, so
-    `parse_delisting` (XML only) is never even called for it."""
+    """A text Form 25 (`.txt`, the pre-2001 shape) is neither XML nor an
+    issuer's HTML form, so it is never even fetched (#3084 kept this)."""
     form_25 = "0005555555-26-000001"
     line = index_line("25", "Old Corp", 5555555, "2026-09-01", form_25)
     router = _delisting_router(line)
     router.add(
         f"{SUBMISSIONS_URL}CIK0005555555.json",
-        _index_payload(5555555, (form_25, "25", "2026-09-01T20:00:00")),
+        _document_payload(
+            5555555, form_25, "2026-09-01T20:00:00", form="25", document="form25.txt"
+        ),
     )
     _add_klx_document(router)
     source = _delisting_source(router, tmp_path)
@@ -991,6 +1002,93 @@ def test_a_pre_xml_form_25_is_not_downloaded_and_is_counted(tmp_path: Path) -> N
     # submissions are fetched (to know the primary document is `doc.htm`),
     # but no `Archives/edgar/data/...` document request for it
     assert not any("Archives/edgar/data/5555555" in u for u in router.urls)
+
+
+#: An issuer's HTML Form 25 (#3084), in the shape `test_edgar_form25_html` reads.
+_HTML_FORM_25 = (
+    "<html><body><p>FORM 25</p><p>Commission File Number 001-11111</p>"
+    "<p>Html Corp</p><p>The Nasdaq Stock Market LLC</p>"
+    "<p>(Exact name of Issuer as specified in its charter, and name of Exchange where "
+    "security is listed and/or registered)</p><p>1 Main St</p>"
+    "<p>(Address, including zip code, and telephone number, including area code, of "
+    "Issuer&#8217;s principal executive offices)</p><p>Common Stock, $0.01 par value</p>"
+    "<p>(Description of class of securities)</p></body></html>"
+)
+
+
+def _html_form_25(
+    tmp_path: Path, body: str, *, form: str = "25", document: str = "form25.htm"
+) -> tuple[EdgarRouter, EdgarFilingSource, str]:
+    accession = "0005555580-26-000001"
+    router = _delisting_router(index_line(form, "Html Corp", 5555580, "2026-09-01", accession))
+    router.add(
+        f"{SUBMISSIONS_URL}CIK0005555580.json",
+        _document_payload(5555580, accession, "2026-09-01T20:00:00", form=form, document=document),
+    )
+    router.add(_download_url("0005555580", accession, document), body)
+    _add_klx_document(router)
+    return router, _delisting_source(router, tmp_path), accession
+
+
+def test_an_issuers_html_form_25_is_read_and_cached(tmp_path: Path) -> None:
+    """#3084: an issuer's own Form 25 is HTML; it is read under its one CIK,
+    stamped at its acceptance, and served from the cache afterwards."""
+    router, source, accession = _html_form_25(tmp_path, _HTML_FORM_25)
+    [html] = [d for d in source.delistings() if d.accession == accession]
+    assert (html.cik, html.form, html.class_title, html.exchange) == (
+        "0005555580",
+        "25",
+        "Common Stock, $0.01 par value",
+        "NASDAQ",
+    )
+    assert html.accepted_at == datetime(2026, 9, 1, 20, 0, tzinfo=UTC)
+    assert source.pre_xml_delistings == 0
+    assert source.unread_html_delistings == 0
+    document_url = _download_url("0005555580", accession, "form25.htm")
+    assert router.urls.count(document_url) == 1
+
+    before = len(router.urls)
+    assert accession in {d.accession for d in source.delistings()}
+    assert document_url not in router.urls[before:]
+
+
+def test_an_unreadable_html_form_25_is_counted_not_failed_and_not_refetched(
+    tmp_path: Path,
+) -> None:
+    """A layout naming no exchange (a third of sampled issuers) is no
+    malformed filing: no row, no failure (which would trip the run's
+    failure share), counted on `.unread_html_delistings` and never fetched
+    again under this `DELISTING_HTML_VERSION`."""
+    body = _HTML_FORM_25.replace("<p>The Nasdaq Stock Market LLC</p>", "")
+    router, source, accession = _html_form_25(tmp_path, body)
+    assert accession not in {d.accession for d in source.delistings()}
+    assert source.unread_html_delistings == 1
+    assert source.failed_filings == 0
+    source.check_failures()  # no failure to trip the run
+    document_url = _download_url("0005555580", accession, "form25.htm")
+    before = len(router.urls)
+    assert accession not in {d.accession for d in source.delistings()}
+    assert source.unread_html_delistings == 1
+    assert document_url not in router.urls[before:]
+
+
+@pytest.mark.parametrize(("form", "document"), [("25-NSE", "form25.htm"), ("25", "form25.pdf")])
+def test_an_html_25nse_or_another_document_stays_pre_xml(
+    tmp_path: Path, form: str, document: str
+) -> None:
+    """Only an issuer's `25`/`25/A` as `.htm`/`.html` is read as HTML; an
+    exchange's 25-NSE is always the XML form."""
+    accession = "0005555581-26-000001"
+    router = _delisting_router(index_line(form, "Html Corp", 5555581, "2026-09-01", accession))
+    router.add(
+        f"{SUBMISSIONS_URL}CIK0005555581.json",
+        _document_payload(5555581, accession, "2026-09-01T20:00:00", form=form, document=document),
+    )
+    _add_klx_document(router)
+    source = _delisting_source(router, tmp_path)
+    assert accession not in {d.accession for d in source.delistings()}
+    assert source.pre_xml_delistings == 1
+    assert not any("Archives/edgar/data/5555581" in u for u in router.urls)
 
 
 def test_an_http_error_on_a_delisting_document_propagates(tmp_path: Path) -> None:

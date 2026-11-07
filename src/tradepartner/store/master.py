@@ -240,6 +240,10 @@ class MasterBuild:
     #: entries (#821), and the entries that derive none with their reason.
     chains: tuple[Chain, ...] = ()
     chain_refusals: tuple[ChainRefusal, ...] = ()
+    #: Name changes (`symbol_changes`) judged for a missing new-ticker
+    #: listing row (#3057): the refusals with their reasons; the rows that
+    #: passed are in `listings` (`provenance = 'snapshot'`).
+    rename_refusals: tuple[RenameRefusal, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -583,6 +587,75 @@ def _named_common_titles(title: str) -> tuple[str, ...]:
     return tuple(names)
 
 
+#: A listing title's tail naming the units (or SAIL securities) a class also
+#: trades inside: "Class A common stock included as part of the units" is a
+#: SPAC's common class, the shares themselves (#3084).
+_UNIT_COMPONENT = re.compile(
+    r"[\s,]*\b(?:included|includes)\s+(?:as\s+(?:a\s+)?part\s+of|in)\s+"
+    r"(?:the\s+|each\s+)?(?:units?\b|sail\S*\s+securities\b).*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+#: `_NOT_COMMON_WORDS` at a word start ("Community Bancorp" names no unit),
+#: plus the words of other classes that describe themselves against common
+#: stock ("Preference Shares, convertible into Common Stock", "Subscription
+#: Receipts, each exchangeable for one common share", EDGAR's "Depository").
+#: Read by `_form25_title` only; `_NOT_COMMON_WORDS` is unchanged.
+_OTHER_CLASS_WORD = re.compile(
+    r"\b(?:"
+    + "|".join(
+        (
+            *_NOT_COMMON_WORDS,
+            "preference",
+            "depository",
+            "exchangeable",
+            "convertible",
+            "receipt",
+            "subscription",
+            "option",
+            "bond",
+            "trust",
+            "interest",
+        )
+    )
+    + ")",
+    re.IGNORECASE,
+)
+#: A title that is a company name or par value, then a class name:
+#: "HD Supply Holdings, Inc. common stock, par value ...", "ShockWave Medical
+#: Inc., common stock ...", "$.01 Par Value, Common Stock". The head holds at
+#: most one comma and ends in a legal suffix or a par value; `rest` starts
+#: with the class name itself.
+_NAME_THEN_CLASS = re.compile(
+    r"\A(?P<head>[^,]*?(?:,[^,]*?)?\b(?:inc|incorporated|corp|corporation|co|company|"
+    r"ltd|limited|llc|plc|holdings|group|bancorp|par\s+value|no\s+par)\.?)\s*,?\s+"
+    r"(?P<rest>(?:(?:class|series)\s+[a-z0-9]{1,2}\s+)?(?:common|ordinary|capital\s+stock)"
+    r"\b.*)\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _form25_title(title: str) -> str:
+    """`title` as Form 25 class matching reads it (#3084), never as a
+    class's identity (`_norm_title`, which names ids, is unchanged):
+
+    - a unit-component tail is dropped ("Class A common stock included as
+      part of the units" reads "Class A common stock");
+    - a title naming no other class (`_OTHER_CLASS_WORD`) whose head before
+      the first comma names no common equity reads from its class name only
+      when the head is a company name or a par value (`_NAME_THEN_CLASS`).
+      A description after a comma ("Shares, convertible into Common Stock")
+      is never read as the class.
+
+    Anything else is returned as it is."""
+    cut = _UNIT_COMPONENT.sub("", title)
+    if _is_common(cut) or _OTHER_CLASS_WORD.search(cut):
+        return cut
+    match = _NAME_THEN_CLASS.match(cut.strip())
+    return match.group("rest") if match else cut
+
+
 def _form25_classes[K](title: str, classes: Mapping[K, Collection[str | None]]) -> tuple[K, ...]:
     """The keys of `classes` (each class listed on the Form 25's exchange,
     with its titles there; `None` is an untitled row) that a Form 25
@@ -602,7 +675,27 @@ def _form25_classes[K](title: str, classes: Mapping[K, Collection[str | None]]) 
        exact title match gives, never a guessed class); failing that, for a
        plain-common title naming at most one class, the one class whose
        titles are all plain common.
-    Anything else is `()`: never a guess."""
+    Anything else is `()`: never a guess.
+
+    4. Only when 1-3 resolve nothing, 1-3 again with every title, the
+       filing's and the classes', read through `_form25_title` (#3084), so
+       a filing resolved today keeps exactly its classes."""
+    found = _form25_classes_read(title, classes)
+    if found:
+        return found
+    return _form25_classes_read(
+        _form25_title(title),
+        {
+            key: [None if t is None else _form25_title(t) for t in titles]
+            for key, titles in classes.items()
+        },
+    )
+
+
+def _form25_classes_read[K](
+    title: str, classes: Mapping[K, Collection[str | None]]
+) -> tuple[K, ...]:
+    """`_form25_classes`' rules 1-3 over the titles as given."""
 
     def by_title(name: str) -> list[K]:
         return [
@@ -1117,6 +1210,207 @@ def _first_per_line(entries: Iterable[CompanySnapshotEntry]) -> tuple[CompanySna
     return tuple(first.values())
 
 
+@dataclass(frozen=True)
+class RenameChange:
+    """One stored `symbol_changes` revision, as the master judges it (#3057).
+
+    `held_by` are the `(security_id, exchange)` of every *other* security whose
+    listing in force on the change's session was already the new ticker."""
+
+    security_id: str
+    old_symbol: str
+    new_symbol: str
+    process_date: date
+    known_at: datetime
+    held_by: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class RenameListing:
+    """A listing row `derive_rename_listings` adds: the new ticker from the
+    change's session, known when the evidence for it was."""
+
+    security_id: str
+    ticker: str
+    exchange: str
+    valid_from: date
+    known_at: datetime
+
+
+@dataclass(frozen=True)
+class RenameRefusal:
+    """A name change that adds no row, and why (`RENAME_*`)."""
+
+    security_id: str
+    old_symbol: str
+    new_symbol: str
+    reason: str
+
+
+RENAME_OLD_NOT_CURRENT = "old_ticker_not_current"  # the class showed another ticker that day
+RENAME_NO_EVIDENCE = "no_evidence"  # no ticker-file fetch or listing row shows the new ticker
+RENAME_EXCHANGE_DIFFERS = "exchange_differs"  # the evidence is on another exchange
+RENAME_HELD = "new_ticker_held"  # another security held the new ticker that day
+
+
+def derive_rename_listings(
+    listings: Iterable[Mapping[str, Any]],
+    fetches: Iterable[CompanySnapshotEntry],
+    renames: Iterable[RenameChange],
+    *,
+    ingested_at: datetime,
+) -> tuple[tuple[RenameListing, ...], tuple[RenameRefusal, ...]]:
+    """The new-ticker listing rows a name change implies (#3057). Pure.
+
+    A cover page names a rename only when the filing carries its 12(b) block;
+    Revvity's (PKI -> RVTY, 2023-05) and Expand Energy's (CHK -> EXE, 2024-10)
+    10-Ks and 10-Qs carry none, so the class kept its old ticker for years
+    and a ticker-keyed read saw no bars. A change adds a row when: the class's
+    listing in force on the change's session (`process_date`, rolled to a
+    session) shows the old ticker; no row of the class already shows the new
+    ticker by then; the new ticker is evidenced, by a SEC ticker-file fetch
+    (`fetches`) taken after the change was known or by a later listing row of
+    the class; that evidence is on the old listing's exchange; and no other
+    security held the new ticker there (`RenameChange.held_by`). The row
+    starts on the change's session and is known at the evidence (never
+    before the change was known), so a read before it sees the old ticker.
+    A change that was not yet known at `ingested_at` is skipped. Each other
+    case is returned as a `RenameRefusal`."""
+    rows_by_id: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in listings:
+        rows_by_id[row["security_id"]].append(row)
+    seen_fetches: dict[tuple[str, str], list[CompanySnapshotEntry]] = defaultdict(list)
+    for fetch in fetches:
+        seen_fetches[(fetch.cik, fetch.ticker)].append(fetch)
+    added: dict[tuple[str, str, str, date], RenameListing] = {}
+    refused: list[RenameRefusal] = []
+    for change in sorted(renames, key=lambda c: (c.security_id, c.process_date, c.new_symbol)):
+        old, new, sid = change.old_symbol, change.new_symbol, change.security_id
+        if old == new or change.known_at > ingested_at:
+            continue
+        start = _session_on_or_after(change.process_date)
+        rows = rows_by_id.get(sid, [])
+        if any(r["ticker"] == new and r["valid_from"] <= start for r in rows):
+            continue  # a cover page or an earlier run already starts it
+        in_force = [r for r in rows if r["valid_from"] <= start]
+        current = max(in_force, key=lambda r: (r["valid_from"], r["known_at"]), default=None)
+        if current is None or current["ticker"] != old:
+            refused.append(RenameRefusal(sid, old, new, RENAME_OLD_NOT_CURRENT))
+            continue
+        evidence: list[tuple[datetime, str]] = [
+            (fetch.fetched_at, fetch.exchange)
+            for fetch in seen_fetches.get((security_cik(sid), new), ())
+            if fetch.fetched_at >= change.known_at
+        ]
+        evidence += [(r["known_at"], r["exchange"]) for r in rows if r["ticker"] == new]
+        if not evidence:
+            refused.append(RenameRefusal(sid, old, new, RENAME_NO_EVIDENCE))
+            continue
+        on_exchange = [item for item in evidence if item[1] == current["exchange"]]
+        if not on_exchange:
+            refused.append(RenameRefusal(sid, old, new, RENAME_EXCHANGE_DIFFERS))
+            continue
+        if any(holder != sid for holder, _ex in change.held_by):  # on any exchange
+            refused.append(RenameRefusal(sid, old, new, RENAME_HELD))
+            continue
+        known_at = max(min(at for at, _ in on_exchange), change.known_at)
+        if known_at > ingested_at:
+            continue
+        key = (sid, new, current["exchange"], start)
+        added[key] = RenameListing(sid, new, current["exchange"], start, known_at)
+    return tuple(added.values()), tuple(refused)
+
+
+_STORED_RENAMES_SQL = """
+    SELECT security_id, old_symbol, new_symbol, process_date, known_at
+    FROM (
+        SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY security_id, source_action_id,
+                CASE WHEN source_action_id = '' THEN old_symbol ELSE '' END,
+                CASE WHEN source_action_id = '' THEN new_symbol ELSE '' END,
+                CASE WHEN source_action_id = '' THEN process_date ELSE NULL END
+            ORDER BY known_at DESC
+        ) AS _rn
+        FROM symbol_changes WHERE known_at <= ?
+    ) WHERE _rn = 1
+    ORDER BY security_id, process_date, new_symbol
+"""
+
+
+def stored_rename_changes(
+    conn: duckdb.DuckDBPyConnection, at: datetime, ciks: Collection[str] | None = None
+) -> tuple[RenameChange, ...]:
+    """The store's `symbol_changes` known at `at` as `RenameChange`s (#3057),
+    each with the other securities that held its new ticker on its session.
+    `ciks` limits them to those CIKs' securities. None on a store without the
+    table."""
+    at = _validate_t(at)
+    tables = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
+    if "symbol_changes" not in tables:
+        return ()
+    changes = [
+        row
+        for row in conn.execute(_STORED_RENAMES_SQL, [at]).fetchall()
+        if ciks is None or security_cik(row[0]) in ciks
+    ]
+    news = sorted({row[2] for row in changes})
+    holders: dict[str, set[str]] = defaultdict(set)  # new ticker -> securities ever showing it
+    if news:
+        for sid, ticker in conn.execute(
+            "SELECT DISTINCT security_id, ticker FROM listings "
+            "WHERE known_at <= ? AND list_contains(?, ticker)",
+            [at, news],
+        ).fetchall():
+            holders[ticker].add(sid)
+    latest = _latest_listing_rows(conn, at, {sid for ids in holders.values() for sid in ids})
+    out: list[RenameChange] = []
+    for sid, old, new, process_date, known_at in changes:
+        start = _session_on_or_after(process_date)
+        held = tuple(
+            sorted(
+                {
+                    (other, held[1])
+                    for other in holders.get(new, ())
+                    if other != sid
+                    and (held := latest_in_force(latest.get(other, ()), start)) is not None
+                    and held[0] == new
+                }
+            )
+        )
+        out.append(RenameChange(sid, old, new, process_date, known_at, held))
+    return tuple(out)
+
+
+def _latest_listing_rows(
+    conn: duckdb.DuckDBPyConnection, at: datetime, security_ids: Collection[str]
+) -> dict[str, list[tuple[date, datetime, str, str]]]:
+    """`(valid_from, known_at, ticker, exchange)` of each live listing row of `security_ids`
+    known at `at`, by security."""
+    out: dict[str, list[tuple[date, datetime, str, str]]] = defaultdict(list)
+    if not security_ids:
+        return out
+    for sid, valid_from, known_at, ticker, exchange in conn.execute(
+        "SELECT security_id, valid_from, known_at, ticker, exchange FROM listings "
+        "WHERE known_at <= ? AND list_contains(?, security_id) "
+        "QUALIFY NOT retracted AND row_number() OVER (PARTITION BY security_id, ticker, "
+        "exchange, valid_from ORDER BY known_at DESC) = 1",
+        [at, sorted(security_ids)],
+    ).fetchall():
+        out[sid].append((valid_from, known_at, ticker, exchange))
+    return out
+
+
+def latest_in_force(
+    rows: Sequence[tuple[date, datetime, str, str]], session: date
+) -> tuple[str, str] | None:
+    """The `(ticker, exchange)` of the latest row starting on or before `session`."""
+    in_force = [r for r in rows if r[0] <= session]
+    if not in_force:
+        return None
+    *_, ticker, exchange = max(in_force, key=lambda r: (r[0], r[1]))
+    return ticker, exchange
+
+
 def _filing_index_for_cik(source: FilingSource, cik: str) -> list[FilingIndexEntry]:
     """Use a store-backed CIK query when the source offers one."""
     reader = getattr(source, "filing_index_for_cik", None)
@@ -1157,8 +1451,13 @@ def build_master(
     *,
     ingested_at: datetime,
     earlier_fetches: Sequence[CompanySnapshotEntry] = (),
+    renames: Sequence[RenameChange] = (),
 ) -> MasterBuild:
     """`securities` and `listings` rows for every issuer CIK and benchmark.
+
+    `renames` are the stored `symbol_changes` (`stored_rename_changes`,
+    #3057): a change whose new ticker no cover page or fetch row starts by
+    its date gets a `snapshot` listing row (`derive_rename_listings`).
 
     `earlier_fetches` are companies-snapshot entries from earlier runs
     (`stored_snapshot_fetches`, #2291): judged with `source`'s fetches in
@@ -1255,6 +1554,23 @@ def build_master(
         else:
             missing.append(ticker)
 
+    # One walk of every listing, only when a name change is to be judged.
+    rename_rows, rename_refusals = (
+        derive_rename_listings(builder.listings, every, renames, ingested_at=ingested_at)
+        if renames
+        else ((), ())
+    )
+    for rename in rename_rows:
+        builder.listing(
+            rename.security_id,
+            rename.ticker,
+            rename.exchange,
+            None,
+            rename.valid_from,
+            rename.known_at,
+            provenance="snapshot",
+        )
+
     listed = {row["security_id"] for row in builder.listings}
     return MasterBuild(
         securities=tuple(builder.securities),
@@ -1271,6 +1587,7 @@ def build_master(
         filename_form25_accessions=tuple(filename_form25_accessions),
         filename_enabled=settings.edgar.filename_listings,
         filename_conflict_ciks=tuple(filename_conflict_ciks),
+        rename_refusals=rename_refusals,
     )
 
 

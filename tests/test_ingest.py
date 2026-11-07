@@ -2502,16 +2502,18 @@ def test_edgar_run_message_carries_the_exchange_axis_mismatch_counts(settings: S
 
 
 def test_edgar_run_message_carries_the_pre_xml_delistings_count(settings: Settings) -> None:
-    """T11f: a Form 25/25-NSE skipped pre-fetch (not XML)."""
+    """T11f: a Form 25/25-NSE skipped pre-fetch (not XML); #3084: an issuer's
+    HTML Form 25 read with no class or exchange."""
 
     class Delistings(FixtureFilingSource):
         pre_xml_delistings = 7
+        unread_html_delistings = 3
         unstamped_delistings = 2
 
     message = _run(settings, filings=_filings(cls=Delistings), source="edgar").runs[0].message
     assert (
-        "; pre-XML delistings: 7; unstamped delistings: 2; chain_candidates: none; missing"
-        in message
+        "; pre-XML delistings: 7; unread HTML delistings: 3; unstamped delistings: 2; "
+        "chain_candidates: none; missing" in message
     )
 
 
