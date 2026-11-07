@@ -1717,3 +1717,90 @@ def test_every_static_invariant_test_file_exists() -> None:
 def test_book_page_requires_the_safety_review() -> None:
     path = "src/tradepartner/dashboard/book_page.py"
     assert ready_pr.required_reviews([path]) == {"safety-reviewer"}
+
+
+# ── #3147: the exam ledger's append-only check ─────────────────────────────────────
+
+LEDGER = ready_pr.EXAM_LEDGER
+LEDGER_MAIN = 'budget = 4\nbudget_adr = "docs/decisions/0016.md#a"\n'
+LEDGER_ENTRY = """
+[[exam]]
+seq = 1
+hypothesis = "h"
+hypothesis_fingerprint = "f"
+family = "fam"
+book_id = "b"
+window_id = {window_id}
+start_date = 2027-01-04
+kill_line = "https://github.com/o/r/issues/1#issuecomment-2"
+campaign_k = -1
+outcome = "{outcome}"
+outcome_on = 2027-01-04
+"""
+
+
+def _ledger_runner(branch_text: str | None, main_text: str | None = LEDGER_MAIN) -> FakeRunner:
+    return FakeRunner(
+        touched=[LEDGER, "changelog.d/69-x.md"],
+        deleted=[LEDGER] if branch_text is None else [],
+        main_files={} if main_text is None else {LEDGER: main_text},
+        conflicted={} if branch_text is None else {LEDGER: branch_text},
+        comments=(),
+    )
+
+
+def test_an_appended_pending_exam_entry_passes_the_ledger_check(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    branch = LEDGER_MAIN + LEDGER_ENTRY.format(outcome="pending", window_id=0)
+    assert ready_pr.ready(_ledger_runner(branch), 69, dry_run=True) == 0
+    assert "class B" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("allow_shared_files", [False, True])
+def test_a_ledger_change_that_is_not_append_only_is_refused(allow_shared_files: bool) -> None:
+    main = LEDGER_MAIN + LEDGER_ENTRY.format(outcome="pending", window_id=0)
+    with pytest.raises(ready_pr.ReadyError, match=r"exam_ledger_not_append_only.*removed"):
+        ready_pr.ready(
+            _ledger_runner(LEDGER_MAIN, main),
+            69,
+            dry_run=True,
+            allow_shared_files=allow_shared_files,
+        )
+
+
+def test_an_entry_appended_as_passed_is_refused() -> None:
+    branch = LEDGER_MAIN + LEDGER_ENTRY.format(outcome="passed", window_id=7)
+    with pytest.raises(
+        ready_pr.ReadyError, match=r"exam_ledger_not_append_only.*appended as passed"
+    ):
+        ready_pr.ready(_ledger_runner(branch), 69, dry_run=True)
+
+
+def test_a_budget_raise_without_budget_adr_is_refused() -> None:
+    with pytest.raises(ready_pr.ReadyError, match="budget changed 4 -> 5 without budget_adr"):
+        ready_pr.ready(_ledger_runner(LEDGER_MAIN.replace("4", "5")), 69, dry_run=True)
+
+
+def test_a_budget_or_budget_adr_change_is_named_for_the_owner(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#3147 comment: `check_append_only` lets `budget` move with any new `budget_adr`,
+    so the run names the change; the class-B rule (the owner's word) is what lands it."""
+    branch = LEDGER_MAIN.replace("4", "5").replace("#a", "#b")
+    assert ready_pr.ready(_ledger_runner(branch), 69, dry_run=True) == 0
+    out = capsys.readouterr().out
+    assert "budget 4 -> 5" in out and "budget_adr" in out
+
+
+def test_an_invalid_or_deleted_ledger_is_refused() -> None:
+    with pytest.raises(ready_pr.ReadyError, match="exam_ledger_invalid"):
+        ready_pr.ready(_ledger_runner("budget = 4\n"), 69, dry_run=True)
+    with pytest.raises(ready_pr.ReadyError, match="deletes"):
+        ready_pr.ready(_ledger_runner(None), 69, dry_run=True)
+
+
+def test_a_new_ledger_is_loaded_and_checked_as_appended_to_nothing() -> None:
+    assert ready_pr.exam_ledger_refusal(None, LEDGER_MAIN) is None
+    passed = LEDGER_MAIN + LEDGER_ENTRY.format(outcome="passed", window_id=7)
+    assert "appended as passed" in (ready_pr.exam_ledger_refusal(None, passed) or "")
