@@ -39,6 +39,18 @@ stop's liquidation is not a rebalance. Beside the pool, never instead of it: the
 orders on sessions where a `month_end` book also had orders (#2886, its buys then wait
 for `daily`'s). Point-in-time at `cutoff`: a fill, an order or a stop known after it is
 not read, and each open is read as of its own session's close, which is at or before it.
+
+The arrival split (#3179). Each measured order's total `sign * (VWAP - open) / open`
+is split in two at its arrival, the order's journaled submit time (`orders.known_at`,
+stamped just before the order is sent): `open->arrival = sign * (arrival - open) / open`,
+the market's move before the order existed, and `arrival->fill = total - open->arrival`,
+the cost of trading from the submission. Same sign, same open denominator, same
+notional weights as the total, and the two sum to it. The arrival price comes only from
+the bars this module already reads, the daily bar: an order submitted before its
+session's official open first trades at the open, so its arrival price is the open; an
+order submitted at or after the open has no arrival price (the store holds no intraday
+bar), is counted as `no arrival price`, and is never guessed. Measurement only: the
+total, its statistics and the figure to freeze are unchanged by the split.
 """
 
 from __future__ import annotations
@@ -53,7 +65,7 @@ import duckdb
 import polars as pl
 
 from tradepartner.backtest.frozen import frozen_values
-from tradepartner.calendar import is_session, next_session, session_close
+from tradepartner.calendar import is_session, next_session, session_close, session_open
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
 from tradepartner.store.asof import prices_as_of
@@ -76,8 +88,27 @@ class SideSlippage:
 
 
 @dataclass(frozen=True)
+class ArrivalSplit:
+    """One group's orders that have an arrival price (module docstring), as
+    notional-weighted means in bp: their total and its two terms, `open_to_arrival`
+    (arrival - open) and `arrival_to_fill` (fill - arrival), which sum to it; the
+    means are None when no order of the group has an arrival price."""
+
+    count: int
+    total_wmean_bp: float | None
+    open_to_arrival_wmean_bp: float | None
+    arrival_to_fill_wmean_bp: float | None
+
+
+#: The split of a group with no order priced at arrival.
+NO_SPLIT = ArrivalSplit(0, None, None, None)
+
+
+@dataclass(frozen=True)
 class Slippage:
-    """A window's per-order slippage summary and its exclusion counts."""
+    """A window's per-order slippage summary and its exclusion counts, with the
+    arrival split of the measured orders beside it (`no_arrival` counts the measured
+    orders without an arrival price; they stay in the totals)."""
 
     buy: SideSlippage
     sell: SideSlippage
@@ -85,6 +116,10 @@ class Slippage:
     no_bar: int
     off_session: int = 0
     pending: int = 0
+    buy_split: ArrivalSplit = NO_SPLIT
+    sell_split: ArrivalSplit = NO_SPLIT
+    overall_split: ArrivalSplit = NO_SPLIT
+    no_arrival: int = 0
 
 
 @dataclass(frozen=True)
@@ -117,6 +152,26 @@ def slippage_bp(side: str, price: float, open_price: float) -> float:
     """Signed adverse-positive slippage in bp of one price against its open."""
     sign = 1.0 if side == "buy" else -1.0
     return sign * (price - open_price) / open_price * _BP
+
+
+def arrival_price(open_price: float, session: date, submitted_at: datetime | None) -> float | None:
+    """The order's price at arrival from its session's daily bar: the open when it was
+    submitted before the session's official open (it first trades at the open), else
+    None (no submit time, or submitted at or after the open: the store holds no
+    intraday bar, and a price is never guessed)."""
+    if submitted_at is None or submitted_at >= session_open(session):
+        return None
+    return open_price
+
+
+def split_bp(side: str, price: float, open_price: float, arrival: float) -> tuple[float, float]:
+    """`(open->arrival, arrival->fill)` in bp of the open, signed as `slippage_bp`.
+    The second is the total minus the first, so with the arrival at the open (the
+    only arrival the daily bar prices) the first is 0.0 and the second is the total,
+    bit for bit."""
+    total = slippage_bp(side, price, open_price)
+    drift = slippage_bp(side, arrival, open_price)
+    return drift, total - drift
 
 
 def _session_of(item: OrderedFill) -> date:
@@ -162,13 +217,32 @@ def _group(points: Sequence[tuple[float, float]]) -> SideSlippage:
     return SideSlippage(len(points), wmean, quantile(bps, 0.5), quantile(bps, _P90))
 
 
+def _split(points: Sequence[tuple[float, float, float, float]]) -> ArrivalSplit:
+    """`points` are `(total bp, open->arrival bp, arrival->fill bp, notional)`."""
+    weight = sum(p[3] for p in points)
+    if not points or weight <= 0:
+        return ArrivalSplit(len(points), None, None, None)
+
+    def mean(i: int) -> float:
+        return sum(p[i] * p[3] for p in points) / weight
+
+    return ArrivalSplit(len(points), mean(0), mean(1), mean(2))
+
+
 def summarise(
-    fills: Sequence[OrderedFill], opens: dict[tuple[str, date], float], now: datetime
+    fills: Sequence[OrderedFill],
+    opens: dict[tuple[str, date], float],
+    now: datetime,
+    submitted_at: Mapping[str, datetime] | None = None,
 ) -> Slippage:
     """Pure: the per-order summary of `fills` against `opens` (keyed
-    `(security_id, session)`) as of `now`."""
+    `(security_id, session)`) as of `now`, with the arrival split of each order whose
+    journaled submit time (`submitted_at`, keyed `client_order_id`) prices an arrival.
+    Without `submitted_at` every measured order counts as `no_arrival`."""
+    submitted = submitted_at or {}
     by_side: dict[str, list[tuple[float, float]]] = {"buy": [], "sell": []}
-    no_bar = off_session = pending = 0
+    splits: dict[str, list[tuple[float, float, float, float]]] = {"buy": [], "sell": []}
+    no_bar = off_session = pending = no_arrival = 0
     for order in _orders(fills):
         if session_close(order.session) > now:
             pending += 1
@@ -181,7 +255,14 @@ def summarise(
             no_bar += 1
             continue
         bp = slippage_bp(order.side, order.vwap, open_price)
-        by_side.setdefault(order.side, []).append((bp, abs(order.notional)))
+        weight = abs(order.notional)
+        by_side.setdefault(order.side, []).append((bp, weight))
+        arrival = arrival_price(open_price, order.session, submitted.get(order.client_order_id))
+        if arrival is None:
+            no_arrival += 1
+            continue
+        drift, impact = split_bp(order.side, order.vwap, open_price, arrival)
+        splits.setdefault(order.side, []).append((bp, drift, impact, weight))
     return Slippage(
         buy=_group(by_side["buy"]),
         sell=_group(by_side["sell"]),
@@ -189,6 +270,10 @@ def summarise(
         no_bar=no_bar,
         off_session=off_session,
         pending=pending,
+        buy_split=_split(splits["buy"]),
+        sell_split=_split(splits["sell"]),
+        overall_split=_split([p for pts in splits.values() for p in pts]),
+        no_arrival=no_arrival,
     )
 
 
@@ -235,7 +320,10 @@ def window_slippage(
     fills = store_journal.fills_for(conn, window_id=window_id)
     if sessions is not None:
         fills = _newest_sessions(fills, sessions)
-    return summarise(fills, read_opens(conn, fills), now)
+    submitted = {
+        o.client_order_id: o.known_at for o in store_journal.orders_for(conn, window_id=window_id)
+    }
+    return summarise(fills, read_opens(conn, fills), now, submitted)
 
 
 def slippage_line(s: Slippage) -> str:
@@ -255,13 +343,32 @@ def slippage_line(s: Slippage) -> str:
     )
 
 
+def split_part(name: str, g: ArrivalSplit) -> str:
+    """One group of the arrival split: `<name> n=<k> <open->arrival> + <arrival->fill>
+    = <total>` (bp, notional-weighted), or `<name> n=0`."""
+    drift, impact, total = g.open_to_arrival_wmean_bp, g.arrival_to_fill_wmean_bp, g.total_wmean_bp
+    if drift is None or impact is None or total is None:
+        return f"{name} n={g.count}"
+    return f"{name} n={g.count} {drift:+.2f} + {impact:+.2f} = {total:+.2f}"
+
+
+def split_line(s: Slippage) -> str:
+    """The arrival split line beside `slippage_line` (#3179)."""
+    return (
+        "slippage split at arrival (bp, open->arrival + arrival->fill = total, per order "
+        f"with an arrival price): {split_part('buy', s.buy_split)}; "
+        f"{split_part('sell', s.sell_split)}; {split_part('all', s.overall_split)}; "
+        f"no arrival price {s.no_arrival}"
+    )
+
+
 def slippage_report_lines(s: Slippage | None, unavailable: str | None = None) -> list[str]:
-    """The slippage diagnostic for `paper report`/`paper status` (#1741): the one
-    summary line when it was computed, `slippage n/a (<reason>)` when the
-    computation raised and the caller kept its row, or nothing when there is no
-    summary and no reason to give."""
+    """The slippage diagnostic for `paper report`/`paper status` (#1741): the
+    summary line and its arrival split line (#3179) when it was computed,
+    `slippage n/a (<reason>)` when the computation raised and the caller kept its
+    row, or nothing when there is no summary and no reason to give."""
     if s is not None:
-        return [slippage_line(s)]
+        return [slippage_line(s), split_line(s)]
     return [] if unavailable is None else [f"slippage n/a ({unavailable})"]
 
 
@@ -359,7 +466,7 @@ def measured_cost(
         stop_session=stop_session,
         orders_known_at=orders_known_at,
     )
-    pool = summarise(kept, opens, cutoff)
+    pool = summarise(kept, opens, cutoff, orders_known_at)
     month_end = summarise(
         [item for item in kept if _session_of(item) in month_end_sessions], opens, cutoff
     ).overall
