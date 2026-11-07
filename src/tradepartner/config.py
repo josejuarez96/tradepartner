@@ -924,7 +924,9 @@ class PaperConfig(BaseModel):
     #: once in eight daily sessions, while a 100x, 0.01x or 10x fill (a broker-side bad
     #: print, a unit error) is still far outside. The band is linear, [0.5x, 1.5x]:
     #: a real gap past it still halts (Audit C's extract: one +51.6% takeover gap in
-    #: 7,165 name-sessions, about one halt in 35 daily sessions). After a halt, `paper resume
+    #: 7,165 name-sessions, about one halt in 35 daily sessions). A late split read
+    #: unadjusted (#2089): a 2:1 fill sits at 0.5x, on the edge; 3:2 at 0.67x passes;
+    #: a missed 1:2 reverse split at 2x halts. After a halt, `paper resume
     #: --accept-fill-band` releases once the owner has checked the print. Read at run
     #: time, never frozen, so the open windows see it.
     max_fill_price_deviation: float = Field(default=0.5, gt=0, lt=1)

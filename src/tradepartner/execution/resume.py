@@ -540,6 +540,15 @@ def _band_view_violations(
     return list(fill_band_violations(group, band))
 
 
+def _band_fault_seen(violation: str, reasons: Sequence[str]) -> bool:
+    """Whether a band `violation` (`fill_band_violations`' message, which starts with
+    the order's `client_order_id` and a space and a parenthesis) is named by one of the
+    engagement `reasons`, so an output has shown it to the owner (#3130). The id is
+    matched with its `" ("`, since `tp-...-1` is a prefix of `tp-...-12`."""
+    order = violation.split(" ", 1)[0]
+    return any(f"{order} (" in reason for reason in reasons)
+
+
 def _rejudged_band_violations(
     conn: duckdb.DuckDBPyConnection,
     window: PaperWindowRow,
@@ -831,11 +840,7 @@ def resume(
         # A rejudged fill (#3027) is accepted only once a band engagement since the
         # last release names its order, i.e. once an output has shown it to the owner;
         # until then it refuses (and engages, naming it) even with the flag.
-        unseen = [
-            v
-            for v in prior_violations
-            if not any(v.split(" ", 1)[0] in reason for reason in prior_band_faults)
-        ]
+        unseen = [v for v in prior_violations if not _band_fault_seen(v, prior_band_faults)]
         if prior_violations and (not accept_fill_band or unseen):
             return refuse_bad_fill("fill_price_outside_band: " + "; ".join(prior_violations))
         band_accepted = [

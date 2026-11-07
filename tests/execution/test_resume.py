@@ -601,6 +601,14 @@ def test_accept_fill_band_never_accepts_a_rejudged_fill_nobody_has_seen(
     assert any("tp-unseen" in a for a in second.accepted_fill_band)
 
 
+def test_a_shown_later_attempt_does_not_mark_an_earlier_attempt_seen() -> None:
+    """Review on #3140: `tp-x-1` is a prefix of `tp-x-12`; seen means `"<id> ("`."""
+    shown = ["SystemFaultError: fill_price_outside_band: tp-x-12 (SEC_SPY): fill price 400"]
+    seen = resume_module._band_fault_seen
+    assert seen("tp-x-12 (SEC_SPY): fill price 400 is outside 50%", shown)
+    assert not seen("tp-x-1 (SEC_SPY): fill price 400 is outside 50%", shown)
+
+
 @pytest.mark.parametrize("price, expected", [(200.0, REFUSED), (100.0, RELEASED)])
 def test_a_run_fill_whose_band_engagement_was_never_written_is_rejudged(
     journal_settings: Settings,

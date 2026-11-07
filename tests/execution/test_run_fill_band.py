@@ -48,7 +48,7 @@ def test_the_default_band_is_half_the_reference_price() -> None:
     assert PaperConfig().max_fill_price_deviation == 0.5
 
 
-@pytest.mark.parametrize("factor", [100.0, 0.01, 2.0, 0.45])
+@pytest.mark.parametrize("factor", [100.0, 0.01, 2.0, 1.55, 0.45])
 def test_a_fill_far_outside_the_band_halts_with_a_named_alert(
     env: Env, window: PaperWindowRow, factor: float
 ) -> None:
