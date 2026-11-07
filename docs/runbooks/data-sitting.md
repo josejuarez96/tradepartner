@@ -446,9 +446,9 @@ Every value below comes from the record named beside it:
 | `read_at` (launch start) | 2026-10-31T19:29:43.089Z. It crashed at 19:31:30.937Z: `RuntimeError: no last close for held 0001235010` | 2026-10-31T19:31:49.105Z. It finished at 19:36:01.497Z | the builder's Codex session log, `~/.codex/sessions/2026/10/31/rollout-2026-10-31T15-29-17-01a19370-0f6b-7a60-8734-9b20e045d300.jsonl` (tool-call times). Launch 1 failed in `uv` before Python started and read nothing |
 | window | 2020-08-31 to 2023-12-29 | same | kill line; spec backfill table |
 | configurations, verdict | 1, `incomplete` | 1, `fail` | spec backfill table; desk read |
-| family | `profitability` | same | spec backfill table; holdout 2024-01-01..2026-09-30, no overlap |
-| store read | `data/tradepartner.duckdb.bak-20261031-0441`, read-only | same | the `--store` argument in the session log |
-| `store_max_ingested_at` | `2026-10-31T00:03:40.029464+00:00`, declared | same | that copy is gone. Read-only on the live store (2026-11-07): it is the newest `ingested_at` before 04:41Z. No `ingestion_runs` row started between 00:03:40Z and 16:21:12Z. roles-2691 restamped 30,439 Form 4 rows, but 2.67M rows still carry 00:03:40.029464Z |
+| family | `profitability` | same | spec backfill table. The store's profitability holdout is 2024-01-01..2026-09-30 (read-only, 2026-11-07), so there is no overlap and no `--holdout-reason` |
+| store read | `data/tradepartner.duckdb.bak-20261031-0441`, read-only. The path is relative to the main checkout; the launch read `/Users/josejuarez/Projects/tradepartner/data/…` | same | the `--store` argument in the session log |
+| `store_max_ingested_at` | `2026-10-31T00:03:40.029464+00:00`, declared | same | that copy is gone, so the value was rebuilt read-only from the live store on 2026-11-07. The spec's fallback (line 169) filters on `ingested_at <= read_at`, but that would count rows written after the copy was taken. The filter here is the copy's time, 04:41Z: `store backup` names copies in UTC. 00:03:40.029464Z is the newest `ingested_at` before it. Nothing wrote in the gap from 00:03:40Z to 16:21:12Z: no `ingestion_runs` row started, and no data release was open (none ran between `ops-1549b`, 10-13, and `roles-2691`, opened 10-31T23:27Z). The releases since are roles-2691 and restamp-1382b-retry. They restamp rows to their own, later clock, which can move rows out of the gap but never into it. 2.67M rows still carry 00:03:40.029464Z, so the max holds. Had `0441` been EDT (08:41Z), the gap would give the same value |
 | inputs | none hashed. `companyfacts.zip` was replaced 2026-11-07T00:31:10Z, so today's hash is not the hash that was read; it is a declared pin instead | same | `stat` |
 | desk read, audit | `docs/research/2026-10-31-cash-profitability-long-only-desk-read.md`, audit comment 6548223852 | same | #2704 |
 
@@ -457,15 +457,17 @@ Every value below comes from the record named beside it:
   ```bash
   uv run tradepartner exposures
   uv run tradepartner exposures --candidates --since 2026-10-30
-  uv run python -c 'from tradepartner.config import get_settings; from tradepartner.store.db import open_read_only; from tradepartner.backtest.results import family_n_split; cm = open_read_only(get_settings()); conn = cm.__enter__(); print(family_n_split(conn, "profitability")); print(conn.execute("SELECT exposure_id, candidate_ref, read_at, probe_sha256 FROM research_exposures WHERE candidate_ref = ? ORDER BY exposure_id", ["#2689"]).fetchall()); cm.__exit__(None, None, None)'
-  shasum -a 256 docs/research/2026-10-31-candidate-5-kill-line.md ~/tradepartner-probes/cbl/probe.py
+  uv run python -c 'from tradepartner.config import get_settings; from tradepartner.store.db import open_read_only; from tradepartner.backtest.results import family_n_split; cm = open_read_only(get_settings()); conn = cm.__enter__(); print(family_n_split(conn, "profitability")); print(conn.execute("SELECT exposure_id, candidate_ref, read_at, probe_sha256 FROM research_exposures WHERE candidate_ref = ? ORDER BY exposure_id", ["#2689"]).fetchall()); print(conn.execute("SELECT DISTINCT holdout_start, holdout_end FROM hypotheses WHERE family = ? ORDER BY 1", ["profitability"]).fetchall()); cm.__exit__(None, None, None)'
+  printf '%s  %s\n' 7a2b91fb5ce5427548091a5efd3d669d138b05f68103fd1eeb7810b5f91a15d6 docs/research/2026-10-31-candidate-5-kill-line.md bb32fdb0587cfecc35e9cafd41926ab9d760c19271364fdebe55463b357fb08b ~/tradepartner-probes/cbl/probe.py | shasum -a 256 -c
   TZ=UTC stat -f '%Sm %N' -t '%Y-%m-%dT%H:%M:%SZ' ~/tradepartner-probes/cbl/probe.py
   ```
 
   Expected:
-  - Each `exposures` command prints its header line and no rows. Any other row is a finding: paste it on #3116 before going on.
-  - The snippet prints `FamilyN(trials=1, research=0, exposures=0)` and `[]`. If `[]` lists rows, this step already ran. The commands below then print those ids again and write nothing.
-  - The two hashes are `7a2b91fb…a15d6` and `bb32fdb0…fb08b`.
+  - Each `exposures` command prints its header line and no rows.
+  - The snippet prints `FamilyN(trials=1, research=0, exposures=0)`, then `[]`, then `[(datetime.date(2024, 1, 1), datetime.date(2026, 9, 30))]`.
+  - **Rows already there.** Say the only rows are `#2689` rows whose `read_at` and `probe_sha256` equal launch 2's (19:29:43.089Z, `916339ee…`) or launch 3's (19:31:49.105Z, `bb32fdb0…`). Then this step already ran: run only the commands for a launch that has no row, then go to **After**. Any other row, for any candidate, is a stop. Paste it on #3116 and write nothing, because a new record beside it could not be deleted.
+  - A different holdout line is a stop: the write would refuse or count a holdout spend.
+  - `shasum -c` prints `OK` for both files.
   - The mtime is `2026-10-31T19:31:44Z`. A later mtime means the file was touched, and launch 3 would be refused. Stop.
 
 - [ ] **Rebuild the frozen probe** beside the current one. It writes only `~/tradepartner-probes/cbl/probe-frozen-916339ee.py`. It refuses unless the hunk is found exactly once and the result hashes to the kill line's `916339ee…a770`. A rerun rewrites the same bytes.
@@ -514,20 +516,22 @@ Every value below comes from the record named beside it:
     --note "candidate 5 launch 3, after the crash-only edit (probe mtime 19:31:44Z). read_at is the tool-call start in Codex session 01a19370-0f6b-7a60-8734-9b20e045d300; finished 19:36:01.497Z, output in out.txt. store_max_ingested_at as launch 2's record (#3176)"
   ```
 
-  Each command prints `exposure <id>`. A refusal exits 2 and writes nothing: stop and paste it on #3116. If launch 2 wrote and launch 3 refused, launch 2's row stays (there is no delete), and N is 2. Paste both outputs on #3116 and run nothing more here.
+  Each command prints `exposure <id>`. A refusal exits 2 and a busy store exits 1. Either way nothing is written: stop and paste the output on #3116. If launch 2 wrote and launch 3 refused, launch 2's row stays (there is no delete), and N is 2. Paste both outputs on #3116 and run nothing more here.
 
 - [ ] **After.** Re-run the read-only checks:
 
   ```bash
   uv run tradepartner exposures
   uv run tradepartner exposures --candidates --since 2026-10-30
-  uv run python -c 'from tradepartner.config import get_settings; from tradepartner.store.db import open_read_only; from tradepartner.backtest.results import family_n_split; cm = open_read_only(get_settings()); conn = cm.__enter__(); print(family_n_split(conn, "profitability")); cm.__exit__(None, None, None)'
+  uv run python -c 'from tradepartner.config import get_settings; from tradepartner.store.db import open_read_only; from tradepartner.backtest.results import family_n_split; cm = open_read_only(get_settings()); conn = cm.__enter__(); print(family_n_split(conn, "profitability")); print(conn.execute("SELECT exposure_id, kill_line_basis, kill_line_sha256 FROM research_exposures WHERE candidate_ref = ? ORDER BY exposure_id", ["#2689"]).fetchall()); cm.__exit__(None, None, None)'
   ```
 
   Expected:
-  - Two rows, both `#2689  store  profitability`, window `2020-08-31..2023-12-29`, 1 configuration, holdout `-`, probe `verified`, store `real`. The verdicts are `fail` and `incomplete`.
+  - `exposures` prints two rows, newest first, exactly these after the id:
+    - `#2689  store  profitability  2026-10-31T19:31:49.105000+00:00  2020-08-31..2023-12-29  1  fail  -  verified  real`
+    - `#2689  store  profitability  2026-10-31T19:29:43.089000+00:00  2020-08-31..2023-12-29  1  incomplete  -  verified  real`
   - One candidate line: `#2689  2026-10-31T19:29:43.089000+00:00  2  incomplete,fail  no`.
-  - `FamilyN(trials=1, research=0, exposures=2)`, so profitability N goes from **1 to 3**.
+  - `FamilyN(trials=1, research=0, exposures=2)`, so profitability N goes from **1 to 3**. Both rows show `posted_before_read` and kill-line hash `7a2b91fb5ce5427548091a5efd3d669d138b05f68103fd1eeb7810b5f91a15d6`.
 
   Any other figure is a stop. Paste every printed output on #3116: the two exposure ids against launches 2 and 3, the before and after listings, and N. On #3110, note that #3092 was not recorded, and why (above). Citing the ids in the desk-read note and in `docs/research/claims.toml` is a later PR.
 
