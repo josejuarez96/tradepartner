@@ -899,6 +899,26 @@ def _print_figi_types(report: HealthReport) -> None:
         )
 
 
+def _print_mergers(report: HealthReport) -> None:
+    """The report-only mergers block (#1762, T248e; printed since #3215)."""
+    echo = typer.echo
+    mergers = report.mergers
+    kinds = ", ".join(f"{kind} {n}" for kind, n in mergers.rows_by_kind.items())
+    latest = mergers.latest_known_at.isoformat() if mergers.latest_known_at else "never"
+    runs = ", ".join(f"{k} {v}" for k, v in sorted(mergers.run_counts.items())) or "never"
+    echo(f"mergers: {kinds}; latest known at {latest}; last run: {runs}")
+    echo(f"  merger conflicts: {mergers.conflicts.height}")
+    for row in mergers.conflicts.iter_rows(named=True):
+        echo(f"    {row['security_id']} effective {row['effective_date']}: {', '.join(row['ids'])}")
+    after = mergers.after_effective
+    echo(f"  acquirees with a bar after their effective date: {after.height}")
+    for row in after.iter_rows(named=True):
+        echo(
+            f"    {row['security_id']} effective {row['effective_date']}: "
+            f"{row['bars']} bars, last {row['last_bar']} ({row['kind']})"
+        )
+
+
 def _print_report(report: HealthReport) -> None:
     echo = typer.echo
     echo(f"health at {report.t.isoformat()} (session {report.session.isoformat()})")
@@ -995,6 +1015,10 @@ def _print_report(report: HealthReport) -> None:
     _print_duplicate_dividends(report)
     _print_successor_chains(report)
     _print_borrow(report)
+    _print_mergers(report)
+    if report.delisting_reasons is not None:
+        for line in report.delisting_reasons.lines():
+            echo(line)
     _print_figi_types(report)
     echo(f"settings: {report.settings}")
     _print_coverage_reference(report.coverage_reference)
