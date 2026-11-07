@@ -766,6 +766,7 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
                 "adjust.apply_spin_offs",
                 "strategy.hold_top_fraction",
                 "backtest.delisting_failure_return",
+                "universe.shares_split_dating",
                 "portfolio.",
                 "costs.borrow",
             )
@@ -884,6 +885,7 @@ def _register_more(
             "adjust.apply_spin_offs",
             "strategy.hold_top_fraction",
             "backtest.delisting_failure_return",
+            "universe.shares_split_dating",
             "portfolio.",
             "costs.borrow",
         )
