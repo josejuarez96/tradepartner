@@ -134,7 +134,7 @@ import uuid
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -1467,16 +1467,51 @@ def _refetch_month(
 
 
 def _rows_written(conn: duckdb.DuckDBPyConnection, stamp: datetime) -> list[str]:
-    """The `corporate_actions` rows this write stamped at `stamp`, one line each."""
+    """The `corporate_actions` rows this write stamped at `stamp`, one line
+    each: `"<tag> <security> <type> <ex-date> <amount> known_at=<stamp>"`
+    with the exact stored amount (#3074 review). The tag is `revision` when
+    the row's identity (#108: the source id, else security, type and
+    ex-date) was stored before; `collision` when it is new but another live
+    identity of the security already holds that type and ex-date (a source
+    re-issuing an event under a new id would apply it twice); else `new`."""
     rows = conn.execute(
-        "SELECT security_id, action_type, ex_date, ratio_or_amount, cancelled "
-        "FROM corporate_actions WHERE ingested_at = ? ORDER BY 1, 2, 3",
+        """
+        WITH ident AS (
+            SELECT *, CASE WHEN coalesce(source_action_id, '') <> '' THEN source_action_id
+                      ELSE action_type || '|' || CAST(ex_date AS VARCHAR) END AS key
+            FROM corporate_actions
+        ),
+        latest AS (
+            SELECT * FROM ident
+            QUALIFY row_number() OVER (
+                PARTITION BY security_id, key ORDER BY ingested_at DESC, known_at DESC
+            ) = 1
+        )
+        SELECT w.security_id, w.action_type, w.ex_date, w.ratio_or_amount, w.cancelled,
+               w.known_at,
+               EXISTS (
+                   SELECT 1 FROM ident o
+                   WHERE o.security_id = w.security_id AND o.key = w.key
+                     AND o.ingested_at < w.ingested_at
+               ) AS revision,
+               EXISTS (
+                   SELECT 1 FROM latest l
+                   WHERE l.security_id = w.security_id AND l.action_type = w.action_type
+                     AND l.ex_date = w.ex_date AND l.key <> w.key AND NOT l.cancelled
+               ) AS collision
+        FROM ident w WHERE w.ingested_at = ?
+        ORDER BY 1, 2, 3, 6
+        """,
         [stamp],
     ).fetchall()
-    return [
-        f"{sid} {kind} {ex} {amount:g}{' cancelled' if cancelled else ''}"
-        for sid, kind, ex, amount, cancelled in rows
-    ]
+    lines = []
+    for sid, kind, ex, amount, cancelled, known_at, revision, collision in rows:
+        tag = "revision" if revision else "collision" if collision else "new"
+        lines.append(
+            f"{tag} {sid} {kind} {ex} {amount!r}{' cancelled' if cancelled else ''} "
+            f"known_at={known_at.astimezone(UTC).isoformat()}"
+        )
+    return lines
 
 
 def _action_counts(conn: duckdb.DuckDBPyConnection) -> Counter[str]:

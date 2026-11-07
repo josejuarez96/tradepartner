@@ -24,6 +24,7 @@ from test_backfill_refetch_actions import (
     LATER,
     REL,
     _committed,
+    _dividend,
     _open_release,
     _refetch,
     _rows,
@@ -36,6 +37,8 @@ from tradepartner.backfill import span_settings
 from tradepartner.config import Settings
 
 THROUGH = date(2019, 6, 28)
+STAMP = action_first_seen_known_at(EX).isoformat()
+AGAIN = LATER + timedelta(days=1)  # a second run's clock
 
 
 @pytest.fixture
@@ -62,14 +65,44 @@ def test_span_lists_each_row_it_would_add(settings: Settings) -> None:
     result = _refetch(
         settings, prices, since=SINCE, through=THROUGH, span=True, securities=[ACME], dry_run=True
     )
-    assert result.rows == (f"{ACME} dividend {EX} 0.25",)
+    assert result.rows == (f"new {ACME} dividend {EX} 0.25 known_at={STAMP}",)
     assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(0,)]
 
 
 def test_month_mode_also_lists_its_rows(settings: Settings) -> None:
     prices = _committed(settings)
     result = _refetch(settings, prices, dry_run=True)
-    assert result.rows == (f"{ACME} dividend {EX} 0.25",)
+    assert result.rows == (f"new {ACME} dividend {EX} 0.25 known_at={STAMP}",)
+
+
+def _stored_then(settings: Settings, again: Any) -> Any:
+    """ACME's dividend stored by a first span run; the source then answers `again`."""
+    prices = _committed(settings)
+    _open_release(settings)
+    _refetch(settings, prices, since=SINCE, through=THROUGH, span=True, securities=[ACME])
+    prices.actions = [again]
+    return _refetch(
+        settings,
+        prices,
+        since=SINCE,
+        through=THROUGH,
+        span=True,
+        securities=[ACME],
+        dry_run=True,
+        clock=lambda: AGAIN,
+    )
+
+
+def test_a_changed_amount_is_listed_as_a_revision_at_the_clock(settings: Settings) -> None:
+    result = _stored_then(settings, _dividend(amount=0.2501))
+    [line] = result.rows
+    assert line.startswith(f"revision {ACME} dividend {EX} 0.2501 ")
+    assert line.endswith(f"known_at={AGAIN.isoformat()}")  # never back-dated
+
+
+def test_a_reissued_id_for_a_stored_event_is_listed_as_a_collision(settings: Settings) -> None:
+    result = _stored_then(settings, _dividend(action_id="acme-q2-reissued"))
+    assert result.rows == (f"collision {ACME} dividend {EX} 0.25 known_at={STAMP}",)
 
 
 def test_span_needs_named_securities(settings: Settings) -> None:
@@ -186,7 +219,7 @@ def test_the_cli_span_builds_the_source_with_the_wide_lag(
     )
     assert done.exit_code == 0, done.output
     assert "would add 1 dividend" in done.output
-    assert f"{ACME} dividend {EX} 0.25" in done.output
+    assert f"would write new {ACME} dividend {EX} 0.25" in done.output
     [used] = seen
     assert THROUGH + timedelta(days=used.alpaca.actions_process_lag_days) >= LATER.date()
     nameless = CliRunner().invoke(app, [*args, "--release", REL, "--span", "--dry-run"])
