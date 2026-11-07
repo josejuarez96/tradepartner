@@ -2257,9 +2257,10 @@ class _Run:
 
     def _lapses(self, actions: pl.DataFrame) -> None:
         """The lapse rows from `marks.lapses`, with one `missed_rebalance` alert. A
-        lapsing rebalance that traded (`plan.traded_at_lapse`: every decision sent and
-        filled, only small remainders left, #3141) is journaled `executed` instead, with
-        a note naming it; only the others are `missed`."""
+        lapsing rebalance that traded (`plan.traded_at_lapse`: every order of every
+        open decision filled, #3141) is journaled `executed` instead, with a note
+        naming its open remainders, and goes through the unspent-cash check; only the
+        others are `missed`."""
         with open_read_only(self.settings, retry=True) as conn:
             runs = runs_for(conn, self.window_id)
             events = rebalance_events_for(conn, self.window_id)
@@ -2321,18 +2322,21 @@ class _Run:
             self.notes.append(
                 f"rebalance {t_i.isoformat()} executed at its lapse: every order filled; "
                 f"open remainders not traded further ({total:.2f} in all): "
-                + ", ".join(f"{side} {sid} {notional:.2f}" for side, sid, notional in left[t_i])
+                + ", ".join(
+                    f"{side or 'no side'} {sid} {notional:.2f}" for side, sid, notional in left[t_i]
+                )
             )
-        # Idle cash of a rebalance executed here is judged like any other executed one.
+        if missed:
+            self._alert(
+                "missed_rebalance",
+                "; ".join(
+                    f"rebalance {m.rebalance_session.isoformat()} missed ({m.reason})"
+                    for m in missed
+                ),
+            )
+        # After the missed alert, so a halting broker read here never swallows it. Idle
+        # cash of a rebalance executed here is judged like any other executed one.
         self._unspent_cash(sorted(traded))
-        if not missed:
-            return
-        self._alert(
-            "missed_rebalance",
-            "; ".join(
-                f"rebalance {m.rebalance_session.isoformat()} missed ({m.reason})" for m in missed
-            ),
-        )
 
     def _outcomes(self, actions: pl.DataFrame) -> None:
         """The due outcomes and the lot-ledger write (T62). A lot-ledger error is
