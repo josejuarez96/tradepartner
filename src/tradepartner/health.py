@@ -1428,6 +1428,10 @@ _CONSIDERATION_SCHEMA: dict[str, Any] = {
     "end_session": pl.Date,
     "detail": pl.Utf8,
 }
+_MISSING_EIGHTK_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "reason_evidence_accession": pl.Utf8,
+}
 _REASON_STAMP_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "delisting_form": pl.Utf8,
@@ -1461,13 +1465,15 @@ class DelistingReasonsHealth:
     close (a transferred listing is never an exit and is skipped): no delisted
     listing end, not exactly one acquiree `mergers` row in
     [`end_session`, `end_session` + the window], or a stock component without the
-    acquirer's raw traded close on `effective_date`."""
+    acquirer's raw traded close on `effective_date`. `missing_eightk_evidence`
+    names 8-K sourced reasons whose accession has no filing event visible at `t`."""
 
     by_reason_source: dict[tuple[str, str], int]
     unknown: pl.DataFrame
     conflicted: pl.DataFrame
     unmatched_items: dict[str, int]
     missing_consideration: pl.DataFrame
+    missing_eightk_evidence: pl.DataFrame
 
     def lines(self) -> list[str]:
         """The block as text lines."""
@@ -1476,11 +1482,17 @@ class DelistingReasonsHealth:
             for (reason, source), n in sorted(self.by_reason_source.items())
         )
         items = ", ".join(f"{item} {n}" for item, n in self.unmatched_items.items())
+        missing = ", ".join(
+            f"{row['security_id']} ({row['reason_evidence_accession']})"
+            for row in self.missing_eightk_evidence.iter_rows(named=True)
+        )
         return [
             f"delisting reasons: {counts or 'none'}",
             f"  unknown episodes: {self.unknown.height}; conflicted: {self.conflicted.height}",
             f"  unmatched 8-K items: {items}",
             f"  missing merger consideration: {self.missing_consideration.height}",
+            f"  missing 8-K evidence: {self.missing_eightk_evidence.height}",
+            *([f"    {missing}"] if missing else []),
         ]
 
 
@@ -1499,6 +1511,7 @@ def delisting_reasons_report(
             pl.DataFrame(schema=_CONFLICT_SCHEMA),
             unmatched,
             pl.DataFrame(schema=_CONSIDERATION_SCHEMA),
+            pl.DataFrame(schema=_MISSING_EIGHTK_SCHEMA),
         )
     reasons = delisting_reasons_as_of(conn, t)
     by_reason_source = dict(
@@ -1534,6 +1547,33 @@ def delisting_reasons_report(
         conflicted.select(list(_CONFLICT_SCHEMA)).cast(pl.Schema(_CONFLICT_SCHEMA)),
         _unmatched_items(conn, t, episodes, reasons, unmatched),
         _missing_consideration(conn, t, reasons, listings),
+        _missing_eightk_evidence(conn, t, reasons),
+    )
+
+
+def _missing_eightk_evidence(
+    conn: duckdb.DuckDBPyConnection, t: datetime, reasons: pl.DataFrame
+) -> pl.DataFrame:
+    """Visible 8-K sourced reasons whose accession has no visible filing event."""
+    candidates = reasons.filter(pl.col("reason_source") == "eightk_item").select(
+        list(_MISSING_EIGHTK_SCHEMA)
+    )
+    if candidates.is_empty() or "filing_events" not in _present_tables(conn):
+        return candidates.sort("security_id", "reason_evidence_accession")
+    accessions = candidates["reason_evidence_accession"].drop_nulls().unique().to_list()
+    if not accessions:
+        return candidates.sort("security_id", "reason_evidence_accession")
+    placeholders = ", ".join("?" for _ in accessions)
+    found = {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT accession FROM filing_events WHERE known_at <= ? "
+            f"AND accession IN ({placeholders})",
+            [t, *accessions],
+        ).fetchall()
+    }
+    return candidates.filter(~pl.col("reason_evidence_accession").is_in(found)).sort(
+        "security_id", "reason_evidence_accession"
     )
 
 
@@ -1593,6 +1633,7 @@ def _missing_consideration(
     )
     chains = dict(live_chains(conn, t))
     out: list[dict[str, Any]] = []
+    pending: list[tuple[int, str, date]] = []
     for reason in mergers_wanted.iter_rows(named=True):
         sid = reason["security_id"]
         key = (sid, reason["delisting_form"], reason["delisting_filed_at"])
@@ -1618,30 +1659,36 @@ def _missing_consideration(
                 detail = f"{len(found)} merger rows in the window"
             elif found[0]["share_ratio"] is not None:
                 acquirer = found[0]["acquirer_security_id"]
-                bars = (
-                    prices_as_of(
-                        conn,
-                        t,
-                        [chains.get(acquirer, acquirer)],
-                        traded_only=True,
-                        sessions_from=found[0]["effective_date"],
-                    )
-                    if acquirer is not None
-                    else pl.DataFrame()
-                )
-                if bars.is_empty() or found[0]["effective_date"] not in bars["session"].to_list():
+                if acquirer is None:
                     detail = "no acquirer raw close on the effective date"
-        if detail is not None:
-            out.append(
-                {
-                    "security_id": sid,
-                    "delisting_form": key[1],
-                    "delisting_filed_at": key[2],
-                    "end_session": end,
-                    "detail": detail,
-                }
-            )
-    return pl.DataFrame(out, schema=_CONSIDERATION_SCHEMA)
+                else:
+                    pending.append(
+                        (len(out), chains.get(acquirer, acquirer), found[0]["effective_date"])
+                    )
+        out.append(
+            {
+                "security_id": sid,
+                "delisting_form": key[1],
+                "delisting_filed_at": key[2],
+                "end_session": end,
+                "detail": detail,
+            }
+        )
+    if pending:
+        bars = prices_as_of(
+            conn,
+            t,
+            sorted({acquirer for _, acquirer, _ in pending}),
+            traded_only=True,
+            sessions_from=min(effective for _, _, effective in pending),
+        )
+        closes = set(bars.select("security_id", "session").iter_rows())
+        for index, acquirer, effective in pending:
+            if (acquirer, effective) not in closes:
+                out[index]["detail"] = "no acquirer raw close on the effective date"
+    return pl.DataFrame(
+        [row for row in out if row["detail"] is not None], schema=_CONSIDERATION_SCHEMA
+    )
 
 
 def _reason_stamps(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:

@@ -5376,6 +5376,114 @@ def test_missing_merger_consideration_is_listed(
     )
 
 
+def test_missing_eightk_reason_evidence_is_reported_only(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    known = datetime(2018, 10, 24, 20, tzinfo=UTC)
+    insert_row(
+        fixture_store,
+        "delisting_reasons",
+        _reason_row("SEC_TRANSFER", _TRANSFER_FILED, "bankruptcy", known, accession="missing-8k"),
+    )
+    block = health_report(fixture_store, T_END, settings).delisting_reasons
+    assert block is not None
+    assert block.missing_eightk_evidence.to_dicts() == [
+        {"security_id": "SEC_TRANSFER", "reason_evidence_accession": "missing-8k"}
+    ]
+    assert "  missing 8-K evidence: 1" in block.lines()
+    assert "SEC_TRANSFER (missing-8k)" in "\n".join(block.lines())
+
+    insert_row(
+        fixture_store, "filing_events", _eightk("CIK0001000007", "missing-8k", "1.03", known)
+    )
+    block = health_report(fixture_store, T_END, settings).delisting_reasons
+    assert block is not None
+    assert block.missing_eightk_evidence.is_empty()
+    assert "  missing 8-K evidence: 0" in block.lines()
+
+
+def test_future_filing_event_does_not_resolve_missing_eightk_evidence(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    insert_row(
+        fixture_store,
+        "delisting_reasons",
+        _reason_row(
+            "SEC_TRANSFER",
+            _TRANSFER_FILED,
+            "bankruptcy",
+            datetime(2018, 10, 24, 20, tzinfo=UTC),
+            accession="future-8k",
+        ),
+    )
+    future = T_END + timedelta(days=1)
+    insert_row(
+        fixture_store, "filing_events", _eightk("CIK0001000007", "future-8k", "1.03", future)
+    )
+    at_t = health_report(fixture_store, T_END, settings).delisting_reasons
+    after = health_report(fixture_store, future + timedelta(days=1), settings).delisting_reasons
+    assert at_t is not None and after is not None
+    assert at_t.missing_eightk_evidence.height == 1
+    assert after.missing_eightk_evidence.is_empty()
+
+
+def test_stock_merger_close_lookup_is_batched_with_same_report(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    episodes = (
+        ("SEC_TRUNC_DELIST", datetime(2018, 6, 14, 20, 30, tzinfo=UTC)),
+        ("SEC_BOUNDARY_DELIST", datetime(2018, 10, 1, 20, 30, tzinfo=UTC)),
+        ("SEC_WINDOW_DELIST", datetime(2019, 6, 28, 20, 30, tzinfo=UTC)),
+    )
+    ends = {
+        row["security_id"]: row["end_session"]
+        for row in health.listing_ends_as_of(fixture_store, T_END, settings).iter_rows(named=True)
+        if row["delisting_form"] is not None
+    }
+    seed = fixture_store.execute("SELECT * FROM mergers WHERE security_id = 'SEC_DIV_CANCELLED'")
+    merger = dict(zip([column[0] for column in seed.description], seed.fetchone(), strict=True))
+    for sid, filed in episodes:
+        effective = ends[sid]
+        insert_row(
+            fixture_store,
+            "delisting_reasons",
+            _reason_row(sid, filed, "merger_acquisition", filed + timedelta(days=1)),
+        )
+        insert_row(
+            fixture_store,
+            "mergers",
+            merger
+            | {
+                "security_id": sid,
+                "source_action_id": f"stock-{sid}",
+                "effective_date": effective,
+                "process_date": effective,
+                "known_at": filed + timedelta(days=1),
+                "ingested_at": filed + timedelta(days=1, minutes=1),
+            },
+        )
+    calls: list[tuple[datetime, tuple[str, ...], date | None]] = []
+    real = health.prices_as_of
+
+    def spy(
+        conn: duckdb.DuckDBPyConnection, at: datetime, ids: list[str], **kwargs: Any
+    ) -> pl.DataFrame:
+        calls.append((at, tuple(ids), kwargs.get("sessions_from")))
+        return real(conn, at, ids, **kwargs)
+
+    monkeypatch.setattr(health, "prices_as_of", spy)
+    block = health_report(fixture_store, T_END, settings).delisting_reasons
+    assert block is not None
+    assert block.missing_consideration.select("security_id", "detail").to_dicts() == [
+        {
+            "security_id": "SEC_TRUNC_DELIST",
+            "detail": "no acquirer raw close on the effective date",
+        },
+    ]
+    assert len(calls) == 1
+    assert calls[0][0] == T_END
+
+
 def test_reason_8k_items_outside_every_window_or_uncorroborated_are_unmatched(
     fixture_store: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
