@@ -519,6 +519,28 @@ def test_cross_day_rule_skips_stored_entries_that_parsed_this_run(tmp_path: Path
         source.check_failures()
 
 
+def test_cross_day_rule_keeps_stored_collisions_even_if_the_accession_parsed(
+    tmp_path: Path,
+) -> None:
+    """A fact collision is not resolved by a successful parse (#3240)."""
+    source = _bare_source(tmp_path)
+    source._failed_filings_cache = {
+        f"a-{n}": {
+            "error_class": "ValueError",
+            "base_form": "10-K",
+            "kind": "collision",
+            "message_hash": "h",
+            "count": 1,
+            "last_counted_day": "2026-06-01",
+            "accepted": False,
+        }
+        for n in range(5)
+    }
+    source._succeeded_this_run.update(f"a-{n}" for n in range(5))
+    with pytest.raises(FilingFailuresError, match="ValueError/10-K"):
+        source.check_failures()
+
+
 def test_fsn_manifest_failures_are_not_pooled_into_the_cross_day_pair_rule(
     tmp_path: Path,
 ) -> None:
