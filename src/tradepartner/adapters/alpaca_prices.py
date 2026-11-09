@@ -350,6 +350,7 @@ repeated key, or a placeholder whose zeros are not integers.
 
 from __future__ import annotations
 
+import bisect
 import functools
 import itertools
 import math
@@ -376,7 +377,7 @@ from tradepartner.adapters.prices import (
     bar_known_at,
     check_request,
 )
-from tradepartner.calendar import is_session, next_session, previous_session
+from tradepartner.calendar import all_sessions, is_session, next_session, previous_session
 from tradepartner.config import AlpacaConfig, Settings, get_settings
 from tradepartner.store import spinoff_splits as spinoff_split_list
 from tradepartner.store.classify import EQUITY, listing_kind
@@ -802,6 +803,23 @@ def _sessions_in(first: date, last: date) -> int:
     while day < last:
         count, day = count + 1, next_session(day)
     return count
+
+
+def _sessions_through(first: date, last: date) -> Sequence[date]:
+    """XNYS sessions in `[first, last]`, ascending: one slice of the cached
+    `all_sessions()` (#3234: `ListingResolver._takes` walked each day with
+    `next_session`, ~1M calendar calls per store resolver). A range not
+    inside the calendar walks day by day as before, so a date off the
+    calendar raises as it did."""
+    sessions = all_sessions()
+    if not sessions or first < sessions[0] or last >= sessions[-1]:
+        out: list[date] = []
+        day = first if is_session(first) else next_session(first)
+        while day <= last:
+            out.append(day)
+            day = next_session(day)
+        return out
+    return sessions[bisect.bisect_left(sessions, first) : bisect.bisect_right(sessions, last)]
 
 
 def _sessions_after(end: date, session: date, cap: int) -> int:
@@ -1309,8 +1327,7 @@ class ListingResolver:
         security_id, day, old, new = change
         tickers = {alpaca_symbol(t) or t for t in (old, new)}
         added = alpaca_symbol(new) or new
-        session = day if is_session(day) else next_session(day)
-        while session <= self.run_day:
+        for session in _sessions_through(day, self.run_day):
             for ticker in tickers:
                 before = base.resolve(ticker, session) or base.lead(ticker, session)
                 after = self.resolve(ticker, session) or self.lead(ticker, session)
@@ -1324,7 +1341,6 @@ class ListingResolver:
                 # design, so only the new ticker is judged.
                 if ticker == added and before == security_id and after != security_id:
                     return True
-            session = next_session(session)
         return False
 
     def _hand_over(

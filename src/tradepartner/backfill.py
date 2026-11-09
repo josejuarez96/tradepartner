@@ -130,6 +130,7 @@ refreshes one series only; its outcome is printed instead.
 from __future__ import annotations
 
 import re
+import time
 import uuid
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Mapping
@@ -432,6 +433,83 @@ def _month(month: date) -> str:
     return month.strftime("%Y-%m")
 
 
+@dataclass
+class _Resolvers:
+    """The store's resolver for a hole fill's months (#3234), rebuilt only
+    when a month could read a different one: the `store_resolver` at
+    `started`, as `_price_chunk` read it, is the one read at an earlier
+    `at` of the same day while the store file and its WAL are byte-for-byte
+    the same files (no commit since, by this process or another) and no
+    stored row of a table with `known_at` became known in between (a row
+    stored before the read but known only after it). Its inputs are rows
+    filtered on `known_at <= at` and `at`'s day, so those are every way two
+    reads can differ. `drop` forgets it after this process writes."""
+
+    settings: Settings
+    resolver: ListingResolver | None = None
+    at: datetime | None = None
+    stamp: tuple[object, ...] | None = None
+    builds: int = 0
+
+    def get(self, conn: duckdb.DuckDBPyConnection, at: datetime) -> ListingResolver:
+        """The resolver as of `at` over `conn` (a read of the store)."""
+        if self.resolver is not None and self._reusable(conn, at):
+            return self.resolver
+        self.stamp = _store_stamp(self.settings)  # before the read: a later write rebuilds
+        self.resolver = store_resolver(conn, at, self.settings)
+        self.at = at
+        self.builds += 1
+        return self.resolver
+
+    def drop(self) -> None:
+        """Forget the resolver: the next `get` builds one."""
+        self.resolver = None
+
+    def _reusable(self, conn: duckdb.DuckDBPyConnection, at: datetime) -> bool:
+        if self.at is None or at < self.at or at.date() != self.at.date():
+            return False
+        if _store_stamp(self.settings) != self.stamp:
+            return False
+        return not _known_between(conn, self.at, at)
+
+
+def _store_stamp(settings: Settings) -> tuple[object, ...]:
+    """The store file's and its WAL's identity, size and change times: any
+    commit changes one of them."""
+    out: list[object] = []
+    for path in (Path(settings.store.path), Path(f"{settings.store.path}.wal")):
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            out.append(None)
+            continue
+        out.append((st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+    return tuple(out)
+
+
+def _known_between(conn: duckdb.DuckDBPyConnection, after: datetime, through: datetime) -> bool:
+    """True when a row of any store table with a `known_at` column has
+    `after < known_at <= through`."""
+    tables = [
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT c.table_name FROM duckdb_columns() c "
+            "JOIN duckdb_tables() t ON t.table_name = c.table_name "
+            "AND t.schema_name = c.schema_name "
+            "WHERE c.column_name = 'known_at' AND c.schema_name = 'main' ORDER BY 1"
+        ).fetchall()
+    ]
+    for table in tables:
+        quoted = '"' + table.replace('"', '""') + '"'
+        hit = conn.execute(
+            f"SELECT 1 FROM {quoted} WHERE known_at > ? AND known_at <= ? LIMIT 1",
+            [after, through],
+        ).fetchone()
+        if hit is not None:
+            return True
+    return False
+
+
 def fill_holes(
     settings: Settings,
     *,
@@ -440,10 +518,12 @@ def fill_holes(
     clock: Callable[[], datetime] = utc_now,
     dry_run: bool = False,
     securities: Collection[str] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> HoleFill:
     """Refetch the holes in the committed months of the backfill for
     `since` (the module docstring's **Holes**), only those of `securities`
-    when given; with `dry_run`, list them and fetch nothing."""
+    when given; with `dry_run`, list them and fetch nothing. A real fill
+    hands `progress` one line per month as it ends (#3234)."""
     if isinstance(since, datetime) or not isinstance(since, date):
         raise TypeError(f"since must be a date, got {since!r}")
     if isinstance(securities, str):
@@ -480,18 +560,41 @@ def fill_holes(
             return HoleFill((), (run,), dry_run)
     runs: list[SourceRun] = []
     halted = False
-    for window in windows:
+    resolvers = _Resolvers(settings)
+    for n, window in enumerate(windows, start=1):
+        began = time.monotonic()
         chunk = _price_chunk(
-            settings, prices, since, window, clock, fill=True, only=only, tally=tally
+            settings,
+            prices,
+            since,
+            window,
+            clock,
+            fill=True,
+            only=only,
+            tally=tally,
+            resolvers=resolvers,
         )
+        if progress is not None:
+            progress(_progress_line(window, n, len(windows), chunk, time.monotonic() - began))
         if chunk is None:
             continue
+        resolvers.drop()  # this month wrote (bars, or its run row): read the store again
         runs.append(chunk)
         if chunk.status != FILLED:
             halted = True
             break
     named = _named(only, known, tally, halted=halted)
     return HoleFill((), tuple(runs), dry_run, tally.totals(), named)
+
+
+def _progress_line(
+    window: tuple[date, date], n: int, of: int, run: SourceRun | None, seconds: float
+) -> str:
+    """`alpaca holes 2019-06 (3/130): filled, 46 rows, 2.1 s`, or `no hole`."""
+    head = f"alpaca holes {_month(window[0])} ({n}/{of}): "
+    if run is None:
+        return f"{head}no hole, {seconds:.1f} s"
+    return f"{head}{run.status}, {run.rows_added} rows, {seconds:.1f} s"
 
 
 def _sessions_in(window: tuple[date, date]) -> list[date]:
@@ -763,6 +866,7 @@ def _price_chunk(
     fill: bool = False,
     only: frozenset[str] | None = None,
     tally: _Tally | None = None,
+    resolvers: _Resolvers | None = None,
 ) -> SourceRun | None:
     """One month. The store is read as of the clock when the month starts
     (after the EDGAR chunk committed) and rows are stamped with the clock
@@ -771,7 +875,9 @@ def _price_chunk(
     ids, when given: `_month_holes`, the store's resolver then) are
     fetched, with the reference; the dropped ones are counted in the message and `tally`; the
     stored bars count toward the staleness share; and a month with no hole
-    to fetch is skipped (`None`)."""
+    to fetch is skipped (`None`). `resolvers` (a fill's, #3234) serves the
+    store's resolver at the month's start, reusing the last one read when
+    the store cannot have changed since (`_Resolvers`)."""
     first, last = window
     mode, done = (HOLES, FILLED) if fill else (BACKFILL, OK)
     cursor = f"{HOLES};{_cursor(since, last)}" if fill else _cursor(since, last)
@@ -783,7 +889,11 @@ def _price_chunk(
 
     try:
         with _read(settings) as conn:
-            resolver = store_resolver(conn, started, settings)
+            resolver = (
+                store_resolver(conn, started, settings)
+                if resolvers is None
+                else resolvers.get(conn, started)
+            )
             ids, listed, static_only, may_count, reference = _window_names(
                 conn, started, window, settings, resolver
             )
