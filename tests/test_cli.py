@@ -746,6 +746,21 @@ def test_a_fill_holes_run_prints_each_month_and_exits_on_its_status(
     assert _invoke(secrets_set, args).exit_code == 0
 
 
+def test_a_fill_holes_run_prints_a_progress_line_as_each_month_ends(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    # #3234: a fill ran hours with nothing on stdout until it ended.
+    def fill(settings: Settings, **kwargs: Any) -> HoleFill:
+        kwargs["progress"]("alpaca holes 2018-08 (1/1): filled, 40 rows, 1.0 s")
+        return HoleFill((), (), False)
+
+    monkeypatch.setattr(cli, "fill_holes", fill)
+    args = ["ingest", "--backfill", "--since", "2016-01-01", "--source", "alpaca", "--fill-holes"]
+    result = _invoke(_with_store(secrets_set), args)
+    assert result.exit_code == 0, result.output
+    assert "alpaca holes 2018-08 (1/1): filled, 40 rows, 1.0 s" in result.output
+
+
 def test_a_fill_holes_dry_run_on_a_locked_store_says_so_and_lists_nothing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

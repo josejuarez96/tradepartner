@@ -3121,7 +3121,14 @@ def make_app(
             else StorePriceSource(s, clock=clock, fill_handovers=fill_holes_)
         )
         if fill_holes_ and start is not None:
-            filled = fill_holes(s, prices=prices, since=start, clock=clock, securities=named)
+            filled = fill_holes(
+                s,
+                prices=prices,
+                since=start,
+                clock=clock,
+                securities=named,
+                progress=typer.echo,  # one line per month as it ends (#3234)
+            )
             _print_holes(filled)
             raise typer.Exit(filled.exit_code)
         if start is not None:

@@ -21,6 +21,7 @@ from typing import Any, ClassVar
 import pytest
 import requests
 from alpaca.common.exceptions import APIError
+from exchange_calendars.errors import DateOutOfBounds
 
 from tradepartner.adapters.alpaca_prices import (
     AlpacaPriceSource,
@@ -5212,6 +5213,43 @@ class TestARenameNeverCostsItsOwnSessions:
             assert resolver.resolve("ALIT", session) == plain.resolve("ALIT", session)
             assert resolver.lead("ALIT", session) == plain.lead("ALIT", session)
             assert resolver.holds(self.ALIGHT, session) == plain.holds(self.ALIGHT, session)
+
+    def test_the_change_check_reads_the_session_list_not_one_day_at_a_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #3234: `_takes` walked every session from the change to the run's day
+        # with `next_session` (~1M calendar calls per store resolver). It now
+        # slices the session list once, with the same answer.
+        from tradepartner.adapters import alpaca_prices
+
+        listings = [_listing(self.ALIGHT, "WPF", date(2020, 9, 1), self.TITLE)]
+        change = _change(self.ALIGHT, "WPF", "ALIT", date(2021, 7, 6))
+        calls = 0
+        real = alpaca_prices.next_session
+
+        def counting(d: date) -> date:
+            nonlocal calls
+            calls += 1
+            return real(d)
+
+        monkeypatch.setattr(alpaca_prices, "next_session", counting)
+        resolver = ListingResolver(listings, rename_lead_days=400, symbol_changes=[change])
+        assert resolver.report.symbol_changes_followed == 1
+        assert calls < 50  # the walk spans ~1,300 sessions to today
+
+    def test_the_session_slice_matches_the_day_walk(self) -> None:
+        from tradepartner.adapters.alpaca_prices import _sessions_through
+
+        first, last = date(2021, 7, 3), date(2021, 9, 7)  # a weekend start, Labor Day
+        walked = []
+        d = first if is_session(first) else next_session(first)
+        while d <= last:
+            walked.append(d)
+            d = next_session(d)
+        assert list(_sessions_through(first, last)) == walked
+        assert list(_sessions_through(last, first)) == []
+        with pytest.raises(DateOutOfBounds):  # off the calendar raises, as the walk did
+            _sessions_through(date(2099, 1, 5), date(2021, 9, 7))
 
     def test_a_clean_rename_is_still_followed(self) -> None:
         # No rival holds the ticker: the change is followed as in #1696.
