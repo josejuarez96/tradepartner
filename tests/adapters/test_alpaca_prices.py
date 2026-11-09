@@ -21,6 +21,7 @@ from typing import Any, ClassVar
 import pytest
 import requests
 from alpaca.common.exceptions import APIError
+from exchange_calendars.errors import DateOutOfBounds
 
 from tradepartner.adapters.alpaca_prices import (
     AlpacaPriceSource,
@@ -5247,6 +5248,8 @@ class TestARenameNeverCostsItsOwnSessions:
             d = next_session(d)
         assert list(_sessions_through(first, last)) == walked
         assert list(_sessions_through(last, first)) == []
+        with pytest.raises(DateOutOfBounds):  # off the calendar raises, as the walk did
+            _sessions_through(date(2099, 1, 5), date(2021, 9, 7))
 
     def test_a_clean_rename_is_still_followed(self) -> None:
         # No rival holds the ticker: the change is followed as in #1696.

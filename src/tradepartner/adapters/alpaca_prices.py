@@ -812,7 +812,7 @@ def _sessions_through(first: date, last: date) -> Sequence[date]:
     inside the calendar walks day by day as before, so a date off the
     calendar raises as it did."""
     sessions = all_sessions()
-    if not sessions or first < sessions[0] or last >= sessions[-1]:
+    if not sessions or first < sessions[0] or first > sessions[-1] or last >= sessions[-1]:
         out: list[date] = []
         day = first if is_session(first) else next_session(first)
         while day <= last:
