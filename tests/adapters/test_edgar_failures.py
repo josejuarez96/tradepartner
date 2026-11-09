@@ -491,6 +491,56 @@ def test_cross_day_pair_rule_fails_and_accepted_lifts_it(tmp_path: Path) -> None
     source.check_failures()  # 4 distinct non-accepted accessions: below min_failed_filings
 
 
+def test_cross_day_rule_skips_stored_entries_that_parsed_this_run(tmp_path: Path) -> None:
+    """#3240: a stored entry this run re-parsed is not counted, though a dry run
+    never prunes it; one not re-attempted or that failed again still is."""
+    source = _bare_source(tmp_path)
+    store = {
+        f"a-{n}": {
+            "error_class": "ValueError",
+            "base_form": "10-K",
+            "message_hash": "h",
+            "count": 1,
+            "last_counted_day": "2026-06-01",
+            "accepted": False,
+        }
+        for n in range(5)
+    }
+    source._failed_filings_cache = store
+    source._succeeded_this_run.add("a-0")
+    source.check_failures()  # 4 left, below min_failed_filings
+    source._succeeded_this_run.clear()
+    source._succeeded_this_run.add("zzz-unrelated")  # not a stored entry
+    with pytest.raises(FilingFailuresError, match="ValueError/10-K"):
+        source.check_failures()
+    source._succeeded_this_run.add("a-0")
+    source._pending_failures["a-0"] = ("ValueError", "10-K", "again")  # failed again
+    with pytest.raises(FilingFailuresError, match="ValueError/10-K"):
+        source.check_failures()
+
+
+def test_cross_day_rule_keeps_stored_collisions_even_if_the_accession_parsed(
+    tmp_path: Path,
+) -> None:
+    """A fact collision is not resolved by a successful parse (#3240)."""
+    source = _bare_source(tmp_path)
+    source._failed_filings_cache = {
+        f"a-{n}": {
+            "error_class": "ValueError",
+            "base_form": "10-K",
+            "kind": "collision",
+            "message_hash": "h",
+            "count": 1,
+            "last_counted_day": "2026-06-01",
+            "accepted": False,
+        }
+        for n in range(5)
+    }
+    source._succeeded_this_run.update(f"a-{n}" for n in range(5))
+    with pytest.raises(FilingFailuresError, match="ValueError/10-K"):
+        source.check_failures()
+
+
 def test_fsn_manifest_failures_are_not_pooled_into_the_cross_day_pair_rule(
     tmp_path: Path,
 ) -> None:
