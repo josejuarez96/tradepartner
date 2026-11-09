@@ -827,11 +827,6 @@ def shares_as_of(
     )
 
 
-#: DuckDB's own default `asof_loop_join_threshold`, restored when a connection
-#: does not report its setting (#3232).
-_DUCKDB_ASOF_LOOP_THRESHOLD = 64
-
-
 def shares_cap_jumps(
     conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings
 ) -> pl.DataFrame:
@@ -879,11 +874,10 @@ def shares_cap_jumps(
     # `asof_loop_join_threshold`, rewrites the ASOF join as a nested loop over
     # every bar (#3232: 363k picks x 10.8M bars, 616 s on the real store). The
     # threshold is 0 for this query only; the caller's value is restored.
-    setting = conn.execute("SELECT current_setting('asof_loop_join_threshold')").fetchone()
-    prior = int(setting[0]) if setting is not None else _DUCKDB_ASOF_LOOP_THRESHOLD
+    (prior,) = conn.execute("SELECT current_setting('asof_loop_join_threshold')").fetchall()[0]
     conn.register("_cap_picks", frame.to_arrow())
-    conn.execute("SET asof_loop_join_threshold = 0")
     try:
+        conn.execute("SET asof_loop_join_threshold = 0")
         closes = conn.execute(
             "WITH bars AS ("
             "  SELECT security_id, session, close FROM ("
@@ -898,7 +892,7 @@ def shares_cap_jumps(
             [t],
         ).fetchall()
     finally:
-        conn.execute(f"SET asof_loop_join_threshold = {prior}")
+        conn.execute(f"SET asof_loop_join_threshold = {int(prior)}")
         conn.unregister("_cap_picks")
     capped: dict[str, list[tuple[date, float, float, date, float]]] = defaultdict(list)
     for sid, as_of, value, session, close in closes:
