@@ -4586,6 +4586,8 @@ class EdgarFilingSource(FilingSource):
         for accession, entry in store.items():
             if accession in self._pending_failures:
                 continue  # judged below, by this run's own error
+            if accession in self._succeeded_this_run:
+                continue  # re-parsed this run: a write prunes it (#3240)
             if not entry.get("accepted", False):
                 pairs[(entry["error_class"], entry["base_form"])].add(accession)
         for accession, (error_class, base_form, message) in self._pending_failures.items():
