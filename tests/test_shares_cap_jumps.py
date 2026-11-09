@@ -128,3 +128,49 @@ def test_health_carries_the_list(fixture_store: duckdb.DuckDBPyConnection) -> No
     report = health_report(fixture_store, BEFORE_SPLIT, _settings())
     frame = report.shares_cap_jumps.frame
     assert frame.filter(frame["security_id"] == SID)["as_of_date"].to_list() == [date(2018, 11, 30)]
+
+
+class _PlanSpy:
+    """Forwards to a real connection and records the plan DuckDB picks for the
+    cap query (its `ASOF LEFT JOIN`), at the moment it runs."""
+
+    def __init__(self, conn: duckdb.DuckDBPyConnection) -> None:
+        self._conn = conn
+        self.plans: list[str] = []
+
+    def execute(self, sql: str, params: Any = None) -> duckdb.DuckDBPyConnection:
+        if "ASOF LEFT JOIN" in sql:
+            rows = self._conn.execute("EXPLAIN " + sql, params).fetchall()
+            self.plans.append("\n".join(str(row[1]) for row in rows))
+        return self._conn.execute(sql, params)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+
+def test_the_cap_query_runs_as_an_asof_join_not_a_nested_loop(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#3232: DuckDB estimates the registered picks at about one row and, under
+    `asof_loop_join_threshold`, rewrites the ASOF join as a nested loop over
+    every bar: 363k picks x 10.8M bars took 616 s on a copy of the real store.
+    The plan must stay an ASOF join, whose work grows with picks + bars."""
+    _fact(fixture_store, date(2018, 11, 30), 2_000_000, _known(date(2018, 12, 3)))
+    spy = _PlanSpy(fixture_store)
+    shares_cap_jumps(spy, BEFORE_SPLIT, _settings())  # type: ignore[arg-type]
+    (plan,) = spy.plans
+    assert "ASOF_JOIN" in plan
+    assert "NESTED_LOOP_JOIN" not in plan
+
+
+@pytest.mark.parametrize("prior", [64, 7])
+def test_the_cap_query_restores_the_connections_asof_setting(
+    fixture_store: duckdb.DuckDBPyConnection, prior: int
+) -> None:
+    """#3232: the plan fix is scoped to the cap query; the caller's connection
+    keeps its own `asof_loop_join_threshold`."""
+    fixture_store.execute(f"SET asof_loop_join_threshold = {prior}")
+    _fact(fixture_store, date(2018, 11, 30), 2_000_000, _known(date(2018, 12, 3)))
+    shares_cap_jumps(fixture_store, BEFORE_SPLIT, _settings())
+    row = fixture_store.execute("SELECT current_setting('asof_loop_join_threshold')").fetchone()
+    assert row is not None and int(row[0]) == prior
