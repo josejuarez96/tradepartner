@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from tradepartner.adapters.edgar import (
+    _EXCHANGES,
     acceptance_times,
     normalize_class_member,
     normalize_exchange,
@@ -699,6 +700,61 @@ class TestCoverPageFailClosed:
         )
         with pytest.raises(ValueError, match="not a CIK"):
             _cover(document)
+
+
+class TestExchangeNameFormat:
+    """#3230: `ixt-sec:exchnameen` in edgartools folds only some suffixes
+    ("Cboe BZX Exchange, Inc." keys as `cboe bzx exchange`, which its table
+    lacks), so a registered venue's written name failed the whole filing
+    (10-Q 0001193125-26-450234, the 2026-11-08 nightly). A name the
+    exact-name table holds is read from the element text; anything else
+    still fails closed."""
+
+    @staticmethod
+    def _document(name: str) -> bytes:
+        return _ixbrl(
+            _context("c1"),
+            _nn("Security12bTitle", "c1", "Common Stock")
+            + _nn("TradingSymbol", "c1", "ABC")
+            + _nn("SecurityExchangeName", "c1", name, ' format="ixt-sec:exchnameen"'),
+        )
+
+    @pytest.mark.parametrize(
+        ("written", "expected"),
+        [
+            ("Cboe BZX Exchange, Inc.", "CBOE_BZX"),  # the 2026-11-08 failure
+            ("Cboe BZX Exchange", "CBOE_BZX"),
+            ("BATS BZX Exchange, Inc.", "CBOE_BZX"),
+            ("Nasdaq BX, Inc.", "NASDAQ_BX"),
+            ("NASDAQ OMX BX, Inc.", "NASDAQ_BX"),
+            ("Nasdaq PHLX LLC", "NASDAQ_PHLX"),
+            ("NASDAQ OMX PHLX, LLC", "NASDAQ_PHLX"),
+            ("NYSE MKT LLC", "NYSE_AMERICAN"),
+            ("NYSE Amex LLC", "NYSE_AMERICAN"),
+            ("NYSE Alternext US LLC", "NYSE_AMERICAN"),
+            # Names edgartools already maps keep their code.
+            ("New York Stock Exchange LLC", "NYSE"),
+            ("The Nasdaq Stock Market LLC", "NASDAQ"),
+            ("NYSE American LLC", "NYSE_AMERICAN"),
+            ("NYSE Arca, Inc.", "NYSE_ARCA"),
+            ("NYSE National, Inc.", "NYSE_NATIONAL"),
+            ("NYSE Chicago, Inc.", "NYSE_CHICAGO"),
+            ("Chicago Stock Exchange, Inc.", "NYSE_CHICAGO"),
+        ],
+    )
+    def test_registered_written_names_read_as_their_code(self, written: str, expected: str) -> None:
+        [listing] = _cover(self._document(written)).cover.listings
+        assert listing.exchange == expected
+
+    @pytest.mark.parametrize("name", sorted(_EXCHANGES))
+    def test_every_table_name_reads_as_its_code(self, name: str) -> None:
+        [listing] = _cover(self._document(name)).cover.listings
+        assert listing.exchange == _EXCHANGES[name]
+
+    @pytest.mark.parametrize("written", ["Acme Stock Exchange, Inc.", "Pink Sheets"])
+    def test_unregistered_name_still_raises(self, written: str) -> None:
+        with pytest.raises(ValueError, match="SecurityExchangeName"):
+            _cover(self._document(written))
 
 
 class TestDelisting:
