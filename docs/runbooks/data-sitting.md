@@ -1,6 +1,6 @@
 # Run sheet: the one data sitting
 
-Owner and orchestrator only, on the owner's job checkout and real store. Target **Monday 2026-11-09**, after book main's 08:05 stop run lets `paper stop` close window 6 (daily's window 5 closed 2026-11-06). The orchestrator runs each step on the owner's go; the owner decides after each dry run and any stop rule. Follow [named data releases](data-releases.md) for the release record and restore procedure, and [scheduling](scheduling.md) to stop and restart jobs. This sheet records the 2026-10-18 one-sitting order and its 2026-10-20 timing amendment in [the data-foundation plan](../plans/data-foundation.md), and the 2026-11-06 Audit F additions (#3114, #3115, #3116, #3117).
+Owner and orchestrator only, on the owner's job checkout and real store. Target **Monday 2026-11-09**, after book main's 08:05 stop run lets `paper stop` close window 6 (daily's window 5 closed 2026-11-06). The orchestrator runs each step on the owner's go; the owner decides after each dry run and any stop rule. Follow [named data releases](data-releases.md) for the release record and restore procedure, and [scheduling](scheduling.md) to stop and restart jobs. This sheet records the 2026-10-18 one-sitting order and its 2026-10-20 timing amendment in [the data-foundation plan](../plans/data-foundation.md), and the 2026-11-06 Audit F additions (#3114, #3115, #3116, #3117). A rehearsal on a store copy (2026-11-08 evening, steps 1 to 8, #3235) gave the measured times, counts and refusals quoted below as "the rehearsal".
 
 **This sheet is the complete list.** Every store repair a merged PR defines for "the sitting" is a step below, in the order to run them. A repair not listed here is not part of this sitting. Run the steps in number order; never reorder or merge two releases.
 
@@ -10,7 +10,7 @@ Owner and orchestrator only, on the owner's job checkout and real store. Target 
 | 2 | `dupdiv-1613` | T186c, #1613 | done 11-05: verify, skip |
 | 3 | `restamp-1382a3` | #1382 | done (toml `after`): verify, skip |
 | 4 | no release (FRED) | T170d, #2011 | done 11-05: verify, skip |
-| 5 | no release: **the pull** | all of origin/main | pinned → origin/main |
+| 5 | no release: **the pull** and the schema migration | all of origin/main | pinned → origin/main |
 | 6 | `classstart-3080` | #3090 (79-id backfill) | origin/main |
 | 7 | `biob-3082` | #3086 (BIO.B holes) | origin/main |
 | 8 | `rename-listings-3057` | #3068 | origin/main |
@@ -40,11 +40,13 @@ Owner and orchestrator only, on the owner's job checkout and real store. Target 
 
   Required free space = `S × C + X + F`. Each term:
   - `S` is the store plus WAL size now. It was 2.4 GB on 2026-11-06.
-  - `C` is the copies this sheet keeps on the volume. That is the baseline plus one checkpoint each for steps 6, 7, 8, 9, 12 and 13 (7 copies). Add one each for steps 10, 11, 14 and 15 if they write, and one failed-state copy for a restore (12 copies at most).
+  - `C` is the copies this sheet keeps on the volume. That is the baseline, the automatic pre-migration copy of step 5's migration, and one checkpoint each for steps 6, 7, 8, 9, 12 and 13 (8 copies). Add one each for steps 10, 11, 14 and 15 if they write, and one failed-state copy for a restore (13 copies at most).
   - `X` is the FSN re-extraction headroom of step 9's first EDGAR write. This sheet carries 7.6 GB, the earlier "10 GB for one copy plus extraction" less one copy. That figure is not measured.
   - `F` is `ingest.min_free_disk_gb` (5 GB). Ingest refuses below it.
 
-  With every copy kept on the volume: 12 × 2.4 + 7.6 + 5 ≈ **42 GB**. If the owner moves each closed release's copy off the volume, only the open release's checkpoint and a failed-state copy stay. That needs 2 × 2.4 + 7.6 + 5 ≈ **17.4 GB** on the volume and about 29 GB on the other one. A copy moves only after its release is closed and its `shasum -a 256` is recorded, and moves with its WAL copy and manifest. Re-hash it at the destination; the hashes must match. Record the new path beside the old one. On 2026-11-06 the volume had 11–12 GiB free, below both figures and below `health.warn_free_disk_gb` (15). Free space or attach the second volume before the sitting. Before every later `store backup`, re-run `df -h` and stop if free space is under `S × (copies still to take) + F`, plus `X` until step 9 is closed.
+  With every copy kept on the volume: 13 × 2.4 + 7.6 + 5 ≈ **44 GB**. If the owner moves each closed release's copy off the volume, only the open release's checkpoint and a failed-state copy stay. That needs 2 × 2.4 + 7.6 + 5 ≈ **17.4 GB** on the volume and up to about 26 GB on the other one (11 closed copies), or 31 GB if the last checkpoint and the failed-state copy move too. The pre-migration copy moves like a closed release's copy, before step 6's `store backup`. A copy moves only after its release is closed and its `shasum -a 256` is recorded, and moves with its WAL copy and manifest. Re-hash it at the destination; the hashes must match. Record the new path beside the old one. On 2026-11-06 the volume had 11–12 GiB free, below both figures and below `health.warn_free_disk_gb` (15). Free space or attach the second volume before the sitting. Before every later `store backup`, re-run `df -h` and stop if free space is under `S × (copies still to take) + F`, plus `X` until step 9 is closed.
+
+  **Measured in the rehearsal** (S = 2.41 GB, no WAL, 12.63 GiB free at the start). Each `store backup` took about 7 s and 2.25 GiB of free space. The migration's pre-migration copy took the same, in about 4 s. The rehearsal deleted each closed release's copy, which this sheet does not allow without the owner's word. Even so, its low point through step 8 was **7.78 GiB free**, right after the migration, with two copies on the volume: the pre-migration copy and step 6's checkpoint. The fills in steps 6 and 7 grew the store by under 0.1 GiB, but free space dipped 0.9 to 1.4 GiB while each fill ran. Step 1's EDGAR dry run grew the EDGAR cache by 0.26 GiB. Step 9 was not reached, so `X` is still not measured.
 - [ ] **Missing release backups (#3115).** The `before` rows of store releases 18 (`roles-2691`, `data/tradepartner.duckdb.bak-20261031-2319`) and 20 (`restamp-1382b-retry`, `data/tradepartner.duckdb.bak-20261104-0225`) name backups that are not on disk; `data/` holds no backup copy at all. Those releases cannot be restored or audited against their `before` state. Before the sitting, record on each release's issue where its copy went (deleted or moved). Delete none of this sitting's copies without the owner's word.
 - [ ] **Owner question 1 — how will each book close?** Resolve the conflict between T197 step (2), which names `paper stop`, and spec question 31(a), which names `abandon`. Record the chosen route per book on #1682 before touching a window. Both routes **end the existing paper book's record** and a new window starts a new record. Normal `stop` **sells the book's holdings** through the paper order path, with fills and possible trading costs; it may carry only documented `dust`/`untradable` residues. `abandon` makes no trades but leaves the holdings at Alpaca; the owner must reset that paper account in Alpaca's dashboard before a new start, discarding those paper holdings. Neither route preserves the current window's continuous record.
 - [ ] For a book using **stop**, complete this on a session *before the sitting's release work*, while its submit window is open. The owner requests the stop, runs the book's ordinary stop run in the submit window, lets the collector reach terminal order events, then calls `stop` again to close. Confirm `paper stop: closed` and the reconciliation and residues in `paper status`. If liquidation or reconciliation cannot complete, stop the sitting and get an owner decision; do not assume the account is flat. State on 2026-11-06: daily's window 5 is closed. Main's window 6 is `requested`: the 11-06 stop run sold all 91 (all filled, reconciliation 74 ok), and `paper stop` closes it only after Monday's 08:05 run.
@@ -73,34 +75,67 @@ Owner and orchestrator only, on the owner's job checkout and real store. Target 
   ```
 
   Save the **printed copy path and any printed log-copy path** as `<baseline-copy>` and `<baseline-wal-copy>`. Check the manifest and record the paths, sizes and hashes. The baseline contains the two ended windows; restoring it will restore that ended state. Paste starting coverage, health, closure method, stop/reconciliation ids, broker positions or residues, and baseline path on T197's PR. **Close once here; restart once after all the steps.**
-- [ ] **Import the legacy releases (Audit F row 10).** `restamp-1382a2`, `restamp-1382a3` and `ops-1549` changed data, but they exist only in `data/releases.toml`, not in the store's `owner_decisions`. So `data_releases(conn)` and `data-release open`'s checks do not see them. With no release open, import them once:
+
+  In the rehearsal, `store backup` took 7 s, `health --coverage` 47 s and `health --check` 19 s on the pinned checkout.
+- [ ] **Baseline health failures.** The baseline store already fails `health --check`. In the rehearsal it exited 1 with `health check failed: duplicate_dividends`. The integrity block showed `duplicate_dividends: FAIL (2 rows)` and the warning `1 listed duplicate dividend keys are pending repair`; no other rule failed. The real store gave this, measured read-only on 2026-11-09 at the pinned 1fe51c9f with the snippet below:
+  - **The violation (the FAIL's 2 rows): FCX, `0000831259`, ex-date 2026-10-15, 0.075**, with two identities (`c7a92302-…`, `e490e9c7-…`, both known 2026-10-14T20:00Z). This is #2972's open key. FCX's 2026-10-15 dividend is stored three times: a 0.15 combined record, plus the 0.075 base and the 0.075 variable. The 0.15 record is a different key, outside this one; the two 0.075 records are the two identities here. No reviewed-list row covers the key on origin/main, and a list row needs exactly two identities on the key. No step of this sheet repairs it, and none can be added mid-sitting. **The owner records a decision on #2972 before step 1: accept the key as a known residue for this sitting, with its repair after the sitting.** Without that decision, stop before step 1.
+  - **The pending key (the warning): PFLT, `0001504619`, ex-date 2026-10-15, 0.0033**, with two identities. It is a listed `duplicate` (retract id `764fdbfa-…`) in `store/dividend_reviews.csv`. A pending key is a warning, never a failure. Step 13's `repair-dividends` retracts it: that step runs with no `--to`, so it retracts every listed duplicate still in the store.
+  - **STX** (`0001137789`, 2021-05-11) is not pending on the pinned code, where the list holds it as `unresolved`. origin/main's list makes it a `duplicate` (#3054), so after step 5's pull it should show as a second `pending` key, which step 13 also retracts. If it shows as a `violation` instead (the retract id is not among its live identities), stop and ask on #3054.
+
+  List the findings read-only, and save the output with the baseline. Rerun it after step 5's migration:
+
+  ```bash
+  uv run python -c 'from datetime import datetime, UTC; from tradepartner.config import get_settings; from tradepartner.store.db import open_read_only; from tradepartner.health import duplicate_dividends; from tradepartner.store.dividend_reviews import reviewed_groups; cm = open_read_only(get_settings()); conn = cm.__enter__(); b = duplicate_dividends(conn, datetime.now(UTC), reviewed_groups()); [print(g.group_class, g.security_id, g.ex_date, g.amount, [(i.source_action_id, i.known_at.isoformat()) for i in g.identities]) for g in b.groups if g.group_class in ("violation", "pending")]; cm.__exit__(None, None, None)'
+  ```
+
+  At the baseline, expect exactly the FCX `violation` line and the PFLT `pending` line above. After step 5's migration, expect exactly three lines: the FCX `violation`, the PFLT `pending` and the STX `pending`. Any other line, at either point, is a stop. Paste the output on #2972 and #3054.
+
+  Save the baseline's `health check failed:` line, the FAIL row count and the FCX violation key as the **baseline failing rules**. "Failed health" in any step below means a failing rule not on that line, a changed `duplicate_dividends` row count, or a violation key other than FCX's. Rerun the snippet whenever `duplicate_dividends` still fails. The gate is **no new failing rule versus the baseline**; the known FCX FAIL is expected. After step 13, no `pending` line may remain (PFLT and STX retracted). The FCX FAIL stays through the sitting. It is the one accepted residue at **Restart and close**.
+- [ ] **Legacy releases (Audit F row 10): run the import, expect a refusal.** `restamp-1382a2`, `restamp-1382a3` and `ops-1549` changed data, but they exist only in `data/releases.toml`, not in the store's `owner_decisions`. So `data_releases(conn)` and `data-release open`'s checks do not see them. With no release open, run the import once:
 
   ```bash
   uv run tradepartner decision data-release import-file data/releases.toml
   ```
 
-  There is no dry run. The command checks every entry first and refuses, listing every problem and writing nothing, when an entry is malformed or a (name, stage) pair is already stored. It also refuses an `after` made on or after the version-18 migration, or a file that would leave a release open. If the only problems are names already in the store, make a copy of the file beside the original holding only the three releases' `[[release]]` tables, and import that copy. Any other problem stops this item: leave the three unimported and record it on #1382. Imported `after` rows move no vintage. Paste the printed `imported` lines and decision ids on #1382.
+  There is no dry run. The command checks every entry first and refuses, listing every problem and writing nothing. **Expect it to refuse.** In the rehearsal it exited 1 with `release refused:` and only shape problems, which are checked first: `record` entries that lack `['trial']` (entries 8, 17, 18, 19) and `after` entries with unknown keys `['backup_path']` (entries 10, 12, 14, 16). A copy of the file holding only the three releases is refused too, on shape: `ops-1549`'s `record` lacks a trial. With `ops-1549` left out as well, the a2 and a3 entries are refused on date: `an after made at 2026-10-11/12 is after the store gained the release commands (2026-10-09 ...); record it with close`. So `import-file` cannot import these three releases. Paste the printed refusal on #1382 and continue with the three unimported. How, or whether, they reach the store is an owner decision on #1382, outside this sitting. If the command instead prints `imported` lines, paste them and the decision ids on #1382.
 
-Each named release needs a `before` and `after` record. The `--backup` path is the **copy path printed by `uv run tradepartner store backup` immediately before that release**; `decision data-release open` checks its latest `ingested_at` against the live store. For every backup, record each printed copy/log/manifest path, the copy's `ls -lh` size and `shasum -a 256` hash; repeat for its WAL copy if present. The command refuses an existing target or busy store and verifies the copy byte for byte. Its filename has minute precision: if another backup already used that minute, wait for the next UTC minute and rerun; never reuse or overwrite the old copy. Keep every copy. For every `close`, use the first and last **actual XNYS sessions touched**, not guessed calendar dates. Stop if those are unknown. Never open the next release while one remains open.
+Each named release needs a `before` and `after` record. The `--backup` path is the **copy path printed by `uv run tradepartner store backup` immediately before that release**; `decision data-release open` checks its latest `ingested_at` against the live store. For every backup, record each printed copy/log/manifest path, the copy's `ls -lh` size and `shasum -a 256` hash; repeat for its WAL copy if present. The command refuses an existing target or busy store and verifies the copy byte for byte. Its filename has minute precision: if another backup already used that minute, wait for the next UTC minute and rerun; never reuse or overwrite the old copy. Keep every copy. For every `close`, use the first and last **actual XNYS sessions touched**, not guessed calendar dates. Stop if those are unknown. No command prints "sessions touched", so derive them as follows. Move any date that is not an XNYS session to the next session.
+- `delete-master-rows` (step 1): the earliest and latest date among the dry run's found lines, using the `listings` rows' `valid_from` and the `delistings` rows' `filed_at` date.
+- `ingest ... --fill-holes` (steps 6, 7, 9, 10): the dry run's hole months bound the range, but only the apply knows which sessions got bars. After the apply, with jobs stopped so nothing else writes, read the first and last session it wrote:
+
+  ```bash
+  uv run python -c 'import sys; from tradepartner.config import get_settings; from tradepartner.store.db import open_read_only; cm = open_read_only(get_settings()); conn = cm.__enter__(); print(conn.execute("SELECT MIN(session), MAX(session), COUNT(*) FROM prices_daily WHERE ingested_at >= CAST(? AS TIMESTAMPTZ)", [sys.argv[1]]).fetchone()); cm.__exit__(None, None, None)' <apply start, UTC ISO time>
+  ```
+
+  Take `<apply start>` from `date -u +%Y-%m-%dT%H:%M:%SZ` run just before the apply.
+- `repair-rename-listings` (steps 8, 15): the first and last `from <valid_from>` on the dry run's `+` lines.
+- `repair-dividends` and `repair-spinoff-splits` (steps 12, 13): the span their summaries print (`on N ex-dates A..B`). `refetch-actions` (steps 13, 14): the ex-date on each `would write` line.
+- `spinoff-backfill` (step 12) prints no ex-dates, only one line per month with its rows added. Use the first session of the earliest month whose line shows rows above 0.
+- `repair-resolution` (steps 9, 10): the earliest and latest of the per-security `N bar rows A..B` spans in its dry run. `master-retract` (steps 9 to 11): the earliest and latest `valid_from` in the listing keys its dry run prints. Neither summary line prints sessions. A post-apply `prices_daily` read cannot see their deletions.
+- `ingest --source edgar` writes (steps 3 and 9): a full rebuild can change listing rows on any date. Use the sheet's stated `--from`, and for `--to` the last XNYS session completed before the write, or the latest session any other command in the release touched if later.
+- Take the earliest and latest over every command in the release. Never open the next release while one remains open. Every "failed health" stop rule below is judged against the baseline failing rules (above).
 
 ## 1. T197: `restate-1682` (#1682)
 
 Purpose: delete only the reviewed never-true master rows (lever B). Runs on the pinned checkout, before the pull.
 
-- [ ] Record `uv run tradepartner health --coverage` over the configured twelve sample months and the 86 month-end index key. The census expects lever B to explain **98 member-months**; compare actual bucket counts, not just the total. Use the manifest reviewed on #1682, with no other rows.
-- [ ] Open, dry-run, read every found and refused row, then apply only on the owner's go:
+- [ ] Record `uv run tradepartner health --coverage` before and after the release, and compare its `index misses by bucket` line bucket by bucket. That line counts **member-sessions** on `health`'s own sample sessions (the last session of each `coverage.sample_months` month). The census's **98 member-months** was counted over the 86 month-end index key, so no `health` figure equals it: do not compare the two. Compare the bucket line before against after, and read every other coverage line that changes. In the rehearsal the bucket line was identical before and after. Delisted names fell 2777 → 2772 (PG25, CAT/29, GM/26, HMC/22C and TPTA gone), `snapshot_static` reliance rose 1166 → 1167, and listed-name counts per sample month fell by 3 to 6.
+- [ ] Use the manifest reviewed on #1682, with no other rows: `~/tradepartner-probes/sitting-inputs/manifest-restate-1682.csv` (33 rows plus a header). Open, dry-run, read every found and refused row, then apply only on the owner's go:
 
   ```bash
+  uv run tradepartner paper status --all
   uv run tradepartner decision data-release open --name restate-1682 --backup <baseline-copy> --reason "#1682 reviewed lever B manifest"
-  uv run tradepartner delete-master-rows --manifest <reviewed-master-manifest.csv> --release restate-1682 --dry-run
-  uv run tradepartner delete-master-rows --manifest <reviewed-master-manifest.csv> --release restate-1682
+  uv run tradepartner delete-master-rows --manifest ~/tradepartner-probes/sitting-inputs/manifest-restate-1682.csv --release restate-1682 --dry-run
+  uv run tradepartner delete-master-rows --manifest ~/tradepartner-probes/sitting-inputs/manifest-restate-1682.csv --release restate-1682
   uv run tradepartner ingest --source edgar --dry-run
   uv run tradepartner health --check
   uv run tradepartner health --coverage
   uv run tradepartner decision data-release close --name restate-1682 --from <earliest-touched-session> --to <last-touched-session> --reason "#1682 delete-only; list touched sessions and affected sweeps"
   ```
 
-- [ ] The dry run must match the manifest census exactly with **zero refused**; the EDGAR dry run must leave the note's Form 25 unmatched and must not rederive a deleted key. Stop on any other row, refusal, reappearance, failed health check or unpromised coverage change. With jobs stopped, follow **Restore and gaps** using the baseline; record the rollback on the PR/issue and retry under a **new** release name after review. Paste before/after bucket counts, found/refused rows, EDGAR dry-run output and release ids on T197's PR and #1682.
+- [ ] **Paper window refusal.** While a paper window is open, the `delete-master-rows` dry run refuses every row, each with `an open paper window (first session ...) read it` or `known inside the open paper window (first session ...)`, and ends `33 manifest rows refused: fix the manifest`. The manifest is fine in that case; the cause is the open window. `data-release open` does not check windows, so it accepts first. That refusal means the precondition in **Before the first write** failed: a window is not closed, so the baseline was taken against an open window, and paper jobs may still be loaded. **Stop the sitting.** Run no `paper` command (no `stop`, no `run`) while `restate-1682` is open, because a stop run submits sells and rule 5 of [named data releases](data-releases.md) keeps a release out of an open window. Confirm the paper jobs are unloaded and `pgrep -f "tradepartner "` is empty, then ask the owner how to handle the open release (for example, restore the baseline as in **Restore and gaps**) before any window is closed and a new baseline taken. To make sure this refusal is never the first signal, run `uv run tradepartner paper status --all` right before step 1's `data-release open`, and stop there unless both windows show closed or abandoned. In the rehearsal, with both windows closed, it printed `would delete 25 listings and 8 delistings rows of 33 manifest rows; refused 0` (5 s), and the apply printed the same counts as `deleted` (4 s).
+- [ ] **Pinned EDGAR dry run fails on Cboe BZX.** On the pinned checkout `ingest --source edgar --dry-run` fails after about 25 minutes with `edgar: failed, 0 rows ... FilingFailuresError: ... unaccepted filing failures`, every failure being `dei:SecurityExchangeName ... 'Cboe BZX Exchange, Inc.' is not a registered securities exchange name` (8 10-Qs in the rehearsal, such as 0001193125-26-450234). The real 11-08 nightly failed the same way. #3231 fixes this on origin/main, so only steps after the pull have the fix. When that is the only failure: paste the output on #1682 and do not retry. Do not raise `edgar.min_failed_filings` to get past it: it is a build-fingerprint setting, and the sheet changes no setting. With the owner's go, continue, and make this dry run's two checks in step 9's first post-pull EDGAR dry run (see step 9). Write `EDGAR dry-run checks deferred to step 9 (Cboe BZX, #3231)` in `restate-1682`'s close reason and in its #1682 comment. Any other EDGAR failure is a stop.
+- [ ] The dry run must match the manifest census exactly with **zero refused**. The EDGAR dry run must leave the note's Form 25 unmatched and must not rederive a deleted key. When the Cboe BZX failure above applies, these two EDGAR checks move to step 9 and are not this step's stop. Stop on any other row, refusal, reappearance, failed health check or unpromised coverage change. With jobs stopped, follow **Restore and gaps** using the baseline; record the rollback on the PR/issue and retry under a **new** release name after review. Paste before/after bucket counts, found/refused rows, EDGAR dry-run output and release ids on T197's PR and #1682.
 
 ## 2. T186c: `dupdiv-1613` (#1613)
 
@@ -126,7 +161,7 @@ Purpose: delete reviewed duplicate dividends through the safe ex-date bound.
 
 Purpose: apply the already repaired cache's manifest to stored filing stamps. The phase-B release was cut.
 
-**Status: done.** Its `after` is in `data/releases.toml`, and the legacy import above puts it in the store. The commands below are for a store where it is not.
+**Status: done.** Its `before` and `after` are in `data/releases.toml` (the `after` made 2026-10-12T20:42:23Z), but not in the store's `owner_decisions`. The legacy import above refuses the file, so it does not put them in the store. Confirm both entries in the toml, read-only, paste them on #1382 and skip this step. The commands below are for a3 not yet applied.
 
 - [ ] First reconcile #1553/#1582's reported a3 `after` record (4,978 changes) with the owner's release registry and manifest. If the store step is **already closed**, paste its evidence and skip the write; never apply it twice. If not, obtain #1974's dated decision about the 37 pre-2003 rows and its census. Any unresolved decision stops this step.
 - [ ] If still needed, use the frozen `v<PARSER_VERSION>.restamp-1382a3.manifest.csv`, not a newly generated manifest. The read-only precheck must pass and its hash belongs in the `before` reason. Take a release checkpoint, then:
@@ -162,11 +197,11 @@ Purpose: load FRED DTB3 history, then land the already reviewed default flip. It
 
 ## 5. The pull: all of origin/main
 
-Purpose: move the job checkout from the pinned `1fe51c9f` to origin/main once, so every later step runs the merged repairs. No release: this step writes nothing to the store.
+Purpose: move the job checkout from the pinned `1fe51c9f` to origin/main once, so every later step runs the merged repairs. No release. Its one store write is the schema migration below, outside any release; the pull itself writes nothing to the store.
 
-- [ ] The pull is **all of origin/main**, not a T198-only diff. On 2026-11-06 that was 54+ commits. They include T198's flip and FSN/COVER bumps (#2975), the schema 47 fill cursor (#3029), and ingest behaviour changes #3073, #3064, #3068, #3090, #3086 and #3095. `BUILD_RULES_VERSION` is 8 (#3064, #3095, #3091, #3192), so step 9's first `ingest --source edgar` is a full master rebuild. #2975's bumps make it re-extract every FSN period too. Read its census with that in mind (step 9).
+- [ ] The pull is **all of origin/main**, not a T198-only diff. The count grows as PRs merge (over 107 commits by 2026-11-09), so record it rather than expect a figure. The commits include T198's flip and FSN/COVER bumps (#2975), the schema 47 fill cursor (#3029), and ingest behaviour changes #3073, #3064, #3068, #3090, #3086 and #3095. `BUILD_RULES_VERSION` is 8 (#3064, #3095, #3091, #3192), so step 9's first `ingest --source edgar` is a full master rebuild. #2975's bumps make it re-extract every FSN period too. Read its census with that in mind (step 9).
 - [ ] Record what is pulled. Only what is merged at this moment is in the sitting; nothing merged later is pulled mid-sitting.
-  - **Open on 2026-11-06:** #3071 (shares split dating), the #3070 flip that follows it and #3091 (issuer-class tags, schema 48). Steps 9 and 17 depend on whether each is in. The #3116 exposure-backfill tool will not come (#3133 closed). Step 16 needs only #3176's kill-line copy, `docs/research/2026-10-31-candidate-5-kill-line.md`, to be in the pull.
+  - **Open on 2026-11-06:** #3071 (shares split dating), the #3070 flip that follows it and #3091 (issuer-class tags, schema 48). Steps 9 and 17 depend on whether each is in. In the rehearsal's pull (to 56dc2579), #3071, #3091 and #3176 were in and the #3070 flip was not (`universe.shares_split_dating` still `false`; it still is on origin/main at d00c00e4). The #3116 exposure-backfill tool will not come (#3133 closed). Step 16 needs only #3176's kill-line copy, `docs/research/2026-10-31-candidate-5-kill-line.md`, to be in the pull.
   - **T214 (PR #1968):** closed without merging, so there is nothing to merge. D8's lapse needs its dated strike note in the data-foundation plan, outside this sheet.
 
   ```bash
@@ -180,32 +215,60 @@ Purpose: move the job checkout from the pinned `1fe51c9f` to origin/main once, s
   ```
 
   Stop if the merge is not a fast-forward or the working tree is dirty. Paste both hashes, the commit count and which of #3071, the #3070 flip, #3091 and #3176 are in, on #1682.
-- [ ] **Schema.** The store is at 46 and origin/main needs 47 (48 if #3091 is in). The migration runs on the first store write after the pull, which is step 6's `decision data-release open`. Step 6's checkpoint is therefore the last copy at schema 46. Restoring it with origin/main code migrates it again on the next write.
+- [ ] **Migrate the store, right after the pull.** The store is at schema 46 and origin/main needs 48. `decision data-release open` does not migrate: at 46 it refuses with ``store schema_version is 46, this code expects 48; run `tradepartner ingest` to back up and migrate the store``. `ingest --dry-run` refuses too. Only a non-dry `ingest` and the write-mode `paper` commands migrate (`store/migrate.py`, called from `cli.py`). There is no `store migrate` command. A plain `ingest` is a full nightly write, and the paper commands touch the books, so use the one ingest entry point that fetches nothing: a borrow-snapshot import from an empty folder. It needs no secret and makes no request. It migrates, then applies zero files and writes no run row:
+
+  ```bash
+  mkdir -p ~/tradepartner-probes/sitting-inputs/empty-assets
+  ls -A ~/tradepartner-probes/sitting-inputs/empty-assets   # must print nothing
+  df -h data
+  uv run tradepartner ingest --source alpaca_assets --import-dir ~/tradepartner-probes/sitting-inputs/empty-assets
+  ls -lh data/tradepartner.duckdb.bak-*
+  grep -l '"pre_migration"' data/tradepartner.duckdb.bak-*.manifest.json
+  ```
+
+  Expect exit 0 and `alpaca_assets import: 0 applied, 0 skipped (at or before the latest observation), 0 refused`. Before migrating, `migrate` writes an automatic **pre-migration copy** beside the store (`<store>.bak-YYYYMMDD-HHMM`, manifest reason `pre_migration`). The rehearsal migrated by calling `store.migrate.migrate` directly, not through this command: that took about 4 s and 2.25 GiB. The command and its expected output line are verified against the code and a temp store (the same `migrate` call), not on a store copy. The pre-migration copy counts as one of the disk precheck's copies. The `ls` lists every copy in `data/`. The `grep` prints every `pre_migration` manifest in `data/`. The sweep keeps two, so an older one may print too. **Exactly one** printed line must carry this run's UTC minute (`bak-YYYYMMDD-HHMM` within a minute of the command); that copy is the pre-migration copy. Record any other line as an older copy. If no line, or more than one, carries this run's minute, stop. Save its path as `<pre-migration-copy>`, with its size and `shasum -a 256` hash; it is the last copy at schema 46. The migration also deletes older `pre_migration` copies beyond `store.pre_migration_backups_to_keep` (2). It never touches a `store backup` checkpoint. Then confirm the version read-only, and stop unless it prints 48:
+
+  ```bash
+  uv run python -c 'from tradepartner.config import get_settings; from tradepartner.store.db import open_read_only; from tradepartner.store.schema import stored_version; cm = open_read_only(get_settings()); conn = cm.__enter__(); print(stored_version(conn)); cm.__exit__(None, None, None)'
+  ```
+
+  A refusal (disk below `ingest.min_free_disk_gb`, a busy store, a backup error) writes nothing; stop and ask. Step 6's checkpoint is then at schema 48. Restoring the pre-migration copy or any earlier copy with origin/main code needs this migration again before any release command.
+- [ ] **`health` on origin/main.** In the rehearsal, `health --check` took 11 to 12 minutes after the pull (724 s, 647 s), against 19 s before it. #3233 (#3232) has since merged on main and should bring it back near the pinned time. If it still takes minutes, check the pull includes #3233, and budget that time for each of the sheet's `health` calls.
 - [ ] **#3070 `universe.shares_split_dating` flip (conditional).** This step applies only if the flip PR, which follows #3071, is in the pull; otherwise the switch stays `false` and this sitting does nothing for it. It needs no store write: 115 shares facts straddle a split, and 62 of them are read as already split once it is on. It moves the pinned twin fingerprints, so list the trials it stales under [named data releases](data-releases.md), and run step 17 after it.
-- [ ] Copy the two local id lists this sheet uses, `starts3053/ids.txt` (step 6, 79 ids) and `spyacts3074-ids.txt` (step 14), from the orchestrator's scratchpad under `/private/tmp` to a durable local folder outside the repo. Do this before the sitting: `/private/tmp` does not survive a restart. Check that `tr ',' '\n' < <ids file> | grep -c .` prints 79 for the first.
+- [ ] The two local id lists this sheet uses are in a durable folder outside the repo: `~/tradepartner-probes/sitting-inputs/ids3053.txt` (step 6, 79 ids) and `~/tradepartner-probes/sitting-inputs/spyacts3074-ids.txt` (step 14, 320 ids). Each is one comma-separated line. The old scratchpad copy of the first, `starts3053/ids.txt`, began with a count line (`79`), which glued the count onto P&G's id; never use it. Check both files before step 6:
+
+  ```bash
+  head -c 40 ~/tradepartner-probes/sitting-inputs/ids3053.txt; echo
+  tr ',' '\n' < ~/tradepartner-probes/sitting-inputs/ids3053.txt | grep -c .
+  tr ',' '\n' < ~/tradepartner-probes/sitting-inputs/spyacts3074-ids.txt | grep -c .
+  ```
+
+  The first line must start with `0000080424:common-stock,` (no count line), then the counts must be **79** and **320**. Stop on anything else.
 
 ## 6. #3080: `classstart-3080` (79-id class-window backfill, #3090)
 
 Purpose: fetch the bars of the 79 class ids that #3090's rule now leads from their company's first filing. Each is its company's only equity id, which until now got bars only from its first cover page (P&G `0000080424:common-stock` has bars only from 2024-08-05). It runs before step 9, so its count is its own and matches #3090's measurement on today's store.
 
-- [ ] Census first: the dry run lists each id's month-holes and fetches nothing. Expect holes only on the 79 ids in the file (lead windows in `gained2.json` beside it), every window ending on or after 2016-01-04.
+- [ ] Census first: the dry run lists each id's month-holes and fetches nothing. Expect holes only on the 79 ids in the file (lead windows in `gained2.json` from the #3080 diagnosis), every window ending on or after 2016-01-04. The ids file is `~/tradepartner-probes/sitting-inputs/ids3053.txt`, checked in step 5.
 
   ```bash
   uv run tradepartner store backup
   uv run tradepartner decision data-release open --name classstart-3080 --backup <classstart-copy> --reason "#3080 only-class first-span lead, 79 ids"
-  uv run tradepartner ingest --source alpaca --backfill --since 2016-01-04 --fill-holes --security "$(cat <79-ids file>)" --dry-run
-  uv run tradepartner ingest --source alpaca --backfill --since 2016-01-04 --fill-holes --security "$(cat <79-ids file>)"
+  uv run tradepartner ingest --source alpaca --backfill --since 2016-01-04 --fill-holes --security "$(cat ~/tradepartner-probes/sitting-inputs/ids3053.txt)" --dry-run
+  uv run tradepartner ingest --source alpaca --backfill --since 2016-01-04 --fill-holes --security "$(cat ~/tradepartner-probes/sitting-inputs/ids3053.txt)"
   uv run tradepartner health --check
   uv run tradepartner decision data-release close --name classstart-3080 --from <earliest-touched-session> --to <last-touched-session> --reason "#3080 bars added per id"
   ```
 
 - [ ] `--since 2016-01-04` must match the store's backfill runs; hole filling reads only committed months of runs with the same `--since`. Stop on a hole or bar for an id outside the file, or failed health. Follow **Restore and gaps** using `<classstart-copy>`. Paste the dry-run hole list size, the bars written, and P&G's first stored bar after the run on #3080.
+- [ ] **Rehearsal figures.** The dry run took about 260 s (it builds the resolver; it is not instant) and printed `3066 holes (security, month) over 76 securities in 130 months; 324 between stored bars (22 securities); 395 lead gaps; 48 holes the resolver cannot assign`. P&G was listed as `0000080424:common-stock PG: 2016-01..2024-08 (104 months, ...)`. Three ids printed `not fetched, no hole in a committed month`: `0001131312:common-stock`, `0001784058:common-stock` and `0001821169:subunits-included-as-part-of-the-units`. If the dry run prints `not fetched, unknown id` for `0000080424:common-stock`, or for an id that starts with a count, the ids file is wrong: stop. The apply took **2 h 52 m** (10,342 s). It writes one committed chunk per month of the `--since` window, about 75 to 80 s each whatever the ids or holes, so 130 months. It prints nothing until it ends; watch progress read-only in `ingestion_runs` (`chunk_cursor` `holes;since=2016-01-04;through=<month end>`). It added 21,798 rows over 130 `filled` chunks, and P&G's first stored bar became 2016-01-04. A fix to the per-month cost is in flight. If it merges before step 5's pull, the time may drop. Budget the measured figure unless it does.
 
 ## 7. #3082: `biob-3082` (BIO.B holes, #3086)
 
 Purpose: fill Bio-Rad class B's holes now that `alpaca.class_symbols` maps `BIOB` to Alpaca's `BIO.B`. Its own release, run before step 9's store-wide fill, so its count is not mixed into rederive-1682's.
 
-- [ ] Census first: expect 1 security and **45 month-holes**: the 43 months 2019-08 to 2023-02, plus 2023-04 and 2023-08. 22 bars are already stored from 2019-08-06 to 2024-02-15. The dry run lists holes and fetches nothing, so the bar count is known only after the fill. Expect about 80 bars; any number up to the window's ~940 sessions is plausible.
+- [ ] Census first: expect 1 security and **87 month-holes**, 2019-08 to 2026-10. The rehearsal's dry run printed `87 holes (security, month) over 1 securities in 87 months; 43 between stored bars; 36 lead gaps` and `BIOb: 2019-08..2026-10 (87 months)`. The 43 holes between stored bars are the earlier census's months (2019-08 to 2023-02, 2023-04, 2023-08); the rest are months outside the stored bars, up to 2026-10. (The earlier census said 45.) Another count, or a hole on another security, is a stop. 22 bars are already stored from 2019-08-06 to 2024-02-15. The dry run lists holes and fetches nothing, so the bar count is known only after the fill. Any number up to the window's sessions is plausible; in the rehearsal 2019-08 got 8 bars and 2019-09 got 5.
+- [ ] **Time.** The dry run takes about 265 s. The apply walks all 130 months of the `--since` window at about 75 s each, whether a month has a hole or not, so about **2.7 h**. For the first ~52 min (2016-01 to 2019-07) it writes no chunk row, so `ingestion_runs` shows no progress then. The rehearsal stopped this apply after an hour. As in step 6, an in-flight fix may cut the per-month cost if it is in the pull.
 
   ```bash
   uv run tradepartner store backup
@@ -222,7 +285,7 @@ Purpose: fill Bio-Rad class B's holes now that `alpaca.class_symbols` maps `BIOB
 
 Purpose: add the back-dated new-ticker listing rows that stored `symbol_changes` imply, where no cover page gave one (PKI→RVTY, CHK→EXE). Run before step 9 so these rows are this release's. Step 9's full rebuild derives the same rows through `build_master`, so it should add none of them again.
 
-- [ ] Census first. Expect at least +1 RVTY row (`0000031791`, from 2023-05-16, known 2026-11-02) and +1 EXE row (`0000895126`, from 2024-10-02, known 2026-04-28). Other stored changes may add a row or be refused with a reason (`no_evidence`, `new_ticker_held`); the dry run lists all of them. Read each one.
+- [ ] Census first. Expect an RVTY row (`0000031791`, from 2023-05-16) and an EXE row (`0000895126`, from 2024-10-02). In the rehearsal RVTY's row was known 2026-11-03T00:44:48Z and EXE's 2026-04-28T20:03:56Z. Expect about **668 rows**, not 2: the rehearsal's dry run (1 s) printed `would add 668 new-ticker listing rows of 1649 name changes; refused: exchange_differs 122, new_ticker_held 29, no_evidence 600, old_ticker_not_current 79`. The four refusal reasons are `no_evidence`, `new_ticker_held`, `exchange_differs` (the evidence is on another exchange) and `old_ticker_not_current` (the class showed another ticker that day). The dry run lists every row and refusal. Read each one; budget real time for about 668 rows and 830 refusals. A count far from these, or a refusal reason not in this list, is a stop-and-ask.
 
   ```bash
   uv run tradepartner store backup
@@ -249,7 +312,13 @@ Purpose: flip the two EDGAR switches, bump both cache versions, rederive rows, r
 
   Record each count against the source above that explains it, and name any count none of them explains. The actual expected row and bar counts come from the agreed censuses: **census first**. T184h stays out unless its own gates and questions 22–24 are satisfied. Record `health --coverage` first.
 - [ ] Take the release checkpoint and snapshot the books before any EDGAR write (#3064, #3095). Both windows are closed, so expect no open lot, but run the check anyway:
-  - **BOOK IDS** (read-only SQL): every `security_id` with an open lot or a latest `positions_daily` row, per book, with each id's current listing `end_session` (NULL if open). Save the list.
+  - **BOOK IDS** (read-only SQL): every `security_id` with an open lot or a latest `positions_daily` row, per book. `listings` has no `end_session` column. A listing's end is derived from the listings, delistings and bars known at a time by `store.delistings.listing_ends_as_of`, the same read the paper planner uses for forced exits (`execution/planning.py` `_ended`, through `execution/exits.py`'s `listings_at`). Save the ids, one per line or comma-separated, in `~/tradepartner-probes/sitting-inputs/book-ids.txt`, with the ids in the next bullet. Then snapshot every listing row of those ids with its derived status and end:
+
+    ```bash
+    IDS=~/tradepartner-probes/sitting-inputs/book-ids.txt uv run python -c 'import os; from datetime import datetime, UTC; from tradepartner.config import get_settings; from tradepartner.store.db import open_read_only; from tradepartner.store.delistings import listing_ends_as_of; s = get_settings(); ids = sorted({x.strip() for x in open(os.environ["IDS"]).read().replace(",", "\n").split() if x.strip()}); cm = open_read_only(s); conn = cm.__enter__(); f = listing_ends_as_of(conn, datetime.now(UTC), s, ids).sort("security_id", "valid_from", "exchange", "ticker"); [print(r["security_id"], r["ticker"], r["exchange"], r["valid_from"], r["status"], r["end_session"], r["delisting_form"], r["effective_on"]) for r in f.iter_rows(named=True)]; cm.__exit__(None, None, None)' > ~/tradepartner-probes/sitting-inputs/book-ends-before.txt
+    ```
+
+    One line per listing row: id, ticker, exchange, `valid_from`, status (`listed`, `delisted` or `transferred`), `end_session` (`None` when listed or unknown), the ending form and its effective day. Run it once here, then **again after the three dry runs in the block below and before the EDGAR write**. Add the old ids the dry runs name (next bullet) to `book-ids.txt` first, so every id has a before line. The second run overwrites `book-ends-before.txt`.
   - Add #3064's ids `0000874499`, `0000105319` and `0001844505`, and every old id the EDGAR dry run makes a successor of or that `repair-resolution`'s dry run names. An open lot on any of them is a **STOP**: do not write, and report it on #3056.
 
   ```bash
@@ -259,13 +328,14 @@ Purpose: flip the two EDGAR switches, bump both cache versions, rederive rows, r
   uv run tradepartner ingest --source edgar --dry-run
   uv run tradepartner ingest --source edgar --rebuild-classifications --dry-run
   uv run tradepartner repair-resolution --dry-run
+  # add the dry runs' old ids to book-ids.txt and re-run the BOOK IDS snapshot here
   uv run tradepartner ingest --source edgar --rebuild-classifications
   ```
 
-  Read `unread HTML delistings`, `pre-XML delistings` and the delistings/listings row counts in the EDGAR dry run. If the EDGAR ingest refuses on the build fingerprint and asks for `--rebuild-index`, stop and ask; do not add it from this sheet.
+  Read `unread HTML delistings`, `pre-XML delistings` and the delistings/listings row counts in the EDGAR dry run. If step 1's pinned EDGAR dry run failed on the Cboe BZX names, make its two checks on this first dry run: the note's Form 25 stays unmatched, and no key `restate-1682` deleted is derived again. A key that comes back here is a **stop-and-ask**, not a restore: `<rederive-copy>` cannot undo `restate-1682`, and under `BUILD_RULES_VERSION` 8 the cause may be another merged rule. Paste it on #1682 and write nothing until the owner decides. This dry run must not fail on `'Cboe BZX Exchange, Inc.'`: if it does, the pull lacks #3231, so stop. If the EDGAR ingest refuses on the build fingerprint and asks for `--rebuild-index`, stop and ask; do not add it from this sheet.
 - [ ] **BOOK CHECK** (#3095; read-only SQL, right after the EDGAR write, before any other command):
   - (a) `SELECT security_id, form, filed_at, effective_on FROM delistings WHERE ingested_at = <this run's ingested_at> AND security_id IN (<BOOK IDS>);`
-  - (b) Listing ends are the source of forced exits (`execution/exits.py`). Check for any `listings` row on a BOOK ID whose `end_session` is new, or earlier than in the pre-write snapshot.
+  - (b) Listing ends are the source of forced exits (`execution/exits.py`). Re-run the BOOK IDS snapshot command with its output going to `book-ends-after.txt` instead of `book-ends-before.txt`, then `diff ~/tradepartner-probes/sitting-inputs/book-ends-before.txt ~/tradepartner-probes/sitting-inputs/book-ends-after.txt`. **Any line of diff output on a BOOK ID is a hit.** That covers a new, earlier or changed end, a status change, a new row and a row that disappeared. A row that disappears can make an older, already `delisted` row current, and that forces an exit. A `transferred` change or a non-current row is counted too: forced exits ignore those, but this check does not try to tell them apart. Read every diff line before deciding.
 
   Any row in (a) or (b) is a **STOP**: restore as in **Restore and gaps** using `<rederive-copy>`, after saving the failed state, and report it on #3084. Keep paper jobs unloaded throughout. Do not run `data-release close` after the restore. Then continue:
 
@@ -300,7 +370,7 @@ Purpose: apply what is left of #3064's post-bankruptcy repair after step 9. Step
   ```
 
   Expect no new successor, no retract row, no resolution row and no new hole. GPOR's old id should end at its own last print, and WW's 07-07..07-11 bars should be gone. If every dry run is empty, open no release and paste the outputs and `spliced_series` on #3056.
-- [ ] Only if a dry run lists rows, re-run step 9's BOOK IDS check on the listed ids, then write under its own release:
+- [ ] Only if a dry run lists rows, repeat step 9's BOOK IDS snapshot with the listed ids added, writing `book-ends-before-10.txt` (step 9's files stay as they are). Then write under its own release. Right after the `master-retract` and `repair-resolution` lines, take `book-ends-after-10.txt` and diff the two. Any diff line on a BOOK ID is a STOP, as in step 9's BOOK CHECK (b), together with BOOK CHECK (a) on this release's `ingested_at`:
 
   ```bash
   uv run tradepartner store backup
@@ -327,7 +397,7 @@ Purpose: apply what is left of #3095's Form 25 repair after step 9. Its EDGAR wr
   ```
 
   The second EDGAR run reads the HTML Form 25s from the `DELISTING_VERSION` cache and the unread ones from `delisting_html_unread/v1/`, so it fetches none again. Expect no new delistings row and no retract row. If both are empty, open no release and paste the outputs on #3084.
-- [ ] Only if `master-retract` lists rows: re-run step 9's BOOK IDS check and BOOK CHECK on the listed ids, then:
+- [ ] Only if `master-retract` lists rows: repeat step 9's BOOK IDS snapshot with the listed ids added, writing `book-ends-before-11.txt`. Right after the `master-retract --apply` line, take `book-ends-after-11.txt` and diff the two. Any diff line on a BOOK ID is a STOP, as in step 9's BOOK CHECK (b):
 
   ```bash
   uv run tradepartner store backup
@@ -360,7 +430,7 @@ Purpose: delete the 33 spin-offs stored as splits (2016-04-04..2021-11-02), whic
 
 ## 13. #3054: `actions-3054` (missing splits and dividends)
 
-Purpose: store the pre-2020 name changes, then ask Alpaca again for the splits and dividends of committed months, so a renamed security's pre-rename symbol carries its actions (`ListingResolver.action_alias`). Also retract the STX 2021-05-11 duplicate, which is now on the reviewed list.
+Purpose: store the pre-2020 name changes, then ask Alpaca again for the splits and dividends of committed months, so a renamed security's pre-rename symbol carries its actions (`ListingResolver.action_alias`). Also retract the two listed duplicate dividends still in the store: STX 2021-05-11, which origin/main's reviewed list now holds as a duplicate, and PFLT 2026-10-15 (`0001504619`), pending at the baseline.
 
 - [ ] Census first: dry-run both steps and read the counts before writing. The measurement (#3053, 11-02 store) put 307 missing dividends and 61 missing splits under an old symbol the master never lists. That is the most this can recover. Rows with no rename (SPY 2016-03-18, 2018-06-15) are expected to stay missing unless Alpaca serves them now.
 
@@ -374,23 +444,23 @@ Purpose: store the pre-2020 name changes, then ask Alpaca again for the splits a
   uv run tradepartner repair-dividends --release actions-3054 --dry-run
   uv run tradepartner repair-dividends --release actions-3054 --expect-action-rows <dry-run-row-count>
   uv run tradepartner health --check
-  uv run tradepartner decision data-release close --name actions-3054 --from 2016-01-04 --to <last touched ex-date> --reason "#3054 added actions by type, STX retract"
+  uv run tradepartner decision data-release close --name actions-3054 --from 2016-01-04 --to <last touched ex-date, at least 2026-10-15> --reason "#3054 added actions by type, STX and PFLT retracts"
   ```
 
-- [ ] Name-change step: read `symbol_change_backdated` and `actions_unresolved` on each month's run row. Refetch step: the dry run's last line names the rows per type (`would add N dividend, M split`). Stop when splits outnumber the census's 61 + 26, or when an added split lands on a name with no matching raw price gap. Paste both summaries, the repair count and `health --check` on #3054. `repair-dividends` expects exactly STX's one row plus any duplicates the list already holds and the store still has.
+- [ ] Name-change step: read `symbol_change_backdated` and `actions_unresolved` on each month's run row. Refetch step: the dry run's last line names the rows per type (`would add N dividend, M split`). Stop when splits outnumber the census's 61 + 26, or when an added split lands on a name with no matching raw price gap. Paste both summaries, the repair count and `health --check` on #3054. `repair-dividends` expects exactly one row each for STX and PFLT (`0001504619` 2026-10-15, pending at the baseline), plus any other duplicates the list holds and the store still has. It does not touch FCX's #2972 key. The close's `--to` is the latest ex-date any command in this release touched. PFLT's retract makes that at least 2026-10-15, later than the refetch's `--through`.
 
 ## 14. #3074: `actions-3074` (span refetch for actions with no rename)
 
 Purpose: tell vendor absence from late processing for the rows step 13 cannot reach, then store what Alpaca serves. Alpaca filters on `process_date`. A month request asks only `alpaca.actions_process_lag_days` (90) past the month, so a record Alpaca processed later is in no month's answer. `refetch-actions --span` asks once over the whole range for the named securities. It asks every symbol each one held and every process date up to today (`backfill.span_settings`). Timing is unchanged: a first-seen row is stamped at the close of the session before its ex-date.
 
-- [ ] Run it after step 13's release is closed. The ids are SPY (`BENCH:SPY`) plus the 319 securities of the #3053 measurement's "no later rename" and "old symbol known" groups. The list is a local file from the #3074 diagnosis (`spyacts3074-ids.txt`, comma-separated; the figures stay local). HTA (`0001360604`) is left out: its 26 "missing" dividends are old Healthcare Realty's, not HTA's (#3074 PR).
+- [ ] Run it after step 13's release is closed. The ids are SPY (`BENCH:SPY`) plus the 319 securities of the #3053 measurement's "no later rename" and "old symbol known" groups. The list is a local file from the #3074 diagnosis, `~/tradepartner-probes/sitting-inputs/spyacts3074-ids.txt` (320 ids, comma-separated, checked in step 5; the figures stay local). Below, `<ids file>` is that path. HTA (`0001360604`) is left out: its 26 "missing" dividends are old Healthcare Realty's, not HTA's (#3074 PR).
 
   ```bash
-  uv run tradepartner refetch-actions --span --since 2016-01-04 --through <last committed backfill day> --release actions-3074 --security "$(cat <ids file>)" --dry-run
+  uv run tradepartner refetch-actions --span --since 2016-01-04 --through <last committed backfill day> --release actions-3074 --security "$(cat ~/tradepartner-probes/sitting-inputs/spyacts3074-ids.txt)" --dry-run
   # only when the dry run lists rows to write:
   uv run tradepartner store backup
   uv run tradepartner decision data-release open --name actions-3074 --backup <actions-copy> --reason "#3074 span refetch, no-rename actions"
-  uv run tradepartner refetch-actions --span --since 2016-01-04 --through <last committed backfill day> --release actions-3074 --security "$(cat <ids file>)"
+  uv run tradepartner refetch-actions --span --since 2016-01-04 --through <last committed backfill day> --release actions-3074 --security "$(cat ~/tradepartner-probes/sitting-inputs/spyacts3074-ids.txt)"
   uv run tradepartner health --check
   uv run tradepartner decision data-release close --name actions-3074 --from 2016-01-04 --to <last touched ex-date> --reason "#3074 added actions by type"
   ```
@@ -578,7 +648,7 @@ Purpose: give each book a survivorship-gap sign-off computed on the post-sitting
 
 ## Restart and close
 
-- [ ] Confirm every opened release has an `after` row, `uv run tradepartner health --check` exits 0, and `uv run tradepartner health --coverage` has the reviewed final buckets. Confirm the counts comment for every release is on #1682. List every stale trial. Besides step 17's two gap replays, replay only H1 and a kill-ladder rung-4 survivor, per ADR 0023. Record delete-only affected sweep decisions under [named data releases](data-releases.md); each rerun counts in N.
+- [ ] Confirm every opened release has an `after` row and that `uv run tradepartner health --check` exits 0. It may instead fail only on the baseline's FCX `duplicate_dividends` violation, as #2972's decision accepted (see **Before the first write**). That accepted FAIL also makes `paper shakedown`'s line E.7 ("health integrity rules all pass", `execution/shakedown.py`) report FAIL, already before the restart and after it, until #2972 is repaired. This fails safe and is expected; do not read it as a new data fault. Confirm, too, that `uv run tradepartner health --coverage` has the reviewed final buckets. Confirm the counts comment for every release is on #1682. List every stale trial. Besides step 17's two gap replays, replay only H1 and a kill-ladder rung-4 survivor, per ADR 0023. Record delete-only affected sweep decisions under [named data releases](data-releases.md); each rerun counts in N.
 - [ ] **Which books restart (orchestrator decision on #3117, 2026-11-06).** H1 is retired by its own rule (TP-12, PR #3123).
   - **Daily** restarts only once step 17's replay of its gap sign-off on the post-sitting store has passed and been signed off.
   - **Main stays closed.** It may restart only if it is first relabelled as an execution shakedown whose results are never read as H1 evidence, and that relabel is recorded on #3117 before `paper start`. Without it, skip main's account check and its `paper start` below.
@@ -609,7 +679,13 @@ cp "$CHECKPOINT_COPY" data/tradepartner.duckdb
 if [ -n "$CHECKPOINT_WAL_COPY" ]; then cp "$CHECKPOINT_WAL_COPY" data/tradepartner.duckdb.wal; fi
 ```
 
-Before opening the restored store, compare the checkpoint manifest's `wal_bytes` with the restored WAL's size (`stat -f %z data/tradepartner.duckdb.wal` on macOS). A numeric `wal_bytes` requires a WAL of that size; `null` requires no restored WAL. Stop on a mismatch. Then check health:
+Before opening the restored store, compare the checkpoint manifest's `wal_bytes` with the restored WAL's size (`stat -f %z data/tradepartner.duckdb.wal` on macOS). A numeric `wal_bytes` requires a WAL of that size; `null` requires no restored WAL. Stop on a mismatch.
+
+**A schema-46 copy.** A copy taken before step 5's migration (the baseline or the pre-migration copy) is at schema 46. Under origin/main code, `health --check` and every release command refuse on it until it is migrated again. So, after the copy and the `wal_bytes` check, and before anything else:
+1. Move the original `<pre-migration-copy>` out of `data/`, with its manifest and its WAL copy, if any. Re-hash it and record the new path. The migration's sweep keeps only two `pre_migration` copies in the store's folder and may delete it.
+2. Re-run step 5's migration command and its version check. Count the new pre-migration copy in the disk check. Its name has minute precision, like the failed-state copy just taken. If the migration refuses on an existing target, wait for the next UTC minute and rerun.
+
+Then check health (judged against the baseline failing rules):
 
 ```bash
 uv run tradepartner health --check
