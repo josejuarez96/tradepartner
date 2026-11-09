@@ -77,19 +77,20 @@ Owner and orchestrator only, on the owner's job checkout and real store. Target 
   Save the **printed copy path and any printed log-copy path** as `<baseline-copy>` and `<baseline-wal-copy>`. Check the manifest and record the paths, sizes and hashes. The baseline contains the two ended windows; restoring it will restore that ended state. Paste starting coverage, health, closure method, stop/reconciliation ids, broker positions or residues, and baseline path on T197's PR. **Close once here; restart once after all the steps.**
 
   In the rehearsal, `store backup` took 7 s, `health --coverage` 47 s and `health --check` 19 s on the pinned checkout.
-- [ ] **Baseline health failures.** The baseline store already fails `health --check`. In the rehearsal it exited 1 with `health check failed: duplicate_dividends`. The integrity block showed `duplicate_dividends: FAIL (2 rows)`; no other rule failed. Two separate findings sit under that rule:
-  - **1 pending key.** `warning: 1 listed duplicate dividend keys are pending repair` is STX 2021-05-11 (`0001137789`), a listed `duplicate` that step 13's `repair-dividends` retracts. A pending key is a warning, never a failure.
-  - **The 2 FAIL rows.** These are a `violation`: one row per live identity, so most likely one key with two identities. `health` does not print which key. Until it is named, nothing in this sheet is known to repair it.
+- [ ] **Baseline health failures.** The baseline store already fails `health --check`. In the rehearsal it exited 1 with `health check failed: duplicate_dividends`. The integrity block showed `duplicate_dividends: FAIL (2 rows)` and the warning `1 listed duplicate dividend keys are pending repair`; no other rule failed. The real store gave this, measured read-only on 2026-11-09 at the pinned 1fe51c9f with the snippet below:
+  - **The violation (the FAIL's 2 rows): FCX, `0000831259`, ex-date 2026-10-15, 0.075**, with two identities (`c7a92302-…`, `e490e9c7-…`, both known 2026-10-14T20:00Z). This is #2972's open key: FCX's 2026-10-15 dividend is stored three times. No reviewed-list row covers it on origin/main, so no step of this sheet repairs it. **The owner records a decision on #2972 before step 1**: either accept it as a known residue for this sitting, or name the repair. Without that decision, stop before step 1.
+  - **The pending key (the warning): PFLT, `0001504619`, ex-date 2026-10-15, 0.0033**, with two identities. It is a listed `duplicate` (retract id `764fdbfa-…`) in `store/dividend_reviews.csv`. A pending key is a warning, never a failure. Step 13's `repair-dividends` retracts it: that step runs with no `--to`, so it retracts every listed duplicate still in the store.
+  - **STX** (`0001137789`, 2021-05-11) is not pending on the pinned code, where the list holds it as `unresolved`. origin/main's list makes it a `duplicate` (#3054), so after step 5's pull it should show as a second `pending` key, which step 13 also retracts. If it shows as a `violation` instead (the retract id is not among its live identities), stop and ask on #3054.
 
-  List both findings read-only, and save the output with the baseline:
+  List the findings read-only, and save the output with the baseline. Rerun it after step 5's migration:
 
   ```bash
   uv run python -c 'from datetime import datetime, UTC; from tradepartner.config import get_settings; from tradepartner.store.db import open_read_only; from tradepartner.health import duplicate_dividends; from tradepartner.store.dividend_reviews import reviewed_groups; cm = open_read_only(get_settings()); conn = cm.__enter__(); b = duplicate_dividends(conn, datetime.now(UTC), reviewed_groups()); [print(g.group_class, g.security_id, g.ex_date, g.amount, [(i.source_action_id, i.known_at.isoformat()) for i in g.identities]) for g in b.groups if g.group_class in ("violation", "pending")]; cm.__exit__(None, None, None)'
   ```
 
-  Expect one `pending` line for STX, plus `violation` line(s) whose identities total the FAIL's row count. Paste the output on #1613 and #3054. The owner says whether the violation key is a known residue for this sitting, and which step (if any) repairs it. Without that answer, stop before step 1.
+  At the baseline, expect exactly the FCX `violation` line and the PFLT `pending` line above. Any other line is a stop. Paste the output on #2972 and #3054.
 
-  Save the baseline's `health check failed:` line, the FAIL row count and the violation keys as the **baseline failing rules**. "Failed health" in any step below means a failing rule not on that line, a changed `duplicate_dividends` row count, or a violation key not in the saved list. Rerun the snippet whenever `duplicate_dividends` still fails. The gate is **no new failing rule versus the baseline**; the known `duplicate_dividends` FAIL is expected. After step 13, the STX `pending` line must be gone. `health --check` exits 0 only once the violation key is also repaired or reviewed. **Restart and close** needs exit 0, so a violation still there after step 15 is the owner's call before restart.
+  Save the baseline's `health check failed:` line, the FAIL row count and the FCX violation key as the **baseline failing rules**. "Failed health" in any step below means a failing rule not on that line, a changed `duplicate_dividends` row count, or a violation key other than FCX's. Rerun the snippet whenever `duplicate_dividends` still fails. The gate is **no new failing rule versus the baseline**; the known FCX FAIL is expected. After step 13, no `pending` line may remain (PFLT and STX retracted). `health --check` exits 0 only if #2972's decision also repairs or lists FCX's key. Otherwise the FCX FAIL is the one accepted residue at **Restart and close**.
 - [ ] **Legacy releases (Audit F row 10): run the import, expect a refusal.** `restamp-1382a2`, `restamp-1382a3` and `ops-1549` changed data, but they exist only in `data/releases.toml`, not in the store's `owner_decisions`. So `data_releases(conn)` and `data-release open`'s checks do not see them. With no release open, run the import once:
 
   ```bash
@@ -209,7 +210,7 @@ Purpose: move the job checkout from the pinned `1fe51c9f` to origin/main once, s
   ls -lh data/tradepartner.duckdb.bak-*
   ```
 
-  Expect exit 0 and `alpaca_assets import: 0 applied, 0 skipped (at or before the latest observation), 0 refused`. Before migrating, `migrate` writes an automatic **pre-migration copy** beside the store (`<store>.bak-YYYYMMDD-HHMM`, manifest reason `pre_migration`). The rehearsal migrated by calling `store.migrate.migrate` directly, not through this command: that took about 4 s and 2.25 GiB. The command and its expected output line are verified against the code and a temp store (the same `migrate` call), not on a store copy. It counts as one of the disk precheck's copies. Record its path, size and `shasum -a 256` hash; it is the last copy at schema 46. The migration also deletes older `pre_migration` copies beyond `store.pre_migration_backups_to_keep` (2). It never touches a `store backup` checkpoint. Then confirm the version read-only, and stop unless it prints 48:
+  Expect exit 0 and `alpaca_assets import: 0 applied, 0 skipped (at or before the latest observation), 0 refused`. Before migrating, `migrate` writes an automatic **pre-migration copy** beside the store (`<store>.bak-YYYYMMDD-HHMM`, manifest reason `pre_migration`). The rehearsal migrated by calling `store.migrate.migrate` directly, not through this command: that took about 4 s and 2.25 GiB. The command and its expected output line are verified against the code and a temp store (the same `migrate` call), not on a store copy. The pre-migration copy counts as one of the disk precheck's copies. Record its path, size and `shasum -a 256` hash; it is the last copy at schema 46. The migration also deletes older `pre_migration` copies beyond `store.pre_migration_backups_to_keep` (2). It never touches a `store backup` checkpoint. Then confirm the version read-only, and stop unless it prints 48:
 
   ```bash
   uv run python -c 'from tradepartner.config import get_settings; from tradepartner.store.db import open_read_only; from tradepartner.store.schema import stored_version; cm = open_read_only(get_settings()); conn = cm.__enter__(); print(stored_version(conn)); cm.__exit__(None, None, None)'
@@ -423,7 +424,7 @@ Purpose: store the pre-2020 name changes, then ask Alpaca again for the splits a
   uv run tradepartner decision data-release close --name actions-3054 --from 2016-01-04 --to <last touched ex-date> --reason "#3054 added actions by type, STX retract"
   ```
 
-- [ ] Name-change step: read `symbol_change_backdated` and `actions_unresolved` on each month's run row. Refetch step: the dry run's last line names the rows per type (`would add N dividend, M split`). Stop when splits outnumber the census's 61 + 26, or when an added split lands on a name with no matching raw price gap. Paste both summaries, the repair count and `health --check` on #3054. `repair-dividends` expects exactly STX's one row plus any duplicates the list already holds and the store still has.
+- [ ] Name-change step: read `symbol_change_backdated` and `actions_unresolved` on each month's run row. Refetch step: the dry run's last line names the rows per type (`would add N dividend, M split`). Stop when splits outnumber the census's 61 + 26, or when an added split lands on a name with no matching raw price gap. Paste both summaries, the repair count and `health --check` on #3054. `repair-dividends` expects exactly one row each for STX and PFLT (`0001504619` 2026-10-15, pending at the baseline), plus any other duplicates the list holds and the store still has. It does not touch FCX's #2972 key.
 
 ## 14. #3074: `actions-3074` (span refetch for actions with no rename)
 
@@ -624,7 +625,7 @@ Purpose: give each book a survivorship-gap sign-off computed on the post-sitting
 
 ## Restart and close
 
-- [ ] Confirm every opened release has an `after` row, `uv run tradepartner health --check` exits 0, and `uv run tradepartner health --coverage` has the reviewed final buckets. Confirm the counts comment for every release is on #1682. List every stale trial. Besides step 17's two gap replays, replay only H1 and a kill-ladder rung-4 survivor, per ADR 0023. Record delete-only affected sweep decisions under [named data releases](data-releases.md); each rerun counts in N.
+- [ ] Confirm every opened release has an `after` row and that `uv run tradepartner health --check` exits 0. It may instead fail only on the baseline's FCX `duplicate_dividends` violation, and only if #2972's decision accepted it as a residue (see **Before the first write**). Confirm, too, that `uv run tradepartner health --coverage` has the reviewed final buckets. Confirm the counts comment for every release is on #1682. List every stale trial. Besides step 17's two gap replays, replay only H1 and a kill-ladder rung-4 survivor, per ADR 0023. Record delete-only affected sweep decisions under [named data releases](data-releases.md); each rerun counts in N.
 - [ ] **Which books restart (orchestrator decision on #3117, 2026-11-06).** H1 is retired by its own rule (TP-12, PR #3123).
   - **Daily** restarts only once step 17's replay of its gap sign-off on the post-sitting store has passed and been signed off.
   - **Main stays closed.** It may restart only if it is first relabelled as an execution shakedown whose results are never read as H1 evidence, and that relabel is recorded on #3117 before `paper start`. Without it, skip main's account check and its `paper start` below.
@@ -645,7 +646,7 @@ Purpose: give each book a survivorship-gap sign-off computed on the post-sitting
 
 ## Restore and gaps
 
-With every job still stopped and no DuckDB process holding the store, save the **failed live store and WAL first** using `uv run tradepartner store backup`; label its printed paths as failed-state evidence on the release PR/issue. Then restore the chosen checkpoint. A copy taken before step 5's migration (the baseline or the pre-migration copy) is at schema 46. Under origin/main code, `health --check` and every release command refuse on it until it is migrated again. Before that, move the original pre-migration copy out of `data/`: the migration's sweep keeps only two `pre_migration` copies in the store's folder and would delete the oldest. Then re-run step 5's migration command. Count the new pre-migration copy in the disk check. Current `store backup` names a copy `<store>.bak-YYYYMMDD-HHMM` and a WAL copy `<copy>.wal` when one exists; older backups use `<store>.wal.bak-YYYYMMDD-HHMM`. Use their **printed paths**, not a guessed release filename. A copy moved off the volume (see the disk precheck) is restored from its recorded new path:
+With every job still stopped and no DuckDB process holding the store, save the **failed live store and WAL first** using `uv run tradepartner store backup`; label its printed paths as failed-state evidence on the release PR/issue. Then restore the chosen checkpoint. Current `store backup` names a copy `<store>.bak-YYYYMMDD-HHMM` and a WAL copy `<copy>.wal` when one exists; older backups use `<store>.wal.bak-YYYYMMDD-HHMM`. Use their **printed paths**, not a guessed release filename. A copy moved off the volume (see the disk precheck) is restored from its recorded new path:
 
 ```bash
 CHECKPOINT_COPY="<printed-copy-path>"
@@ -655,7 +656,13 @@ cp "$CHECKPOINT_COPY" data/tradepartner.duckdb
 if [ -n "$CHECKPOINT_WAL_COPY" ]; then cp "$CHECKPOINT_WAL_COPY" data/tradepartner.duckdb.wal; fi
 ```
 
-Before opening the restored store, compare the checkpoint manifest's `wal_bytes` with the restored WAL's size (`stat -f %z data/tradepartner.duckdb.wal` on macOS). A numeric `wal_bytes` requires a WAL of that size; `null` requires no restored WAL. Stop on a mismatch. Then check health:
+Before opening the restored store, compare the checkpoint manifest's `wal_bytes` with the restored WAL's size (`stat -f %z data/tradepartner.duckdb.wal` on macOS). A numeric `wal_bytes` requires a WAL of that size; `null` requires no restored WAL. Stop on a mismatch.
+
+**A schema-46 copy.** A copy taken before step 5's migration (the baseline or the pre-migration copy) is at schema 46. Under origin/main code, `health --check` and every release command refuse on it until it is migrated again. So, after the copy and the `wal_bytes` check, and before anything else:
+1. Move the original pre-migration copy out of `data/` (with its manifest; record the new path). The migration's sweep keeps only two `pre_migration` copies in the store's folder and would delete the oldest.
+2. Re-run step 5's migration command and its version check. Count the new pre-migration copy in the disk check.
+
+Then check health (judged against the baseline failing rules):
 
 ```bash
 uv run tradepartner health --check
