@@ -870,8 +870,14 @@ def shares_cap_jumps(
         schema={"security_id": pl.Utf8, "as_of_date": pl.Date, "value": pl.Float64},
         orient="row",
     )
+    # DuckDB estimates a registered Arrow table at about one row and, at or under
+    # `asof_loop_join_threshold`, rewrites the ASOF join as a nested loop over
+    # every bar (#3232: 363k picks x 10.8M bars, 616 s on the real store). The
+    # threshold is 0 for this query only; the caller's value is restored.
+    (prior,) = conn.execute("SELECT current_setting('asof_loop_join_threshold')").fetchall()[0]
     conn.register("_cap_picks", frame.to_arrow())
     try:
+        conn.execute("SET asof_loop_join_threshold = 0")
         closes = conn.execute(
             "WITH bars AS ("
             "  SELECT security_id, session, close FROM ("
@@ -886,6 +892,7 @@ def shares_cap_jumps(
             [t],
         ).fetchall()
     finally:
+        conn.execute(f"SET asof_loop_join_threshold = {int(prior)}")
         conn.unregister("_cap_picks")
     capped: dict[str, list[tuple[date, float, float, date, float]]] = defaultdict(list)
     for sid, as_of, value, session, close in closes:
