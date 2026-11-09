@@ -287,13 +287,24 @@ def _exchange_axis_mismatch(member: str, exchange: str) -> bool:
     return venue is not None and exchange in _EXCHANGE_CODES and venue != exchange
 
 
+def _exchange_key(raw: str) -> str:
+    """`raw` as `_EXCHANGES` keys it: upper case, `.`/`,` dropped, spaces
+    collapsed ("Cboe BZX Exchange, Inc." -> `CBOE BZX EXCHANGE INC`)."""
+    return " ".join(re.sub(r"[.,]", " ", raw.upper()).split())
+
+
+def _registered_exchange(raw: str) -> str | None:
+    """The code of the venue `_EXCHANGES` names exactly as `raw`, or `None`
+    for any other name (never a slug)."""
+    return _EXCHANGES.get(_exchange_key(raw))
+
+
 def normalize_exchange(raw: str) -> str:
     """The exchange code config uses for `raw`, from an exact-name table;
     any other name becomes its upper-case slug ("Nasdaq Global Select
     Market" -> `NASDAQ_GLOBAL_SELECT_MARKET`), which matches no listing, so
     ingest should report codes outside the table."""
-    text = " ".join(re.sub(r"[.,]", " ", raw.upper()).split())
-    return _EXCHANGES.get(text) or re.sub(r"[^A-Z0-9]+", "_", text).strip("_")
+    return _registered_exchange(raw) or re.sub(r"[^A-Z0-9]+", "_", _exchange_key(raw)).strip("_")
 
 
 # --- submissions and the filing index -------------------------------------
@@ -1162,10 +1173,19 @@ def _dei_facts(document: bytes, accession: str) -> _DeiFacts:
                 raise ValueError(f"{accession}: dei:{name} is nil but has text {text[:40]!r}")
             continue
         issue = (fact.metadata or {}).get("format_issue")
+        value = _trading_symbol(str(fact.value)) if name == "TradingSymbol" else fact.value
+        if name == "SecurityExchangeName" and _is_exchange_name_format(element):
+            # #3230: edgartools' `exchnameen` rejects some registered venues'
+            # written names ("Cboe BZX Exchange, Inc.") and maps others to
+            # codes this table lacks ("NYSE Chicago, Inc." -> `NYSECHX`); a
+            # name the exact-name table holds is read by the table. Any other
+            # name keeps the transform's value or its failure.
+            code = _registered_exchange("".join(element.itertext()))
+            if code is not None:
+                issue, value = None, code
         if issue:
             raise ValueError(f"{accession}: dei:{name}: {issue}")
         context = fact.context or {}
-        value = _trading_symbol(str(fact.value)) if name == "TradingSymbol" else fact.value
         if name == "TradingSymbol" and not value:
             continue  # quote-only text is no symbol, never an empty ticker
         key = (name, str(context.get("id", "")))
@@ -1176,6 +1196,12 @@ def _dei_facts(document: bytes, accession: str) -> _DeiFacts:
         seen[key] = value
         out.append((name, value, context))
     return _DeiFacts(out, ciks)
+
+
+def _is_exchange_name_format(element: Any) -> bool:
+    """Whether an iXBRL element declares the `ixt-sec:exchnameen` format."""
+    fmt = str(element.get("format") or "")
+    return fmt.rsplit(":", 1)[-1].strip().lower() == "exchnameen"
 
 
 @_fail_closed
