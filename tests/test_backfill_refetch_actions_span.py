@@ -155,6 +155,33 @@ def test_a_reviewed_distinct_dividend_is_not_refused(settings: Settings) -> None
         mp.setattr(dr, "reviewed_groups", lambda: (group,))
         result = _collide(settings)
     assert result.ok and result.refused == ()
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(2,)]
+
+
+def test_a_reviewed_distinct_group_does_not_cover_a_third_identity(settings: Settings) -> None:
+    from tradepartner.store import dividend_reviews as dr
+
+    group = dr.ReviewedGroup(ACME, EX, 0.25, "distinct", "", "ACME", "regular and special")
+    prices = _committed(settings)
+    _open_release(settings)
+    _refetch(settings, prices, since=SINCE, through=THROUGH, span=True, securities=[ACME])
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr, "reviewed_groups", lambda: (group,))
+        for n in range(2):
+            when = AGAIN + timedelta(days=n)
+            prices.actions = [_dividend(action_id=f"acme-extra-{n}")]
+            result = _refetch(
+                settings,
+                prices,
+                since=SINCE,
+                through=THROUGH,
+                span=True,
+                securities=[ACME],
+                clock=lambda when=when: when,
+            )
+    assert not result.ok and len(result.refused) == 1
+    assert result.added == ()  # a refused month shows nothing as added
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(2,)]
 
 
 def test_span_needs_named_securities(settings: Settings) -> None:

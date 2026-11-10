@@ -190,6 +190,7 @@ from tradepartner.store.benchmarks import (
 from tradepartner.store.classify import EQUITY, classifications_as_of, listing_kind
 from tradepartner.store.db import StoreLockedError, insert_row, open_for_write, utc_now
 from tradepartner.store.delistings import DELISTED, LISTED, TRANSFERRED, listing_ends_as_of
+from tradepartner.store.dividend_reviews import REVIEWED_IDENTITIES
 from tradepartner.store.master import first_session, securities_as_of
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -1604,7 +1605,6 @@ def _refetch_month(
             stats=stats,
         )
         moved = _action_counts(conn) - before
-        totals.update(moved)
         lines, blocked = _rows_written(conn, stamp, allowed)
         if refused is not None:
             refused.extend(blocked)
@@ -1613,6 +1613,7 @@ def _refetch_month(
                 f"{len(blocked)} collision row(s): a new id on a security, type and ex-date "
                 f"that already holds a live one; nothing written: {'; '.join(blocked)}"
             )
+        totals.update(moved)
         written.extend(lines)
         by_type = ", ".join(f"{kind}={n}" for kind, n in sorted(moved.items())) or "none"
         extra = "".join(f"; {key}={value}" for key, value in sorted(stats.items()))
@@ -1680,7 +1681,12 @@ def _rows_written(
                    SELECT 1 FROM latest l
                    WHERE l.security_id = w.security_id AND l.action_type = w.action_type
                      AND l.ex_date = w.ex_date AND l.key <> w.key AND NOT l.cancelled
-               ) AS collision
+               ) AS collision,
+               (
+                   SELECT count(*) FROM latest l
+                   WHERE l.security_id = w.security_id AND l.action_type = w.action_type
+                     AND l.ex_date = w.ex_date AND NOT l.cancelled
+               ) AS live
         FROM ident w WHERE w.ingested_at = ?
         ORDER BY 1, 2, 3, 6
         """,
@@ -1688,14 +1694,17 @@ def _rows_written(
     ).fetchall()
     lines: list[str] = []
     blocked: list[str] = []
-    for sid, kind, ex, amount, cancelled, known_at, revision, collision in rows:
+    for sid, kind, ex, amount, cancelled, known_at, revision, collision, live in rows:
         tag = "revision" if revision else "collision" if collision else "new"
         line = (
             f"{tag} {sid} {kind} {ex} {amount!r}{' cancelled' if cancelled else ''} "
             f"known_at={known_at.astimezone(UTC).isoformat()}"
         )
         covered = (sid, ex) in allow_pairs or (
-            kind == ActionType.DIVIDEND and (sid, ex, float(amount)) in distinct
+            # A reviewed group was judged as exactly two identities: a third is not covered.
+            kind == ActionType.DIVIDEND
+            and (sid, ex, float(amount)) in distinct
+            and live <= REVIEWED_IDENTITIES
         )
         if tag == "collision" and not cancelled and not covered:
             blocked.append(line)
