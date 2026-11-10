@@ -618,8 +618,8 @@ Purpose: store the pre-2020 name changes, then ask Alpaca again for the splits a
 - [ ] **Stop before writing on any `collision` or `revision` row.** The dry run tags each line `new`, `revision` or `collision`. A `collision` is a new id on a type and ex-date the security already holds live, so the dividend would apply twice; a `revision` is a stored identity with changed values stamped at the run. The re-rehearsal's dry run had 34 collisions and 25 revisions among 914 lines, and writing them took `duplicate_dividends` from 2 to 21 rows. Count them from the saved dry run:
 
   ```bash
-  grep -cE '^  would write collision ' ~/tradepartner-probes/sitting-inputs/refetch-3054-dry.txt
-  grep -E '^  would write (collision|revision) ' ~/tradepartner-probes/sitting-inputs/refetch-3054-dry.txt
+  grep -cE '^  (would write|refused) collision ' ~/tradepartner-probes/sitting-inputs/refetch-3054-dry.txt
+  grep -E '^  (would write (collision|revision)|refused collision) ' ~/tradepartner-probes/sitting-inputs/refetch-3054-dry.txt
   ```
 
   Both counts must be 0, or the owner has read every listed line and approved it on #3054. Since **#3246**, `refetch-actions` refuses collision rows (the dry run prints them as `refused collision ...`; a real run writes nothing for the month and exits 1) unless a `distinct` group of the reviewed dividend list or `--allow-collision <security>:<ex-date>` covers them, so this check is the sitting's read, not its only guard. A `revision` is still not refused. Some collisions are false positives (EXE's regular and special dividend on one day); that is the owner's read, not a waiver of the stop. Paste the list on #3054 and do not write without that word.
