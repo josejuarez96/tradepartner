@@ -3,7 +3,7 @@
 Owner and orchestrator only, on the owner's job checkout and real store, after the [data sitting](data-sitting.md)'s releases are closed. The orchestrator runs each step on the owner's go, and the owner decides after each dry run and each stop rule. No team window or subagent runs them. Follow [named data releases](data-releases.md) for the release record and the restore, and [scheduling](scheduling.md) to unload and reload jobs.
 
 **Where this sheet starts (`<OWNER>`, one choice).** Step 3 is a named release, and rule 5 of [named data releases](data-releases.md) keeps a release out of an open paper window. The sitting's **Restart and close** ends with daily's `paper start`. So the owner picks one of two:
-- **(a) Before `paper start`.** Run steps 1 to 3 once every sitting release has its `after` row and `health --check` exits 0, with the jobs still stopped and no window open. Then do the sitting's `paper start`. Step 4 may run after the restart.
+- **(a) Before `paper start`.** Run steps 1 to 3 once every sitting release has its `after` row and `health --check` shows no failure beyond the accepted residue (see **Before any step**), with the jobs still stopped and no window open. Then do the sitting's `paper start`. Step 4 may run after the restart.
 - **(b) After the restart.** Run steps 1, 2 and 4 with daily's window open. Step 3 waits until no window is open. Step 4 then seeds without it or waits too (**Why this order**, last paragraph).
 
 The code for all four is merged. What is left are runs that only the owner can make:
@@ -28,7 +28,8 @@ If step 3 cannot run (see its first stop rule), the owner chooses: run T324 with
 
 ## Before any step
 
-- [ ] Every release the sitting opened has an `after` row, and `uv run tradepartner health --check` exits 0. Record the entry point chosen above, and which windows are open (`uv run tradepartner paper status --all`).
+- [ ] **Health gates in this sheet.** Wherever this sheet says `health --check` exits 0 or fails, read it as: no failing rule beyond the sitting's accepted residue (FCX's `duplicate_dividends` key, #2972, and whatever #3242's list allows once it merges; see the sitting's **Before the first write**). A failure beyond that residue is the stop. This applies to entry point (a), the stop rules of steps 2, 3 and 4, and the restores they name.
+- [ ] Every release the sitting opened has an `after` row, and `uv run tradepartner health --check` shows no failure beyond that residue. Record the entry point chosen above, and which windows are open (`uv run tradepartner paper status --all`).
 - [ ] Nothing else is writing: `pgrep -f "tradepartner "` is empty, and no sweep is running.
 - [ ] **The two jobs.** The paper run is at 08:05 ET and the ingest at 18:30 local. A scheduled writer waits `store.writer_lock_retry_seconds` (300 s) for the store lock, then fails. Start a long step only when it will finish before the next job. Otherwise unload that job first and reload it after ([scheduling](scheduling.md)). With a paper window open, an unloaded paper job means a missed run, so prefer the gap between 08:05 and 18:30.
 - [ ] **Disk.** Before every `store backup`, check free space and stop if it is under what the step needs, plus `ingest.min_free_disk_gb` (5 GB; ingest refuses below it). `health.warn_free_disk_gb` is 15.
@@ -193,7 +194,7 @@ Purpose: seed `filing_index` with one full walk, prove one incremental night equ
 
 **Preconditions.**
 - [ ] Step 3 is done (its flip decided), or the owner has chosen to seed without it (see **Why this order**). Every hashed setting must have its final value now, `edgar.filing_events_enabled` included. If the switch is on, it must be on for the seed itself: `EDGAR__FILING_EVENTS_ENABLED=true` in `.env`, or the default-flip PR merged, not a per-command override. Confirm the effective value with `uv run tradepartner health`, which reports the switch's state. A seed run with the switch off hashes `false`, and turning it on later closes the gate.
-- [ ] **Code.** The sitting's pull (step 5) already brought every T324 dependency. Pull nothing between the seed and turning the key on. A later pull that changes the schema, a cache version or `BUILD_RULES_VERSION` (8 once #3192 lands) changes the fingerprint and closes the gate again. If the owner pulls before the seed, record both hashes and the commit count, as in sitting step 5.
+- [ ] **Code.** The sitting's pull (step 5) already brought every T324 dependency. Pull nothing between the seed and turning the key on. A later pull that changes the schema, a cache version or `BUILD_RULES_VERSION` (8) changes the fingerprint and closes the gate again. If the owner pulls before the seed, record both hashes and the commit count, as in sitting step 5.
 - [ ] **Disk.** The live store grows by about 2.2 GB. The comparison needs two copies of the seeded store. Required free space is about `S + 2 × (S + 2.2) + 5` GB, where `S` is the store plus WAL size now. Stop if `df -h data` shows less.
 - [ ] Outside the 08:05 and 18:30 jobs. The seed takes most of a working day's gap, so unload the 18:30 ingest if it might overlap ([scheduling](scheduling.md)).
 
