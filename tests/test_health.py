@@ -1480,6 +1480,120 @@ def test_finra_temporary_d_symbol_beside_its_base_is_not_an_overlap(
     assert check.passed, check.violations
 
 
+def test_same_day_pair_with_a_dot_space_spelling_is_one_line(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #3243: `DSAQ. WS` / `DSAQ.WS` (one warrant line, a stray space after the
+    # dot on one cover page) is one Alpaca symbol under two filer spellings.
+    for ticker in ("DSAQ. WS", "DSAQ.WS"):
+        insert_row(
+            fixture_store,
+            "listings",
+            _listing_row(
+                "SEC_DOT_SPACE",
+                ticker,
+                "NYSE",
+                date(2019, 11, 15),
+                "Redeemable warrants, each warrant exercisable for one share",
+            ),
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert check.passed, check.violations
+
+
+def test_same_day_warrant_suffix_pair_is_one_line_for_a_late_form25_too(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #3243: TMPM held NASDAQ, then TMPM and TMPMW both start one day (the
+    # warrant symbol on the common line's cover page). The pair is one line,
+    # so the later Form 25 on TMPM is not tested against TMPMW as "the next
+    # exchange line", which started before the filing.
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row("SEC_WARRANT_SUFFIX", "TMPM", "NASDAQ", date(2018, 11, 30)),
+    )
+    for ticker in ("TMPM", "TMPMW"):
+        insert_row(
+            fixture_store,
+            "listings",
+            _listing_row("SEC_WARRANT_SUFFIX", ticker, "NASDAQ", date(2019, 3, 18)),
+        )
+    insert_row(
+        fixture_store,
+        "delistings",
+        _form25_row("SEC_WARRANT_SUFFIX", "NASDAQ", date(2019, 10, 18), date(2019, 10, 28)),
+    )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert "SEC_WARRANT_SUFFIX" not in check.violations["security_id"].to_list()
+
+
+def test_same_day_warrant_suffix_pair_with_no_held_ticker_is_one_line(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row("SEC_WARRANT_FIRST", "TMPM", "NASDAQ", date(2019, 3, 18)),
+    )
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row(
+            "SEC_WARRANT_FIRST",
+            "TMPMW",
+            "NASDAQ",
+            date(2019, 3, 18),
+            "Redeemable warrants, each exercisable for one share",
+        ),
+    )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert check.passed, check.violations
+
+
+def test_same_day_equity_pair_with_a_suffix_and_no_held_ticker_still_fails(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Control: both rows equity and no ticker held before: the resolver
+    # assigns the security nothing, so health keeps failing it.
+    for ticker in ("TMPM", "TMPMW"):
+        insert_row(
+            fixture_store,
+            "listings",
+            _listing_row("SEC_EQUITY_SUFFIX", ticker, "NASDAQ", date(2019, 3, 18)),
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
+
+
+def test_same_day_pair_with_another_suffix_or_exchange_still_fails(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Control: only the warrant, unit and right letters excuse a pair, and
+    # only on one exchange.
+    for ticker in ("EXCH", "EXCHX"):
+        insert_row(
+            fixture_store,
+            "listings",
+            _listing_row("SEC_SUFFIX_X", ticker, "NASDAQ", date(2019, 6, 3)),
+        )
+    for ticker, exchange in (("OTHR", "NASDAQ"), ("OTHRW", "NYSE")):
+        insert_row(
+            fixture_store,
+            "listings",
+            _listing_row("SEC_SUFFIX_EXCHANGES", ticker, exchange, date(2019, 6, 3)),
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert set(check.violations["security_id"].to_list()) == {
+        "SEC_SUFFIX_X",
+        "SEC_SUFFIX_EXCHANGES",
+    }
+
+
 def test_finra_d_suffix_on_an_exchange_is_still_a_second_listing(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
