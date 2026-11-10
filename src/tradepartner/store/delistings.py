@@ -79,6 +79,17 @@ a filing ends only a listing already known at T.
   exchange is known at T with `valid_from` within
   `master.transfer_window_sessions` sessions of the filing session. The
   old listing's end is then the session before the new `valid_from`.
+- It is also a **transfer** at T when the security **keeps trading** after
+  the filing's `effective_on` (#3242; owner, 2026-11-10): a bar known at T
+  within `master.transfer_window_sessions` of `effective_on`, or one within
+  that many sessions before the security's next listing on another exchange
+  (a cover page starts that listing late, a Form 25 may be filed after it).
+  The old listing's end is then the session before that next listing; with
+  no next listing known it stays a delisting. Only bars known at T are read, so the same
+  filing is a delisting at an earlier T. A security with no bar after
+  `effective_on` stays delisted below. A filing also ends the other rows of
+  its exchange that start the same day as the listing it ends (one line,
+  two cover-page tickers).
 - Otherwise it is **delisted** at T (conservative: the state between the
   filing and a new listing becoming known). Its end is the last bar
   session known at T from its `valid_from` up to, not including, any later
@@ -415,6 +426,51 @@ def _ended_listing(
     return target
 
 
+def _keeps_trading(
+    bars: list[date],
+    siblings: list[Row],
+    row: Row,
+    filing: Row,
+    window_sessions: int,
+) -> tuple[date] | None:
+    """`(end,)` when `filing` ends `row` as a transfer because the security
+    keeps trading after the filing's `effective_on`, else `None` (#3242).
+
+    The owner's reading (2026-11-10): a Form 25 for a security that trades on
+    is a move to its next listing, never a terminal delisting. Judged on
+    `bars`, the security's sessions with a bar known at T only (the caller
+    passes nothing later), so the reading is the one a run at T would make.
+    The security trades on when a bar falls within `window_sessions` of
+    `effective_on`, or a bar falls within `window_sessions` before the
+    security's next listing on another exchange (it traded into it; a cover
+    page may start that listing months late, and a hole in the store can sit
+    between).
+    The end is the session before that next listing. A security with no next
+    listing known stays a delisting (a reused ticker's bars after a real
+    delisting look the same), and so does one with no bar after
+    `effective_on` (VLD, stopped for 13 months)."""
+    effective_on = filing["effective_on"]
+    after = sorted(s for s in bars if s > effective_on)
+    if not after:
+        return None
+    first = after[0]
+    later = sorted(
+        o["valid_from"]
+        for o in siblings
+        if o["valid_from"] > row["valid_from"]
+        and o["exchange"] != filing["exchange"]
+        and o["exchange"] not in _OFF_EXCHANGE
+    )
+    if not later:
+        return None  # nothing to move to: bars on a line with no next listing are no proof
+    next_start = later[0]
+    low = _window(next_start, window_sessions)[0]
+    runs_in = any(effective_on < s < next_start and s >= low for s in after)
+    if not (first <= _window(effective_on, window_sessions)[1] or runs_in):
+        return None
+    return (previous_session(next_start),)
+
+
 def _spares(delisting: Row, listing: Row) -> bool:
     """Whether `delisting` names a debt class and `listing` is a common or
     untitled one: a notes filing never ends the common listing (#2937), whether
@@ -499,6 +555,17 @@ def derive_listing_ends(
         )
         if target is not None:
             ended.setdefault(target["_index"], delisting)
+            # The filing names a line, not a ticker: rows of the same class
+            # on its exchange from the same day are that one line (#3242:
+            # AEVA and IPV, two cover-page tickers of one NYSE line).
+            for tied in by_security.get(security_id, []):
+                if (
+                    tied["_index"] != target["_index"]
+                    and tied["exchange"] == target["exchange"]
+                    and tied["valid_from"] == target["valid_from"]
+                    and (tied["class_title"] is None) == (target["class_title"] is None)
+                ):
+                    ended.setdefault(tied["_index"], delisting)
     reopened = _reopened(by_security, ended, bars)
     ended.update(reopened)
 
@@ -525,8 +592,17 @@ def derive_listing_ends(
             if other["exchange"] != filing["exchange"] and low <= other["valid_from"] <= high
         )
         end: date | None
+        keeps = (
+            None
+            if index in reopened
+            else _keeps_trading(
+                bars.get(row["security_id"], []), siblings, row, filing, transfer_window_sessions
+            )
+        )
         if successors and index not in reopened:
             status, end = TRANSFERRED, previous_session(successors[0])
+        elif keeps is not None:
+            status, end = TRANSFERRED, keeps[0]
         else:
             later = [o["valid_from"] for o in siblings if o["valid_from"] > row["valid_from"]]
             stop = min(later, default=date.max)

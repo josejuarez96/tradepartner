@@ -140,10 +140,16 @@ class TestFixtureCases:
     def test_transfer_window_comes_from_config(
         self, fixture_store: duckdb.DuckDBPyConnection
     ) -> None:
-        # NASDAQ valid_from 2018-10-26 is 3 sessions after the 2018-10-23 filing.
+        # NASDAQ valid_from 2018-10-26 is 3 sessions after the 2018-10-23 filing,
+        # so a 2-session window misses the destination by the filing rule. The
+        # security trades into the NASDAQ listing (a bar on 2018-10-25), which
+        # is the transfer reading of #3242: still a transfer, same end. Before
+        # that bar is known the narrow window leaves it delisted.
         narrow = _settings(master={"transfer_window_sessions": 2})
         row = _status(listing_ends_as_of(fixture_store, LATE, narrow), "SEC_TRANSFER", "NYSE")
-        assert row["status"] == "delisted"
+        assert (row["status"], row["end_session"]) == ("transferred", date(2018, 10, 25))
+        early = listing_ends_as_of(fixture_store, _at(2018, 10, 24, 20, 0), narrow)
+        assert _status(early, "SEC_TRANSFER", "NYSE")["status"] == "delisted"
 
     def test_every_fixture_delisting_ends_a_listing(
         self, fixture_store: duckdb.DuckDBPyConnection
@@ -543,8 +549,10 @@ class TestExchangeTagFlip:
         before = listing_ends_as_of(synthetic, session_close(date(2019, 1, 18)), _settings())
         assert _status(before, "S", "NASDAQ")["status"] == "delisted"
         assert _status(before, "S", "NYSE")["status"] == "listed"
+        # A bar after the effective day: the security traded on, so the NYSE
+        # filing is the transfer to its next (NASDAQ) listing (#3242).
         after = listing_ends_as_of(synthetic, session_close(date(2019, 1, 22)), _settings())
-        assert _status(after, "S", "NYSE")["status"] == "delisted"
+        assert _status(after, "S", "NYSE")["status"] == "transferred"
         assert _status(after, "S", "NASDAQ")["status"] == "listed"
 
     def test_late_amendment_never_ends_the_transfer_destination(
