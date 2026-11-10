@@ -1533,15 +1533,40 @@ def test_same_day_warrant_suffix_pair_is_one_line_for_a_late_form25_too(
 def test_same_day_warrant_suffix_pair_with_no_held_ticker_is_one_line(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row("SEC_WARRANT_FIRST", "TMPM", "NASDAQ", date(2019, 3, 18)),
+    )
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row(
+            "SEC_WARRANT_FIRST",
+            "TMPMW",
+            "NASDAQ",
+            date(2019, 3, 18),
+            "Redeemable warrants, each exercisable for one share",
+        ),
+    )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert check.passed, check.violations
+
+
+def test_same_day_equity_pair_with_a_suffix_and_no_held_ticker_still_fails(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Control: both rows equity and no ticker held before: the resolver
+    # assigns the security nothing, so health keeps failing it.
     for ticker in ("TMPM", "TMPMW"):
         insert_row(
             fixture_store,
             "listings",
-            _listing_row("SEC_WARRANT_FIRST", ticker, "NASDAQ", date(2019, 3, 18)),
+            _listing_row("SEC_EQUITY_SUFFIX", ticker, "NASDAQ", date(2019, 3, 18)),
         )
     checks = integrity_checks(fixture_store, T_END, _settings())
-    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
-    assert check.passed, check.violations
+    assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
 
 
 def test_same_day_pair_with_another_suffix_or_exchange_still_fails(

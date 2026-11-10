@@ -4217,22 +4217,25 @@ def _derivative_suffix_pair(current: dict[str, Any], following: dict[str, Any]) 
     """True when a same-start pair on one exchange is a ticker and the same
     ticker plus a warrant, unit or right letter (`TMPM`/`TMPMW`, #3243): the
     derivative's symbol on the common line's cover page, one line, not two
-    listings. Exchange lines only: an off-exchange pair has its own rules."""
+    listings, when the suffixed row's own title is non-equity.
+    Exchange lines only: an off-exchange pair has its own rules."""
     if current["exchange"] != following["exchange"] or current["exchange"] in OFF_EXCHANGE:
         return False
-    shorter, longer = sorted(
-        (_resolver_ticker(str(current["ticker"])), _resolver_ticker(str(following["ticker"]))),
-        key=len,
+    shorter_row, longer_row = sorted((current, following), key=lambda r: len(str(r["ticker"])))
+    shorter, longer = (_resolver_ticker(str(r["ticker"])) for r in (shorter_row, longer_row))
+    # The suffixed row must be non-equity by its own title: two equity rows
+    # with no held ticker are unassigned by the resolver, never one line.
+    return _row_kind(longer_row) != EQUITY and any(
+        longer == shorter + suffix for suffix in DERIVATIVE_SUFFIXES
     )
-    return any(longer == shorter + suffix for suffix in DERIVATIVE_SUFFIXES)
 
 
 def _one_line_pair(
     ordered: list[dict[str, Any]], index: int, current: dict[str, Any], following: dict[str, Any]
 ) -> bool:
     """True when `current` and `following` (same start) are one line by any
-    of the tolerated shapes: a filer's typo or spelling, FINRA's temporary
-    symbol, a derivative's suffix."""
+    of the tolerated shapes (also the test of a late Form 25's
+    partner row): a filer's typo or spelling, FINRA's temporary symbol, a derivative's suffix."""
     return (
         _same_line(current, following)
         or _same_day_typo_pair(ordered, index, current, following)
