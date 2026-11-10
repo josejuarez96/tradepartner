@@ -318,9 +318,6 @@ derived at `t`, as the data is read.
   `effective_on`, or from `effective_on` when there is none, so a delisting
   that took effect long before the store's first bar fails its line's bars:
   the store cannot show the line kept trading.
-  A company's repair successor id (`<cik>@<date>`, #3056) counts as the
-  security's next listing: the old id's bars from its first session are the
-  resolver's to move (#3242).
   Such a bar is another equity's resolved to this one (a reused ticker,
   EGLE), a relisting with no listing row, or bars on both sides of a hole in
   the store. A delisting whose next *equity* listing of the security
@@ -4387,16 +4384,6 @@ def _bars_after_delisting(
 ) -> pl.DataFrame:
     bounds: list[dict[str, Any]] = []
     by_security = _by_security(listings)
-    # A repair successor (`<cik>@<date>`, #3056) is the company's next listing
-    # too: its bars belong to the new id, so a bar of the old id from the
-    # successor's first session is the resolver's business, not a resumption
-    # (#3242: VLD/VELO, ADEX/GRDI).
-    successor_starts: dict[str, list[date]] = defaultdict(list)
-    for sid, rows in by_security.items():
-        if "@" in sid:
-            successor_starts[sid.split("@")[0].split(":")[0]].extend(
-                r["valid_from"] for r in rows if r["exchange"] not in OFF_EXCHANGE
-            )
     for ordered in by_security.values():
         for row in ordered:
             if row["status"] != DELISTED:
@@ -4410,13 +4397,6 @@ def _bars_after_delisting(
                 key=lambda o: o["valid_from"],
             )
             next_valid_from = later[0]["valid_from"] if later else None
-            if "@" not in str(row["security_id"]):
-                company = str(row["security_id"]).split(":")[0]
-                starts = [d for d in successor_starts.get(company, ()) if d > row["valid_from"]]
-                if starts:
-                    next_valid_from = min(
-                        [*starts, *([next_valid_from] if next_valid_from else [])]
-                    )
             if next_valid_from is not None and _row_kind(row) == EQUITY:
                 # The resolver's own rule 7 (spec data-foundation.md,
                 # "Resolver rules"; #819) only keeps a span running under a

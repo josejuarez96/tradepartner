@@ -323,16 +323,40 @@ def _cik_rows(violations: pl.DataFrame) -> list[str]:
     ]
 
 
-def test_the_sixteen_ciks_pass_both_health_rules(
+#: Old ids whose bars after a Form 25 are not a transfer's: VLD and ADEX relist
+#: under a successor id (`@date`, #3056) and keep the new line's bars on the old
+#: id until `repair-resolution` moves them; NHIC has no next listing yet.
+STILL_FLAGGED = {"0001825079:common-stock", "0001830029", "0002043699"}
+
+
+def test_the_sixteen_ciks_pass_both_health_rules_but_three_unmoved_bar_sets(
     conn: duckdb.DuckDBPyConnection, store_settings: Settings
 ) -> None:
     checks = {c.rule: c for c in integrity_checks(conn, T, store_settings)}
-    # NHIC (0002043699) has no next listing yet: its 22 bars stay flagged until
-    # the cover page naming the new ticker is read (reported on #3242).
-    bars = [s for s in _cik_rows(checks[NO_BARS_AFTER_DELISTING].violations) if s != "0002043699"]
+    bars = set(_cik_rows(checks[NO_BARS_AFTER_DELISTING].violations))
     overlaps = _cik_rows(checks[NON_OVERLAPPING_LISTINGS].violations)
-    assert bars == []
+    assert bars == STILL_FLAGGED
     assert overlaps == []
+
+
+def test_applying_the_repair_clears_the_successor_id_bars(
+    tmp_path: Path, store_settings: Settings
+) -> None:
+    # The resolver proposes deleting the old ids' VELO and GRDI bars (their
+    # tickers resolve to the successor ids); with those gone the rule passes
+    # for VLD and ADEX. NHIC waits for its next listing.
+    with open_for_write(store_settings) as writer:
+        resolver = store_resolver(writer, T, store_settings)
+        found = misattributed(resolver, _all_bars(writer), ()).bars
+        proposed = {k for k in found if k[0] in ("0001825079:common-stock", "0001830029")}
+        assert len(proposed) == 248 + 139
+        for sid, session in proposed:
+            writer.execute(
+                "DELETE FROM prices_daily WHERE security_id = ? AND session = ?", [sid, session]
+            )
+    with duckdb.connect(store_settings.store.path, read_only=True) as conn:
+        checks = {c.rule: c for c in integrity_checks(conn, T, store_settings)}
+    assert set(_cik_rows(checks[NO_BARS_AFTER_DELISTING].violations)) == {"0002043699"}
 
 
 def test_repair_resolution_keeps_the_bars_after_a_transfer(
