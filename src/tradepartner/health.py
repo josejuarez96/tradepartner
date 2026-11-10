@@ -292,6 +292,10 @@ derived at `t`, as the data is read.
   tested against the next row that is neither; and a same-start OTC pair
   where one ticker is the other plus FINRA's fifth-letter `D` temporary
   symbol (`JFIL`/`JFILD`) is one line, the new quote a reverse split opens.
+  A same-start pair on one exchange whose tickers differ by a warrant, unit
+  or right letter (`TMPM`/`TMPMW`), or only by a space round a dot
+  (`DSAQ. WS`/`DSAQ.WS`), is one line too (#3243); such a partner is no "next
+  exchange line" for a late Form 25 either.
   Every other same-start pair of different tickers fails unless the owner
   lists it in
   `universe.accepted_same_day_pairs` (#855). An accepted pair counts as one
@@ -577,6 +581,11 @@ FINRA_TEMPORARY_SUFFIX = "D"
 #: The length of the base a FINRA temporary symbol is built on: the suffix
 #: is the base's *fifth* character, so the base itself is four letters.
 FINRA_TEMPORARY_BASE_LENGTH = 4
+#: The letters a SPAC's or issuer's cover page appends to the common ticker
+#: for its warrant (`TMPM` -> `TMPMW`), unit (`U`) or right (`R`) (#3243).
+DERIVATIVE_SUFFIXES: tuple[str, ...] = ("W", "U", "R")
+#: A stray space round a dot in a filer's ticker (`DSAQ. WS`, #3243).
+_DOT_SPACES = re.compile(r"\s*\.\s*")
 #: `_row_kind`'s result for a placeholder-ticker row (#846): never `EQUITY`,
 #: matching `ListingResolver`'s own `_PLACEHOLDER` kind.
 _PLACEHOLDER_KIND = "placeholder"
@@ -4199,7 +4208,36 @@ def _same_day_typo_pair(
     pair_kind = EQUITY if EQUITY in (current_kind, following_kind) else current_kind
     held = _held_ticker(ordered, index, day, pair_kind)
     return is_same_day_typo(held, tickers) or same_alpaca_symbol(
-        str(current["ticker"]), str(following["ticker"])
+        _DOT_SPACES.sub(".", str(current["ticker"])),
+        _DOT_SPACES.sub(".", str(following["ticker"])),
+    )
+
+
+def _derivative_suffix_pair(current: dict[str, Any], following: dict[str, Any]) -> bool:
+    """True when a same-start pair on one exchange is a ticker and the same
+    ticker plus a warrant, unit or right letter (`TMPM`/`TMPMW`, #3243): the
+    derivative's symbol on the common line's cover page, one line, not two
+    listings. Exchange lines only: an off-exchange pair has its own rules."""
+    if current["exchange"] != following["exchange"] or current["exchange"] in OFF_EXCHANGE:
+        return False
+    shorter, longer = sorted(
+        (_resolver_ticker(str(current["ticker"])), _resolver_ticker(str(following["ticker"]))),
+        key=len,
+    )
+    return any(longer == shorter + suffix for suffix in DERIVATIVE_SUFFIXES)
+
+
+def _one_line_pair(
+    ordered: list[dict[str, Any]], index: int, current: dict[str, Any], following: dict[str, Any]
+) -> bool:
+    """True when `current` and `following` (same start) are one line by any
+    of the tolerated shapes: a filer's typo or spelling, FINRA's temporary
+    symbol, a derivative's suffix."""
+    return (
+        _same_line(current, following)
+        or _same_day_typo_pair(ordered, index, current, following)
+        or _finra_temporary_pair(current, following)
+        or _derivative_suffix_pair(current, following)
     )
 
 
@@ -4259,10 +4297,7 @@ def _overlapping_listings(
             same_start = current["valid_from"] == following["valid_from"]
             flagged = (
                 following
-                if same_start
-                and not _same_line(current, following)
-                and not _same_day_typo_pair(ordered, i, current, following)
-                and not _finra_temporary_pair(current, following)
+                if same_start and not _one_line_pair(ordered, i, current, following)
                 else None
             )
             filed = current["delisting_filed_at"]
@@ -4282,6 +4317,10 @@ def _overlapping_listings(
                         for r in ordered[i + 1 :]
                         if r["exchange"] not in OFF_EXCHANGE
                         and not _same_line(current, r)
+                        and not (
+                            r["valid_from"] == current["valid_from"]
+                            and _one_line_pair(ordered, i, current, r)
+                        )
                         and r["valid_from"] != one_line_day
                     ),
                     None,
