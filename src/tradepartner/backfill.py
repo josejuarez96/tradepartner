@@ -1404,6 +1404,11 @@ class ActionsRefetch:
     #: <amount>"`, sorted: what the sitting reviews before the real run (#3074).
     rows: tuple[str, ...] = ()
     span: bool = False
+    #: Collision rows (a new id on a type and ex-date the security already
+    #: holds live) that no allow entry or reviewed `distinct` group covers
+    #: (#3246): a real run writes none of a month holding one and fails; a
+    #: dry run lists them here, not in `rows`.
+    refused: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -1446,6 +1451,7 @@ def refetch_actions(
     dry_run: bool = False,
     securities: Collection[str] | None = None,
     span: bool = False,
+    allow_collisions: Collection[tuple[str, date]] = (),
 ) -> ActionsRefetch:
     """Ask the source again for the splits and dividends of the committed
     months `since..through` (#3054), with no bars: a month the backfill
@@ -1471,7 +1477,14 @@ def refetch_actions(
     (`repair.release_refusal`) and records one `ingestion_runs` row per
     month, mode `ACTIONS_REFETCH`, status `filled` (never `ok`); a dry run
     fetches the same and rolls every write and its run row back, so its
-    counts are the run's. Halts at the first month that is not `filled`."""
+    counts are the run's. Halts at the first month that is not `filled`.
+
+    A `collision` row (#3246: a new id on a security, type and ex-date that
+    already holds a live identity, so the event would apply twice) is
+    refused unless its dividend is a `distinct` group of the reviewed list
+    (`store.dividend_reviews`) or its `(security, ex-date)` is in
+    `allow_collisions`: a dry run lists it in `ActionsRefetch.refused`; a
+    real run writes nothing for that month and it ends `failed`."""
     if isinstance(since, datetime) or not isinstance(since, date):
         raise TypeError(f"since must be a date, got {since!r}")
     if isinstance(through, datetime) or not isinstance(through, date) or through < since:
@@ -1485,18 +1498,54 @@ def refetch_actions(
         raise ValueError("a span needs --security: it asks the whole history in one request")
     totals: Counter[str] = Counter()
     written: list[str] = []
+    refused: list[str] = []
     runs: list[SourceRun] = []
     windows = [(since, through)] if span else month_windows(since, through)
+    allowed = _allowed_collisions(allow_collisions)
     for window in windows:
         run = _refetch_month(
-            settings, prices, since, window, release, clock, dry_run, only, totals, written, span
+            settings,
+            prices,
+            since,
+            window,
+            release,
+            clock,
+            dry_run,
+            only,
+            totals,
+            written,
+            span,
+            allowed,
+            refused,
         )
         runs.append(run)
         if run.status != FILLED:
             break
     return ActionsRefetch(
-        tuple(runs), dry_run, tuple(sorted(totals.items())), tuple(sorted(written)), span
+        tuple(runs),
+        dry_run,
+        tuple(sorted(totals.items())),
+        tuple(sorted(written)),
+        span,
+        tuple(sorted(refused)),
     )
+
+
+def _allowed_collisions(
+    allow: Collection[tuple[str, date]],
+) -> tuple[frozenset[tuple[str, date]], frozenset[tuple[str, date, float]]]:
+    """The collisions a refetch may write (#3246): the caller's
+    `(security, ex-date)` allow entries, and the reviewed list's `distinct`
+    dividend groups (two declared payments, both kept), as
+    `(security, ex-date, amount)`."""
+    from tradepartner.store.dividend_reviews import DISTINCT, reviewed_groups
+
+    for entry in allow:
+        sid, ex = entry
+        if not sid or isinstance(ex, datetime) or not isinstance(ex, date):
+            raise ValueError(f"allow_collisions entry must be (security, date), got {entry!r}")
+    distinct = frozenset(g.key for g in reviewed_groups() if g.verdict == DISTINCT)
+    return frozenset(allow), distinct
 
 
 def _refetch_month(
@@ -1511,6 +1560,11 @@ def _refetch_month(
     totals: Counter[str],
     written: list[str],
     span: bool = False,
+    allowed: tuple[frozenset[tuple[str, date]], frozenset[tuple[str, date, float]]] = (
+        frozenset(),
+        frozenset(),
+    ),
+    refused: list[str] | None = None,
 ) -> SourceRun:
     """One month (or the one span) of `refetch_actions`; adds the rows it
     moved to `totals` and names each row written in `written`."""
@@ -1551,7 +1605,15 @@ def _refetch_month(
         )
         moved = _action_counts(conn) - before
         totals.update(moved)
-        written.extend(_rows_written(conn, stamp))
+        lines, blocked = _rows_written(conn, stamp, allowed)
+        if refused is not None:
+            refused.extend(blocked)
+        if blocked and not dry_run:
+            raise ValueError(
+                f"{len(blocked)} collision row(s): a new id on a security, type and ex-date "
+                f"that already holds a live one; nothing written: {'; '.join(blocked)}"
+            )
+        written.extend(lines)
         by_type = ", ".join(f"{kind}={n}" for kind, n in sorted(moved.items())) or "none"
         extra = "".join(f"; {key}={value}" for key, value in sorted(stats.items()))
         message = (
@@ -1576,14 +1638,24 @@ def _refetch_month(
     )
 
 
-def _rows_written(conn: duckdb.DuckDBPyConnection, stamp: datetime) -> list[str]:
+def _rows_written(
+    conn: duckdb.DuckDBPyConnection,
+    stamp: datetime,
+    allowed: tuple[frozenset[tuple[str, date]], frozenset[tuple[str, date, float]]] = (
+        frozenset(),
+        frozenset(),
+    ),
+) -> tuple[list[str], list[str]]:
     """The `corporate_actions` rows this write stamped at `stamp`, one line
     each: `"<tag> <security> <type> <ex-date> <amount> known_at=<stamp>"`
     with the exact stored amount (#3074 review). The tag is `revision` when
     the row's identity (#108: the source id, else security, type and
     ex-date) was stored before; `collision` when it is new but another live
     identity of the security already holds that type and ex-date (a source
-    re-issuing an event under a new id would apply it twice); else `new`."""
+    re-issuing an event under a new id would apply it twice); else `new`.
+    Returns the lines to write and the lines refused (#3246): a live
+    `collision` that `allowed` (`_allowed_collisions`) does not cover."""
+    allow_pairs, distinct = allowed
     rows = conn.execute(
         """
         WITH ident AS (
@@ -1614,14 +1686,22 @@ def _rows_written(conn: duckdb.DuckDBPyConnection, stamp: datetime) -> list[str]
         """,
         [stamp],
     ).fetchall()
-    lines = []
+    lines: list[str] = []
+    blocked: list[str] = []
     for sid, kind, ex, amount, cancelled, known_at, revision, collision in rows:
         tag = "revision" if revision else "collision" if collision else "new"
-        lines.append(
+        line = (
             f"{tag} {sid} {kind} {ex} {amount!r}{' cancelled' if cancelled else ''} "
             f"known_at={known_at.astimezone(UTC).isoformat()}"
         )
-    return lines
+        covered = (sid, ex) in allow_pairs or (
+            kind == ActionType.DIVIDEND and (sid, ex, float(amount)) in distinct
+        )
+        if tag == "collision" and not cancelled and not covered:
+            blocked.append(line)
+        else:
+            lines.append(line)
+    return lines, blocked
 
 
 def _action_counts(conn: duckdb.DuckDBPyConnection) -> Counter[str]:
