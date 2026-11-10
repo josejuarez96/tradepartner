@@ -140,10 +140,19 @@ class TestFixtureCases:
     def test_transfer_window_comes_from_config(
         self, fixture_store: duckdb.DuckDBPyConnection
     ) -> None:
-        # NASDAQ valid_from 2018-10-26 is 3 sessions after the 2018-10-23 filing.
+        # The NASDAQ row (valid_from 2018-10-26, known 2018-11-01) is 3 sessions
+        # after the 2018-10-23 filing and starts before the Form 25's effective
+        # day (2018-11-02). At the T it becomes known no bar after the
+        # effective day is known yet, so the window decides: 2 sessions misses
+        # the destination and leaves it delisted; the default 5 reaches it.
+        known = _at(2018, 11, 1)
         narrow = _settings(master={"transfer_window_sessions": 2})
-        row = _status(listing_ends_as_of(fixture_store, LATE, narrow), "SEC_TRANSFER", "NYSE")
+        row = _status(listing_ends_as_of(fixture_store, known, narrow), "SEC_TRANSFER", "NYSE")
         assert row["status"] == "delisted"
+        wide = _status(
+            listing_ends_as_of(fixture_store, known, _settings()), "SEC_TRANSFER", "NYSE"
+        )
+        assert wide["status"] == "transferred"
 
     def test_every_fixture_delisting_ends_a_listing(
         self, fixture_store: duckdb.DuckDBPyConnection
@@ -543,8 +552,10 @@ class TestExchangeTagFlip:
         before = listing_ends_as_of(synthetic, session_close(date(2019, 1, 18)), _settings())
         assert _status(before, "S", "NASDAQ")["status"] == "delisted"
         assert _status(before, "S", "NYSE")["status"] == "listed"
+        # A bar after the effective day: the security traded on, so the NYSE
+        # filing is the transfer to its next (NASDAQ) listing (#3242).
         after = listing_ends_as_of(synthetic, session_close(date(2019, 1, 22)), _settings())
-        assert _status(after, "S", "NYSE")["status"] == "delisted"
+        assert _status(after, "S", "NYSE")["status"] == "transferred"
         assert _status(after, "S", "NASDAQ")["status"] == "listed"
 
     def test_late_amendment_never_ends_the_transfer_destination(

@@ -296,6 +296,9 @@ derived at `t`, as the data is read.
   or right letter (`TMPM`/`TMPMW`), or only by a space round a dot
   (`DSAQ. WS`/`DSAQ.WS`), is one line too (#3243); such a partner is no "next
   exchange line" for a late Form 25 either.
+  A listing a Form 25 ended as a transfer (the security traded on after its
+  effective day, `store.delistings`) is never a late Form 25 (#3242), and two
+  same-start rows one Form 25 ended are one line.
   Every other same-start pair of different tickers fails unless the owner
   lists it in
   `universe.accepted_same_day_pairs` (#855). An accepted pair counts as one
@@ -4236,8 +4239,12 @@ def _one_line_pair(
     """True when `current` and `following` (same start) are one line by any
     of the tolerated shapes (also the test of a late Form 25's
     partner row): a filer's typo or spelling, FINRA's temporary symbol, a derivative's suffix."""
+    filed = current.get("delisting_filed_at")
     return (
         _same_line(current, following)
+        # One Form 25 ended both rows (#3242): it names the line, so the
+        # same-day tickers on its exchange are that line's spellings.
+        or (filed is not None and filed == following.get("delisting_filed_at"))
         or _same_day_typo_pair(ordered, index, current, following)
         or _finra_temporary_pair(current, following)
         or _derivative_suffix_pair(current, following)
@@ -4313,7 +4320,9 @@ def _overlapping_listings(
             if flagged is not None and accepted_day:
                 accepted.append(_overlap_row(current, flagged, filing_session))
                 flagged = None
-            if flagged is None and filing_session is not None:
+            # A Form 25 read as a transfer (the security traded on, #3242) is
+            # no second live line however late it was filed.
+            if flagged is None and filing_session is not None and current["status"] != TRANSFERRED:
                 exchange_line = next(
                     (
                         r
@@ -4374,7 +4383,8 @@ def _bars_after_delisting(
     conn: duckdb.DuckDBPyConnection, t: datetime, listings: pl.DataFrame, window_sessions: int
 ) -> pl.DataFrame:
     bounds: list[dict[str, Any]] = []
-    for ordered in _by_security(listings).values():
+    by_security = _by_security(listings)
+    for ordered in by_security.values():
         for row in ordered:
             if row["status"] != DELISTED:
                 continue

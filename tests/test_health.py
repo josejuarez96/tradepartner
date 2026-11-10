@@ -1639,6 +1639,15 @@ def test_an_otc_pair_on_a_base_longer_than_four_letters_is_not_temporary(
     assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
 
 
+def _stopped_after(conn: duckdb.DuckDBPyConnection, security_id: str, day: date) -> None:
+    """The security's bars end on `day`: a Form 25 effective then is a real stop.
+    With bars after its effective day a Form 25 is a transfer (#3242) and the
+    late-Form-25 test is not run."""
+    conn.execute(
+        "DELETE FROM prices_daily WHERE security_id = ? AND session > ?", [security_id, day]
+    )
+
+
 def test_listing_live_after_the_next_one_started_fails_its_rule(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
@@ -1653,7 +1662,7 @@ def test_listing_live_after_the_next_one_started_fails_its_rule(
         "listings",
         {
             "security_id": "SEC_SPLIT_BACKFILLED",
-            "ticker": "BKFL",
+            "ticker": "BKFN",
             "exchange": "NASDAQ",
             "class_title": "Common Stock",
             "valid_from": date(2018, 6, 1),
@@ -1680,6 +1689,7 @@ def test_listing_live_after_the_next_one_started_fails_its_rule(
             "provenance": "filing",
         },
     )
+    _stopped_after(fixture_store, "SEC_SPLIT_BACKFILLED", date(2019, 1, 20))
     checks = integrity_checks(fixture_store, T_END, _settings())
     assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
     check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
@@ -1765,13 +1775,14 @@ def test_late_form25_is_checked_against_the_next_exchange_line_past_an_otc_row(
     insert_row(
         fixture_store,
         "listings",
-        _listing_row("SEC_SPLIT_BACKFILLED", "BKFL", "NASDAQ", date(2018, 6, 1)),
+        _listing_row("SEC_SPLIT_BACKFILLED", "BKFN", "NASDAQ", date(2018, 6, 1)),
     )
     insert_row(
         fixture_store,
         "delistings",
         _form25_row("SEC_SPLIT_BACKFILLED", "NYSE", date(2019, 1, 10), date(2019, 1, 20)),
     )
+    _stopped_after(fixture_store, "SEC_SPLIT_BACKFILLED", date(2019, 1, 20))
     checks = integrity_checks(fixture_store, T_END, _settings())
     check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
     [row] = check.violations.to_dicts()
@@ -2282,11 +2293,14 @@ def test_an_accepted_pair_does_not_excuse_a_late_form25_on_its_row(
         "delistings",
         _form25_row(FIRST_PAIR_SID, "NASDAQ", date(2020, 1, 10), date(2020, 1, 20)),
     )
+    _stopped_after(fixture_store, FIRST_PAIR_SID, date(2020, 1, 20))
     report = health_report(fixture_store, T_END, _accepting(FIRST_PAIR_ENTRY))
     check = next(c for c in report.integrity if c.rule == NON_OVERLAPPING_LISTINGS)
     assert not check.passed
     assert set(check.violations["next_valid_from"].to_list()) == {date(2019, 7, 1)}
-    assert report.accepted_same_day_pairs.frame.height == 1
+    # The Form 25 ended both rows of the pair, so they are one line without the
+    # owner's entry (#3242); the late filing still fails against the NYSE line.
+    assert report.accepted_same_day_pairs.frame.height == 0
 
 
 @pytest.mark.parametrize("bad", ["SEC_A", "@2019-06-03", "SEC_A@2019-13-01", "SEC_A@"])
