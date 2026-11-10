@@ -3,16 +3,16 @@
 Owner and orchestrator only, on the owner's job checkout and real store, after the [data sitting](data-sitting.md)'s releases are closed. The orchestrator runs each step on the owner's go, and the owner decides after each dry run and each stop rule. No team window or subagent runs them. Follow [named data releases](data-releases.md) for the release record and the restore, and [scheduling](scheduling.md) to unload and reload jobs.
 
 **Where this sheet starts (`<OWNER>`, one choice).** Step 3 is a named release, and rule 5 of [named data releases](data-releases.md) keeps a release out of an open paper window. The sitting's **Restart and close** ends with daily's `paper start`. So the owner picks one of two:
-- **(a) Before `paper start`.** Run steps 1 to 3 once every sitting release has its `after` row and `health --check` exits 0, with the jobs still stopped and no window open. Then do the sitting's `paper start`. Step 4 may run after the restart.
+- **(a) Before `paper start`.** Run steps 1 to 3 once every sitting release has its `after` row and `health --check` shows no failure beyond the accepted residue (see **Before any step**), with the jobs still stopped and no window open. Then do the sitting's `paper start`. Step 4 may run after the restart.
 - **(b) After the restart.** Run steps 1, 2 and 4 with daily's window open. Step 3 waits until no window is open. Step 4 then seeds without it or waits too (**Why this order**, last paragraph).
 
 The code for all four is merged. What is left are runs that only the owner can make:
 
 | Step | Task | What it writes | Release | Rough time | Rough disk |
 |---|---|---|---|---|---|
-| 1 | T246 (#1598) | `BENCH:RSP` bars and actions (check-only); the check writes nothing | none | minutes for the backfill (about 130 months); the check itself not measured | under 1 GB |
-| 2 | T248f (#1762) | `mergers`, `symbol_changes`, spin-off `corporate_actions` rows, 2020-06 on | none | not measured (about 78 monthly scans, run twice) | one store copy |
-| 3 | T164e (#1358) | `filing_events`, every issuer's 8-K and 8-K/A | **named** | three full EDGAR passes, about 1.5 to 2 h each | one store copy, plus a new table, size not measured |
+| 1 | T246 (#1598) | `BENCH:RSP` bars and actions (check-only); the check writes nothing | none | minutes for the backfill (about 130 months); the check itself not measured; **cannot run until RSP's `--cik` and `--exchange` are filled in** | under 1 GB |
+| 2 | T248f (#1762) | `mergers`, `symbol_changes`, spin-off `corporate_actions` rows, 2020-06 on | none | dry run about 13 m (78 months, re-rehearsal); the apply about the same | one store copy |
+| 3 | T164e (#1358) | `filing_events`, every issuer's 8-K and 8-K/A | **named** | **8 to 20 h** for the one-time stamps-cache refresh alone, then three full EDGAR passes, about 1.5 to 2 h each; **give it its own day** | one store copy, plus a new table, size not measured |
 | 4 | T324 (#2629) | `filing_index` and its three state tables, then one full build | none | about 8 min for the index plus one full build (about 1.5 to 2 h) | one copy, about 2.2 GB of table, two comparison copies |
 
 `<OWNER>` marks a value the code and docs do not settle. Fill it in before the step; never guess it.
@@ -28,7 +28,8 @@ If step 3 cannot run (see its first stop rule), the owner chooses: run T324 with
 
 ## Before any step
 
-- [ ] Every release the sitting opened has an `after` row, and `uv run tradepartner health --check` exits 0. Record the entry point chosen above, and which windows are open (`uv run tradepartner paper status --all`).
+- [ ] **Health gates in this sheet.** Wherever this sheet says `health --check` exits 0 or fails, read it as: no failing rule beyond the sitting's accepted residue (FCX's `duplicate_dividends` key, #2972, and whatever #3242's list allows once it merges; see the sitting's **Before the first write**). A failure beyond that residue is the stop. This applies to entry point (a), the stop rules of steps 2, 3 and 4, and the restores they name.
+- [ ] Every release the sitting opened has an `after` row, and `uv run tradepartner health --check` shows no failure beyond that residue. Record the entry point chosen above, and which windows are open (`uv run tradepartner paper status --all`).
 - [ ] Nothing else is writing: `pgrep -f "tradepartner "` is empty, and no sweep is running.
 - [ ] **The two jobs.** The paper run is at 08:05 ET and the ingest at 18:30 local. A scheduled writer waits `store.writer_lock_retry_seconds` (300 s) for the store lock, then fails. Start a long step only when it will finish before the next job. Otherwise unload that job first and reload it after ([scheduling](scheduling.md)). With a paper window open, an unloaded paper job means a missed run, so prefer the gap between 08:05 and 18:30.
 - [ ] **Disk.** Before every `store backup`, check free space and stop if it is under what the step needs, plus `ingest.min_free_disk_gb` (5 GB; ingest refuses below it). `health.warn_free_disk_gb` is 15.
@@ -65,7 +66,7 @@ Purpose: store RSP as the check-only equal-weight series, then run `index-check`
   uv run tradepartner index-check --out <OWNER: research library>/index-check-<YYYY-MM-DD>.json
   ```
 
-  Expected: the header (`index-check 2019-08 to 2026-09 (not a trial, nothing written)`, store, schema version, code version, data vintage, universe, `adjust.apply_spin_offs`, `edge E`), then the by-year table, the zone totals, the by-month table and the worst months with their names. Months after the protected edge print `·`, never a level.
+  Without the RSP backfill first, `index-check` exits 2 with `benchmark RSP: no benchmark security lists it in the store` (re-rehearsal, 2 s), so the two `<OWNER>` values above gate this whole step. Expected: the header (`index-check 2019-08 to 2026-09 (not a trial, nothing written)`, store, schema version, code version, data vintage, universe, `adjust.apply_spin_offs`, `edge E`), then the by-year table, the zone totals, the by-month table and the worst months with their names. Months after the protected edge print `·`, never a level.
 
 **Stop rules.**
 - The backfill exits 2 because another security already lists `RSP`, or `BENCH:RSP` is taken. Stop and report on #1598 (spec open question 36). Do not read that security by ticker.
@@ -93,7 +94,7 @@ Purpose: ask Alpaca for cash, stock and stock-and-cash mergers by process-date m
   uv run tradepartner lab status
   ```
 
-  Expected: one line per month, `alpaca: filled, <rows> rows, cursor actions;since=2020-06-01;through=<day>: <first>..<last>: <n> spin-off action(s), <n> name change(s), <n> merger(s); …` and then the counts. In a dry run the message starts with `dry run:`. The merger counts are `mergers_stored`, `merger_rows_refused`, `actions_unresolved`, `merger_self`, `merger_unordered`, `merger_conflict` and `actions_not_yet_known`. The run exits 0 when every month is `filled`. `through` defaults to today, New York time. `health` shows the mergers block, and `lab status` shows no stale trial.
+  The re-rehearsal's dry run took **801 s (13 m)**, all 78 months `filled`. Its summed month lines (1,344 mergers seen, `merger_rows_refused` 434, `merger_conflict` 44, `mergers_stored` 1,285, 1,531 rows, `actions_not_yet_known` 4) are **dry-run sums that may count the same row in several months** (as in sitting step 12, where the dry run printed 15 and the write 3), so do not post them as counts; post the apply's figures. Expected: one line per month, `alpaca: filled, <rows> rows, cursor actions;since=2020-06-01;through=<day>: <first>..<last>: <n> spin-off action(s), <n> name change(s), <n> merger(s); …` and then the counts. In a dry run the message starts with `dry run:`. The merger counts are `mergers_stored`, `merger_rows_refused`, `actions_unresolved`, `merger_self`, `merger_unordered`, `merger_conflict` and `actions_not_yet_known`. The run exits 0 when every month is `filled`. `through` defaults to today, New York time. `health` shows the mergers block, and `lab status` shows no stale trial.
 
 **Stop rules.**
 - A month that is not `filled`. The run stops at that month, and earlier months stay. A rerun asks again from `--since`: a repeat adds nothing, and a changed value is a revision stamped at the run.
@@ -128,6 +129,7 @@ Purpose: turn `edgar.filing_events_enabled` on for the owner's store, fill `fili
 
 **The switch for these runs.** Settings read nested environment variables, and the process environment beats `.env`. So each command below sets `EDGAR__FILING_EVENTS_ENABLED=true` for itself alone. The config key is `edgar.filing_events_enabled`.
 
+- [ ] **Its own day.** The re-rehearsal stopped the dry run after about 48 min inside the one-time items refresh of the stamps cache (`edgar_cache/stamps/v1`, layout 2): 1,490 CIK files rewritten at 15 to 45 per minute, CPU-bound, with about 35% of 58,290 files still unrefreshed in a 400-file sample. That extrapolates to **8 to 20 h for the refresh alone**, before the EDGAR pass, and the three passes below come on top. The earlier "1.5 to 2 h per pass" does not include it. Plan the dry run as an unattended day with the jobs unloaded, and do not start it in a window the 08:05 or 18:30 jobs share. A faster refresh or a measured figure is an open question for the owner (#3245).
 - [ ] **Dry run first, before the release.** It writes no store row, so `decision data-release open`'s check still passes afterwards. The adapter has no dry-run mode (`adapters/edgar_source.py`), so the dry run's fetch pass already does the one-time items refresh into the stamps cache. That refresh writes `items` and the refreshed flag only, never a stamp (spec, "One refresh rule").
 
   ```bash
@@ -192,7 +194,7 @@ Purpose: seed `filing_index` with one full walk, prove one incremental night equ
 
 **Preconditions.**
 - [ ] Step 3 is done (its flip decided), or the owner has chosen to seed without it (see **Why this order**). Every hashed setting must have its final value now, `edgar.filing_events_enabled` included. If the switch is on, it must be on for the seed itself: `EDGAR__FILING_EVENTS_ENABLED=true` in `.env`, or the default-flip PR merged, not a per-command override. Confirm the effective value with `uv run tradepartner health`, which reports the switch's state. A seed run with the switch off hashes `false`, and turning it on later closes the gate.
-- [ ] **Code.** The sitting's pull (step 5) already brought every T324 dependency. Pull nothing between the seed and turning the key on. A later pull that changes the schema, a cache version or `BUILD_RULES_VERSION` (8 once #3192 lands) changes the fingerprint and closes the gate again. If the owner pulls before the seed, record both hashes and the commit count, as in sitting step 5.
+- [ ] **Code.** The sitting's pull (step 5) already brought every T324 dependency. Pull nothing between the seed and turning the key on. A later pull that changes the schema, a cache version or `BUILD_RULES_VERSION` (8) changes the fingerprint and closes the gate again. If the owner pulls before the seed, record both hashes and the commit count, as in sitting step 5.
 - [ ] **Disk.** The live store grows by about 2.2 GB. The comparison needs two copies of the seeded store. Required free space is about `S + 2 × (S + 2.2) + 5` GB, where `S` is the store plus WAL size now. Stop if `df -h data` shows less.
 - [ ] Outside the 08:05 and 18:30 jobs. The seed takes most of a working day's gap, so unload the 18:30 ingest if it might overlap ([scheduling](scheduling.md)).
 
@@ -252,4 +254,5 @@ Purpose: seed `filing_index` with one full walk, prove one incremental night equ
 - **The entry point.** (a) steps 1 to 3 before daily's `paper start`, or (b) after it, with step 3 waiting for a closed window. Rule 5 keeps T164e's named release out of an open window.
 - **T164e before or after T324.** The switch is in the fingerprint, so turning it on after the seed costs one more full `--rebuild-index`.
 - **T164e's cost.** Its dry run, real run and zero-row rerun are three full EDGAR passes on the full walk.
+- **T164e's refresh.** The stamps-cache refresh (8 to 20 h, not an EDGAR pass) needs its own day before the three passes; its true figure is unmeasured.
 - **Values no doc settles.** RSP's CIK and Alpaca exchange code; the `index-check --out` folder; T164e's release name and coverage query; T324's comparison query and the monthly dry-run schedule.
