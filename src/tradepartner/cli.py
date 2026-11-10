@@ -3529,6 +3529,13 @@ def make_app(
                 "every process date up to today (#3074)"
             ),
         ] = False,
+        allow_collision: Annotated[
+            list[str] | None,
+            typer.Option(
+                help="SECURITY:YYYY-MM-DD (repeatable, or A,B): write the collision rows "
+                "of this security and ex-date, after review (#3246)"
+            ),
+        ] = None,
     ) -> None:
         """Ask Alpaca again for the splits and dividends of committed months (#3054),
         or, with --span, of named securities over the whole range at once (#3074)."""
@@ -3549,6 +3556,18 @@ def make_app(
                 "a span needs --security: it asks the whole history in one request",
                 USAGE_ERROR,
             )
+        allowed: list[tuple[str, date]] = []
+        for item in allow_collision or ():
+            for entry in (e.strip() for e in item.split(",")):
+                sid, _, day = entry.rpartition(":")
+                try:
+                    allowed.append((sid, date.fromisoformat(day)))
+                except ValueError:
+                    sid = ""
+                if not sid:
+                    raise _fail(
+                        f"--allow-collision {entry!r} is not SECURITY:YYYY-MM-DD", USAGE_ERROR
+                    )
         s = settings()
         if (missing_store := _store_missing(s)) is not None:
             raise missing_store
@@ -3574,6 +3593,7 @@ def make_app(
                 dry_run=dry_run,
                 securities=named,
                 span=span,
+                allow_collisions=allowed,
             )
         except ValueError as exc:
             raise _fail(_scrubbed(f"refused: {exc}", s), USAGE_ERROR) from None
@@ -3581,6 +3601,8 @@ def make_app(
             typer.echo(f"{run.status} {run.chunk_cursor}: {run.message}")
         for line in result.rows:
             typer.echo(f"  {'would write' if result.dry_run else 'wrote'} {line}")
+        for line in result.refused:
+            typer.echo(f"  refused {line}")
         typer.echo(result.summary())
         raise typer.Exit(0 if result.ok else 1)
 

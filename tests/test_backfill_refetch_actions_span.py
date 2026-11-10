@@ -35,6 +35,7 @@ from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, ListingResolv
 from tradepartner.adapters.prices import action_first_seen_known_at
 from tradepartner.backfill import span_settings
 from tradepartner.config import Settings
+from tradepartner.ingest import FAILED
 
 THROUGH = date(2019, 6, 28)
 STAMP = action_first_seen_known_at(EX).isoformat()
@@ -102,7 +103,86 @@ def test_a_changed_amount_is_listed_as_a_revision_at_the_clock(settings: Setting
 
 def test_a_reissued_id_for_a_stored_event_is_listed_as_a_collision(settings: Settings) -> None:
     result = _stored_then(settings, _dividend(action_id="acme-q2-reissued"))
+    line = f"collision {ACME} dividend {EX} 0.25 known_at={STAMP}"
+    assert result.rows == ()
+    assert result.refused == (line,)  # #3246: listed as refused, not as a row to write
+    assert result.added == ()  # and not counted under "would add"
+
+
+def _collide(settings: Settings, **kwargs: Any) -> Any:
+    """A stored dividend, then the source re-issues it under a new id; real run."""
+    prices = _committed(settings)
+    _open_release(settings)
+    _refetch(settings, prices, since=SINCE, through=THROUGH, span=True, securities=[ACME])
+    prices.actions = [_dividend(action_id="acme-q2-reissued")]
+    return _refetch(
+        settings,
+        prices,
+        since=SINCE,
+        through=THROUGH,
+        span=True,
+        securities=[ACME],
+        clock=lambda: AGAIN,
+        **kwargs,
+    )
+
+
+def test_a_real_run_with_a_collision_writes_nothing_and_fails(settings: Settings) -> None:
+    result = _collide(settings)
+    assert not result.ok and result.runs[-1].status == FAILED
+    assert "1 collision row(s)" in result.runs[-1].message
+    assert result.refused == (f"collision {ACME} dividend {EX} 0.25 known_at={STAMP}",)
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(1,)]
+
+
+def test_an_allowed_collision_is_written(settings: Settings) -> None:
+    result = _collide(settings, allow_collisions=[(ACME, EX)])
+    assert result.ok and result.refused == ()
     assert result.rows == (f"collision {ACME} dividend {EX} 0.25 known_at={STAMP}",)
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(2,)]
+
+
+def test_an_allow_entry_for_another_ex_date_does_not_cover_it(settings: Settings) -> None:
+    result = _collide(settings, allow_collisions=[(ACME, EX + timedelta(days=1))])
+    assert not result.ok
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(1,)]
+
+
+def test_a_reviewed_distinct_dividend_is_not_refused(settings: Settings) -> None:
+    from tradepartner.store import dividend_reviews as dr
+
+    group = dr.ReviewedGroup(ACME, EX, 0.25, "distinct", "", "ACME", "regular and special")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr, "reviewed_groups", lambda: (group,))
+        result = _collide(settings)
+    assert result.ok and result.refused == ()
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(2,)]
+
+
+def test_a_reviewed_distinct_group_does_not_cover_a_third_identity(settings: Settings) -> None:
+    from tradepartner.store import dividend_reviews as dr
+
+    group = dr.ReviewedGroup(ACME, EX, 0.25, "distinct", "", "ACME", "regular and special")
+    prices = _committed(settings)
+    _open_release(settings)
+    _refetch(settings, prices, since=SINCE, through=THROUGH, span=True, securities=[ACME])
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr, "reviewed_groups", lambda: (group,))
+        for n in range(2):
+            when = AGAIN + timedelta(days=n)
+            prices.actions = [_dividend(action_id=f"acme-extra-{n}")]
+            result = _refetch(
+                settings,
+                prices,
+                since=SINCE,
+                through=THROUGH,
+                span=True,
+                securities=[ACME],
+                clock=lambda when=when: when,
+            )
+    assert not result.ok and len(result.refused) == 1
+    assert result.added == ()  # a refused month shows nothing as added
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(2,)]
 
 
 def test_span_needs_named_securities(settings: Settings) -> None:
@@ -224,3 +304,31 @@ def test_the_cli_span_builds_the_source_with_the_wide_lag(
     assert THROUGH + timedelta(days=used.alpaca.actions_process_lag_days) >= LATER.date()
     nameless = CliRunner().invoke(app, [*args, "--release", REL, "--span", "--dry-run"])
     assert nameless.exit_code != 0 and "span needs --security" in nameless.output
+
+
+def test_the_cli_refuses_a_collision_unless_allowed(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from typer.testing import CliRunner
+
+    from tradepartner import cli
+
+    prices = _committed(settings)
+    _open_release(settings)
+    _refetch(settings, prices, since=SINCE, through=THROUGH, span=True, securities=[ACME])
+    prices.actions = [_dividend(action_id="acme-q2-reissued")]
+    monkeypatch.setattr(cli, "_missing_secrets", lambda *_: [])
+    app = cli.make_app(
+        settings=lambda: settings, clock=lambda: AGAIN, price_source=lambda _: prices
+    )
+    args = ["refetch-actions", "--since", str(SINCE), "--through", str(THROUGH), "--release", REL]
+    dry = CliRunner().invoke(app, [*args, "--dry-run"])
+    assert f"  refused collision {ACME} dividend {EX}" in dry.output
+    real = CliRunner().invoke(app, args)
+    assert real.exit_code == 1 and f"  refused collision {ACME}" in real.output
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(1,)]
+    bad = CliRunner().invoke(app, [*args, "--allow-collision", "nonsense"])
+    assert bad.exit_code != 0 and "SECURITY:YYYY-MM-DD" in bad.output
+    ok = CliRunner().invoke(app, [*args, "--allow-collision", f"{ACME}:{EX}"])
+    assert ok.exit_code == 0, ok.output
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(2,)]
