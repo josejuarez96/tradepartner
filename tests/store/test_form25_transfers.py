@@ -9,10 +9,11 @@ carried on under the next listing.
 
 **Reading (owner, 2026-11-10).** A Form 25 ends its listing as a *transfer*,
 not a delisting, when the security keeps trading after `effective_on`,
-judged only on bars with `known_at <= T`: a bar within
-`master.transfer_window_sessions` of `effective_on`, or any bar between
-`effective_on` and the next listing of the security on another exchange. A
-terminal delisting (no such bar) still ends at its last bar.
+judged only on bars with `known_at <= T`, and a next listing on another
+exchange known at T: a bar within `master.transfer_window_sessions` of
+`effective_on` when that listing started before it (a late Form 25), or a bar
+within the window before a listing that starts after it. A terminal delisting
+(no such bar, or no next listing) still ends at its last bar.
 """
 
 from __future__ import annotations
@@ -241,7 +242,7 @@ def test_a_terminal_delisting_with_no_bars_after_it_still_ends_the_listing(
 
 def test_the_transfer_reading_uses_only_bars_known_at_t(tmp_path: Path) -> None:
     """No look-ahead. "Bars known at T" is the evidence: the same store reads
-    as a delisting at a T before the first bar after the effective day is
+    as a delisting at a T before the bar that runs into the next listing is
     known (the conservative state), and as a transfer from the close of that
     bar's session, though the store holds the bar throughout."""
     settings = Settings(_env_file=None, store={"path": str(tmp_path / "la.duckdb")})
@@ -274,11 +275,11 @@ def test_the_transfer_reading_uses_only_bars_known_at_t(tmp_path: Path) -> None:
                 "provenance": "filing",
             },
         )
-        for session in (date(2018, 3, 9), date(2018, 3, 13)):
+        for session in (date(2018, 3, 9), date(2018, 3, 13), date(2018, 8, 31)):
             _bar(writer, "SEC_LA", session)
     with duckdb.connect(settings.store.path, read_only=True) as conn:
-        before = listing_ends_as_of(conn, session_close(date(2018, 3, 12)), settings)
-        at = listing_ends_as_of(conn, session_close(date(2018, 3, 13)), settings)
+        before = listing_ends_as_of(conn, session_close(date(2018, 8, 30)), settings)
+        at = listing_ends_as_of(conn, session_close(date(2018, 8, 31)), settings)
         unfiled = listing_ends_as_of(conn, session_close(date(2018, 2, 28)), settings)
     key = ("SEC_LA", "AAA", "NYSE", "2018-01-02")
     assert _end(unfiled, *key)["status"] == "listed"
@@ -465,3 +466,81 @@ def test_one_form25_ends_both_same_day_rows_of_its_line() -> None:
     ends = derive_listing_ends(listings, delistings, bars, transfer_window_sessions=5)
     assert set(ends["status"].to_list()) == {DELISTED}
     assert set(ends["delisting_filed_at"].to_list()) == {filed}
+
+
+def _synthetic(tmp_path: Path, name: str) -> Settings:
+    settings = Settings(_env_file=None, store={"path": str(tmp_path / name)})
+    filed = datetime(2018, 3, 1, 21, tzinfo=UTC)
+    with open_for_write(settings) as writer:
+        init_schema(writer)
+        insert_row(writer, "listings", _listing("SEC_GAP", "AAA", "NYSE", date(2018, 1, 2)))
+        insert_row(writer, "listings", _listing("SEC_GAP", "BBB", "NASDAQ", date(2021, 3, 1)))
+        insert_row(
+            writer,
+            "delistings",
+            {
+                "security_id": "SEC_GAP",
+                "form": "25",
+                "class_title": "Common Stock",
+                "exchange": "NYSE",
+                "filed_at": filed,
+                "effective_on": date(2018, 3, 12),
+                "known_at": filed,
+                "ingested_at": filed,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+    return settings
+
+
+def test_tail_bars_and_an_uplisting_years_later_are_not_one_line(tmp_path: Path) -> None:
+    # A few bars after the effective day, then a listing three years on: two
+    # lines, so the first stays a delisting.
+    settings = _synthetic(tmp_path, "gap.duckdb")
+    with open_for_write(settings) as writer:
+        for session in (date(2018, 3, 9), date(2018, 3, 13), date(2018, 3, 14)):
+            _bar(writer, "SEC_GAP", session)
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        ends = listing_ends_as_of(conn, T, settings)
+    assert _end(ends, "SEC_GAP", "AAA", "NYSE", "2018-01-02")["status"] == DELISTED
+    # Trading into the next listing is a transfer.
+    with open_for_write(settings) as writer:
+        _bar(writer, "SEC_GAP", date(2021, 2, 26))
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        ends = listing_ends_as_of(conn, T, settings)
+    assert _end(ends, "SEC_GAP", "AAA", "NYSE", "2018-01-02")["status"] == TRANSFERRED
+
+
+def test_a_bar_stored_early_but_known_late_is_not_evidence_before_it_is_known(
+    tmp_path: Path,
+) -> None:
+    # A backfilled bar for 2021-02-26 with known_at weeks later is not seen by
+    # a read at a T before that known_at, whatever its session.
+    settings = _synthetic(tmp_path, "late.duckdb")
+    late = datetime(2021, 4, 1, 21, tzinfo=UTC)
+    with open_for_write(settings) as writer:
+        _bar(writer, "SEC_GAP", date(2018, 3, 9))
+        insert_row(
+            writer,
+            "prices_daily",
+            {
+                "security_id": "SEC_GAP",
+                "session": date(2021, 2, 26),
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 1,
+                "known_at": late,
+                "ingested_at": late,
+                "source": "alpaca_sip",
+                "provenance": "bar",
+            },
+        )
+    key = ("SEC_GAP", "AAA", "NYSE", "2018-01-02")
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        early = listing_ends_as_of(conn, datetime(2021, 3, 15, 21, tzinfo=UTC), settings)
+        after = listing_ends_as_of(conn, late, settings)
+    assert _end(early, *key)["status"] == DELISTED
+    assert _end(after, *key)["status"] == TRANSFERRED

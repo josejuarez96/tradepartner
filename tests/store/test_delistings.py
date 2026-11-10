@@ -140,16 +140,19 @@ class TestFixtureCases:
     def test_transfer_window_comes_from_config(
         self, fixture_store: duckdb.DuckDBPyConnection
     ) -> None:
-        # NASDAQ valid_from 2018-10-26 is 3 sessions after the 2018-10-23 filing,
-        # so a 2-session window misses the destination by the filing rule. The
-        # security trades into the NASDAQ listing (a bar on 2018-10-25), which
-        # is the transfer reading of #3242: still a transfer, same end. Before
-        # that bar is known the narrow window leaves it delisted.
+        # The NASDAQ row (valid_from 2018-10-26, known 2018-11-01) is 3 sessions
+        # after the 2018-10-23 filing and starts before the Form 25's effective
+        # day (2018-11-02). At the T it becomes known no bar after the
+        # effective day is known yet, so the window decides: 2 sessions misses
+        # the destination and leaves it delisted; the default 5 reaches it.
+        known = _at(2018, 11, 1)
         narrow = _settings(master={"transfer_window_sessions": 2})
-        row = _status(listing_ends_as_of(fixture_store, LATE, narrow), "SEC_TRANSFER", "NYSE")
-        assert (row["status"], row["end_session"]) == ("transferred", date(2018, 10, 25))
-        early = listing_ends_as_of(fixture_store, _at(2018, 10, 24, 20, 0), narrow)
-        assert _status(early, "SEC_TRANSFER", "NYSE")["status"] == "delisted"
+        row = _status(listing_ends_as_of(fixture_store, known, narrow), "SEC_TRANSFER", "NYSE")
+        assert row["status"] == "delisted"
+        wide = _status(
+            listing_ends_as_of(fixture_store, known, _settings()), "SEC_TRANSFER", "NYSE"
+        )
+        assert wide["status"] == "transferred"
 
     def test_every_fixture_delisting_ends_a_listing(
         self, fixture_store: duckdb.DuckDBPyConnection

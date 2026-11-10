@@ -81,9 +81,11 @@ a filing ends only a listing already known at T.
   old listing's end is then the session before the new `valid_from`.
 - It is also a **transfer** at T when the security **keeps trading** after
   the filing's `effective_on` (#3242; owner, 2026-11-10): a bar known at T
-  within `master.transfer_window_sessions` of `effective_on`, or one within
-  that many sessions before the security's next listing on another exchange
-  (a cover page starts that listing late, a Form 25 may be filed after it).
+  within `master.transfer_window_sessions` of `effective_on` when the next
+  listing on another exchange started before it (a late Form 25), or one
+  within that many sessions before a next listing that starts after it (a
+  cover page starts that listing late). Tail bars and an uplisting years
+  later are two lines.
   The old listing's end is then the session before that next listing; with
   no next listing known it stays a delisting. Only bars known at T are read, so the same
   filing is a delisting at an earlier T. A security with no bar after
@@ -441,10 +443,10 @@ def _keeps_trading(
     `bars`, the security's sessions with a bar known at T only (the caller
     passes nothing later), so the reading is the one a run at T would make.
     The security trades on when a bar falls within `window_sessions` of
-    `effective_on`, or a bar falls within `window_sessions` before the
-    security's next listing on another exchange (it traded into it; a cover
-    page may start that listing months late, and a hole in the store can sit
-    between).
+    `effective_on` and the next listing started before it (a late Form 25),
+    or a bar falls within `window_sessions` before a next listing on another
+    exchange that starts after it (it traded into it; a cover page may start
+    that listing months late, and a hole in the store can sit between).
     The end is the session before that next listing. A security with no next
     listing known stays a delisting (a reused ticker's bars after a real
     delisting look the same), and so does one with no bar after
@@ -466,7 +468,11 @@ def _keeps_trading(
     next_start = later[0]
     low = _window(next_start, window_sessions)[0]
     runs_in = any(effective_on < s < next_start and s >= low for s in after)
-    if not (first <= _window(effective_on, window_sessions)[1] or runs_in):
+    # A next listing that starts after the effective day must be run into:
+    # a few tail bars and an uplisting years later are two lines, not one.
+    # One that started before it (a late Form 25) has no gap to bridge.
+    adjacent = next_start <= effective_on and first <= _window(effective_on, window_sessions)[1]
+    if not (adjacent or runs_in):
         return None
     return (previous_session(next_start),)
 
