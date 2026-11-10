@@ -1613,7 +1613,9 @@ def _refetch_month(
                 f"{len(blocked)} collision row(s): a new id on a security, type and ex-date "
                 f"that already holds a live one; nothing written: {'; '.join(blocked)}"
             )
-        totals.update(moved)
+        # A dry run's refused rows would not be written: they are not "would add".
+        moved.subtract(Counter(line.split()[2] for line in blocked))
+        totals.update(+moved)
         written.extend(lines)
         by_type = ", ".join(f"{kind}={n}" for kind, n in sorted(moved.items())) or "none"
         extra = "".join(f"; {key}={value}" for key, value in sorted(stats.items()))

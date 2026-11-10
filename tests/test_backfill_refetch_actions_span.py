@@ -106,6 +106,7 @@ def test_a_reissued_id_for_a_stored_event_is_listed_as_a_collision(settings: Set
     line = f"collision {ACME} dividend {EX} 0.25 known_at={STAMP}"
     assert result.rows == ()
     assert result.refused == (line,)  # #3246: listed as refused, not as a row to write
+    assert result.added == ()  # and not counted under "would add"
 
 
 def _collide(settings: Settings, **kwargs: Any) -> Any:
