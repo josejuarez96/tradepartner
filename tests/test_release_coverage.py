@@ -200,3 +200,11 @@ def test_core_counts_partial_move(tmp_path: Path) -> None:
     (loss,) = losses
     assert (loss.lost, loss.moved, loss.unmoved, loss.moved_to) == (20, 8, 12, ("C2",))
     assert failing(losses, max_lost_sessions=5) == losses
+
+
+def test_unknown_release_name_is_scrubbed(tmp_path: Path) -> None:
+    s = _settings(tmp_path)
+    _seed(s)
+    app = cli.make_app(settings=lambda: s, clock=lambda: NOW)
+    res = CliRunner().invoke(app, ["decision", "data-release", "coverage", "--name", "x"])
+    assert res.exit_code == 2 and "no release named 'x'" in res.output
