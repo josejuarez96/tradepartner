@@ -2210,3 +2210,96 @@ def test_a_bulk_payload_is_kept_when_the_api_404s(tmp_path: Path) -> None:
     fresh = _source(source._settings, router)
     _shares(fresh, APPLE)
     assert router.urls.count(api) == before + 1  # not cached as complete
+
+
+# --- #3259: a cache or FSN hit is a parse this run ---------------------------
+
+
+def _stored_cross_day_entries(accessions: list[str], *, kind: str = "fetch") -> dict[str, dict]:
+    return {
+        a: {
+            "error_class": "ValueError",
+            "base_form": "10-K",
+            "kind": kind,
+            "message_hash": "h",
+            "count": 1,
+            "last_counted_day": "2026-06-01",
+            "accepted": False,
+        }
+        for a in accessions
+    }
+
+
+def _cross_day_reasons(source: EdgarFilingSource) -> list[str]:
+    reasons: list[str] = []
+    source._check_cross_day_pairs(reasons)
+    return reasons
+
+
+def _store_with_hit(source: EdgarFilingSource, hit: str, *, kind: str = "fetch") -> None:
+    """Five stored failures (min_failed_filings): `hit` plus four others."""
+    others = [f"0000999999-26-00000{n}" for n in range(4)]
+    source._failed_filings_cache = _stored_cross_day_entries([hit, *others], kind=kind)
+
+
+def test_cover_cache_hit_marks_filing_succeeded_so_stored_failure_is_not_counted(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    source = _source(settings, _router())
+    accession = "0000320193-26-000777"
+    path = Path(settings.edgar.cache_dir) / "cover" / f"v{COVER_VERSION}" / f"{accession}.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": COVER_VERSION,
+                "accession": accession,
+                "cik": APPLE,
+                "entity_cik": APPLE,
+                "listings": [],
+                "facts": [],
+            }
+        )
+    )
+    _seed_stamps(source, APPLE, {accession: _record(accession, "10-K", INSIDE_LAG)})
+    _store_with_hit(source, accession)
+    assert _cross_day_reasons(source)  # before the parse: 5 stored failures count
+    source.cover_pages(APPLE)
+    assert accession in source._succeeded_this_run
+    assert _cross_day_reasons(source) == []  # 4 left, below min_failed_filings
+
+
+def test_fsn_hit_marks_filing_succeeded_so_stored_failure_is_not_counted(tmp_path: Path) -> None:
+    source = _source(_settings(tmp_path), _router())
+    _seed_stamps(source, APPLE, {APPLE_ACCESSION: _record(APPLE_ACCESSION, "10-K", APPLE_ACCEPTED)})
+    _store_with_hit(source, APPLE_ACCESSION)
+    assert _cross_day_reasons(source)
+    [_page] = source.cover_pages(APPLE)
+    assert APPLE_ACCESSION in source._succeeded_this_run
+    assert _cross_day_reasons(source) == []
+
+
+def test_fsn_header_hit_marks_filing_succeeded(tmp_path: Path) -> None:
+    source = _source(_settings(tmp_path), _router())
+    _seed_stamps(source, APPLE, {APPLE_ACCESSION: _record(APPLE_ACCESSION, "10-K", APPLE_ACCEPTED)})
+    _store_with_hit(source, APPLE_ACCESSION)
+    source.filing_headers(APPLE, ["10-K"])
+    assert _cross_day_reasons(source) == []
+
+
+def test_a_genuine_failure_this_run_still_counts_alongside_cache_hits(tmp_path: Path) -> None:
+    source = _source(_settings(tmp_path), _router())
+    _seed_stamps(source, APPLE, {APPLE_ACCESSION: _record(APPLE_ACCESSION, "10-K", APPLE_ACCEPTED)})
+    _store_with_hit(source, APPLE_ACCESSION)
+    source.cover_pages(APPLE)  # parses from FSN: stored entry dropped (4 left)
+    source._pending_failures["0000999999-26-000099"] = ("ValueError", "10-K", "new")
+    assert _cross_day_reasons(source)  # 4 stored + 1 failed this run = 5
+
+
+def test_a_stored_collision_still_counts_after_an_fsn_hit(tmp_path: Path) -> None:
+    source = _source(_settings(tmp_path), _router())
+    _seed_stamps(source, APPLE, {APPLE_ACCESSION: _record(APPLE_ACCESSION, "10-K", APPLE_ACCEPTED)})
+    _store_with_hit(source, APPLE_ACCESSION, kind="collision")
+    source.cover_pages(APPLE)
+    assert _cross_day_reasons(source)
