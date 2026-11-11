@@ -5774,3 +5774,19 @@ def test_old_id_rule_reads_only_rows_known_at_t(fixture_store: duckdb.DuckDBPyCo
     assert _old_id_check(fixture_store, session_close(date(2019, 2, 28))).passed
     at_start = _old_id_check(fixture_store, session_close(date(2019, 3, 1)))
     assert at_start.violations["session"].to_list() == [date(2019, 3, 1)]
+
+
+def test_old_id_rule_matches_reworded_titles_and_ignores_missing_ones(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # VLD's two wordings of common stock are one class; a null title names none.
+    insert_row(fixture_store, "listings", _listing_row(_OLD, "VLD", "NYSE", date(2018, 1, 2)))
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row(_NEW, "VELO", "NASDAQ", date(2019, 3, 1), "Common Stock, $0.0001 par value"),
+    )
+    insert_row(fixture_store, "prices_daily", _bar(_OLD, date(2019, 3, 4)))
+    assert not _old_id_check(fixture_store).passed
+    fixture_store.execute("UPDATE listings SET class_title = NULL")
+    assert _old_id_check(fixture_store).passed

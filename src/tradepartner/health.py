@@ -565,7 +565,13 @@ from tradepartner.store.index_members import (
     normalize_ticker,
     resolve,
 )
-from tradepartner.store.master import first_session, securities_as_of, security_cik, session_of
+from tradepartner.store.master import (
+    _norm_title,
+    first_session,
+    securities_as_of,
+    security_cik,
+    session_of,
+)
 from tradepartner.store.retraction import EDGAR, live_chains_as_of, underived_as_of
 from tradepartner.store.schema import (
     STATEMENT_FACT_BASIS_VALUES,
@@ -4472,7 +4478,10 @@ def _cik_of(security_id: str) -> str:
 
 
 def _class_titles(rows: list[dict[str, Any]]) -> set[str]:
-    return {re.sub(r"\s+", " ", str(r.get("class_title") or "")).strip().lower() for r in rows}
+    """The rows' normalised class titles (the master's own `_norm_title`, so
+    two wordings of one class match); a missing title names no class."""
+    titles = {_norm_title(str(r["class_title"])) for r in rows if r.get("class_title")}
+    return titles - {""}
 
 
 def _old_id_bars_after_successor(
@@ -4482,16 +4491,19 @@ def _old_id_bars_after_successor(
     id, the bars known at `t` under a same-CIK, same-class old id from the
     successor's first listing day on."""
     by_security = _by_security(listings)
+    by_cik: dict[str, list[str]] = defaultdict(list)
+    for sid in by_security:
+        by_cik[_cik_of(sid)].append(sid)
     pairs: list[tuple[str, str, date]] = []
     for successor, rows in by_security.items():
         if not _SUCCESSOR_ID.match(successor):
             continue
         start = min(r["valid_from"] for r in rows)
         titles = _class_titles(rows)
-        for old, old_rows in by_security.items():
+        for old in by_cik[_cik_of(successor)]:
+            old_rows = by_security[old]
             if (
                 old != successor
-                and _cik_of(old) == _cik_of(successor)
                 and min(r["valid_from"] for r in old_rows) < start
                 and _class_titles(old_rows) & titles
             ):
