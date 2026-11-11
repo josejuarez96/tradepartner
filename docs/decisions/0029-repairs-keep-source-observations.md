@@ -1,6 +1,6 @@
 # 0029. Identity repairs keep source observations: retract, never delete; every release checks coverage; an independent answer key judges the resolver
 
-**Status:** Proposed (owner approved the direction on #3275, 2026-11-11; Accepted once he has answered open questions 1 and 2 on #3275 and merges this PR)  ·  **Date:** 2026-11-11  ·  **Issue:** #3275  ·  **Related:** [#3264](https://github.com/josejuarez96/tradepartner/issues/3264) (the diagnosis), [#3265](https://github.com/josejuarez96/tradepartner/issues/3265) (orphan guard), [#3269](https://github.com/josejuarez96/tradepartner/issues/3269) (line withdrawal, T388), [#3274](https://github.com/josejuarez96/tradepartner/issues/3274) (release coverage check, size S), [#3250](https://github.com/josejuarez96/tradepartner/pull/3250) (T387), [ADR 0022](0022-no-vendor-security-master.md) (no vendor; the free answer key), [ADR 0023](0023-break-first-fast-books-paper-exam.md), [ADR 0028](0028-one-ingest-pipeline.md), [data-foundation plan](../plans/data-foundation.md) amendment 2026-11-11 (#3275)
+**Status:** Accepted (on merge; the owner approved the direction on #3275 on 2026-11-11 and left the technical questions to the orchestrator, who decided them the same day)  ·  **Date:** 2026-11-11  ·  **Issue:** #3275  ·  **Related:** [#3264](https://github.com/josejuarez96/tradepartner/issues/3264) (the diagnosis), [#3265](https://github.com/josejuarez96/tradepartner/issues/3265) (orphan guard), [#3269](https://github.com/josejuarez96/tradepartner/issues/3269) (line withdrawal, T388), [#3274](https://github.com/josejuarez96/tradepartner/issues/3274) (release coverage check, size S), [#3250](https://github.com/josejuarez96/tradepartner/pull/3250) (T387), [ADR 0022](0022-no-vendor-security-master.md) (no vendor; the free answer key), [ADR 0023](0023-break-first-fast-books-paper-exam.md), [ADR 0028](0028-one-ingest-pipeline.md), [data-foundation plan](../plans/data-foundation.md) amendment 2026-11-11 (#3275)
 
 ## Context
 
@@ -23,14 +23,14 @@ In plain words: the store decides which security owns a price bar by reading its
    - (a) repairs stop destroying observations: they retract them;
    - (b) every release proves, before it closes, that no security lost trading days it should still have;
    - (c) a small answer key, built from sources outside our resolver, judges the resolver itself.
-   Each is useful alone, they cost about nine small tasks, and none of them blocks T387, T388 or #3265.
+   Each is useful alone, they cost about ten small tasks, and none of them blocks T387, T388 or #3265.
 4. **Do nothing but fix the rule (T388) and add the orphan guard (#3265).** Pro: the cheapest. Con: it fixes the line-withdrawal case and refuses orphans, but the next wrong rule would still delete bars that were the only evidence, and nothing would notice a liquid name losing months of bars if the guard's resolver is wrong in the same way. Kept as the floor: T388 and #3265 go ahead regardless. Not enough alone.
 
 ## Decision
 
 We will do the following. The owner approved the direction on #3275 on 2026-11-11.
 
-**1. Repairs retract; they do not delete.** `repair-resolution`, `repair-bars`, `repair-dividends`, `repair-spinoff-splits` and `delete-master-rows` stop issuing `DELETE` on `prices_daily`, `corporate_actions`, `listings` and `delistings`. (Decision 1 is worded for the side table below; if the owner answers open question 1 with the flag, this record is amended before it is Accepted.) A row a repair moves out is **retracted**: it leaves the fact table, so every reader, which never sees it, is unchanged, and it is kept in full in a side table, with:
+**1. Repairs retract; they do not delete.** `repair-resolution`, `repair-bars`, `repair-dividends`, `repair-spinoff-splits` and `delete-master-rows` stop issuing `DELETE` on `prices_daily`, `corporate_actions`, `listings` and `delistings`. A row a repair moves out is **retracted**: it leaves the fact table, so every reader, which never sees it, is unchanged, and it is kept in full in a side table, with:
 - the table and key it came from, and the whole row (every column, including `known_at`, `source`, `provenance`);
 - the **reason** (the repair command's reason text);
 - the **release name** (the repair already refuses without an open release);
@@ -39,7 +39,7 @@ We will do the following. The owner approved the direction on #3275 on 2026-11-1
 
 A retraction is **reversible row by row**: `repair restore` puts one retracted row, or all rows of one release, back into its table (it refuses if the logical key is now held by any revision, whatever its `known_at`, or if another id already holds that ticker and session; it runs only in its own open release, never inside an open paper window, and the release's close records the restored sessions so trials that read them go stale). A restore is itself recorded. The retracted rows of a release are the "after" evidence the coverage check reads.
 
-*Reuse and difference.* The master tables already retract by a `retracted` flag on an append-only revision (schema version 11, `store/retraction.py`, `master-retract`; `corporate_actions.cancelled` does the same for actions). That model withdraws a key *from its `known_at` on*, which is right for a master rule that changed: reads before the correction still return what was believed then. A bar or action moved by `repair-resolution` is different: it was never true on the wrong id, so the old delete removed it from reads at every instant, and the retraction keeps exactly that effect. A revision flag would instead need every reader of `prices_daily` (adjusted prices, universe, gap, health, backtest, paper) to filter it, and a reader that missed the filter would silently read a bad bar. The side table needs no reader change and cannot be missed. `delete-master-rows` also moves to it, because it removes rows "never right at any instant" (its own test); `master-retract` keeps the flag, which is the right model for rows that were right once. T389 pins both with a test that every existing as-of reader returns equal frames with a row retracted and with it deleted. See open question 1.
+*Reuse and difference.* The master tables already retract by a `retracted` flag on an append-only revision (schema version 11, `store/retraction.py`, `master-retract`; `corporate_actions.cancelled` does the same for actions). That model withdraws a key *from its `known_at` on*, which is right for a master rule that changed: reads before the correction still return what was believed then. A bar or action moved by `repair-resolution` is different: it was never true on the wrong id, so the old delete removed it from reads at every instant, and the retraction keeps exactly that effect. A revision flag would instead need every reader of `prices_daily` (adjusted prices, universe, gap, health, backtest, paper) to filter it, and a reader that missed the filter would silently read a bad bar. The side table needs no reader change and cannot be missed. `delete-master-rows` also moves to it, because it removes rows "never right at any instant" (its own test); `master-retract` keeps the flag, which is the right model for rows that were right once. T389 pins both with a test that every existing as-of reader returns equal frames with a row retracted and with it deleted. The choice is settled in the decisions below (question 1).
 
 Schema: one additive migration (new table, no existing row changes), following the version-11 and version-48 pattern: a read-only connection on an older version is accepted and sees no retractions.
 
@@ -75,12 +75,12 @@ The key is stored as fixtures (a packaged file under `src/tradepartner/store/`, 
 - Reversibility: **cheap** for 1 and 2 (a table and a refusal; reverting is a PR); **cheap** for 3 (a check-only file and a test). The retracted rows themselves are the reversibility.
 - Revisit if: the side table passes 10% of `prices_daily` (the design is then wrong, not the data); a vendor's terms start allowing archival of Alpaca bars (then ADR 0028 can archive them and retraction becomes less important); the answer key finds a defect class none of its histories cover (grow it); or a retracted row is restored more than once for the same release (the rule that judged it is wrong).
 
-## Open questions for the owner
+## Decisions on the open questions (orchestrator, 2026-11-11, #3275)
 
-Not guessed; each has a recommendation.
+The owner said these technical questions are the orchestrator's to decide. Decided on #3275:
 
-1. **Where does a retracted bar or action live?** Recommended: a side table, because the effect on every reader stays exactly what the delete was and no reader can miss it. The alternative is your wording of "flagged": a `retracted` flag on `prices_daily` and `corporate_actions` as on `listings` and `securities`, with a revision at the release's time. That reads like the master and shows the row in place, but every reader must filter it, and a trial with a cutoff before the release would still read the bad bar. Yes to the side table, or the flag?
-2. **Does `delete-master-rows` move to the side table, or retract with the flag?** Recommended: the side table, since its own test is "never right at any instant". `master-retract` keeps the flag either way.
-3. **How are the key's histories chosen beyond the starting list?** Recommended: the builder proposes about 20 with sources on the T394 issue and you strike or add before the build PR, as the census tasks do. Should any name be required (a name you hold or may hold)?
-4. **How long are retracted rows kept?** Recommended: until the release that produced them has been closed for 90 days and its coverage record passed, then purge only with your word (a purge is a delete, so it goes through a named release).
-5. **When does the real-store run of `identity-check` (T397) happen?** Recommended: read-only on the sitting copy right after T388 and T396 merge, so it informs the sitting; the other choice is after the sitting, beside T246.
+1. **Where a retracted bar or action lives:** a side table, `retracted_rows`, so every reader's view stays exactly what the delete gave and none can miss a flag.
+2. **`delete-master-rows`:** moves to the same side table. `master-retract` keeps its `retracted` flag.
+3. **The answer key's histories:** the builder proposes about 20, with sources, on the T394 issue; the orchestrator reviews; no names are required by the owner.
+4. **Retention:** retracted rows are kept until the producing release has been closed for 90 days with a passed coverage record; a purge goes only through a named release.
+5. **T397:** `identity-check` runs read-only on the sitting copy right after T388 and T396 merge.
