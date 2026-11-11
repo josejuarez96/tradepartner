@@ -336,6 +336,17 @@ derived at `t`, as the data is read.
   `master.transfer_window_sessions` of `effective_on`, the same grace a
   genuine resumption gets. Zero rows hit this on the 2026-10-04 backfilled
   store.
+- `old_id_bars_after_successor` (#3251): a bar known at `t` stored under an
+  old id on or after the first session of its company's successor id
+  (`<cik>@<date>`, #3056), that `repair-resolution` has not moved. The old id
+  is a same-CIK id that started before the successor and shares one of its
+  class titles (case and spacing aside), so one class's successor never
+  covers another class's bars (a preferred's bars stay under the common's
+  successor: not flagged by it, and a preferred's own successor does not
+  flag the common). It reads raw listings and bars, whatever the old line's
+  status: `no_bars_after_delisting` does not see an old line read as a
+  transfer. Once the bars are deleted or moved the rule passes. Listings and
+  bars are those known at `t`, so a successor not yet known flags nothing.
 - `underived_master_rows` (#859): the stored `securities` and `listings` rows
   the latest master check finished by `t` (an EDGAR ingest chunk or a
   `master-retract --apply`) found the current rules no longer derive, and
@@ -602,6 +613,7 @@ BARS_ON_SESSIONS = "bars_on_sessions"
 NO_DUPLICATE_BARS = "no_duplicate_bars"
 NON_OVERLAPPING_LISTINGS = "non_overlapping_listings"
 NO_BARS_AFTER_DELISTING = "no_bars_after_delisting"
+OLD_ID_BARS_AFTER_SUCCESSOR = "old_id_bars_after_successor"
 UNDERIVED_MASTER_ROWS = "underived_master_rows"
 STATEMENT_PERIOD_DAYS = "statement_period_days"
 STATEMENT_DERIVED_MATCHES_COMPONENTS = "statement_derived_matches_components"
@@ -688,6 +700,7 @@ INTEGRITY_RULES: tuple[str, ...] = (
     NO_DUPLICATE_BARS,
     NON_OVERLAPPING_LISTINGS,
     NO_BARS_AFTER_DELISTING,
+    OLD_ID_BARS_AFTER_SUCCESSOR,
     UNDERIVED_MASTER_ROWS,
     STATEMENT_PERIOD_DAYS,
     STATEMENT_DERIVED_MATCHES_COMPONENTS,
@@ -774,6 +787,12 @@ _AFTER_DELISTING_SCHEMA: dict[str, Any] = {
     "ticker": pl.Utf8,
     "exchange": pl.Utf8,
     "effective_on": pl.Date,
+}
+_OLD_ID_BARS_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "successor_id": pl.Utf8,
+    "session": pl.Date,
+    "successor_start": pl.Date,
 }
 _STATEMENT_PERIOD_SCHEMA: dict[str, Any] = {
     "cik": pl.Utf8,
@@ -3752,6 +3771,7 @@ def _integrity_checks(
         NO_DUPLICATE_BARS: _duplicate_bars(conn),
         NON_OVERLAPPING_LISTINGS: overlaps,
         NO_BARS_AFTER_DELISTING: _bars_after_delisting(conn, t, listings, window),
+        OLD_ID_BARS_AFTER_SUCCESSOR: _old_id_bars_after_successor(conn, t, listings),
         UNDERIVED_MASTER_ROWS: underived_as_of(conn, t),
         STATEMENT_PERIOD_DAYS: _statement_period_days(conn),
         STATEMENT_DERIVED_MATCHES_COMPONENTS: _statement_derived_matches_components(conn),
@@ -4442,6 +4462,59 @@ def _bars_after_delisting(
         )
     ]
     return pl.DataFrame(rows, schema=_AFTER_DELISTING_SCHEMA).sort("security_id", "session")
+
+
+_SUCCESSOR_ID = re.compile(r"^[^:@]+@\d{4}-\d{2}-\d{2}")
+
+
+def _cik_of(security_id: str) -> str:
+    return security_id.split(":")[0].split("@")[0]
+
+
+def _class_titles(rows: list[dict[str, Any]]) -> set[str]:
+    return {re.sub(r"\s+", " ", str(r.get("class_title") or "")).strip().lower() for r in rows}
+
+
+def _old_id_bars_after_successor(
+    conn: duckdb.DuckDBPyConnection, t: datetime, listings: pl.DataFrame
+) -> pl.DataFrame:
+    """`old_id_bars_after_successor` (module docstring, #3251): per successor
+    id, the bars known at `t` under a same-CIK, same-class old id from the
+    successor's first listing day on."""
+    by_security = _by_security(listings)
+    pairs: list[tuple[str, str, date]] = []
+    for successor, rows in by_security.items():
+        if not _SUCCESSOR_ID.match(successor):
+            continue
+        start = min(r["valid_from"] for r in rows)
+        titles = _class_titles(rows)
+        for old, old_rows in by_security.items():
+            if (
+                old != successor
+                and _cik_of(old) == _cik_of(successor)
+                and min(r["valid_from"] for r in old_rows) < start
+                and _class_titles(old_rows) & titles
+            ):
+                pairs.append((old, successor, start))
+    if not pairs:
+        return pl.DataFrame([], schema=_OLD_ID_BARS_SCHEMA)
+    rows_out: list[dict[str, Any]] = []
+    for old, successor, start in pairs:
+        found = conn.execute(
+            """
+            SELECT DISTINCT session FROM prices_daily
+            WHERE known_at <= ? AND security_id = ? AND session >= ?
+            ORDER BY session
+            """,
+            [t, old, start],
+        ).fetchall()
+        rows_out.extend(
+            {"security_id": old, "successor_id": successor, "session": s, "successor_start": start}
+            for (s,) in found
+        )
+    return pl.DataFrame(rows_out, schema=_OLD_ID_BARS_SCHEMA).sort(
+        "security_id", "successor_id", "session"
+    )
 
 
 def _statement_period_days(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
