@@ -4459,7 +4459,12 @@ def make_app(
                 conn.execute(
                     f"ATTACH '{str(backup).replace(chr(39), chr(39) * 2)}' AS bk (READ_ONLY)"
                 )
-                losses = release_coverage(conn, backup_alias="bk", max_lost_sessions=threshold)
+                losses = release_coverage(
+                    conn,
+                    backup_alias="bk",
+                    max_lost_sessions=threshold,
+                    price_tolerance=s.store.release_move_price_tolerance,
+                )
         except StoreLockedError as exc:
             raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         for loss in losses:

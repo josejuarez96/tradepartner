@@ -6,8 +6,8 @@ a liquid security losing months of bars. This compares the distinct
 `prices_daily` sessions per `security_id` in a release's pre-release backup
 (attached read-only) with the current store and lists every security that lost
 more than a threshold of sessions. A lost session is "moved" when another
-`security_id` holds a bar for the same session in the current store that the
-backup did not have for that id (a merge into a successor id). The check fails
+`security_id` gained a bar for the same session that equals the lost bar (same
+volume, OHLC within a relative tolerance), as a merge into a successor id does. The check fails
 when any security's *unmoved* loss exceeds the threshold. It writes nothing.
 """
 
@@ -43,7 +43,11 @@ class SessionLoss:
 
 
 def release_coverage(
-    conn: duckdb.DuckDBPyConnection, *, backup_alias: str, max_lost_sessions: int
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    backup_alias: str,
+    max_lost_sessions: int,
+    price_tolerance: float = 1e-6,
 ) -> list[SessionLoss]:
     """Every security whose lost sessions exceed `max_lost_sessions`, by id.
 
@@ -56,15 +60,32 @@ def release_coverage(
     bk = backup_alias
     rows = conn.execute(
         f"""
-        WITH b AS (SELECT DISTINCT security_id, session FROM {bk}.prices_daily),
-        c AS (SELECT DISTINCT security_id, session FROM main.prices_daily),
+        WITH bb AS (
+            SELECT security_id, session, arg_max(open, known_at) AS o, arg_max(high, known_at) AS h,
+                   arg_max(low, known_at) AS lo, arg_max(close, known_at) AS cl,
+                   arg_max(volume, known_at) AS v
+            FROM {bk}.prices_daily GROUP BY security_id, session),
+        cb AS (
+            SELECT security_id, session, arg_max(open, known_at) AS o, arg_max(high, known_at) AS h,
+                   arg_max(low, known_at) AS lo, arg_max(close, known_at) AS cl,
+                   arg_max(volume, known_at) AS v
+            FROM main.prices_daily GROUP BY security_id, session),
+        b AS (SELECT security_id, session FROM bb),
+        c AS (SELECT security_id, session FROM cb),
         lost AS (SELECT * FROM b ANTI JOIN c USING (security_id, session)),
         gained AS (SELECT * FROM c ANTI JOIN b USING (security_id, session)),
         moved AS (
             SELECT l.security_id, l.session, min(g.security_id) AS successor,
                    list(DISTINCT g.security_id) AS successors
-            FROM lost l JOIN gained g
-              ON g.session = l.session AND g.security_id <> l.security_id
+            FROM lost l
+            JOIN bb ON bb.security_id = l.security_id AND bb.session = l.session
+            JOIN gained g ON g.session = l.session AND g.security_id <> l.security_id
+            JOIN cb ON cb.security_id = g.security_id AND cb.session = g.session
+             AND cb.v = bb.v
+             AND abs(cb.o - bb.o) <= ? * greatest(1, abs(bb.o))
+             AND abs(cb.h - bb.h) <= ? * greatest(1, abs(bb.h))
+             AND abs(cb.lo - bb.lo) <= ? * greatest(1, abs(bb.lo))
+             AND abs(cb.cl - bb.cl) <= ? * greatest(1, abs(bb.cl))
             GROUP BY ALL
         ),
         agg AS (
@@ -88,7 +109,7 @@ def release_coverage(
                     WHERE s.security_id = a.security_id))
         FROM agg a ORDER BY a.lost DESC, a.security_id
         """,
-        [max_lost_sessions],
+        [price_tolerance] * 4 + [max_lost_sessions],
     ).fetchall()
     out: list[SessionLoss] = []
     for sid, first, last, lost, moved, succ, name, ticker in rows:

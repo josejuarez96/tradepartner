@@ -22,7 +22,7 @@ def _days(n: int) -> list[date]:
     return [START + timedelta(days=i) for i in range(n)]
 
 
-def _bar(conn: duckdb.DuckDBPyConnection, sid: str, day: date) -> None:
+def _bar(conn: duckdb.DuckDBPyConnection, sid: str, day: date, close: float = 1.0) -> None:
     insert_row(
         conn,
         "prices_daily",
@@ -30,9 +30,9 @@ def _bar(conn: duckdb.DuckDBPyConnection, sid: str, day: date) -> None:
             "security_id": sid,
             "session": day,
             "open": 1.0,
-            "high": 1.0,
-            "low": 1.0,
-            "close": 1.0,
+            "high": max(1.0, close),
+            "low": min(1.0, close),
+            "close": close,
             "volume": 1,
             "known_at": NOW,
             "ingested_at": NOW,
@@ -191,7 +191,9 @@ def test_core_counts_partial_move(tmp_path: Path) -> None:
     with open_for_write(s) as conn:
         conn.execute("DELETE FROM prices_daily WHERE security_id='A'")
         for d in _days(8):
-            _bar(conn, "C2", d)
+            _bar(conn, "C2", d)  # same bar as A's: a real move
+        for d in _days(20):
+            _bar(conn, "Z", d, close=9.0)  # unrelated prices: not a move
     with duckdb.connect(s.store.path, read_only=True) as conn:
         conn.execute(f"ATTACH '{backup}' AS bk (READ_ONLY)")
         losses = release_coverage(conn, backup_alias="bk", max_lost_sessions=5)
