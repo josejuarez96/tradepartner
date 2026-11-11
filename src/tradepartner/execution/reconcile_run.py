@@ -204,6 +204,7 @@ from tradepartner.config import RiskConfig, Settings, render_validation_errors
 from tradepartner.errors import ClockError, LimitBreachError, ReconciliationError
 from tradepartner.execution import breaks as break_rules
 from tradepartner.execution import switch
+from tradepartner.execution.dividend_dues import net_dividend_dues
 from tradepartner.execution.ledger import (
     TRUE_UP_KINDS,
     Ledger,
@@ -932,37 +933,12 @@ def _dividends(
             dues[row["security_id"]].append((row["ex_date"], amount))
     due: dict[str, float] = defaultdict(float)
     open_dues: dict[str, tuple[float, ...]] = {}
-    for name, dated in dues.items():
-        # `dividend_cash` has no action id. At the credit's own session, consume
-        # only dues still inside its N-session window, oldest ex-date first.
-        # The 2N look-back above (T267's netting rule) retains a due that was
-        # live when credited even after it expires at this reconciliation.
-        credits = sorted(journaled.get(name, ()), key=lambda a: (a.session, a.adjustment_id or 0))
-        remaining = sorted(dated)
-        for credit in credits:
-            cash = credit.cash
-            if cash is None:
-                continue
-            credit_window_start = credit.session
-            for _ in range(credit_sessions):
-                credit_window_start = previous_session(credit_window_start)
-            for index, (ex_date, amount) in enumerate(remaining):
-                if (
-                    not credit_window_start < ex_date <= credit.session
-                    or amount == 0
-                    or cash * amount <= 0
-                ):
-                    continue
-                paid = min(abs(cash), abs(amount))
-                signed_paid = math.copysign(paid, cash)
-                remainder = amount - signed_paid
-                remaining[index] = (
-                    ex_date,
-                    0.0 if abs(remainder) <= cash_tolerance else remainder,
-                )
-                cash -= signed_paid
-                if cash == 0.0:
-                    break
+    # `dividend_cash` has no action id. Retain a second window of old ex-dates
+    # so a just-expired due can consume its late credit before a newer due.
+    remaining_by_name, _ = net_dividend_dues(
+        dues, journaled, credit_sessions=credit_sessions, cash_tolerance=cash_tolerance
+    )
+    for name, remaining in remaining_by_name.items():
         open_dues[name] = tuple(
             amount
             for ex_date, amount in remaining

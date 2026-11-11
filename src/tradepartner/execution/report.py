@@ -15,11 +15,9 @@ computes:
 - the **dividend term**: over equity at close(T_i), the sum over
   `corporate_actions` dividend rows with `ex_date` in (T_i, T_{i+1}] and
   `known_at <= close(T_{i+1})` of amount x the ledger quantity held on the
-  ex-date (`positions_daily`), excluding any dividend the broker already
-  credited (an `adjustments` row of kind `dividend_cash` for the same name
-  that the T_{i+1} mark absorbed: `session <= T_{i+1}` and `known_at` no
-  later than that mark's, the residue term's cut; req 6: paper got the cash
-  already, so counting it again would double it);
+  ex-date (`positions_daily`), net of matched `dividend_cash` credits the
+  T_{i+1} mark absorbed. A credit matched to an older ex-date is subtracted
+  in the period that absorbs it, so it does not leave unexplained equity;
 - the **fill-timing term**: over equity at close(T_i), [sum over buys of
   (the paper fill price - the frozen `execution.fill_price` bar price on the
   fill's session) x filled quantity, less the same sum over sells], so a buy
@@ -46,7 +44,8 @@ with its names whichever rule applies, never excluded. A period whose
 T_{i+1} falls on or after `stop_session` is left out of the result
 entirely ("uncompared"): no term is computed for it. `window.frozen_json`
 is read for `paper.tracking_k` and `paper.tracking_rule` only, never live
-`Settings` (spec req 14).
+`Settings` (spec req 14). The dividend match also reads the window's frozen
+`risk.reconcile_dividend_credit_sessions` and `risk.reconcile_cash_tolerance`.
 """
 
 from __future__ import annotations
@@ -75,6 +74,7 @@ from tradepartner.calendar import (
     session_close,
 )
 from tradepartner.config import Cadence, RiskConfig, Settings
+from tradepartner.execution.dividend_dues import net_dividend_dues
 from tradepartner.execution.ledger import (
     Ledger,
     from_journal,
@@ -314,6 +314,7 @@ def _actions_as_of(actions: pl.DataFrame, t: datetime) -> pl.DataFrame:
 
 
 def _dividend_term(
+    window: PaperWindowRow,
     actions_as_of_next: pl.DataFrame,
     adjustments: Sequence[AdjustmentRow],
     marks: Sequence[PositionDailyRow],
@@ -322,17 +323,28 @@ def _dividend_term(
 ) -> float:
     if actions_as_of_next.is_empty():
         return 0.0
-    #: Sessions a `dividend_cash` adjustment was journaled for each name:
-    #: reconcile stamps it at the reconciliation session, on or after the
-    #: ex-date (`execution.reconcile_run._dividends`), never on the ex-date
-    #: itself, so the match is "on or after", not "equal to". A credit counts
-    #: when the T_{i+1} mark absorbed it (`session <= T_{i+1}` and `known_at`
-    #: no later than that mark's own `known_at`), the same cut the residue
-    #: term uses (spec amendment 2026-10-29, item 3). So a credit is either in
-    #: paper equity at T_{i+1} and not added back, or uncredited; a credit
-    #: journaled after that mark was written was not in the period's return.
+    frozen = json.loads(window.frozen_json)
+    risk = RiskConfig()
+    credit_sessions = int(
+        frozen.get(
+            "risk.reconcile_dividend_credit_sessions", risk.reconcile_dividend_credit_sessions
+        )
+    )
+    cash_tolerance = float(
+        frozen.get("risk.reconcile_cash_tolerance", risk.reconcile_cash_tolerance)
+    )
+    # Reconciliation keeps one extra credit window of older dues, so a late
+    # payment cannot consume a newer dividend on the same name.
+    lookback_start = t_next
+    for _ in range(2 * credit_sessions):
+        lookback_start = previous_session(lookback_start)
+    period_start = t_i
+    for _ in range(credit_sessions):
+        period_start = previous_session(period_start)
+    lookback_start = min(lookback_start, period_start)
     absorbed_at = max(m.known_at for m in marks if m.session == t_next)
-    credited: dict[str, list[date]] = {}
+    prior_absorbed_at = max(m.known_at for m in marks if m.session == t_i)
+    credited: dict[str, list[AdjustmentRow]] = {}
     for adjustment in adjustments:
         if (
             adjustment.kind == _DIVIDEND_CASH
@@ -340,23 +352,42 @@ def _dividend_term(
             and adjustment.session <= t_next
             and adjustment.known_at <= absorbed_at
         ):
-            credited.setdefault(adjustment.security_id, []).append(adjustment.session)
-    total = 0.0
+            credited.setdefault(adjustment.security_id, []).append(adjustment)
+            credit_start = adjustment.session
+            for _ in range(credit_sessions):
+                credit_start = previous_session(credit_start)
+            lookback_start = min(lookback_start, credit_start)
+    dues: dict[str, list[tuple[date, float]]] = {}
     for action_row in actions_as_of_next.filter(pl.col("action_type") == _DIVIDEND).iter_rows(
         named=True
     ):
         ex_date = action_row["ex_date"]
-        if not (t_i < ex_date <= t_next):
+        if not (lookback_start < ex_date <= t_next):
             continue
         security_id = action_row["security_id"]
-        if any(session >= ex_date for session in credited.get(security_id, ())):
-            continue
         #: Entitlement is held as of the session before the ex-date (the
         #: record date; `execution.reconcile_run._dividends` uses the same
         #: `previous_session(ex_date)` holding), never the ex-date's own close.
         quantity = _quantity_at(marks, security_id, previous_session(ex_date))
-        total += float(action_row["ratio_or_amount"]) * quantity
-    return total
+        if quantity:
+            dues.setdefault(security_id, []).append(
+                (ex_date, float(action_row["ratio_or_amount"]) * quantity)
+            )
+    remaining, matches = net_dividend_dues(
+        dues, credited, credit_sessions=credit_sessions, cash_tolerance=cash_tolerance
+    )
+    current_due = math.fsum(
+        amount
+        for dated in remaining.values()
+        for ex_date, amount in dated
+        if t_i < ex_date <= t_next
+    )
+    late_credit = math.fsum(
+        amount
+        for credit, ex_date, amount in matches
+        if ex_date <= t_i and not (credit.session <= t_i and credit.known_at <= prior_absorbed_at)
+    )
+    return current_due - late_credit
 
 
 def _short_terms(
@@ -973,7 +1004,12 @@ def compare_periods(
 
         dividend_term = (
             _dividend_term(
-                actions_as_of_next, journal.adjustments, journal.positions_daily, t_i, t_next
+                window,
+                actions_as_of_next,
+                journal.adjustments,
+                journal.positions_daily,
+                t_i,
+                t_next,
             )
             / paper_equity_i
         )
