@@ -85,7 +85,8 @@ a filing ends only a listing already known at T.
   listing on another exchange started before it (a late Form 25), or one
   within that many sessions before a next listing that starts after it (a
   cover page starts that listing late). Tail bars and an uplisting years
-  later are two lines.
+  later are two lines. Only bars in sessions a listing row on an exchange
+  covers count (#3252; owner, 2026-11-10): OTC bars leave it a delisting.
   The old listing's end is then the session before that next listing; with
   no next listing known it stays a delisting. Only bars known at T are read, so the same
   filing is a delisting at an earlier T. A security with no bar after
@@ -428,6 +429,20 @@ def _ended_listing(
     return target
 
 
+def _on_exchange(siblings: list[Row], session: date) -> bool:
+    """Whether `session` is covered by a listing row on an exchange (#3252).
+
+    The row that covers a session is the latest of the security's rows (known
+    at T: the caller passes nothing later) starting on or before it; a row on
+    `_OFF_EXCHANGE` (OTC, NONE) covers it off the exchange. A session no row
+    covers is not on an exchange either."""
+    started = [o for o in siblings if o["valid_from"] <= session]
+    if not started:
+        return False
+    latest = max(o["valid_from"] for o in started)
+    return any(o["exchange"] not in _OFF_EXCHANGE for o in started if o["valid_from"] == latest)
+
+
 def _keeps_trading(
     bars: list[date],
     siblings: list[Row],
@@ -450,9 +465,11 @@ def _keeps_trading(
     The end is the session before that next listing. A security with no next
     listing known stays a delisting (a reused ticker's bars after a real
     delisting look the same), and so does one with no bar after
-    `effective_on` (VLD, stopped for 13 months)."""
+    `effective_on` (VLD, stopped for 13 months). Only bars in sessions a
+    listing row on an exchange covers count (#3252; owner, 2026-11-10): an OTC
+    tail before an uplisting leaves the line a delisting."""
     effective_on = filing["effective_on"]
-    after = sorted(s for s in bars if s > effective_on)
+    after = sorted(s for s in bars if s > effective_on and _on_exchange(siblings, s))
     if not after:
         return None
     first = after[0]

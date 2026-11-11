@@ -568,3 +568,38 @@ def test_a_bar_stored_early_but_known_late_is_not_evidence_before_it_is_known(
         after = listing_ends_as_of(conn, late, settings)
     assert _end(early, *key)["status"] == DELISTED
     assert _end(after, *key)["status"] == TRANSFERRED
+
+
+def _otc_years(tmp_path: Path, name: str, *, otc_known_at: datetime | None = None) -> Settings:
+    """NYSE Form 25, OTC bars, then a NASDAQ uplisting (#3252)."""
+    settings = _synthetic(tmp_path, name)
+    otc = _listing("SEC_GAP", "AAAQ", "OTC", date(2018, 3, 13))
+    if otc_known_at is not None:
+        otc["known_at"] = otc["ingested_at"] = otc_known_at
+    with open_for_write(settings) as writer:
+        insert_row(writer, "listings", otc)
+        for session in (date(2018, 3, 9), date(2018, 3, 13), date(2018, 3, 14), date(2021, 2, 26)):
+            _bar(writer, "SEC_GAP", session)
+    return settings
+
+
+def test_otc_bars_before_an_uplisting_do_not_make_the_form25_a_transfer(tmp_path: Path) -> None:
+    settings = _otc_years(tmp_path, "otc.duckdb")
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        ends = listing_ends_as_of(conn, T, settings)
+    row = _end(ends, "SEC_GAP", "AAA", "NYSE", "2018-01-02")
+    assert row["status"] == DELISTED
+    assert row["end_session"] == date(2018, 3, 9)
+
+
+def test_a_listing_row_known_after_t_does_not_make_bars_otc(tmp_path: Path) -> None:
+    # The OTC row is known 2021-04-01; a read before it sees the bars as
+    # un-labelled (so they count, as before #3252); a read after sees OTC bars.
+    late = datetime(2021, 4, 1, 21, tzinfo=UTC)
+    settings = _otc_years(tmp_path, "otc_late.duckdb", otc_known_at=late)
+    key = ("SEC_GAP", "AAA", "NYSE", "2018-01-02")
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        early = listing_ends_as_of(conn, datetime(2021, 3, 15, 21, tzinfo=UTC), settings)
+        after = listing_ends_as_of(conn, late, settings)
+    assert _end(early, *key)["status"] == TRANSFERRED
+    assert _end(after, *key)["status"] == DELISTED
