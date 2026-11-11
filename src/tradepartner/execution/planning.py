@@ -374,6 +374,8 @@ def reference_prices(
     session: date,
     names: Collection[str],
     actions_as_of: pl.DataFrame,
+    *,
+    bar_sessions: dict[str, date] | None = None,
 ) -> dict[str, float]:
     """The reference price on S per name (spec Definitions > Reference price):
     the close of its latest bar on or before S-1 known at close(S-1), divided
@@ -388,7 +390,9 @@ def reference_prices(
     successor's, keyed back to the predecessor's id. Only the price is read
     through: which broker symbol an order goes under stays the symbol map's
     call (`reconcile_run.order_symbols`, #3031). A predecessor of more than one
-    live chain raises `ValueError` naming them, never a guessed successor."""
+    live chain raises `ValueError` naming them, never a guessed successor.
+    When given, `bar_sessions` receives the actual bar session of each priced
+    name, using the same read and chain resolution as its reference price."""
     _check_session(session)
     if not names:
         return {}
@@ -436,6 +440,8 @@ def reference_prices(
         if not (math.isfinite(price) and price > 0):
             raise ValueError(f"reference price of {sid} is {price}")
         prices[sid] = price
+        if bar_sessions is not None:
+            bar_sessions[sid] = bar_session
     return prices
 
 

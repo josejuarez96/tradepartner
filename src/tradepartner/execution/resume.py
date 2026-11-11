@@ -529,14 +529,23 @@ def _band_view_violations(
     the fills judged them. An unpriced name stays unjudged, as in a collection."""
     actions = live_actions_as_of(conn, session_close(previous_session(session)))
     prices: dict[str, float] = {}
+    bar_sessions: dict[str, date] = {}
     for name in sorted({item.security_id for item in group}):
         with suppress(ValueError):
-            prices.update(reference_prices(conn, session, [name], actions))
+            prices.update(
+                reference_prices(conn, session, [name], actions, bar_sessions=bar_sessions)
+            )
 
     def price_of(name: str) -> float:
         return prices[name]
 
-    band = PriceBand(price_of, actions, session, settings.paper.max_fill_price_deviation)
+    band = PriceBand(
+        price_of,
+        actions,
+        session,
+        settings.paper.max_fill_price_deviation,
+        bar_sessions.__getitem__,
+    )
     return list(fill_band_violations(group, band))
 
 
@@ -727,16 +736,20 @@ def resume(
             open_orders = non_terminal_orders(conn, window_id=window_id)
             actions = live_actions_as_of(conn, cut)
             prices: dict[str, float] = {}
+            bar_sessions: dict[str, date] = {}
             for name in sorted({order.security_id for order in open_orders}):
                 # An unpriced name remains unjudged, as for an unpriced exit.
                 with suppress(ValueError):
-                    prices.update(reference_prices(conn, session, [name], actions))
+                    prices.update(
+                        reference_prices(conn, session, [name], actions, bar_sessions=bar_sessions)
+                    )
             before = {f.fill.broker_fill_id for f in fills_for(conn, window_id=window_id)}
         band = PriceBand(
             lambda name: prices[name],
             actions,
             session,
             settings.paper.max_fill_price_deviation,
+            bar_sessions.__getitem__,
         )
         band_error: SystemFaultError | None = None
         try:
