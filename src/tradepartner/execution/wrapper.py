@@ -666,6 +666,7 @@ class _Book:
     actions: pl.DataFrame
     ledger: Ledger
     prices: Mapping[str, float]
+    bar_sessions: Mapping[str, date]
     unpriced: Mapping[str, str]
     states: Mapping[int, DecisionState]
     residues: Mapping[str, float]
@@ -1711,9 +1712,12 @@ class RiskGatedBroker:
             # if it can be; a missing one halts only where a number reads it
             # (the reserve, the open-sell check), via `price_of` (#569 (b)).
             names = {d.security_id for d in rows} | set(ledger.positions)
-            prices = reference_prices(conn, session, names, actions)
+            bar_sessions: dict[str, date] = {}
+            prices = reference_prices(conn, session, names, actions, bar_sessions=bar_sessions)
             open_names = {o.security_id for o in orders if o.client_order_id not in terminal}
-            optional, unpriced = _optional_prices(conn, session, open_names - names, actions)
+            optional, unpriced = _optional_prices(
+                conn, session, open_names - names, actions, bar_sessions=bar_sessions
+            )
             prices = {**prices, **optional}
             symbols, unmappable, ended, ambiguous = _listings(
                 conn, session, sorted({d.security_id for d in rows}), self._settings, window_id
@@ -1766,6 +1770,7 @@ class RiskGatedBroker:
             actions,
             ledger,
             prices,
+            bar_sessions,
             unpriced,
             states,
             residues,
@@ -2125,6 +2130,7 @@ class RiskGatedBroker:
             book.actions,
             run.session,
             self._settings.paper.max_fill_price_deviation,
+            book.bar_sessions.__getitem__,
         )
 
     def _collect(
@@ -2339,12 +2345,16 @@ class RiskGatedBroker:
             cut = session_close(previous_session(run.session))
             with self._journal() as conn:
                 actions = live_actions_as_of(conn, cut)
-                prices, unpriced = _optional_prices(conn, run.session, [order.security_id], actions)
+                bar_sessions: dict[str, date] = {}
+                prices, unpriced = _optional_prices(
+                    conn, run.session, [order.security_id], actions, bar_sessions=bar_sessions
+                )
             band = PriceBand(
                 _price_lookup(prices, unpriced),
                 actions,
                 run.session,
                 self._settings.paper.max_fill_price_deviation,
+                bar_sessions.__getitem__,
             )
         except Exception as exc:
             # A halt still reads back fills when its reference-price read fails.
@@ -2567,6 +2577,8 @@ def _optional_prices(
     session: date,
     names: Collection[str],
     actions: pl.DataFrame,
+    *,
+    bar_sessions: dict[str, date] | None = None,
 ) -> tuple[dict[str, float], dict[str, str]]:
     """The reference prices of the names only a non-terminal order brings into
     the book (#569, owner option (b)): each priced on its own, so one name
@@ -2577,7 +2589,9 @@ def _optional_prices(
     unpriced: dict[str, str] = {}
     for security_id in sorted(names):
         try:
-            priced.update(reference_prices(conn, session, [security_id], actions))
+            priced.update(
+                reference_prices(conn, session, [security_id], actions, bar_sessions=bar_sessions)
+            )
         except ValueError as exc:
             unpriced[security_id] = str(exc)
     return priced, unpriced

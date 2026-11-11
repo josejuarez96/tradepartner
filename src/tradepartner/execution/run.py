@@ -1836,18 +1836,27 @@ class _Run:
         if context is None:
             return None
         prices: dict[str, float] = {}
+        bar_sessions: dict[str, date] = {}
         names = sorted({o.security_id for o in orders})
         with open_read_only(self.settings, retry=True) as conn:
             try:
                 prices = planning.reference_prices(
-                    conn, context.session, names, context.actions_as_of
+                    conn,
+                    context.session,
+                    names,
+                    context.actions_as_of,
+                    bar_sessions=bar_sessions,
                 )
             except ValueError:  # one name has no bar: price the others one by one
                 for name in names:
                     with suppress(ValueError):
                         prices.update(
                             planning.reference_prices(
-                                conn, context.session, [name], context.actions_as_of
+                                conn,
+                                context.session,
+                                [name],
+                                context.actions_as_of,
+                                bar_sessions=bar_sessions,
                             )
                         )
         return PriceBand(
@@ -1855,6 +1864,7 @@ class _Run:
             context.actions_as_of,
             context.session,
             self.settings.paper.max_fill_price_deviation,
+            bar_sessions.__getitem__,
         )
 
     def _collect(self) -> Collected:

@@ -649,6 +649,7 @@ from tradepartner.store.db import (
     utc_now,
 )
 from tradepartner.store.lab_schema import LabNotInitialised
+from tradepartner.store.release_coverage import failing, format_loss, release_coverage
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 USAGE_ERROR = 2
@@ -3245,6 +3246,13 @@ def make_app(
         release: Annotated[
             str | None, typer.Option(help="the open data release (required to delete)")
         ] = None,
+        allow_orphans: Annotated[
+            int | None,
+            typer.Option(
+                help="the owner's exact count of bar keys no id receives (#3265); "
+                "refused unless it equals the dry run's orphan count"
+            ),
+        ] = None,
     ) -> None:
         """Delete Alpaca bars and actions the resolver no longer assigns to their security."""
         expect = _repair_expect(dry_run, expect_bar_rows, expect_action_rows, release)
@@ -3253,7 +3261,12 @@ def make_app(
             raise missing
         try:
             result = repair_resolution(
-                s, clock=clock, dry_run=dry_run, expect=expect, release=release
+                s,
+                clock=clock,
+                dry_run=dry_run,
+                expect=expect,
+                release=release,
+                allow_orphans=allow_orphans,
             )
         except StoreLockedError as exc:
             raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
@@ -4430,6 +4443,51 @@ def make_app(
             s,
         )
         typer.echo(f"decision {decision_id}: data_release {name} after ({first}..{last})")
+
+    @release_app.command("coverage")
+    def release_coverage_cmd(
+        name: Annotated[str, typer.Option(help="the release whose backup to compare")],
+    ) -> None:
+        """Read-only: list securities that lost trading days since the release's backup.
+
+        Exits 1 when a loss above `store.release_max_lost_sessions` was not moved to
+        another security id (#3274). Writes nothing.
+        """
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        threshold = s.store.release_max_lost_sessions
+        try:
+            with open_read_only(s) as conn:
+                befores = [
+                    r
+                    for r in registry.data_releases(conn)
+                    if r.name == name and r.stage == "before"
+                ]
+                if not befores or befores[0].backup_path is None:
+                    raise _input_fail(f"no release named {name!r} with a backup", settings)
+                backup = Path(befores[0].backup_path)
+                _backup(backup, s).close()
+                conn.execute(
+                    f"ATTACH '{str(backup).replace(chr(39), chr(39) * 2)}' AS bk (READ_ONLY)"
+                )
+                losses = release_coverage(
+                    conn,
+                    backup_alias="bk",
+                    max_lost_sessions=threshold,
+                    price_tolerance=s.store.release_move_price_tolerance,
+                )
+        except StoreLockedError as exc:
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
+        for loss in losses:
+            typer.echo(format_loss(loss))
+        bad = failing(losses, max_lost_sessions=threshold)
+        typer.echo(
+            f"release {name}: {len(losses)} security(ies) lost more than {threshold} sessions, "
+            f"{len(bad)} not moved"
+        )
+        if bad:
+            raise typer.Exit(1)
 
     @release_app.command("record")
     def release_record(

@@ -142,7 +142,7 @@ import duckdb
 import polars as pl
 
 from tradepartner.adapters.broker import TERMINAL_STATUSES, Broker, Fill, Order
-from tradepartner.calendar import all_sessions, is_session, previous_session
+from tradepartner.calendar import all_sessions, is_session
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, RejectionCapError, SystemFaultError
 from tradepartner.execution.plan import decision_state
@@ -248,12 +248,14 @@ class WriteOffContext:
 class PriceBand:
     """The fill-price sanity band (#1981): the reference price on `session` (a pure
     lookup over data already loaded, as `WriteOffContext.price_of`), the splits known
-    at close(S-1), and the configured `paper.max_fill_price_deviation`."""
+    at close(S-1), the actual bar session per priced name, and the configured
+    `paper.max_fill_price_deviation`."""
 
     price_of: Callable[[str], float]
     actions_as_of: pl.DataFrame
     session: date
     deviation: float
+    reference_session_of: Callable[[str], date]
 
 
 @dataclass(frozen=True)
@@ -865,7 +867,7 @@ def _spinoff_sides(item: OrderedFill, band: PriceBand) -> tuple[bool, bool]:
     A spin-off of the filled name (a `spinoff` row in `band.actions_as_of`, the
     actions known at close(S-1), whose `source_action_id` is the name) takes the
     child's value off its price from the ex-date E on, and the band has no child
-    price. The reference is the close of R = `previous_session(band.session)`; the
+    price. The reference is the close of its actual bar session R; the
     fill is priced in the order's session O (`band.session` when it has none).
     For E in (R, O] the fill is ex-distribution and the reference is not, so only
     the high side applies; for E in (O, R] the reverse, so only the low side
@@ -873,7 +875,7 @@ def _spinoff_sides(item: OrderedFill, band: PriceBand) -> tuple[bool, bool]:
     actions = band.actions_as_of
     if "source_action_id" not in actions.columns:
         return True, True
-    reference = previous_session(band.session)
+    reference = band.reference_session_of(item.security_id)
     filled = item.order_session if item.order_session is not None else band.session
     low_side = high_side = True
     for row in actions.iter_rows(named=True):

@@ -935,10 +935,17 @@ def test_a_held_name_with_no_bar_still_halts_step_7(
     ended_before(env, MAY_3)
     real = run_module.planning.reference_prices
 
-    def no_trns(conn: object, session: date, names: object, actions: object) -> object:
+    def no_trns(
+        conn: object,
+        session: date,
+        names: object,
+        actions: object,
+        *,
+        bar_sessions: dict[str, date] | None = None,
+    ) -> object:
         if "SEC_TRANSFER" in set(names):  # type: ignore[call-overload]
             raise ValueError("no reference price for SEC_TRANSFER")
-        return real(conn, session, names, actions)  # type: ignore[arg-type]
+        return real(conn, session, names, actions, bar_sessions=bar_sessions)  # type: ignore[arg-type]
 
     monkeypatch.setattr(run_module.planning, "reference_prices", no_trns)
     with pytest.raises(ValueError, match="SEC_TRANSFER"):
@@ -1004,9 +1011,11 @@ def counted(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
         session: date,
         names: Collection[str],
         actions: pl.DataFrame,
+        *,
+        bar_sessions: dict[str, date] | None = None,
     ) -> dict[str, float]:
         calls.append(sorted(names))
-        return real(conn, session, names, actions)
+        return real(conn, session, names, actions, bar_sessions=bar_sessions)
 
     monkeypatch.setattr(run_module.planning, "reference_prices", spy)
     return calls
