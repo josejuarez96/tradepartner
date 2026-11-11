@@ -3,6 +3,11 @@
 # the resolver and is never read by a universe, signal, backtest or research
 # module (a source scan in tests/lookahead/test_check_only_inputs.py pins that).
 #
+# line_end.last is the LAST SESSION the security traded on that exchange line
+# (omitted: the line did not end). holds and line_end are in calendar days; bars
+# are sessions. Bar citations attest continued trading from filings and
+# releases, not a price history: a known limit, see #3282.
+#
 # Format (store/identity_answer_key.py): [[history]] with [[history.input]]
 # (events that reach the store), [[history.bars]] (sessions that had bars) and
 # [[history.expected]] (outcomes). Entities are CIKs, never store ids. Every
@@ -44,7 +49,7 @@ cik = "0001841666"
 date = 2021-03-01
 exchange = "Nasdaq"
 ticker = "APA"
-successor_cik = "0000006769"
+predecessor_cik = "0000006769"
 cite = { kind = "accession", ref = "0001193125-21-063695", date = 2021-03-01 }
 
 # Bars: Apache traded on Nasdaq from the session after the Form 25s (2020-06-09)
@@ -68,21 +73,33 @@ kind = "line_end"
 cik = "0000006769"
 exchange = "NYSE"
 last = 2020-06-08
-cite = { kind = "accession", ref = "0001193125-20-163490", date = 2020-06-08 }
+cite = { kind = "press_release", ref = "https://au.finance.yahoo.com/news/apache-corporation-announces-exclusive-listing-204510289.html", date = 2020-05-27 }
 
 [[history.expected]]
 kind = "line_end"
 cik = "0000006769"
 exchange = "NYSE Chicago"
 last = 2020-06-08
-cite = { kind = "accession", ref = "0001193125-20-163501", date = 2020-06-08 }
+cite = { kind = "press_release", ref = "https://au.finance.yahoo.com/news/apache-corporation-announces-exclusive-listing-204510289.html", date = 2020-05-27 }
 
-# The Nasdaq line did not end: this is the fact the rehearsal copy lost (#3264).
+# Apache's Nasdaq line ended with the reorganisation: Nasdaq's Form 25-NSE of
+# 2021-03-04 strikes Apache's common stock ("on 3/2/2021, Apache Corporation was
+# reorganized as APA Corporation"), while APA Corp's stock continued on Nasdaq
+# uninterrupted. Last Apache session 2021-02-26 is the Friday before the
+# 2021-03-01 effective date. Between the two Form 25s of 2020-06-08 and then,
+# the Nasdaq line did NOT end: the fact the rehearsal copy lost (#3264).
 [[history.expected]]
 kind = "line_end"
 cik = "0000006769"
 exchange = "Nasdaq"
-cite = { kind = "accession", ref = "0001193125-20-163490", date = 2020-06-08 }
+last = 2021-02-26
+cite = { kind = "accession", ref = "0001354457-21-000304", date = 2021-03-04 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0001841666"
+exchange = "Nasdaq"
+cite = { kind = "accession", ref = "0001193125-21-063695", date = 2021-03-01 }
 
 [[history.expected]]
 kind = "holds"
@@ -118,6 +135,9 @@ cite = { kind = "accession", ref = "0001193125-21-063695", date = 2021-03-01 }
 id = "mar-nyse-chicago-2020"
 title = "Marriott: NYSE Chicago line withdrawn 2020-09-20 while Nasdaq continues"
 
+# Last session on NYSE Chicago is Friday 2020-09-18: the release says trading is
+# suspended before the open on Monday 2020-09-21 (withdrawal effective Sunday
+# 2020-09-20).
 # Marriott (CIK 0001048286) Form 25 for the Class A common stock on NYSE
 # Chicago, signed 2020-09-10. The company's release of 2020-08-31 says the
 # withdrawal takes effect 2020-09-20, NYSE Chicago suspends trading before the
@@ -140,7 +160,7 @@ cite = { kind = "press_release", ref = "https://www.prnewswire.com/news-releases
 kind = "line_end"
 cik = "0001048286"
 exchange = "NYSE Chicago"
-last = 2020-09-20
+last = 2020-09-18
 cite = { kind = "press_release", ref = "https://www.prnewswire.com/news-releases/marriott-international-inc-to-delist-from-nyse-chicago-stock-exchange-301120767.html", date = 2020-08-31 }
 
 [[history.expected]]

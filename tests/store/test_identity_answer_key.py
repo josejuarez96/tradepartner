@@ -104,7 +104,8 @@ def _true_apa() -> Observed:
         line_ends={
             ("0000006769", "NYSE"): d(2020, 6, 8),
             ("0000006769", "NYSE Chicago"): d(2020, 6, 8),
-            ("0000006769", "Nasdaq"): None,
+            ("0000006769", "Nasdaq"): d(2021, 2, 26),
+            ("0001841666", "Nasdaq"): None,
         },
     )
 
@@ -120,7 +121,7 @@ def test_the_truth_matches_and_the_apa_hole_is_named_with_its_citation() -> None
     )
     misses = match(apa, wrong)
     texts = [str(m) for m in misses]
-    assert any("Nasdaq ended 2020-06-17, expected no end" in t for t in texts)
+    assert any("Nasdaq ended 2020-06-17, expected 2021-02-26" in t for t in texts)
     assert any("holds: 0000006769 APA 2020-06-09..2021-02-28 not covered" in t for t in texts)
     assert any("bars: 0001841666 APA" in t for t in texts)
     assert all("[accession 0001193125-" in t for t in texts)
@@ -148,7 +149,38 @@ def test_an_unknown_line_is_a_miss() -> None:
     observed = Observed(
         holds=(Span("0001048286", "MAR", date(2020, 9, 21), None),),
         bars=(Span("0001048286", "MAR", date(2020, 9, 21), None),),
-        line_ends={("0001048286", "NYSE Chicago"): date(2020, 9, 20)},
+        line_ends={("0001048286", "NYSE Chicago"): date(2020, 9, 18)},
     )
     (miss,) = match(mar, observed)
     assert "Nasdaq unknown" in miss.why
+
+
+def test_two_entities_holding_one_ticker_at_once_is_a_miss() -> None:
+    apa = load_answer_key(date(2026, 11, 11))[0]
+    true = _true_apa()
+    overlong = Observed(
+        holds=(
+            Span("0000006769", "APA", date(2013, 1, 1), None),  # runs past the holdco
+            Span("0001841666", "APA", date(2021, 3, 1), None),
+        ),
+        bars=true.bars,
+        line_ends=true.line_ends,
+    )
+    (miss,) = match(apa, overlong)
+    assert "0000006769 also holds APA" in miss.why
+
+
+def test_a_reversed_span_is_refused() -> None:
+    with pytest.raises(ValueError, match="ends before it starts"):
+        Span("0000006769", "APA", date(2021, 1, 2), date(2021, 1, 1))
+
+
+def test_the_loader_refuses_an_unknown_key_and_a_missing_input_field() -> None:
+    with pytest.raises(AnswerKeyError, match="unknown key"):
+        parse_key(_key(extra="lst = 2021-01-01\n"), date(2026, 1, 1))
+    bad = (
+        '[[history]]\nid = "h"\n[[history.input]]\nkind = "form25"\n'
+        f'cik = "0000006769"\ndate = 2020-06-08\nticker = "APA"\ncite = {_CITE}\n'
+    )
+    with pytest.raises(AnswerKeyError, match="exchange"):
+        parse_key(bad, date(2026, 1, 1))

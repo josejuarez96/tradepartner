@@ -69,9 +69,9 @@ class InputEvent:
     kind: str
     cik: str
     date: date
-    exchange: str | None
-    ticker: str | None
-    successor_cik: str | None
+    exchange: str
+    ticker: str
+    predecessor_cik: str | None
     citation: Citation
 
 
@@ -92,8 +92,9 @@ class Expected:
     """One expected outcome.
 
     `holds`: `cik` holds `ticker` from `first` to `last`. `bars`: the same span
-    has bars. `line_end`: `cik`'s `exchange` line ended on `last`, or, with
-    `last` None, did not end.
+    has bars. `line_end`: `cik`'s `exchange` line ended on `last`, the last
+    session the security traded on that line, or, with `last` None, did not end.
+    `holds` and `line_end` dates are calendar days; `bars` dates are sessions.
     """
 
     kind: ExpectedKind
@@ -124,6 +125,10 @@ class Span:
     ticker: str
     first: date
     last: date | None
+
+    def __post_init__(self) -> None:
+        if self.last is not None and self.last < self.first:
+            raise ValueError(f"span {self.cik} {self.ticker} ends before it starts")
 
 
 @dataclass(frozen=True)
@@ -163,6 +168,30 @@ def _date(raw: Any, where: str, name: str) -> date:
     return raw
 
 
+_KEYS: Final = {
+    "history": {"id", "title", "input", "bars", "expected"},
+    "input": {"kind", "cik", "date", "exchange", "ticker", "predecessor_cik", "cite"},
+    "bars": {"cik", "ticker", "first", "last", "cite"},
+    "expected": {"kind", "cik", "first", "last", "ticker", "exchange", "cite"},
+    "cite": {"kind", "ref", "date"},
+}
+
+
+def _known(row: Mapping[str, Any], table: str, where: str) -> None:
+    """Refuse a key the format does not define (a typo like `lst` would turn
+    "ended on X" into "did not end")."""
+    extra = sorted(set(row) - _KEYS[table])
+    if extra:
+        raise _fail(where, f"unknown key(s) {extra}")
+
+
+def _text(row: Mapping[str, Any], name: str, where: str) -> str:
+    value = row.get(name)
+    if not isinstance(value, str) or not value.strip():
+        raise _fail(where, f"{name} must be a non-empty string")
+    return value
+
+
 def _optional_date(row: Mapping[str, Any], name: str, where: str) -> date | None:
     return _date(row[name], where, name) if name in row else None
 
@@ -178,6 +207,7 @@ def _citation(row: Mapping[str, Any], where: str, check_date: date) -> Citation:
     raw = row.get("cite")
     if not isinstance(raw, dict):
         raise _fail(where, "fact has no citation")
+    _known(raw, "cite", where)
     kind, ref = raw.get("kind"), raw.get("ref")
     if kind not in CITATION_KINDS:
         raise _fail(where, f"citation kind {kind!r} is not one of {CITATION_KINDS}")
@@ -203,6 +233,7 @@ def parse_key(text: str, check_date: date | None = None) -> tuple[History, ...]:
     out: list[History] = []
     seen: set[str] = set()
     for h in data.get("history", []):
+        _known(h, "history", "history")
         hid = h.get("id")
         if not isinstance(hid, str) or not hid or hid in seen:
             raise _fail("history", f"id {hid!r} is missing or repeated")
@@ -210,23 +241,25 @@ def parse_key(text: str, check_date: date | None = None) -> tuple[History, ...]:
         inputs: list[InputEvent] = []
         for i, row in enumerate(h.get("input", [])):
             where = f"{hid}.input[{i}]"
+            _known(row, "input", where)
             if row.get("kind") not in INPUT_KINDS:
                 raise _fail(where, f"kind {row.get('kind')!r} is not one of {INPUT_KINDS}")
-            succ = _cik(row, "successor_cik", where) if "successor_cik" in row else None
+            succ = _cik(row, "predecessor_cik", where) if "predecessor_cik" in row else None
             inputs.append(
                 InputEvent(
                     kind=row["kind"],
                     cik=_cik(row, "cik", where),
                     date=_date(row.get("date"), where, "date"),
-                    exchange=row.get("exchange"),
-                    ticker=row.get("ticker"),
-                    successor_cik=succ,
+                    exchange=_text(row, "exchange", where),
+                    ticker=_text(row, "ticker", where),
+                    predecessor_cik=succ,
                     citation=_citation(row, where, check),
                 )
             )
         bars: list[BarSpan] = []
         for i, row in enumerate(h.get("bars", [])):
             where = f"{hid}.bars[{i}]"
+            _known(row, "bars", where)
             first = _date(row.get("first"), where, "first")
             last = _optional_date(row, "last", where)
             if last is not None and last < first:
@@ -234,7 +267,7 @@ def parse_key(text: str, check_date: date | None = None) -> tuple[History, ...]:
             bars.append(
                 BarSpan(
                     cik=_cik(row, "cik", where),
-                    ticker=str(row["ticker"]),
+                    ticker=_text(row, "ticker", where),
                     first=first,
                     last=last,
                     citation=_citation(row, where, check),
@@ -243,6 +276,7 @@ def parse_key(text: str, check_date: date | None = None) -> tuple[History, ...]:
         expected: list[Expected] = []
         for i, row in enumerate(h.get("expected", [])):
             where = f"{hid}.expected[{i}]"
+            _known(row, "expected", where)
             kind = row.get("kind")
             if kind not in EXPECTED_KINDS:
                 raise _fail(where, f"kind {kind!r} is not one of {EXPECTED_KINDS}")
@@ -345,4 +379,23 @@ def match(history: History, observed: Observed) -> list[Miss]:
                         f"{got.isoformat() if got else 'never'}, expected {want}",
                     )
                 )
+    misses.extend(_double_holders(history, observed))
+    return misses
+
+
+def _double_holders(history: History, observed: Observed) -> list[Miss]:
+    """A ticker held by two entities at once, or a span running into a window
+    the key gives to another entity, is a miss: coverage alone passes spans
+    that run too long."""
+    misses: list[Miss] = []
+    for e in history.expected:
+        if e.kind != "holds" or e.first is None or e.ticker is None:
+            continue
+        for s in observed.holds:
+            if s.ticker != e.ticker or s.cik == e.cik:
+                continue
+            if s.first <= (e.last or date.max) and (s.last or date.max) >= e.first:
+                end = s.last.isoformat() if s.last else "open"
+                why = f"holds: {s.cik} also holds {e.ticker} {s.first.isoformat()}..{end} "
+                misses.append(Miss(history.id, e, why + f"inside {e.cik}'s window"))
     return misses
