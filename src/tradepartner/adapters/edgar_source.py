@@ -3195,12 +3195,13 @@ class EdgarFilingSource(FilingSource):
                 continue
             cached = self._load_cover_cache(accession)
             if cached is not None:
-                self._per_document_attempted.add(accession)  # #610 policy 1: a cache hit
+                self._note_cache_hit(accession)  # #610 policy 1, #3259
                 if cached.entity_cik == cik:  # else a co-registrant's copy: not its page
                     yield record, cached
                 continue
             fsn_filing = fsn_cache.get(accession)
             if fsn_filing is not None:
+                self._succeeded_this_run.add(accession)  # #3259: an FSN row is a parse too
                 yield record, fsn_filing
                 continue
             if accession in self._fsn_extracted_accessions:
@@ -3312,13 +3313,14 @@ class EdgarFilingSource(FilingSource):
                 continue
             cached = self._load_header_cache(cik, accession)
             if cached is not None:
-                self._per_document_attempted.add(accession)  # #610 policy 1: a cache hit
+                self._note_cache_hit(accession)  # #610 policy 1, #3259
                 headers.append(
                     FilingHeader(cik, accession, record.form, cached.sic, record.accepted_at)
                 )
                 continue
             fsn_filing = fsn_cache.get(accession)
             if fsn_filing is not None and fsn_filing.sic is not None:
+                self._succeeded_this_run.add(accession)  # #3259
                 headers.append(
                     FilingHeader(cik, accession, record.form, fsn_filing.sic, record.accepted_at)
                 )
@@ -3509,7 +3511,7 @@ class EdgarFilingSource(FilingSource):
             cik, record, accepted_at = stamped[0]
             cached = self._load_delisting_cache(accession)
             if cached is not None:
-                self._per_document_attempted.add(accession)  # #610 policy 1: a cache hit
+                self._note_cache_hit(accession)  # #610 policy 1, #3259
                 results.append(
                     DelistingFiling(
                         cik=cached.cik,
@@ -3660,7 +3662,7 @@ class EdgarFilingSource(FilingSource):
         fetched here: `notice_text` stays `None` until a caller reads one."""
         cached = self._load_form25_evidence_cache(accession, accepted_at)
         if cached is not None:
-            self._per_document_attempted.add(accession)
+            self._note_cache_hit(accession)
             return cached
         if self._is_quarantined(accession):
             self._quarantined_this_run.add(accession)
@@ -4094,7 +4096,7 @@ class EdgarFilingSource(FilingSource):
         one request at a time as before, with the sequential wait-out."""
         cached = _filename_cache_hit(cache, record, read_document)
         if cached is not None:
-            self._per_document_attempted.add(record.accession)  # #610 policy 1: a cache hit
+            self._note_cache_hit(record.accession)  # #610 policy 1, #3259
             return cached
         if self._is_quarantined(record.accession):
             self._quarantined_this_run.add(record.accession)
@@ -4245,6 +4247,13 @@ class EdgarFilingSource(FilingSource):
             return None
         self._succeeded_this_run.add(accession)
         return result
+
+    def _note_cache_hit(self, accession: str) -> None:
+        """A per-document cache hit: attempted (#610 policy 1) and parsed this
+        run, like `_guarded`'s success, so a stored cross-day failure for it
+        is not counted (#3259)."""
+        self._per_document_attempted.add(accession)
+        self._succeeded_this_run.add(accession)
 
     def _record_failure(
         self,
