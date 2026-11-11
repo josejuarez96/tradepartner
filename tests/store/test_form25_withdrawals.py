@@ -133,6 +133,10 @@ def test_marriotts_nyse_chicago_line_is_withdrawn_while_nasdaq_stays_listed(
     conn: duckdb.DuckDBPyConnection, store_settings: Settings
 ) -> None:
     ends = listing_ends_as_of(conn, T, store_settings)
+    # A later NASDAQ row (2020-11-06, retracted in 2026) is no "next listing"
+    # for a line that ran beside Nasdaq: the end is the same at T 2020-12-02.
+    during = listing_ends_as_of(conn, datetime(2020, 12, 2, 12, tzinfo=UTC), store_settings)
+    assert _row(during, MAR, "NYSE_CHICAGO")["end_session"] == date(2020, 9, 18)
     chicago = _row(ends, MAR, "NYSE_CHICAGO")
     # Effective Sunday 2020-09-20: the line's last session is Friday 09-18.
     assert (chicago["status"], chicago["end_session"]) == (TRANSFERRED, date(2020, 9, 18))
@@ -258,8 +262,6 @@ def _make(
     delistings: list[dict[str, Any]],
     bars: list[date],
     name: str = "s.duckdb",
-    *,
-    late_bars: dict[date, datetime] | None = None,
 ) -> Settings:
     settings = Settings(_env_file=None, store={"path": str(tmp_path / name)})
     with open_for_write(settings) as writer:
@@ -491,3 +493,15 @@ def test_derive_with_no_bars_reads_a_form_25_as_a_delisting() -> None:
     none = pl.DataFrame([], schema={"security_id": pl.Utf8(), "session": pl.Date()})
     ends = derive_listing_ends(listings, delistings, none, transfer_window_sessions=5)
     assert _status(ends, "NYSE")[0] == DELISTED
+
+
+def test_an_older_row_left_behind_by_a_move_is_no_live_sibling(tmp_path: Path) -> None:
+    # NASDAQ 2010, replaced by NYSE in 2015 with no Form 25 for the old line;
+    # a real NYSE Form 25 and two tail bars: still a delisting.
+    settings = _make(
+        tmp_path,
+        [_listing(SEC, "AAA", "NASDAQ", date(2010, 1, 4)), _listing(SEC, "AAA", "NYSE", D0)],
+        [_f25(SEC, "NYSE", FILED1, E1)],
+        BARS,
+    )
+    assert _status(_read(settings), "NYSE")[0] == DELISTED
