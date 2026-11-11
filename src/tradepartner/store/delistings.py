@@ -93,6 +93,20 @@ a filing ends only a listing already known at T.
   `effective_on` stays delisted below. A filing also ends the other rows of
   its exchange that start the same day as the listing it ends (one line,
   two cover-page tickers).
+- It is a **line withdrawal** at T, also a transfer, when the filing ends one
+  line of a security whose other line carries on (#3269: Apache's NYSE and
+  NYSE Chicago Forms 25 of June 2020 with Nasdaq concurrent from the same day,
+  Marriott's NYSE Chicago Form 25 of September 2020): a sibling row of the
+  same security and class (`class_title` equal, or either `None`) on another
+  exchange, not `_OFF_EXCHANGE`, started on or before `effective_on` and not
+  ended by any Form 25 known at T with an `effective_on` on or before this
+  filing's (so the reading does not depend on filing order, and two lines
+  ended the same day with no third row are both delistings), and a bar known
+  at T within `master.transfer_window_sessions` after `effective_on` in a
+  session a listing row on an exchange covers (the evidence #3242 asks for;
+  a stale sibling row with no such bar leaves a delisting). The line's end is
+  the session before `effective_on` and the security stays listed. The rules
+  above come first: a transfer to a later listing keeps its end.
 - Otherwise it is **delisted** at T (conservative: the state between the
   filing and a new listing becoming known). Its end is the last bar
   session known at T from its `valid_from` up to, not including, any later
@@ -494,6 +508,48 @@ def _keeps_trading(
     return (previous_session(next_start),)
 
 
+def _withdrawn(
+    bars: list[date],
+    siblings: list[Row],
+    row: Row,
+    filing: Row,
+    ended: dict[int, Row],
+    window_sessions: int,
+) -> date | None:
+    """The line's last session when `filing` only withdraws `row`'s line while
+    another listing of the security carries on, else `None` (#3269).
+
+    A sibling carries on when it is another row of the same security and
+    class (`class_title` equal, or either `None`, as `_spares` reads it) on
+    another exchange that is not `_OFF_EXCHANGE`, started on or before
+    `effective_on`, and no Form 25 known at T with an `effective_on` on or
+    before this filing's ended it (read from `ended`, whole, so the reading
+    does not depend on filing order: two lines ended the same day with no
+    third row are both delistings). And the security must still trade after
+    `effective_on`: a bar known at T falls within `window_sessions` after it,
+    in a session a listing row on an exchange covers (`_on_exchange`, #3252).
+    Without that bar the sibling is stale, and the Form 25 is the delisting
+    it reads as."""
+    effective_on = filing["effective_on"]
+    title = row["class_title"]
+    live = any(
+        other["exchange"] != filing["exchange"]
+        and other["exchange"] not in _OFF_EXCHANGE
+        and (title is None or other["class_title"] is None or other["class_title"] == title)
+        and other["valid_from"] <= effective_on
+        and not (
+            other["_index"] in ended and ended[other["_index"]]["effective_on"] <= effective_on
+        )
+        for other in siblings
+    )
+    if not live:
+        return None
+    high = _window(effective_on, window_sessions)[1]
+    if not any(effective_on < s <= high and _on_exchange(siblings, s) for s in bars):
+        return None
+    return previous_session(effective_on)
+
+
 def _spares(delisting: Row, listing: Row) -> bool:
     """Whether `delisting` names a debt class and `listing` is a common or
     untitled one: a notes filing never ends the common listing (#2937), whether
@@ -626,6 +682,21 @@ def derive_listing_ends(
             status, end = TRANSFERRED, previous_session(successors[0])
         elif keeps is not None:
             status, end = TRANSFERRED, keeps[0]
+        elif (
+            index not in reopened
+            and (
+                withdrawn := _withdrawn(
+                    bars.get(row["security_id"], []),
+                    siblings,
+                    row,
+                    filing,
+                    ended,
+                    transfer_window_sessions,
+                )
+            )
+            is not None
+        ):
+            status, end = TRANSFERRED, withdrawn
         else:
             later = [o["valid_from"] for o in siblings if o["valid_from"] > row["valid_from"]]
             stop = min(later, default=date.max)
