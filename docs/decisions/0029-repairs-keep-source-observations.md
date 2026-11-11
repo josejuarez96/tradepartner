@@ -57,7 +57,7 @@ The key is stored as fixtures (a packaged file under `src/tradepartner/store/`, 
 
 **4. T246 runs after the sitting.** T246's RSP index check (the known-answer check of S&P 500 membership against the store's universe, backtest plan, #1598) runs **after the data sitting**, as the **economic cross-check**: it asks, with a source we did not build, whether a month-end universe lost members to the sitting's repairs. It does not replace the answer key (it covers index members only, not the delisted, multi-class or OTC names), and the answer key does not replace it. The plan amends T246's line to say so.
 
-**What this does not change.** T388 and #3265 go ahead. The APA Corp chain entry (2021-03-15 to 2021-05-05) remains the owner's config call (T388's amendment). No store is touched by this decision; the real store is only read by T396 and T397.
+**What this does not change.** T388 and #3265 go ahead. The APA Corp chain entry (2021-03-15 to 2021-05-05) remains the owner's config call (T388's amendment). No store is touched by this decision; no task here reads the real store: T396 is a read-only command and T397 runs it on the sitting copy.
 
 ## Consequences
 
@@ -67,7 +67,7 @@ The key is stored as fixtures (a packaged file under `src/tradepartner/store/`, 
   - The resolver is judged by outcomes written down from outside sources, not by its own output. A rule fix (T388, T387) gets a standing regression set instead of one fixture each.
   - No reader changes, no new dependency, no vendor cost, and the real store has not yet run the destructive repair.
 - Bad / accepted risks:
-  - The side table grows by every retracted row (the rehearsal's 101,698 bar keys are on the order of ten MB; a larger run is bounded by the store's size, and a restore or a purge of old releases is a separate owner decision).
+  - The side table grows by every retracted row (the rehearsal's 101,698 bar keys are on the order of ten MB; a larger run is bounded by the store's size, and retention is decision 4 (90 days, purge through a named release); the purge command is not built here).
   - A retraction is still not undone automatically: a restore of a row onto an id whose span is wrong only puts the bar back where the wrong rule left it. The check (2) and the key (3) are what find the wrong rule.
   - The answer key is hand-built and about 20 histories is a sample, not a proof. It catches the known hard shapes (APA, MAR, multi-class) and nothing else. Citations can be wrong; a wrong fact is found when the resolver and a second source disagree, and is fixed in one line.
   - The coverage check needs a pre-release backup. A repair whose backup is missing cannot close; that is a deliberate cost.
