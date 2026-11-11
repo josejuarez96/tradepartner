@@ -408,6 +408,7 @@ Purpose: flip the two EDGAR switches, bump both cache versions, rederive rows, r
   uv run tradepartner health
   uv run tradepartner health --check
   uv run tradepartner health --coverage
+  uv run tradepartner decision data-release coverage --name rederive-1682  # exit 1: a security lost bars no other id gained; stop, do not close (#3274)
   uv run tradepartner decision data-release close --name rederive-1682 --from 2016-01-04 --to <last-touched-session> --reason "#1682 actual rows by source PR, read-time merges and trial replay rule"
   ```
 
@@ -527,6 +528,7 @@ Purpose: apply what is left of #3064's post-bankruptcy repair after step 9. Step
   uv run tradepartner ingest --source alpaca --backfill --since 2016-01-04 --fill-holes
   uv run tradepartner health
   uv run tradepartner health --check
+  uv run tradepartner decision data-release coverage --name splice-3056  # exit 1: a security lost bars no other id gained; stop, do not close (#3274)
   uv run tradepartner decision data-release close --name splice-3056 --from <first> --to <last> --reason "#3056 counts"
   ```
 
@@ -616,6 +618,7 @@ Purpose: store the pre-2020 name changes, then ask Alpaca again for the splits a
   uv run tradepartner repair-dividends --release actions-3054 --dry-run
   uv run tradepartner repair-dividends --release actions-3054 --expect-action-rows <dry-run-row-count>
   uv run tradepartner health --check
+  uv run tradepartner decision data-release coverage --name actions-3054  # exit 1: a security lost bars no other id gained; stop, do not close (#3274)
   uv run tradepartner decision data-release close --name actions-3054 --from 2016-01-04 --to <last touched ex-date, at least 2026-10-15> --reason "#3054 added actions by type, retracts"
   ```
 

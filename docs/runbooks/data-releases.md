@@ -134,6 +134,7 @@ Write the printed times into the entry with a `Z` in place of `+00:00`.
 4. **Open the release.** `uv run tradepartner decision data-release open --name <name> --backup <printed copy path> --reason "<why, issue number>"`. The command computes and stores the two numbers itself; "Read the two numbers" below is only for checking them by hand.
 5. **Run the repair.** Every command in the batch, back to back. Dry runs first where the command has one.
 6. **Check it.** `uv run tradepartner health --check` exits 0, and the checks the release's issue names pass.
+   Then `uv run tradepartner decision data-release coverage --name <name>` (read-only, #3274): it compares each security's trading days in the release's backup with the store now and lists every one that lost more than `store.release_max_lost_sessions` sessions, saying whether another id gained those bars. Exit 1 means a loss no other id took: stop, do not close, and report it.
 7. **Close the release.** `uv run tradepartner decision data-release close --name <name> --from <first session touched> --to <last session touched>`; add `--reason` for anything that differs from the plan.
 8. **Restart the jobs** (scheduling.md). The next plain `sweep run` reruns any stale variants; each rerun counts in N. If the release deleted rows, also rerun the sweeps that read those sessions as "The record" above says.
 
