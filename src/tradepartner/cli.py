@@ -490,7 +490,7 @@ from tradepartner.calendar import is_session as _is_session
 from tradepartner.calendar import session_close as _session_close
 from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.close_gap import close_gaps
-from tradepartner.config import Settings, clean_message, get_settings
+from tradepartner.config import Cadence, Settings, clean_message, get_settings
 from tradepartner.corpus import departure_fetch
 from tradepartner.diskfloor import ingest_floor_refusal, low_disk_warning
 from tradepartner.execution import (
@@ -6648,10 +6648,20 @@ def make_app(
         if kind != "engage_kill_switch":
             paper_schema_gate(s)
         bk = _resolve_book(s, chosen)
+        cadence_out: list[Cadence | None] = []
         override_id = _paper_call(
-            s, lambda: window.override(s, clock, kind, day, name, reason, book_id=bk)
+            s,
+            lambda: window.override(
+                s, clock, kind, day, name, reason, book_id=bk, cadence_out=cadence_out
+            ),
         )
         _echo_scrubbed(f"paper override: override {override_id} written ({kind})", s)
+        if kind == "exclude_name" and cadence_out == ["daily"]:
+            _echo_scrubbed(
+                "warning: daily book exclude_name override takes effect at the next "
+                "session's run after its rebalance session",
+                s,
+            )
 
     @paper_app.command("settle")
     def paper_settle(

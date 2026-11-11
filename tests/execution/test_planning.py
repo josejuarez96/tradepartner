@@ -101,7 +101,9 @@ def _utc(day: date, hour: int) -> datetime:
     return datetime(day.year, day.month, day.day, hour, tzinfo=UTC)
 
 
-def _frozen_settings(turnover_top_fraction: float | None = None) -> Settings:
+def _frozen_settings(
+    turnover_top_fraction: float | None = None, *, cadence: Cadence = CADENCE
+) -> Settings:
     # `profitability` and `combined` take the same top fraction from their own
     # sections (T152); a momentum registration freezes only `strategy.*`.
     strategy: dict[str, Any] = {"top_fraction": 0.5}
@@ -112,6 +114,7 @@ def _frozen_settings(turnover_top_fraction: float | None = None) -> Settings:
         strategy=strategy,
         profitability={"top_fraction": 0.5},
         combined={"top_fraction": 0.5},
+        schedule={"rebalance_cadence": cadence},
         holdout={"start": HOLDOUT_START.isoformat(), "end": HOLDOUT_END.isoformat()},
     )
 
@@ -170,6 +173,7 @@ class Env:
         assets_read: Callable[[Sequence[str]], Mapping[str, Asset]] | None = None,
         lagging: bool = False,
         journal_: planning.Journal = journal,
+        cadence: Cadence = CADENCE,
     ) -> planning.PlanOutcome:
         return plan_rebalance(
             self.conn,
@@ -182,7 +186,7 @@ class Env:
             assets_read or AssetsRead(),
             lagging,
             now=_utc(session, 12),
-            cadence=CADENCE,
+            cadence=cadence,
         )
 
     def counts(self) -> dict[str, int]:
@@ -206,6 +210,7 @@ def open_env(
     *,
     drop_keys: Sequence[str] = (),
     turnover_top_fraction: float | None = None,
+    cadence: Cadence = CADENCE,
 ) -> Iterator[Env]:
     """The module's planning environment for a hypothesis of `family` (T152), its stored
     params less `drop_keys` (a registration stored before those keys existed, T165),
@@ -217,7 +222,7 @@ def open_env(
         store={"path": str(tmp_path / "not-the-fixture.duckdb")},
         paper={"live_capital_reference": LIVE_CAPITAL},
     )
-    params = _frozen_settings(turnover_top_fraction)
+    params = _frozen_settings(turnover_top_fraction, cadence=cadence)
     hypothesis = registry.register_hypothesis(
         conn,
         slug="h-paper-plan",
@@ -1429,6 +1434,32 @@ def test_only_the_windows_overrides_naming_t_i_apply(env: Env) -> None:
     override(T_I, env.window.window_id)  # type: ignore[arg-type]
     dual_b = _decisions(env.plan(run=env.run_on(F_I)))["SEC_DUAL_B"]
     assert (dual_b.decision, dual_b.side, dual_b.reason) == ("override", None, "exclude_name")
+
+
+def test_daily_exclude_written_on_t_plans_a_sale_on_t_plus_one(
+    fixture_store_path: Path, tmp_path: Path
+) -> None:
+    with open_env(fixture_store_path, tmp_path, cadence="daily") as env:
+        assert due_rebalance(env.window, [], [], T_I, MAX_CATCH_UP, cadence="daily") is None
+        stamp = session_close(T_I)
+        journal.append(
+            env.conn,
+            OverrideRow(
+                window_id=env.window.window_id,  # type: ignore[arg-type]
+                made_at=stamp,
+                rebalance_session=T_I,
+                security_id="SEC_DUAL_A",
+                kind="exclude_name",
+                reason="the owner's reason, long enough",
+                known_at=stamp,
+                ingested_at=stamp,
+            ),
+        )
+        outcome = env.plan(cadence="daily")
+        held = _decisions(outcome)["SEC_DUAL_A"]
+        assert env.run.session == F_I == next_session(T_I)
+        assert outcome.rebalance_session == T_I
+        assert (held.decision, held.side, held.reason) == ("override", "sell", "exclude_name")
 
 
 # --- the shared listing tie rule (#534) ---------------------------------------------------
