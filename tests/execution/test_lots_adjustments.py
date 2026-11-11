@@ -1285,6 +1285,39 @@ def test_later_boot_with_float_rounding_and_no_fraction_is_all_boot() -> None:
     assert round(disposals[0].proceeds, 6) == 729.96
 
 
+@pytest.mark.parametrize("cil_payment", [0.0, 0.005, 0.05])
+def test_later_boot_rounding_preserves_unpaid_fraction_basis(cil_payment: float) -> None:
+    """Three target shares owe .30 each. The .30 removal and .60 later
+    payment complete boot despite the float remainder. An unpaid half share
+    keeps its basis; a further real CIL payment disposes of that basis."""
+    book = Book()
+    book.trade("buy", 3, 30.0, D0303, security_id="SEC_T")
+    terms = {
+        **_MERGER,
+        "merger_kind": "stock_and_cash",
+        "acquirer_price": 10.0,
+        "fractional_shares": 0.5,
+        "same_session_cil_cash": 0.0,
+        "merger_cash_due": 0.8999999999999999,
+    }
+    book.adjust("corporate_action_cash", D0307, "SEC_T", quantity=-3, cash=0.30, explanation=terms)
+    book.adjust("merger_receipt", D0307, "SEC_A", quantity=2, explanation=_MERGER)
+    book.adjust("corporate_action_cash", D0310, "SEC_T", cash=0.60, explanation=_MERGER)
+    if cil_payment:
+        book.adjust("corporate_action_cash", D0312, "SEC_T", cash=cil_payment, explanation=_MERGER)
+
+    lot_list, disposals, _ = book.run(D0312)
+    carried_basis = 90.0 * 20.0 / 20.9
+    expected_basis = carried_basis if not cil_payment else carried_basis * 2.0 / 2.5
+    assert [(r.quantity, r.cost_basis) for r in _of("SEC_A", lot_list)] == [
+        pytest.approx((2.0, expected_basis))
+    ]
+    assert len(disposals) == (1 if not cil_payment else 2)
+    assert disposals[0].proceeds == pytest.approx(0.9)
+    if cil_payment:
+        assert disposals[1].proceeds == pytest.approx(cil_payment)
+
+
 def test_later_cash_beyond_the_boot_due_is_cil() -> None:
     """As above with 40 later: 30 completes the 60 boot (sells 40 basis for
     60) and the last 10 sells one of the five fractional shares, f = 1/5 of
@@ -1327,6 +1360,27 @@ def test_same_session_stock_and_cash_cil_sells_fraction_separately() -> None:
     lot_list, disposals, _ = book.run(D0310)
     assert [(r.quantity, r.cost_basis) for r in _of("SEC_A", lot_list)] == [(4.0, 128.0)]
     assert [(d.proceeds, d.realised_pnl) for d in disposals] == [(60.0, 20.0), (30.0, -2.0)]
+
+
+def test_same_session_small_cil_still_disposes_fraction() -> None:
+    """A real same-session CIL payment remains a disposal below cash tolerance."""
+    book = Book()
+    book.trade("buy", 3, 30.0, D0303, security_id="SEC_T")
+    terms = {
+        **_MERGER,
+        "merger_kind": "stock_and_cash",
+        "acquirer_price": 10.0,
+        "fractional_shares": 0.5,
+        "same_session_cil_cash": 0.005,
+        "merger_cash_due": 0.9,
+    }
+    book.adjust("corporate_action_cash", D0307, "SEC_T", quantity=-3, cash=0.305, explanation=terms)
+    book.adjust("merger_receipt", D0307, "SEC_A", quantity=2, explanation=_MERGER)
+    book.adjust("corporate_action_cash", D0310, "SEC_T", cash=0.6, explanation=_MERGER)
+
+    lot_list, disposals, _ = book.run(D0310)
+    assert _of("SEC_A", lot_list)[0].cost_basis == pytest.approx(90.0 * 20.0 / 20.9 * 2 / 2.5)
+    assert [d.proceeds for d in disposals] == pytest.approx([0.9, 0.005])
 
 
 def test_later_cil_date_is_independent_of_adjustment_input_order() -> None:
