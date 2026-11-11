@@ -843,6 +843,43 @@ def test_each_kind_at_its_boundary_session(env: Env) -> None:
     assert kind(env.window, runs, [], fill_session(T_NEXT), MAX_CATCH_UP) == "rebalance"
 
 
+def test_a_part_executed_rebalance_is_caught_up_until_the_next_fill_session(env: Env) -> None:
+    """#3131: a T_i with a fill (sells done, buys halted) does not lapse after the
+    frozen bound; it stays `catch_up` through the session before F_{i+1}."""
+    runs = [env.run]
+    started = frozenset({T_I})
+    past = _sessions_after(F_I, MAX_CATCH_UP + 1)
+    assert rebalance_kind(env.window, runs, [], past, MAX_CATCH_UP, cadence=CADENCE) is None
+    assert due_rebalance(
+        env.window, runs, [], past, MAX_CATCH_UP, cadence=CADENCE, part_executed=started
+    ) == ("catch_up", T_I)
+    last = previous_session(fill_session(T_NEXT))
+    assert (
+        rebalance_kind(
+            env.window, runs, [], last, MAX_CATCH_UP, cadence=CADENCE, part_executed=started
+        )
+        == "catch_up"
+    )
+    # From F_{i+1} only T_{i+1} is planned.
+    assert due_rebalance(
+        env.window,
+        runs,
+        [],
+        fill_session(T_NEXT),
+        MAX_CATCH_UP,
+        cadence=CADENCE,
+        part_executed=started,
+    ) == ("rebalance", T_NEXT)
+    # An executed or missed one is never caught up, started or not.
+    events = [_event(env, "missed")]
+    assert (
+        rebalance_kind(
+            env.window, runs, events, past, MAX_CATCH_UP, cadence=CADENCE, part_executed=started
+        )
+        is None
+    )
+
+
 def test_a_session_before_the_first_rebalance_has_no_kind(env: Env) -> None:
     """#649: before the window's first rebalance session nothing is due, so the
     kind is None instead of the schedule's start-after-end `ValueError`."""

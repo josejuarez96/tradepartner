@@ -340,6 +340,7 @@ from tradepartner.store.journal import (
     pending_orders,
     positions_daily_for,
     rebalance_events_for,
+    rebalances_with_fills,
     reconciliations_for,
     require_journal,
     runs_for,
@@ -1357,6 +1358,7 @@ def _locked_run(
         runs = runs_for(conn, window_id)
         rows = kill_switch_events_for(conn, window_id)
         events = rebalance_events_for(conn, window_id)
+        started = rebalances_with_fills(conn, window_id)
         stops = window_stops_for(conn, window_id)
         # Read once per run (ADR 0015 seam 4) and passed to every schedule call below.
         cadence = window_cadence(conn, window)
@@ -1369,7 +1371,7 @@ def _locked_run(
         reading_run=None,
         lock_free=True,
     )
-    due = _rebalance_kind(window, run_rows, events, day, cadence)
+    due = _rebalance_kind(window, run_rows, events, day, cadence, started)
     kind = _STOP if any(s.state == _REQUESTED for s in stops) else (due or _MARK)
 
     stamp = gate.read_clock()
@@ -2320,6 +2322,7 @@ class _Run:
             runs = runs_for(conn, self.window_id)
             events = rebalance_events_for(conn, self.window_id)
             rows = kill_switch_events_for(conn, self.window_id)
+            started = rebalances_with_fills(conn, self.window_id)
         frozen_values: dict[str, Any] = json.loads(self.window.frozen_json)
         missed = marks.lapses(
             self.window,
@@ -2330,6 +2333,7 @@ class _Run:
             self.session,
             frozen_values,
             cadence=self.cadence,
+            part_executed=started,
         )
         if not missed:
             return
@@ -2493,10 +2497,17 @@ class _Run:
         return stop_session(min(s.at for s in requested_rows)), flat
 
     def _due(self) -> planning.RebalanceKind | None:
+        """The planning kind now, None unless the run was journaled `rebalance` or
+        `catch_up` at lock time: a fill this run's own step 3 first journals can
+        make a pending T_i part-executed (#3131), and a run journaled `mark` must
+        never trade on that; the next run reads the fill at lock time."""
+        if self.kind not in ("rebalance", "catch_up"):
+            return None
         with open_read_only(self.settings, retry=True) as conn:
             run_rows = [r.run for r in runs_for(conn, self.window_id)]
             events = rebalance_events_for(conn, self.window_id)
-        return _rebalance_kind(self.window, run_rows, events, self.session, self.cadence)
+            started = rebalances_with_fills(conn, self.window_id)
+        return _rebalance_kind(self.window, run_rows, events, self.session, self.cadence, started)
 
     def _plan(self, lagging: bool) -> planning.PlanOutcome:
         now = self.gate.read_clock()
@@ -2522,9 +2533,12 @@ def _rebalance_kind(
     events: Sequence[RebalanceEventRow],
     session: date,
     cadence: Cadence,
+    part_executed: Collection[date],
 ) -> planning.RebalanceKind | None:
     """`planning.rebalance_kind` with the window's frozen catch-up bound and cadence (None
-    before the window's first rebalance session, #649)."""
+    before the window's first rebalance session, #649), and the window's part-executed
+    rebalances (`journal.rebalances_with_fills`, #3131), the same set `_lapses` passes
+    `marks.lapses`, so a started T_i is planned exactly while it is not lapsed."""
     return planning.rebalance_kind(
         window,
         runs,
@@ -2532,6 +2546,7 @@ def _rebalance_kind(
         session,
         planning.frozen_max_catch_up_sessions(window),
         cadence=cadence,
+        part_executed=part_executed,
     )
 
 
