@@ -384,18 +384,18 @@ def match(history: History, observed: Observed) -> list[Miss]:
 
 
 def _double_holders(history: History, observed: Observed) -> list[Miss]:
-    """A ticker held by two entities at once, or a span running into a window
-    the key gives to another entity, is a miss: coverage alone passes spans
-    that run too long."""
+    """A ticker held (or with bars) under two entities at once, or a span
+    running into a window the key gives to another entity, is a miss: coverage
+    alone passes spans that run too long."""
     misses: list[Miss] = []
     for e in history.expected:
-        if e.kind != "holds" or e.first is None or e.ticker is None:
+        if e.kind not in ("holds", "bars") or e.first is None or e.ticker is None:
             continue
-        for s in observed.holds:
+        for s in observed.holds if e.kind == "holds" else observed.bars:
             if s.ticker != e.ticker or s.cik == e.cik:
                 continue
             if s.first <= (e.last or date.max) and (s.last or date.max) >= e.first:
                 end = s.last.isoformat() if s.last else "open"
-                why = f"holds: {s.cik} also holds {e.ticker} {s.first.isoformat()}..{end} "
+                why = f"{e.kind}: {s.cik} also has {e.ticker} {s.first.isoformat()}..{end} "
                 misses.append(Miss(history.id, e, why + f"inside {e.cik}'s window"))
     return misses

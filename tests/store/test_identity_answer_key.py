@@ -167,7 +167,7 @@ def test_two_entities_holding_one_ticker_at_once_is_a_miss() -> None:
         line_ends=true.line_ends,
     )
     (miss,) = match(apa, overlong)
-    assert "0000006769 also holds APA" in miss.why
+    assert "0000006769 also has APA" in miss.why
 
 
 def test_a_reversed_span_is_refused() -> None:
@@ -184,3 +184,18 @@ def test_the_loader_refuses_an_unknown_key_and_a_missing_input_field() -> None:
     )
     with pytest.raises(AnswerKeyError, match="exchange"):
         parse_key(bad, date(2026, 1, 1))
+
+
+def test_overlong_bars_running_into_the_holdco_window_are_a_miss() -> None:
+    apa = load_answer_key(date(2026, 11, 11))[0]
+    true = _true_apa()
+    overlong = Observed(
+        holds=true.holds,
+        bars=(
+            Span("0000006769", "APA", date(2020, 6, 9), None),
+            Span("0001841666", "APA", date(2021, 3, 1), None),
+        ),
+        line_ends=true.line_ends,
+    )
+    (miss,) = match(apa, overlong)
+    assert miss.why.startswith("bars: 0000006769 also has APA")
