@@ -1338,6 +1338,7 @@ def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_ro
             "filing_index_pending",
             "edgar_filers",
             "edgar_index_files",
+            "retracted_rows",
         }
         assert {table for table in shape_before if shape_after[table] != shape_before[table]} == {
             "listings",

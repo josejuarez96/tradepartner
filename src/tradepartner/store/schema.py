@@ -2011,6 +2011,7 @@ MASTER_CHECK_TABLE_NAMES: tuple[str, ...] = (
     "filing_index_pending",
     "edgar_filers",
     "edgar_index_files",
+    "retracted_rows",  # version 49, ADR 0029: rows a repair moved out of a fact table
 )
 _MASTER_UNDERIVED_TABLE_DDL: tuple[str, ...] = (_CREATE_MASTER_UNDERIVED,)
 

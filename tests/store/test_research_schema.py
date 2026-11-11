@@ -896,6 +896,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         "filing_index_pending": [],
         "edgar_filers": [],
         "edgar_index_files": [],
+        "retracted_rows": [],
     }
     # And the migrated store is shaped exactly as a fresh one.
     # (A fresh store gets version 18's and version 20's two kinds before the lab's
