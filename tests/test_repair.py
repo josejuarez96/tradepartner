@@ -1899,14 +1899,23 @@ def test_the_command_refuses_orphans_until_the_count_is_passed(orphan_store: Set
     assert len(_bars(orphan_store)) == 3
 
 
-def test_a_retracted_class_id_whose_cik_still_lists_the_ticker_is_moved(
-    orphan_store: Settings,
-) -> None:
-    # quant-auditor on #3266: the id has no live listing row, its base CIK does.
-    base, cls = "0000000088", "0000000088:common-stock"
+def test_a_retracted_class_id_is_moved_only_by_its_own_ticker(orphan_store: Settings) -> None:
+    # quant-auditor on #3266: the id's own retracted listing row names its ticker;
+    # a live sibling class on another ticker must not make it "moved".
+    base, cls, sib = "0000000088", "0000000088:class-a", "0000000088:class-b"
     with open_for_write(orphan_store) as conn:
         insert_row(conn, "listings", _listing(base, "GONE", date(2021, 6, 1)))
+        insert_row(conn, "listings", _listing(sib, "SIBL", date(2019, 1, 2)))
+        insert_row(conn, "listings", _listing(cls, "ZZZZ", date(2019, 1, 2)))
+        insert_row(conn, "listings", _listing("0000000089:class-a", "GONE", date(2019, 1, 2)))
         insert_row(conn, "prices_daily", _bar(cls, date(2021, 6, 1)))
+        insert_row(conn, "prices_daily", _bar("0000000089:class-a", date(2021, 6, 1)))
+    with open_for_write(orphan_store) as conn:
+        conn.execute("UPDATE listings SET retracted = true WHERE security_id = ?", [cls])
+        conn.execute(
+            "UPDATE listings SET retracted = true WHERE security_id = ?", ["0000000089:class-a"]
+        )
     result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
-    assert (cls, date(2021, 6, 1)) in result.found.bars
-    assert (cls, date(2021, 6, 1)) not in result.orphans
+    assert ("0000000089:class-a", date(2021, 6, 1)) in result.found.bars
+    assert (cls, date(2021, 6, 1)) in result.orphans  # ZZZZ: nobody receives it
+    assert ("0000000089:class-a", date(2021, 6, 1)) not in result.orphans  # GONE: base/heir

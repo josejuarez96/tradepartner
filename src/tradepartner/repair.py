@@ -349,14 +349,16 @@ def _held_tickers(
     for row in listings_as_of(conn, at).iter_rows(named=True):
         listed[row["security_id"]].append((row["valid_from"], row["ticker"]))
 
-    family: dict[str, set[str]] = defaultdict(set)
-    for sid, rows in listed.items():
-        family[_base_id(sid)].update(t for _, t in rows)
+    retracted: dict[str, set[str]] = defaultdict(set)  # an id's own rows, retracted too
+    for sid, ticker in conn.execute(
+        "SELECT security_id, ticker FROM listings WHERE known_at <= ?", [at]
+    ).fetchall():
+        retracted[str(sid)].add(str(ticker))
 
     def held(security_id: str, day: date) -> Sequence[str]:
         rows = listed.get(security_id, [])
-        if not rows:  # a retracted class id: its CIK family's tickers (#3265 review)
-            return sorted(family.get(_base_id(security_id), ()))
+        if not rows:  # a retracted id: its own retracted listing rows (#3265 review)
+            return sorted(retracted.get(security_id, ()))
         started = [r for r in rows if r[0] <= day]
         if not started:
             return sorted({t for _, t in rows})
