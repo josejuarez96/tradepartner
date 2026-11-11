@@ -3245,6 +3245,13 @@ def make_app(
         release: Annotated[
             str | None, typer.Option(help="the open data release (required to delete)")
         ] = None,
+        allow_orphans: Annotated[
+            int | None,
+            typer.Option(
+                help="the owner's exact count of bar keys no id receives (#3265); "
+                "refused unless it equals the dry run's orphan count"
+            ),
+        ] = None,
     ) -> None:
         """Delete Alpaca bars and actions the resolver no longer assigns to their security."""
         expect = _repair_expect(dry_run, expect_bar_rows, expect_action_rows, release)
@@ -3253,7 +3260,12 @@ def make_app(
             raise missing
         try:
             result = repair_resolution(
-                s, clock=clock, dry_run=dry_run, expect=expect, release=release
+                s,
+                clock=clock,
+                dry_run=dry_run,
+                expect=expect,
+                release=release,
+                allow_orphans=allow_orphans,
             )
         except StoreLockedError as exc:
             raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
