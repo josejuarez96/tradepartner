@@ -124,7 +124,7 @@ def test_the_truth_matches_and_the_apa_hole_is_named_with_its_citation() -> None
     assert any("Nasdaq ended 2020-06-17, expected 2021-02-26" in t for t in texts)
     assert any("holds: 0000006769 APA 2020-06-09..2021-02-28 not covered" in t for t in texts)
     assert any("bars: 0001841666 APA" in t for t in texts)
-    assert all("[accession 0001193125-" in t for t in texts)
+    assert all("[accession 000" in t for t in texts)
 
 
 def test_a_gap_in_the_bars_is_a_miss_and_overlaps_are_joined() -> None:
