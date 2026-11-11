@@ -433,6 +433,183 @@ def test_dividend_credit_known_only_after_month_end_does_not_zero_term() -> None
     assert result.periods[0].dividend_term == pytest.approx(expected)
 
 
+def test_late_dividend_credit_offsets_its_earlier_period_term() -> None:
+    ex_date = T1
+    equity = {T0: 100_000.0, T1: 100_000.0, T2: 100_005.0}
+    marks = [
+        *_flat_marks(equity),
+        _position_mark(previous_session(ex_date), A, 10.0, 20.0),
+    ]
+    credit = AdjustmentRow(
+        window_id=WINDOW_ID,
+        session=T2,
+        kind="dividend_cash",
+        security_id=A,
+        cash=5.0,
+        known_at=_utc(T2),
+        ingested_at=_utc(T2),
+    )
+    result = compare_periods(
+        _window(tracking_rule="residual"),
+        _trial({T0: 100_000.0, T1: 100_000.0, T2: 100_000.0}, {T0: 0, T1: 0}, (T0, T1, T2)),
+        _journal(positions_daily=marks, adjustments=[credit]),
+        _action(A, "dividend", ex_date, 0.5, _utc(T1)),
+        _no_price,
+        None,
+    )
+    assert [row.dividend_term for row in result.periods] == pytest.approx(
+        [5 / 100_000, -5 / 100_000]
+    )
+    assert result.periods[1].residual == pytest.approx(0.0)
+
+
+def test_older_dividend_credit_does_not_suppress_newer_due() -> None:
+    old_ex_date = T0
+    new_ex_date = T1
+    marks = [
+        *_flat_marks({T0: 100_000.0, T1: 100_005.0}),
+        _position_mark(previous_session(old_ex_date), A, 10.0, 20.0),
+        _position_mark(previous_session(new_ex_date), A, 10.0, 20.0),
+    ]
+    credit = AdjustmentRow(
+        window_id=WINDOW_ID,
+        session=T1,
+        kind="dividend_cash",
+        security_id=A,
+        cash=5.0,
+        known_at=_utc(T1),
+        ingested_at=_utc(T1),
+    )
+    result = compare_periods(
+        _window(tracking_rule="residual"),
+        _trial({T0: 100_000.0, T1: 100_000.0}, {T0: 0}),
+        _journal(positions_daily=marks, adjustments=[credit]),
+        _actions(
+            _action(A, "dividend", old_ex_date, 0.5, _utc(T0)),
+            _action(A, "dividend", new_ex_date, 0.7, _utc(T1)),
+        ),
+        _no_price,
+        None,
+    )
+    assert result.periods[0].dividend_term == pytest.approx((7 - 5) / 100_000)
+    assert result.periods[0].residual == pytest.approx(7 / 100_000)
+
+
+def test_short_frozen_credit_window_keeps_early_period_dividend() -> None:
+    ex_date = date(2026, 10, 1)
+    window = _window(tracking_rule="residual")
+    frozen = json.loads(window.frozen_json)
+    frozen["risk.reconcile_dividend_credit_sessions"] = 5
+    window = replace(window, frozen_json=json.dumps(frozen))
+    result = compare_periods(
+        window,
+        _trial({T0: 100_000.0, T1: 100_000.0}, {T0: 0}),
+        _journal(
+            positions_daily=[
+                _position_mark(T0, A, 10.0, 20.0, cash=99_800.0),
+                _cash_mark(T1, 100_000.0),
+            ]
+        ),
+        _action(A, "dividend", ex_date, 0.5, _utc(T0)),
+        _no_price,
+        None,
+    )
+    assert result.periods[0].dividend_term == pytest.approx(5 / 100_000)
+
+
+def test_backdated_credit_uses_its_own_window_when_mark_absorbs_it_later() -> None:
+    old_ex_date = previous_session(T0)
+    window = _window(tracking_rule="residual")
+    frozen = json.loads(window.frozen_json)
+    frozen["risk.reconcile_dividend_credit_sessions"] = 5
+    window = replace(window, frozen_json=json.dumps(frozen))
+    credit = AdjustmentRow(
+        window_id=WINDOW_ID,
+        session=T0,
+        kind="dividend_cash",
+        security_id=A,
+        cash=5.0,
+        known_at=_utc(T2),
+        ingested_at=_utc(T2),
+    )
+    result = compare_periods(
+        window,
+        _trial({T0: 100_000.0, T1: 100_000.0, T2: 100_000.0}, {T0: 0, T1: 0}, (T0, T1, T2)),
+        _journal(
+            positions_daily=[
+                *_flat_marks({T0: 100_000.0, T1: 100_000.0, T2: 100_005.0}),
+                _position_mark(previous_session(old_ex_date), A, 10.0, 20.0),
+                _position_mark(previous_session(T2), A, 10.0, 20.0),
+            ],
+            adjustments=[credit],
+        ),
+        _actions(
+            _action(A, "dividend", old_ex_date, 0.5, _utc(T0)),
+            _action(A, "dividend", T2, 0.7, _utc(T2)),
+        ),
+        _no_price,
+        None,
+    )
+    assert result.periods[1].dividend_term == pytest.approx((7 - 5) / 100_000)
+
+
+def test_future_stated_credit_is_not_absorbed_by_an_earlier_late_mark() -> None:
+    credit_session = date(2026, 11, 2)
+    late_mark_at = _utc(credit_session) + timedelta(days=2)
+    marks = [
+        _cash_mark(T0, 100_000.0),
+        replace(_cash_mark(T1, 100_000.0), known_at=late_mark_at, ingested_at=late_mark_at),
+        _cash_mark(T2, 100_005.0),
+        _position_mark(previous_session(T1), A, 10.0, 20.0),
+    ]
+    credit = AdjustmentRow(
+        window_id=WINDOW_ID,
+        session=credit_session,
+        kind="dividend_cash",
+        security_id=A,
+        cash=5.0,
+        known_at=_utc(credit_session),
+        ingested_at=_utc(credit_session),
+    )
+    result = compare_periods(
+        _window(tracking_rule="residual"),
+        _trial({T0: 100_000.0, T1: 100_000.0, T2: 100_000.0}, {T0: 0, T1: 0}, (T0, T1, T2)),
+        _journal(positions_daily=marks, adjustments=[credit]),
+        _action(A, "dividend", T1, 0.5, _utc(T1)),
+        _no_price,
+        None,
+    )
+    assert [row.dividend_term for row in result.periods] == pytest.approx(
+        [5 / 100_000, -5 / 100_000]
+    )
+
+
+def test_late_credit_after_period_close_cannot_change_earlier_attribution() -> None:
+    old_ex_date = T0
+    marks = [
+        *_flat_marks({T0: 100_000.0, T1: 100_000.0}),
+        _position_mark(previous_session(old_ex_date), A, 10.0, 20.0),
+    ]
+    credit = AdjustmentRow(
+        window_id=WINDOW_ID,
+        session=T1,
+        kind="dividend_cash",
+        security_id=A,
+        cash=5.0,
+        known_at=session_close(T1) + timedelta(seconds=1),
+        ingested_at=session_close(T1) + timedelta(seconds=1),
+    )
+    result = compare_periods(
+        _window(tracking_rule="residual"),
+        _trial({T0: 100_000.0, T1: 100_000.0}, {T0: 0}),
+        _journal(positions_daily=marks, adjustments=[credit]),
+        _action(A, "dividend", old_ex_date, 0.5, _utc(T0)),
+        _no_price,
+        None,
+    )
+    assert result.periods[0].dividend_term == pytest.approx(0.0)
+
+
 def _credit_after_close_case(
     *,
     credit_known_offset: timedelta,
@@ -939,7 +1116,7 @@ def test_late_credit_enters_first_mark_that_absorbs_it() -> None:
         None,
     )
     assert [m.residue_term for m in result.periods] == pytest.approx([0, 5 / 100_000])
-    assert [m.dividend_term for m in result.periods] == pytest.approx([5 / 100_000, 0])
+    assert [m.dividend_term for m in result.periods] == pytest.approx([5 / 100_000, -5 / 100_000])
 
 
 def test_later_dust_decision_cannot_create_past_residue() -> None:
