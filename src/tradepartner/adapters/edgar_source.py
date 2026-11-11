@@ -4358,8 +4358,11 @@ class EdgarFilingSource(FilingSource):
             # Re-read under the lock, never the copy loaded at the fetch pass:
             # an owner's hand edit (or another writer) since then is kept (#275).
             store = dict(self._load_failed_filings())
-            for accession in self._succeeded_this_run - self._pending_failures.keys():
-                store.pop(accession, None)  # it parses now: the old failure is resolved
+            resolved = self._succeeded_this_run - self._pending_failures.keys()
+            for accession in resolved - self._quarantined_this_run:
+                # It parses now: the old failure is resolved. A quarantined one
+                # stays (a header cache hit is not its cover parsing, #3259).
+                store.pop(accession, None)
             self._merge_pending_failures(store, today)
             self._save_failed_filings(store)
         self._failed_filings_cache = store
@@ -4595,7 +4598,11 @@ class EdgarFilingSource(FilingSource):
         for accession, entry in store.items():
             if accession in self._pending_failures:
                 continue  # judged below, by this run's own error
-            if accession in self._succeeded_this_run and entry.get("kind") != "collision":
+            if (
+                accession in self._succeeded_this_run
+                and accession not in self._quarantined_this_run
+                and entry.get("kind") != "collision"
+            ):
                 continue  # re-parsed this run: a write prunes it (#3240); a collision stays
             if not entry.get("accepted", False):
                 pairs[(entry["error_class"], entry["base_form"])].add(accession)

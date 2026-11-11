@@ -2303,3 +2303,15 @@ def test_a_stored_collision_still_counts_after_an_fsn_hit(tmp_path: Path) -> Non
     _store_with_hit(source, APPLE_ACCESSION, kind="collision")
     source.cover_pages(APPLE)
     assert _cross_day_reasons(source)
+
+
+def test_a_quarantined_stored_failure_is_not_resolved_by_a_cache_hit_on_the_accession(
+    tmp_path: Path,
+) -> None:
+    """The success set is per accession, not per document: a quarantined entry
+    stays counted and unpruned though another document of it hit a cache."""
+    source = _source(_settings(tmp_path), _router())
+    _store_with_hit(source, APPLE_ACCESSION)
+    source._succeeded_this_run.add(APPLE_ACCESSION)
+    source._quarantined_this_run.add(APPLE_ACCESSION)
+    assert _cross_day_reasons(source)  # all 5 still count
