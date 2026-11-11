@@ -589,7 +589,7 @@ def _paper(clock: _Clock, factory: _Factory, *args: str) -> Out:
     return out
 
 
-def _register_h1(tmp_path: Path, *, signed_off: bool) -> None:
+def _register_h1(tmp_path: Path, *, signed_off: bool, cadence: str = "month_end") -> None:
     s = _settings()
     with open_for_write(s) as conn:
         init_schema(conn)
@@ -606,6 +606,7 @@ def _register_h1(tmp_path: Path, *, signed_off: bool) -> None:
                 "costs.commission_per_order": 0.0,
                 "execution.fill_price": "close",
                 "strategy.top_fraction": 0.1,
+                "schedule.rebalance_cadence": cadence,
             },
             in_sample_start=date(2016, 1, 29),
             holdout_start=date(2023, 1, 3),
@@ -937,6 +938,31 @@ def test_override_refuses_a_reason_under_the_frozen_minimum(
     ok = _paper(clock, factory, "override", "--kind", "engage_kill_switch", "--reason", LONG_REASON)
     assert ok.exit_code == 0, ok.output
     assert "override 1 written" in ok.output
+
+
+def test_daily_exclude_override_warns_when_it_will_run(
+    tmp_path: Path, clock: _Clock, factory: _Factory
+) -> None:
+    _register_h1(tmp_path, signed_off=True, cadence="daily")
+    started = _paper(clock, factory, "start", "--hypothesis", "h1")
+    assert started.exit_code == 0, started.output
+    written = _paper(
+        clock,
+        factory,
+        "override",
+        "--kind",
+        "exclude_name",
+        "--session",
+        "2026-10-02",
+        "--name",
+        "SEC_SPY",
+        "--reason",
+        LONG_REASON,
+    )
+    assert written.exit_code == 0, written.output
+    assert "override 1 written (exclude_name)" in written.output
+    assert "takes effect at the next session's run" in written.output
+    assert _count("overrides") == 1
 
 
 @pytest.mark.usefixtures("started")

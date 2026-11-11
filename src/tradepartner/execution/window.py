@@ -2084,7 +2084,7 @@ def _override_fields(
     rebalance_session: date | None,
     security_id: str | None,
     cadence: Callable[[], Cadence],
-) -> None:
+) -> Cadence | None:
     """Refuse `override` for a kind outside the schema's set or fields it does
     not take (module docstring). `cadence` reads the window's frozen cadence, only
     for a kind that names a rebalance session, so an `engage_kill_switch` override
@@ -2095,7 +2095,7 @@ def _override_fields(
     if kind == _ENGAGE_KILL_SWITCH:
         if rebalance_session is not None or security_id is not None:
             raise WindowCommandRefused(OVERRIDE, f"{kind} takes no rebalance session and no name")
-        return
+        return None
     if rebalance_session is None or not security_id:
         raise WindowCommandRefused(OVERRIDE, f"{kind} needs a rebalance session and a name")
     at = cadence()
@@ -2109,6 +2109,7 @@ def _override_fields(
             f"{rebalance_session} is before the window's first rebalance "
             f"{window.first_rebalance_session}",
         )
+    return at
 
 
 def override(
@@ -2120,12 +2121,14 @@ def override(
     reason: str,
     *,
     book_id: str | None = None,
+    cadence_out: list[Cadence | None] | None = None,
 ) -> int:
     """Append one `overrides` row to the book's open window (`book_id`, default
     `paper.book_id`) and return its
     `override_id` (module docstring; spec req 9). Raises
     `WindowCommandRefused` for every refusal, nothing written, and
-    `StoreLockedError` when the store stays locked ("store busy"). Kind
+    `StoreLockedError` when the store stays locked ("store busy"). If supplied,
+    `cadence_out` receives the validated cadence after a successful write. Kind
     `settle_order` is refused first (spec req 17, #571)."""
     if kind == SETTLE_ORDER_KIND:
         raise WindowCommandRefused(
@@ -2138,7 +2141,7 @@ def override(
     note = reason.strip()
     with open_for_write(settings) as conn:
         window, window_id = _window_of(conn, book)
-        _override_fields(
+        cadence = _override_fields(
             window, kind, rebalance_session, security_id, lambda: window_cadence(conn, window)
         )
         minimum = _min_override_reason_chars(window)
@@ -2162,6 +2165,8 @@ def override(
             ),
         )
     assert override_id is not None
+    if cadence_out is not None:
+        cadence_out.append(cadence)
     return override_id
 
 
