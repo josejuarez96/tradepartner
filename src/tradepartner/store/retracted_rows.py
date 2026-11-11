@@ -257,14 +257,19 @@ def restore(
             for name in tables:
                 problems += _held_keys(conn, name)
                 problems += _duplicate_revisions(conn, name)
-                if name == "prices_daily":
-                    problems += _held_bar_tickers(conn)
-                elif name == "listings":
-                    problems += _held_listing_tickers(conn)
             if problems:
                 raise RestoreRefused("; ".join(problems) + "; nothing restored")
-            for name in tables:
+            # Listings first, then the rest: the ticker-session checks read the table as
+            # it will be (a bar's listing may come back in the same release), and a
+            # refusal rolls the whole restore back.
+            for name in sorted(tables, key=lambda n: n != "listings"):
                 _insert_back(conn, name)
+            if "prices_daily" in tables:
+                problems += _held_bar_tickers(conn)
+            if "listings" in tables:
+                problems += _held_listing_tickers(conn)
+            if problems:
+                raise RestoreRefused("; ".join(problems) + "; nothing restored")
             conn.execute(
                 "UPDATE retracted_rows SET restored_at = ? "
                 "WHERE retraction_id IN (SELECT retraction_id FROM _restore_ids)",

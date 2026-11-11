@@ -550,3 +550,30 @@ def test_restore_with_nothing_to_restore_refuses() -> None:
             retracted_rows.restore(conn)
     finally:
         conn.close()
+
+
+def test_a_release_restoring_a_bar_and_its_listing_together_still_refuses_a_held_ticker() -> None:
+    conn = _two_ids_one_ticker()
+    try:
+        retracted_rows.retract(conn, "prices_daily", [("A", date(2020, 1, 6))], "r", "rel", RULE)
+        retracted_rows.retract(
+            conn, "listings", [("A", "TICK", "NYSE", date(2020, 1, 2))], "r", "rel", RULE
+        )
+        stamp = datetime(2020, 1, 3, 21, tzinfo=UTC)
+        conn.execute(
+            "INSERT INTO listings (security_id, ticker, exchange, class_title, valid_from, "
+            "known_at, ingested_at, source, provenance) "
+            "VALUES ('B', 'TICK', 'NYSE', 'Common Stock', DATE '2020-01-03', ?, ?, 'edgar', "
+            "'filing')",
+            [stamp, stamp],
+        )
+        with pytest.raises(retracted_rows.RestoreRefused, match="held by B"):
+            retracted_rows.restore(conn, release="rel")
+        assert conn.execute(
+            "SELECT count(*) FROM prices_daily WHERE security_id = 'A'"
+        ).fetchone() == (0,)
+        assert conn.execute("SELECT count(*) FROM listings WHERE security_id = 'A'").fetchone() == (
+            0,
+        )
+    finally:
+        conn.close()
