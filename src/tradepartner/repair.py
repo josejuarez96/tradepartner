@@ -29,6 +29,16 @@ What the repair is and is not:
 - **Only what a dry run showed.** A real run takes the dry run's bar and
   action row counts and refuses, deleting nothing, on any other count; the
   terminal lists every security found with its counts.
+- **No orphans without the owner's count** (#3265). A bar the resolver does
+  not assign to its security is either *moved* (some other security now owns
+  one of the symbols the security held that session, so a fill-holes refetch
+  puts the bar there) or an *orphan* (no id receives the symbol on that
+  session: the deleted bar is lost, as when a one-exchange Form 25 cut Apache
+  or Marriott while another line stayed listed). The dry run lists every
+  orphan security with its first and last session and its key count. A real
+  run refuses, deleting nothing, on any orphan unless `allow_orphans` equals
+  the dry run's orphan key count exactly. Classified as the resolver at the
+  run (listings, delistings and chains known then); no look-ahead is added.
 - **Inside a named release** (#1319, data-foundation plan T140c; runbook
   `docs/runbooks/data-releases.md`). A real run takes the name of the open
   release (`store.registry.open_release`) and refuses, deleting nothing, when
@@ -306,6 +316,50 @@ def misattributed(
     return Misattributed(bars, actions)
 
 
+def _base_id(security_id: str) -> str:
+    """The CIK of a `<cik>:<class>` or `<cik>@<date>` security id."""
+    return security_id.split(":")[0].split("@")[0]
+
+
+def orphan_bars(
+    resolver: ListingResolver,
+    bar_keys: Iterable[Key],
+    tickers: Callable[[str, date], Sequence[str]],
+) -> dict[Key, int]:
+    """The bar keys among `bar_keys` (each one the resolver does not assign
+    to its security) that no id receives (#3265): no ticker the security held
+    on the session resolves, for a fill or a bar, to another security. A
+    *moved* key has such an owner. Returns `{key: 1}` per orphan key. Pure."""
+    out: dict[Key, int] = {}
+    for sid, day in bar_keys:
+        owners = {resolver.fill_resolve(t, day) for t in tickers(sid, day)}
+        owners |= {resolver.lead(t, day) for t in tickers(sid, day)}
+        if not (owners - {None, sid}):
+            out[(sid, day)] = 1
+    return out
+
+
+def _held_tickers(
+    conn: duckdb.DuckDBPyConnection, at: datetime
+) -> Callable[[str, date], Sequence[str]]:
+    """`(security_id, session)` to the tickers the security's listings known
+    at `at` carry on that session: those of its latest listing starting on or
+    before it, else all of its listings (a bar before its first row)."""
+    listed: dict[str, list[tuple[date, str]]] = defaultdict(list)
+    for row in listings_as_of(conn, at).iter_rows(named=True):
+        listed[row["security_id"]].append((row["valid_from"], row["ticker"]))
+
+    def held(security_id: str, day: date) -> Sequence[str]:
+        rows = listed.get(security_id, [])
+        started = [r for r in rows if r[0] <= day]
+        if not started:
+            return sorted({t for _, t in rows})
+        latest = max(r[0] for r in started)
+        return sorted({t for d, t in started if d == latest})
+
+    return held
+
+
 @dataclass(frozen=True)
 class ChainLine:
     """A live successor chain the run applied (#821, plan T187b): the
@@ -331,6 +385,15 @@ class RepairResult:
     unjudged_symbol_changes: int = 0
     unjudged_mergers: int = 0
     chains: tuple[ChainLine, ...] = ()
+    #: The bar keys no id receives (#3265): `(security_id, session)` to rows.
+    orphans: Mapping[Key, int] = field(default_factory=dict)
+    #: Display names by base id, for the orphan lines only.
+    names: Mapping[str, str] = field(default_factory=dict)
+
+    @property
+    def orphan_keys(self) -> int:
+        """Bar keys no id receives; a real run needs this exact count passed."""
+        return len(self.orphans)
 
     @property
     def bar_rows(self) -> int:
@@ -355,7 +418,9 @@ class RepairResult:
             f"{self.action_keys_checked} keys) that the "
             f"resolver no longer assigns to their security, on {len(named)} securities{shown}; "
             f"{self.unjudged_symbol_changes} symbol_changes rows unjudged; "
-            f"{self.unjudged_mergers} mergers rows unjudged"
+            f"{self.unjudged_mergers} mergers rows unjudged; "
+            f"{self.orphan_keys} orphan bar keys no id receives on "
+            f"{len({sid for sid, _ in self.orphans})} securities"
         )
 
     def lines(self) -> list[str]:
@@ -375,6 +440,16 @@ class RepairResult:
             days = bars.get(sid, [])
             span = f" {min(days)}..{max(days)}" if days else ""
             out.append(f"  {sid}: {rows[sid]} bar rows{span}, {actions[sid]} action rows")
+        by_sid: dict[str, list[date]] = defaultdict(list)
+        for sid, day in self.orphans:
+            by_sid[sid].append(day)
+        for sid in sorted(by_sid):
+            days = by_sid[sid]
+            name = self.names.get(_base_id(sid), "?")
+            out.append(
+                f"  ORPHAN {sid} ({name}): {len(days)} bar keys {min(days)}..{max(days)} "
+                "that no id receives"
+            )
         for chain in self.chains:
             ratio = "-" if chain.ratio is None else f"{chain.ratio:.4f}"
             out.append(
@@ -505,6 +580,7 @@ def repair_resolution(
     dry_run: bool = False,
     expect: tuple[int, int] | None = None,
     release: str | None = None,
+    allow_orphans: int | None = None,
 ) -> RepairResult:
     """Delete the Alpaca bars and actions that the resolver built as of
     `clock()` does not assign to their security, and record the run (module
@@ -514,8 +590,11 @@ def repair_resolution(
     A real run deletes only what a dry run showed: `expect` is that dry
     run's `(bar_rows, action_rows)`, and any other count raises
     `RepairRefused` before anything is deleted. It runs only inside the open
-    data release `release` (`release_refusal`), else `RepairRefused`. Raises
-    `StoreLockedError` like ingest when the store stays locked."""
+    data release `release` (`release_refusal`), else `RepairRefused`. A bar
+    key no id receives (`orphan_bars`, #3265) is deleted only when
+    `allow_orphans` equals the orphan key count exactly, else `RepairRefused`
+    before anything is deleted. Raises `StoreLockedError` like ingest when
+    the store stays locked."""
     if not dry_run and expect is None:
         raise ValueError("a repair deletes only the counts of a dry run: pass expect")
     if not dry_run and release is None:
@@ -555,6 +634,15 @@ def repair_resolution(
                 bad_spins.append((child, ex_date, parent))
         spinoffs = dict(spinoffs)
         found = Misattributed(found_bars, ordinary, spinoffs)
+        orphans = orphan_bars(resolver, found_bars, _held_tickers(conn, started))
+        names = {
+            _base_id(str(sid)): str(name)
+            for sid, name in conn.execute(
+                "SELECT security_id, name FROM securities QUALIFY "
+                "row_number() OVER (PARTITION BY security_id ORDER BY known_at DESC) = 1"
+            ).fetchall()
+            if name is not None
+        }
         unjudged_row = conn.execute("SELECT count(*) FROM symbol_changes").fetchone()
         assert unjudged_row is not None
         unjudged = int(unjudged_row[0])
@@ -568,8 +656,18 @@ def repair_resolution(
             unjudged_symbol_changes=unjudged,
             unjudged_mergers=int(mergers_row[0]),
             chains=_chain_lines(conn, started),
+            orphans=orphans,
+            names=names,
         )
         if not dry_run:
+            if result.orphan_keys != (allow_orphans or 0):
+                raise RepairRefused(
+                    f"{result.orphan_keys} bar keys on "
+                    f"{len({sid for sid, _ in orphans})} securities are received by no id, "
+                    f"and --allow-orphans is {allow_orphans}; the owner's exact count is "
+                    "required to delete them; nothing deleted, run --dry-run and read the "
+                    "ORPHAN lines"
+                )
             if (result.bar_rows, result.action_rows) != expect:
                 raise RepairRefused(
                     f"found {result.bar_rows} bar rows and {result.action_rows} action rows, "

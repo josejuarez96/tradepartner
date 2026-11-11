@@ -111,15 +111,20 @@ def _dividend(sid: str, ex_date: date) -> dict[str, Any]:
     }
 
 
-@pytest.fixture
-def store(settings: Settings) -> Settings:
+HEIR = "0000000077"
+
+
+def _build(settings: Settings, *, heir: bool) -> Settings:
     """DEAD lists GONE from 2019 and is delisted from 2021-05-31; another
-    equity's GONE bars and dividend sit on it after that day. LIVE trades."""
+    equity's GONE bars and dividend sit on it after that day. LIVE trades.
+    With `heir`, HEIR lists GONE from 2021-06-01, so the stale bars have a
+    receiver (moved); without it no id receives them (orphans, #3265)."""
     with open_for_write(settings) as conn:
         init_schema(conn)
         for row in (
             _listing(DEAD, "GONE", date(2019, 1, 2)),
             _listing(LIVE, "LIVE", date(2019, 1, 2)),
+            *([_listing(HEIR, "GONE", date(2021, 6, 1))] if heir else []),
         ):
             insert_row(conn, "listings", row)
         insert_row(
@@ -151,6 +156,18 @@ def store(settings: Settings) -> Settings:
         insert_row(conn, "corporate_actions", _dividend(DEAD, date(2021, 6, 15)))
     _open_release(settings)
     return settings
+
+
+@pytest.fixture
+def store(settings: Settings) -> Settings:
+    """The store whose stale bars are received by HEIR (moved, not orphans)."""
+    return _build(settings, heir=True)
+
+
+@pytest.fixture
+def orphan_store(settings: Settings) -> Settings:
+    """The same store with no heir: no id receives the stale bars."""
+    return _build(settings, heir=False)
 
 
 def _rows(settings: Settings, sql: str) -> list[tuple[Any, ...]]:
@@ -1799,3 +1816,84 @@ def test_the_stopped_before_filing_cut_reads_only_what_was_known(ww: Settings) -
         assert repair.filed_bars(conn, RUN) == {(WW_OLD, date(2025, 7, 3)): date(2025, 7, 2)}
         assert not store_resolver(conn, at, ww).holds(WW_OLD, date(2025, 7, 7))
         assert store_resolver(conn, RUN, ww).holds(WW_OLD, date(2025, 7, 7))
+
+
+# --- #3265: bars no id receives are refused without the owner's count ---
+
+
+def test_moved_keys_are_not_orphans(store: Settings) -> None:
+    result = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert result.orphan_keys == 0
+    assert not any("ORPHAN" in line for line in result.lines())
+    assert " 0 orphan bar keys" in result.summary()
+
+
+def test_a_dry_run_lists_the_orphans_per_security(orphan_store: Settings) -> None:
+    before = _bars(orphan_store)
+    result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
+    assert result.orphan_keys == 2
+    assert dict(result.orphans) == {(DEAD, date(2021, 6, 1)): 1, (DEAD, date(2021, 6, 2)): 1}
+    [line] = [x for x in result.lines() if "ORPHAN" in x]
+    assert line == f"  ORPHAN {DEAD} (?): 2 bar keys 2021-06-01..2021-06-02 that no id receives"
+    assert "2 orphan bar keys no id receives on 1 securities" in result.summary()
+    assert _bars(orphan_store) == before
+
+
+def test_an_orphan_makes_the_apply_refuse(orphan_store: Settings) -> None:
+    before = _bars(orphan_store)
+    with pytest.raises(RepairRefused, match="2 bar keys on 1 securities are received by no id"):
+        repair_resolution(orphan_store, clock=lambda: RUN, expect=(3, 1), release=REL)
+    assert _bars(orphan_store) == before
+    assert _rows(orphan_store, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+@pytest.mark.parametrize("count", [0, 1, 3])
+def test_a_wrong_orphan_count_refuses(orphan_store: Settings, count: int) -> None:
+    before = _bars(orphan_store)
+    with pytest.raises(RepairRefused, match="--allow-orphans"):
+        repair_resolution(
+            orphan_store, clock=lambda: RUN, expect=(3, 1), release=REL, allow_orphans=count
+        )
+    assert _bars(orphan_store) == before
+
+
+def test_the_exact_orphan_count_lets_the_apply_through(orphan_store: Settings) -> None:
+    result = repair_resolution(
+        orphan_store, clock=lambda: RUN, expect=(3, 1), release=REL, allow_orphans=2
+    )
+    assert (result.bar_rows, result.orphan_keys) == (3, 2)
+    assert (DEAD, date(2021, 6, 1)) not in {(r[0], r[1]) for r in _bars(orphan_store)}
+
+
+def test_an_orphan_count_with_no_orphans_refuses(store: Settings) -> None:
+    before = _bars(store)
+    with pytest.raises(RepairRefused, match="--allow-orphans"):
+        repair_resolution(store, clock=lambda: RUN, expect=(3, 1), release=REL, allow_orphans=2)
+    assert _bars(store) == before
+
+
+def test_orphans_are_judged_as_of_the_run_not_later_listings(orphan_store: Settings) -> None:
+    # No look-ahead: a listing known after the run (HEIR, known 2021-06-01 21:00)
+    # does not turn an earlier run's orphans into moved keys.
+    early = datetime(2021, 5, 31, 22, tzinfo=UTC)
+    with open_for_write(orphan_store) as conn:
+        insert_row(conn, "listings", _listing(HEIR, "GONE", date(2021, 6, 1)))
+    result = repair_resolution(orphan_store, clock=lambda: early, dry_run=True)
+    assert result.bar_rows == 3
+    assert result.orphan_keys == 2
+
+
+def test_the_command_refuses_orphans_until_the_count_is_passed(orphan_store: Settings) -> None:
+    app = cli.make_app(settings=lambda: orphan_store, clock=lambda: RUN)
+    runner = CliRunner()
+    dry = runner.invoke(app, ["repair-resolution", "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert f"  ORPHAN {DEAD} (?): 2 bar keys" in dry.output
+    expect = ["--expect-bar-rows", "3", "--expect-action-rows", "1", "--release", REL]
+    refused = runner.invoke(app, ["repair-resolution", *expect])
+    assert refused.exit_code == 1
+    assert "received by no id" in refused.output
+    assert len(_bars(orphan_store)) == 6
+    done = runner.invoke(app, ["repair-resolution", *expect, "--allow-orphans", "2"])
+    assert done.exit_code == 0, done.output
+    assert len(_bars(orphan_store)) == 3
