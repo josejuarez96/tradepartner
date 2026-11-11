@@ -549,6 +549,19 @@ def test_each_fault_halts_in_the_req_4_order(
     ]
 
 
+def _aaa_reference(
+    _conn: object,
+    session: date,
+    _names: object,
+    _actions: object,
+    *,
+    bar_sessions: dict[str, date] | None = None,
+) -> dict[str, float]:
+    if bar_sessions is not None:
+        bar_sessions["SEC-AAA"] = calendar.previous_session(session)
+    return {"SEC-AAA": 100.0}
+
+
 def test_halt_read_judges_the_fill_it_journals(
     journal_settings: Settings,
     ticking_fake: FakeBroker,
@@ -560,7 +573,7 @@ def test_halt_read_judges_the_fill_it_journals(
     run = _run(journal_settings, open_window, ticking())
     _order(journal_settings, ticking_fake, ticking, run, "tp-bad")
     ticking_fake.apply("tp-bad", FillAt(price=200.0))
-    monkeypatch.setattr(wrapper_module, "reference_prices", lambda *_: {"SEC-AAA": 100.0})
+    monkeypatch.setattr(wrapper_module, "reference_prices", _aaa_reference)
     gate = _wrapper(journal_settings, ticking_fake, ticking, alerter_conn)
 
     with pytest.raises(ValueError, match="original fault"):
@@ -584,7 +597,7 @@ def test_halt_read_bad_fill_does_not_record_cancel_failed(
     run = _run(journal_settings, open_window, ticking())
     _order(journal_settings, ticking_fake, ticking, run, "tp-bad")
     ticking_fake.apply("tp-bad", FillAt(price=200.0))
-    monkeypatch.setattr(wrapper_module, "reference_prices", lambda *_: {"SEC-AAA": 100.0})
+    monkeypatch.setattr(wrapper_module, "reference_prices", _aaa_reference)
     gate = _wrapper(journal_settings, ticking_fake, ticking, alerter_conn)
 
     with pytest.raises(ValueError, match="original fault"):
@@ -604,7 +617,7 @@ def test_stale_halt_bad_fill_engages_switch_and_later_resume_refuses(
     run = _run(journal_settings, open_window, ticking())
     _order(journal_settings, ticking_fake, ticking, run, "tp-stale-bad")
     ticking_fake.apply("tp-stale-bad", FillAt(price=200.0))
-    monkeypatch.setattr(wrapper_module, "reference_prices", lambda *_: {"SEC-AAA": 100.0})
+    monkeypatch.setattr(wrapper_module, "reference_prices", _aaa_reference)
     gate = _wrapper(journal_settings, ticking_fake, ticking, alerter_conn)
 
     with pytest.raises(StaleDataError):

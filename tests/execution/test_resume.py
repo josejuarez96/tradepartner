@@ -15,7 +15,7 @@ import pytest
 
 from tradepartner.adapters.broker import Order, OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire, FakeBroker, FillAt, PartialFill, Reject
-from tradepartner.calendar import session_close
+from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, LimitBreachError
 from tradepartner.execution import reconcile_run, switch
@@ -64,6 +64,19 @@ PRICE = 100.0
 SPY = "SEC_SPY"  # a fixture name listed through 2026
 DAY1 = datetime(2026, 10, 1, 14, 0, tzinfo=UTC)  # the conftest clock: S = 2026-10-01
 DAY2 = datetime(2026, 10, 2, 14, 0, tzinfo=UTC)  # the next session
+
+
+def _spy_reference(
+    _conn: object,
+    session: date,
+    _names: object,
+    _actions: object,
+    *,
+    bar_sessions: dict[str, date] | None = None,
+) -> dict[str, float]:
+    if bar_sessions is not None:
+        bar_sessions[SPY] = previous_session(session)
+    return {SPY: PRICE}
 
 
 class SkewedFake(FakeBroker):
@@ -362,7 +375,7 @@ def test_a_pending_order_the_fake_filled_is_settled_with_its_fills_before_its_fi
     fixed_clock: FixedClock,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
     crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
     _order(
         journal_settings,
@@ -410,10 +423,17 @@ def test_resume_judges_a_new_fill_and_reports_its_price(
         cuts.append(cut)
         return real_actions(conn, cut)
 
-    def prices(_conn: object, session: date, names: object, _actions: object) -> dict[str, float]:
+    def prices(
+        _conn: object,
+        session: date,
+        names: object,
+        _actions: object,
+        *,
+        bar_sessions: dict[str, date] | None = None,
+    ) -> dict[str, float]:
         seen.append(session)
         assert names == [SPY]
-        return {SPY: PRICE}
+        return _spy_reference(_conn, session, names, _actions, bar_sessions=bar_sessions)
 
     monkeypatch.setattr(resume_module, "reference_prices", prices)
     monkeypatch.setattr(resume_module, "live_actions_as_of", actions)
@@ -454,7 +474,7 @@ def test_accept_fill_band_releases_a_checked_bad_fill_and_journals_it(
     _order(journal_settings, fake, crashed, "tp-bad", 2.0, DAY1 - timedelta(hours=1))
     fake.apply("tp-bad", FillAt(200.0))
     _engage(journal_settings, window, fixed_clock)
-    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
     first = _resume(journal_settings, fake, fixed_clock, accept_fill_band=True)
     assert first.status == REFUSED
     assert any("fill_price_outside_band" in r for r in first.reasons)
@@ -509,7 +529,7 @@ def test_bad_fill_stays_refused_if_fault_engagement_write_fails(
     fake.apply("tp-bad-write", FillAt(200.0))
     if initially_engaged:
         _engage(journal_settings, window, fixed_clock)
-    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
     monkeypatch.setattr(
         resume_module.switch,
         "engage",
@@ -541,7 +561,7 @@ def test_clock_step_back_rechecks_an_earlier_refused_invocation(
     _order(journal_settings, fake, crashed, "tp-backward-bad", 2.0, DAY1 - timedelta(hours=1))
     fake.apply("tp-backward-bad", FillAt(200.0))
     _engage(journal_settings, window, fixed_clock)
-    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
     real_engage = switch.engage
     monkeypatch.setattr(
         resume_module.switch,
@@ -591,7 +611,7 @@ def test_accept_fill_band_never_accepts_a_rejudged_fill_nobody_has_seen(
         FROZEN,
         journal_settings,
     )
-    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
     first = _resume(journal_settings, fake, fixed_clock, accept_fill_band=True)
     assert first.status == REFUSED, first.reasons
     assert any("tp-unseen" in r for r in first.reasons)
@@ -640,9 +660,16 @@ def test_a_run_fill_whose_band_engagement_was_never_written_is_rejudged(
     assert _all_fills(journal_settings, "tp-halt-read")
     sessions: list[date] = []
 
-    def prices(_conn: object, session: date, names: object, _actions: object) -> dict[str, float]:
+    def prices(
+        _conn: object,
+        session: date,
+        names: object,
+        _actions: object,
+        *,
+        bar_sessions: dict[str, date] | None = None,
+    ) -> dict[str, float]:
         sessions.append(session)
-        return {SPY: PRICE}
+        return _spy_reference(_conn, session, names, _actions, bar_sessions=bar_sessions)
 
     monkeypatch.setattr(resume_module, "reference_prices", prices)
 
@@ -669,7 +696,7 @@ def test_a_run_band_halt_reason_with_its_fault_type_prefix_refuses_a_resume(
     """#3028: a run's halt path engages with its headline, `SystemFaultError:
     fill_price_outside_band: ...`; the prior-fault check must not need the token
     at the start of the reason."""
-    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
     started = DAY1 - timedelta(hours=1)
     run_id = _run(journal_settings, window, started, finished=False)
     _append(
@@ -714,7 +741,9 @@ def test_resume_reports_a_new_fill_without_a_reference_price(
     fake.apply("tp-unpriced", FillAt(PRICE))
     _engage(journal_settings, window, fixed_clock)
 
-    def no_reference(*_args: object) -> dict[str, float]:
+    def no_reference(
+        *_args: object, bar_sessions: dict[str, date] | None = None
+    ) -> dict[str, float]:
         raise ValueError("no bar known at close(S-1)")
 
     monkeypatch.setattr(resume_module, "reference_prices", no_reference)
@@ -2168,7 +2197,7 @@ def test_with_the_flag_the_lag_bound_still_refuses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The fake fills at 100: the faulted run's fills are rejudged against the band (#3027).
-    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
     run_id = _halted_with_rejections(journal_settings, fake, fixed_clock, window)
     fixed_clock.now = DAY1
     _lagging_third_fill(journal_settings, fake, window, fixed_clock, "tp-lag")
@@ -2226,7 +2255,7 @@ def test_with_the_flag_a_run_with_a_verdict_and_a_lagging_order_is_still_refused
     """One halted run carries both a rejection-cap verdict and an order past the
     lag bound: the flag accepts the verdict and the lag still refuses."""
     # The fake fills at 100: the faulted run's fills are rejudged against the band (#3027).
-    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
     capped = RiskConfig(max_rejections_per_run=1)
     window = _open_window(journal_settings, capped)
     at = DAY1 - timedelta(hours=1)
@@ -2362,7 +2391,7 @@ def test_a_skewed_clock_clamps_the_resume_acceptances_stamp_to_the_floor(
     back right before the `resume_acceptances` row, so its `known_at` is
     clamped to the invocation's own first reading instead of preceding it."""
     # The fake fills at 100: the faulted run's fills are rejudged against the band (#3027).
-    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
     fixed_clock.now = DAY1
     run_id = _halted_with_rejections(journal_settings, fake, fixed_clock, window)
     fixed_clock.now = DAY1
@@ -2496,7 +2525,7 @@ def test_a_backward_step_before_the_cut_is_clamped_to_what_collect_wrote(
     reconciliation — a spurious mismatch. `collect`'s readings instead raise
     the floor (`_MonotonicStamps.observe`), so the cut is clamped to T3 and
     the reconciliation sees the fill it was stamped to see."""
-    monkeypatch.setattr(resume_module, "reference_prices", lambda *_: {SPY: PRICE})
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
     crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
     _order(
         journal_settings,

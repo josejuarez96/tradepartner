@@ -83,6 +83,12 @@ class StoreConfig(_ClosedConfig):
     threads: int | None = Field(default=None, ge=1)
     pre_migration_backups_to_keep: int = Field(default=2, ge=1)
     backup_disk_margin_bytes: int = Field(default=1_000_000_000, ge=0)
+    # #3274: `decision data-release coverage` lists a security that lost more than this
+    # many trading days across a release, and fails when more than this many are unmoved.
+    release_max_lost_sessions: int = Field(default=5, ge=0)
+    # A lost bar counts as moved only to an id that gained the same bar (equal volume,
+    # OHLC within this relative tolerance).
+    release_move_price_tolerance: float = Field(default=1e-6, ge=0)
 
     @field_validator("memory_limit")
     @classmethod

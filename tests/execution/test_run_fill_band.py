@@ -18,10 +18,12 @@ from execution.test_run_trade import _no_env_file as _no_env_file  # autouse
 from execution.test_run_trade import env as env
 from execution.test_run_trade import window as window
 from tradepartner.adapters.fake_broker import FillAt
-from tradepartner.calendar import session_open
+from tradepartner.calendar import previous_session, session_open
 from tradepartner.config import PaperConfig
 from tradepartner.errors import SystemFaultError
+from tradepartner.execution import planning
 from tradepartner.execution.collect import PriceBand, fill_band_violations
+from tradepartner.store.db import open_for_write
 from tradepartner.store.journal import FillRow, OrderedFill, OverrideRow, PaperWindowRow
 
 
@@ -189,7 +191,11 @@ def _ordered(
 
 
 def _band(
-    reference: dict[str, float], actions: pl.DataFrame | None = None, session: date = F_0
+    reference: dict[str, float],
+    actions: pl.DataFrame | None = None,
+    session: date = F_0,
+    reference_session: date | None = None,
+    deviation: float = 0.25,
 ) -> PriceBand:
     empty = pl.DataFrame(
         {"security_id": [], "action_type": [], "ex_date": [], "ratio_or_amount": []},
@@ -200,7 +206,15 @@ def _band(
             "ratio_or_amount": pl.Float64,
         },
     )
-    return PriceBand(reference.__getitem__, empty if actions is None else actions, session, 0.25)
+    return PriceBand(
+        reference.__getitem__,
+        empty if actions is None else actions,
+        session,
+        deviation,
+        lambda _name: (
+            reference_session if reference_session is not None else previous_session(session)
+        ),
+    )
 
 
 def test_the_band_edges_are_inclusive_and_a_nonfinite_price_is_a_violation() -> None:
@@ -284,6 +298,46 @@ def test_a_late_fill_from_before_the_ex_date_is_judged_on_the_low_side_only() ->
     assert len(fill_band_violations([_ordered(44.99, order_session=T_0)], band)) == 1
     # An order of the ex-date itself is ex-distribution, like its reference.
     assert len(fill_band_violations([_ordered(100.0, order_session=F_0)], band)) == 1
+
+
+def test_a_stale_reference_before_spinoff_keeps_the_high_side_for_a_late_fill() -> None:
+    """The bar predates the ex-date, but both that bar and the late order's
+    session are cum-distribution. The intervening S-1 is not the reference."""
+    band = _band(
+        {"SEC_A": 100.0},
+        _spun(F_0),
+        session=F_0_PLUS_1,
+        reference_session=T_0,
+        deviation=PaperConfig().max_fill_price_deviation,
+    )
+    too_high = 100.0 * (1 + PaperConfig().max_fill_price_deviation) + 0.01
+    assert len(fill_band_violations([_ordered(too_high, order_session=T_0)], band)) == 1
+
+
+def test_a_real_stale_bar_supplies_the_spinoff_band_session(env: Env) -> None:
+    """Read B from a temp store with no R bar; E lies after B and before R."""
+    with open_for_write(env.settings) as conn:
+        conn.execute(
+            "INSERT INTO prices_daily SELECT * REPLACE ('SEC_A' AS security_id) "
+            "FROM prices_daily WHERE security_id = 'SEC_SPY' AND session = ?",
+            [T_0],
+        )
+        actions = _spun(F_0)
+        bar_sessions: dict[str, date] = {}
+        prices = planning.reference_prices(
+            conn, F_0_PLUS_1, {"SEC_A"}, actions, bar_sessions=bar_sessions
+        )
+    assert bar_sessions == {"SEC_A": T_0}
+    assert T_0 < F_0 <= previous_session(F_0_PLUS_1)
+    band = PriceBand(
+        prices.__getitem__,
+        actions,
+        F_0_PLUS_1,
+        env.settings.paper.max_fill_price_deviation,
+        bar_sessions.__getitem__,
+    )
+    too_high = prices["SEC_A"] * (1 + env.settings.paper.max_fill_price_deviation) + 0.01
+    assert len(fill_band_violations([_ordered(too_high, order_session=T_0)], band)) == 1
 
 
 def test_a_spinoff_moves_only_its_parents_band_and_only_across_its_ex_date() -> None:
