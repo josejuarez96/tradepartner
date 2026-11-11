@@ -65,6 +65,7 @@ from tradepartner.health import (
     NO_BARS_AFTER_DELISTING,
     NO_DUPLICATE_BARS,
     NON_OVERLAPPING_LISTINGS,
+    OLD_ID_BARS_AFTER_SUCCESSOR,
     PROVENANCE_ALLOWED,
     RATE_KNOWN_AT,
     RATE_UNIQUE,
@@ -5686,3 +5687,106 @@ def test_a_reason_stamped_before_its_supporting_acceptance_fails(
     )
     report = health_report(fixture_store, T_END, settings)
     assert (_REASON_RULE in _failed(report.integrity)) == fails
+
+
+# --- Bars left under an old id after its successor starts (#3251) ----------
+
+_OLD = "0001825079:common-stock"
+_NEW = "0001825079@2019-03-01"
+
+
+def _old_id_check(conn: duckdb.DuckDBPyConnection, t: datetime = T_END) -> Any:
+    return next(
+        c for c in integrity_checks(conn, t, _settings()) if c.rule == OLD_ID_BARS_AFTER_SUCCESSOR
+    )
+
+
+def _vld_to_velo(conn: duckdb.DuckDBPyConnection) -> None:
+    """VLD's old id and the successor id VELO, with old-id bars across the
+    hand-over: two before, three on or after the successor's first session."""
+    insert_row(conn, "listings", _listing_row(_OLD, "VLD", "NYSE", date(2018, 1, 2)))
+    insert_row(conn, "listings", _listing_row(_NEW, "VELO", "NASDAQ", date(2019, 3, 1)))
+    for day in (date(2019, 2, 27), date(2019, 2, 28), date(2019, 3, 1), date(2019, 3, 4)):
+        insert_row(conn, "prices_daily", _bar(_OLD, day))
+    insert_row(conn, "prices_daily", _bar(_OLD, date(2019, 3, 5)))
+
+
+def test_old_id_bars_from_the_successors_first_session_fail_the_rule(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    _vld_to_velo(fixture_store)
+    check = _old_id_check(fixture_store)
+    assert not check.passed
+    assert check.violations["session"].to_list() == [
+        date(2019, 3, 1),
+        date(2019, 3, 4),
+        date(2019, 3, 5),
+    ]
+    assert set(check.violations["security_id"]) == {_OLD}
+    assert set(check.violations["successor_id"]) == {_NEW}
+
+
+def test_old_id_bars_once_moved_pass_the_rule(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    _vld_to_velo(fixture_store)
+    fixture_store.execute(
+        "DELETE FROM prices_daily WHERE security_id = ? AND session >= ?", [_OLD, date(2019, 3, 1)]
+    )
+    assert _old_id_check(fixture_store).passed
+
+
+def test_another_classes_successor_does_not_silence_or_flag_an_old_id(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    _vld_to_velo(fixture_store)
+    pref = "0001825079:preferred"
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row(pref, "VLDP", "NYSE", date(2018, 1, 2), "Preferred Stock"),
+    )
+    # The preferred's own successor started earlier, and its old bars stay
+    # under the preferred id: the common's bars are still flagged, and only
+    # the preferred's own successor flags the preferred's bars.
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row(
+            "0001825079@2019-02-01", "VELP", "NASDAQ", date(2019, 2, 1), "Preferred Stock"
+        ),
+    )
+    insert_row(fixture_store, "prices_daily", _bar(pref, date(2019, 2, 4)))
+    check = _old_id_check(fixture_store)
+    flagged = {(r["security_id"], r["successor_id"]) for r in check.violations.to_dicts()}
+    assert flagged == {(_OLD, _NEW), (pref, "0001825079@2019-02-01")}
+    # A common-only company: the preferred's bar is not the common successor's.
+    fixture_store.execute("DELETE FROM prices_daily WHERE security_id = ?", [_OLD])
+    flagged = {
+        (r["security_id"], r["successor_id"])
+        for r in _old_id_check(fixture_store).violations.to_dicts()
+    }
+    assert flagged == {(pref, "0001825079@2019-02-01")}
+
+
+def test_old_id_rule_reads_only_rows_known_at_t(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    _vld_to_velo(fixture_store)
+    # Before the successor's listing is known (its stamp is its start's close)
+    # nothing is flagged; after it, only bars known by `t` count.
+    assert _old_id_check(fixture_store, session_close(date(2019, 2, 28))).passed
+    at_start = _old_id_check(fixture_store, session_close(date(2019, 3, 1)))
+    assert at_start.violations["session"].to_list() == [date(2019, 3, 1)]
+
+
+def test_old_id_rule_matches_reworded_titles_and_ignores_missing_ones(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # VLD's two wordings of common stock are one class; a null title names none.
+    insert_row(fixture_store, "listings", _listing_row(_OLD, "VLD", "NYSE", date(2018, 1, 2)))
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row(_NEW, "VELO", "NASDAQ", date(2019, 3, 1), "Common Stock, $0.0001 par value"),
+    )
+    insert_row(fixture_store, "prices_daily", _bar(_OLD, date(2019, 3, 4)))
+    assert not _old_id_check(fixture_store).passed
+    fixture_store.execute("UPDATE listings SET class_title = NULL")
+    assert _old_id_check(fixture_store).passed
