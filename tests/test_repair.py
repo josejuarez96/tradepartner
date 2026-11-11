@@ -1897,3 +1897,16 @@ def test_the_command_refuses_orphans_until_the_count_is_passed(orphan_store: Set
     done = runner.invoke(app, ["repair-resolution", *expect, "--allow-orphans", "2"])
     assert done.exit_code == 0, done.output
     assert len(_bars(orphan_store)) == 3
+
+
+def test_a_retracted_class_id_whose_cik_still_lists_the_ticker_is_moved(
+    orphan_store: Settings,
+) -> None:
+    # quant-auditor on #3266: the id has no live listing row, its base CIK does.
+    base, cls = "0000000088", "0000000088:common-stock"
+    with open_for_write(orphan_store) as conn:
+        insert_row(conn, "listings", _listing(base, "GONE", date(2021, 6, 1)))
+        insert_row(conn, "prices_daily", _bar(cls, date(2021, 6, 1)))
+    result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
+    assert (cls, date(2021, 6, 1)) in result.found.bars
+    assert (cls, date(2021, 6, 1)) not in result.orphans
