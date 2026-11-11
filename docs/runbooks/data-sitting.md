@@ -300,7 +300,7 @@ Purpose: flip the two EDGAR switches, bump both cache versions, rederive rows, r
 
   Record each count against the source above that explains it, and name any count none of them explains. T184h stays out unless its own gates and questions 22–24 are satisfied. Record `health --coverage` first.
 - [ ] **Time.** The first EDGAR dry run is about **2 h** and rebuilds the caches (FSN v7 re-extraction, then the cover-page refetch, network-bound); do it first and early. After that, an EDGAR dry run or write is about 28 m. Do not read the long first dry run as a hang.
-- [ ] **Holdings check, both books, before any write.** Both windows are closed, so each book's latest `positions_daily` rows must be **flat**, not merely "no open lot": the closed book's last row can still show its last held day unless the stop wrote zero rows, which is exactly what this finds. Run with no argument: it must print nothing (open lots and held positions together; the open-lot arm nets `disposals` and is a candidate list, since the ledger's own `open_lots` also folds adjustments). Then run it once per later id list:
+- [ ] **Holdings check, both books, before any write.** Both windows are closed, so each book's latest `positions_daily` rows must be **flat**, not merely "no open lot": the closed book's last row can still show its last held day unless the stop wrote zero rows, which is exactly what this finds. Run with no argument: it must print nothing (open lots and held positions together; the open-lot arm reads only each book's current lot set, the rows at that book's latest `lots.known_at` (the rule `outcomes._book_stamp` uses; every earlier stamp is a superseded rebuild and must not count), nets that set's `disposals` and is a candidate list, since the ledger's own `open_lots` also folds adjustments). Then run it once per later id list:
 
   ```bash
   tpsql "" <<'SQL'
@@ -310,9 +310,12 @@ Purpose: flip the two EDGAR switches, bump both cache versions, rederive rows, r
     SELECT p.book_id, p.security_id, p.quantity, 'latest positions_daily ' || CAST(p.session AS VARCHAR) AS why
     FROM positions_daily p JOIN latest l ON p.book_id = l.book_id AND p.session = l.session
     WHERE p.security_id IS NOT NULL AND p.quantity <> 0
+  ), cur AS (
+    SELECT book_id, MAX(known_at) AS known_at FROM lots GROUP BY book_id
   ), openlots AS (
     SELECT l.book_id, l.security_id, l.quantity - COALESCE(SUM(d.quantity), 0) AS quantity, 'open lot ' || CAST(l.lot_id AS VARCHAR) AS why
-    FROM lots l LEFT JOIN disposals d ON d.lot_id = l.lot_id
+    FROM lots l JOIN cur c ON l.book_id = c.book_id AND l.known_at = c.known_at
+    LEFT JOIN disposals d ON d.lot_id = l.lot_id AND d.book_id = l.book_id AND d.known_at = l.known_at
     GROUP BY l.book_id, l.security_id, l.lot_id, l.quantity
     HAVING l.quantity - COALESCE(SUM(d.quantity), 0) > 1e-9
   )
