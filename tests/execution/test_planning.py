@@ -941,8 +941,10 @@ def test_an_older_bar_is_divided_by_every_split_after_its_own_session(env: Env) 
     bar = date(2019, 4, 26)
     close = _copy_bar(env, "SEC_X", bar)
     splits = _splits(("SEC_X", bar, 5.0), ("SEC_X", date(2019, 4, 29), 2.0), ("SEC_X", F_I, 3.0))
-    prices = planning.reference_prices(env.conn, F_I, {"SEC_X"}, splits)
+    bar_sessions: dict[str, date] = {}
+    prices = planning.reference_prices(env.conn, F_I, {"SEC_X"}, splits, bar_sessions=bar_sessions)
     assert prices["SEC_X"] == pytest.approx(close / 6.0)
+    assert bar_sessions == {"SEC_X": bar}
 
 
 def test_a_name_with_no_bar_by_s_minus_1_raises(env: Env) -> None:
