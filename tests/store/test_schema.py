@@ -2399,7 +2399,7 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
     (T172b) is version 28; #1813's skip reasons (T202a) are version 29;
     #821's `successor_chains` (T187) is version 30."""
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_ISSUER_CLASS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RETRACTED_ROWS_VERSION + 1
 
 
 def test_version_42_adds_snapshot_sightings_to_a_version_41_store() -> None:
@@ -2408,6 +2408,7 @@ def test_version_42_adds_snapshot_sightings_to_a_version_41_store() -> None:
         schema.init_schema(conn)
         for table in ("filing_index", "filing_index_pending", "edgar_filers", "edgar_index_files"):
             conn.execute(f"DROP TABLE {table}")
+        conn.execute("DROP TABLE retracted_rows")
         conn.execute("DROP TABLE research_exposures")
         conn.execute("ALTER TABLE trial_results DROP COLUMN n_exposure")
         conn.execute("DROP TABLE delisting_reasons")
@@ -2418,9 +2419,9 @@ def test_version_42_adds_snapshot_sightings_to_a_version_41_store() -> None:
         schema.init_schema(conn)
         assert "snapshot_sightings" in _shape(conn)
         assert max(_versions(conn)) == schema.CURRENT_SCHEMA_VERSION
-        assert _versions(conn) == [41, 42, 43, 44, 45, 46, 47, 48]
+        assert _versions(conn) == [41, 42, 43, 44, 45, 46, 47, 48, 49]
         schema.init_schema(conn)
-        assert _versions(conn) == [41, 42, 43, 44, 45, 46, 47, 48]
+        assert _versions(conn) == [41, 42, 43, 44, 45, 46, 47, 48, 49]
     finally:
         conn.close()
 

@@ -627,7 +627,18 @@ registry; #83 took version 2 first, so the registry is version 3):
   class"). Added by `ALTER` after the version-26 rebuild, so the pinned
   version-4 DDL is unchanged; rows written before 48 keep NULL until
   `ingest --source edgar --rebuild-classifications` re-derives them.
-- **A later DDL change goes to version 49**, with its own migration and a
+- **Version 49** (#3281, T389, ADR 0029): additive `retracted_rows`, the side
+  table a repair moves rows into instead of deleting them (`prices_daily`,
+  `corporate_actions`, `listings`, `delistings`): the source table, its
+  logical key, the whole row as text (every column, `known_at` included), the
+  reason, release and rule, `retracted_at` and a `restored_at` that is NULL
+  until `store.retracted_rows.restore` puts the row back. A non-fact state
+  table (no `known_at` of its own), kept out of `TABLE_NAMES` so the
+  look-ahead harness never truncates it and no as-of reader sees it. The
+  migration creates the table and changes no row; a read-only version-48
+  store opens and simply has no retraction (`store.retracted_rows` reads
+  nothing there).
+- **A later DDL change goes to version 50**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -962,9 +973,10 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   `filing_index_pending`.
 #: - 47 (#2490): nullable `resume_invocations.book_id`.
 #: - 48 (#3076): nullable `classifications.issuer_class`.
-#: - A later DDL change goes to version 49, with its own migration and a
+#: - 49 (#3281, T389): additive `retracted_rows` side table.
+#: - A later DDL change goes to version 50, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 48
+CURRENT_SCHEMA_VERSION = 49
 
 #: The last version without `delisting_reasons` (T326, version 43): the
 #: `snapshot_sightings` version (#2665). A named constant, not
@@ -992,6 +1004,10 @@ _PRE_RESUME_BOOK_VERSION = 46
 #: The last version without `classifications.issuer_class` (#3076, version 48):
 #: the `resume_invocations.book_id` version. Named, never `CURRENT_SCHEMA_VERSION - 1`.
 _PRE_ISSUER_CLASS_VERSION = 47
+
+#: The last version without `retracted_rows` (#3281, T389, version 49): the
+#: `classifications.issuer_class` version. Named, never `CURRENT_SCHEMA_VERSION - 1`.
+_PRE_RETRACTED_ROWS_VERSION = 48
 
 #: Last version without the owner-entered Form 8937 allocation table.
 _PRE_SPINOFF_ALLOCATIONS_VERSION = 38
@@ -1515,6 +1531,41 @@ _FILING_INDEX_TABLE_DDL: tuple[str, ...] = (
     _CREATE_EDGAR_FILERS,
     _CREATE_EDGAR_INDEX_FILES,
 )
+
+#: Source tables a repair may retract rows from (ADR 0029).
+RETRACTED_SOURCE_TABLES: tuple[str, ...] = (
+    "prices_daily",
+    "corporate_actions",
+    "listings",
+    "delistings",
+)
+
+# ADR 0029 (#3281, T389): rows a repair moved out of a fact table, kept whole.
+# `row_values` maps every source column to its text (`CAST(x AS VARCHAR)`), so
+# any column type comes back exactly through `CAST(text AS type)`; `row_key` is
+# the logical key as text (`store.retracted_rows.KEY_COLUMNS`). Not a fact
+# table: no `known_at` of its own (the row's is inside `row_values`).
+_CREATE_RETRACTED_ROWS = """
+CREATE TABLE IF NOT EXISTS retracted_rows (
+    retraction_id BIGINT NOT NULL PRIMARY KEY,
+    table_name VARCHAR NOT NULL,
+    row_key VARCHAR[] NOT NULL,
+    row_values MAP(VARCHAR, VARCHAR) NOT NULL,
+    reason VARCHAR NOT NULL,
+    release VARCHAR NOT NULL,
+    rule VARCHAR NOT NULL,
+    retracted_at TIMESTAMPTZ NOT NULL,
+    restored_at TIMESTAMPTZ,
+    CHECK (table_name IN ('prices_daily', 'corporate_actions', 'listings', 'delistings')),
+    CHECK (reason <> '' AND release <> '' AND rule <> ''),
+    CHECK (restored_at IS NULL OR restored_at >= retracted_at)
+)
+"""
+
+#: The version-49 side table: out of `TABLE_NAMES`, `MASTER_CHECK_TABLE_NAMES`
+#: and the registry and journal tuples, so the look-ahead harness never sees it.
+RETRACTED_ROWS_TABLE_NAMES: tuple[str, ...] = ("retracted_rows",)
+_RETRACTED_ROWS_TABLE_DDL: tuple[str, ...] = (_CREATE_RETRACTED_ROWS,)
 
 # Ownership events keep the subject and every reporting owner separate from the
 # issuer-only 8-K table. The identity excludes known_at so a re-read cannot revise it.
@@ -3554,6 +3605,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_LIST_POSITION_VERSION,
         _PRE_RESUME_BOOK_VERSION,
         _PRE_ISSUER_CLASS_VERSION,
+        _PRE_RETRACTED_ROWS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -3602,7 +3654,8 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # `book_id` until 47, #2490), which only the writing `switch.release`
         # and `collect` read; version 47 every read (`classifications_as_of`
         # returns no `issuer_class` column there, which readers take as no tag,
-        # #3076).
+        # #3076); version 48 every read (no `retracted_rows` until 49, #3281:
+        # `store.retracted_rows` finds no table there and reports no retraction).
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -4875,6 +4928,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_LIST_POSITION_VERSION,
         _PRE_RESUME_BOOK_VERSION,
         _PRE_ISSUER_CLASS_VERSION,
+        _PRE_RETRACTED_ROWS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -4929,6 +4983,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _SNAPSHOT_SIGHTINGS_TABLE_DDL
             + _DELISTING_REASONS_TABLE_DDL
             + _FILING_INDEX_TABLE_DDL
+            + _RETRACTED_ROWS_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)

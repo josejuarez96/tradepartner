@@ -330,3 +330,56 @@ def test_the_run_is_byte_identical_with_the_figi_table_populated_and_empty(
         outputs[variant] = RUNS[name](store, work)
     assert outputs["empty"] == outputs["populated"]
     assert len(outputs["empty"]) > 100  # the run produced something to compare
+
+
+#: The `retracted_rows` side table (ADR 0029, #3281, T389): rows a repair moved out of
+#: a fact table. Only repairs, the release coverage check and the schema may name it;
+#: a universe, as-of, signal, backtest, paper or research path never reads it, so a
+#: retracted row can reach no number. (Signals live under `backtest/`.)
+_RETRACTED_BARRED = (
+    "backtest/",
+    "research/",
+    "execution/",
+    "universe.py",
+    "store/asof.py",
+    "store/research.py",
+)
+
+
+def _retracted_offences(relative: str, text: str) -> list[str]:
+    """Why the module at `relative` (under `src/tradepartner/`) names `retracted_rows`
+    on a path that must not read it."""
+    if not relative.startswith(_RETRACTED_BARRED):
+        return []
+    found = []
+    if re.search(r"retracted_rows", text):
+        found.append(f"{relative}: names the retracted_rows table or module")
+    return found
+
+
+def test_the_retracted_rows_source_scan_finds_no_reader_on_a_barred_path() -> None:
+    offences = [
+        offence
+        for path in sorted(_SRC.rglob("*.py"))
+        for offence in _retracted_offences(
+            path.relative_to(_SRC).as_posix(), path.read_text("utf-8")
+        )
+    ]
+    assert offences == []
+    # The scan sees the tree: the barred prefixes exist and the module is where it should be.
+    assert (_SRC / "backtest").is_dir() and (_SRC / "research").is_dir()
+    assert (_SRC / "universe.py").is_file()
+    assert "retracted_rows" in (_SRC / "store" / "retracted_rows.py").read_text("utf-8")
+
+
+def test_the_retracted_rows_source_scan_has_teeth() -> None:
+    sql = "SELECT * FROM retracted_rows"
+    assert _retracted_offences("universe.py", sql)
+    assert _retracted_offences("backtest/signals.py", sql)
+    assert _retracted_offences(
+        "research/experiment.py", "from tradepartner.store import retracted_rows"
+    )
+    assert _retracted_offences("store/asof.py", sql)
+    assert _retracted_offences("execution/check.py", sql)
+    assert _retracted_offences("store/retracted_rows.py", sql) == []
+    assert _retracted_offences("repair.py", sql) == []
