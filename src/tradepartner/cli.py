@@ -4465,7 +4465,7 @@ def make_app(
                     if r.name == name and r.stage == "before"
                 ]
                 if not befores or befores[0].backup_path is None:
-                    raise _fail(f"no release named {name!r} with a backup", USAGE_ERROR)
+                    raise _input_fail(f"no release named {name!r} with a backup", settings)
                 backup = Path(befores[0].backup_path)
                 _backup(backup, s).close()
                 conn.execute(
