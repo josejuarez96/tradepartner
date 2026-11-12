@@ -152,6 +152,7 @@ from tradepartner.store.asof import (
 )
 from tradepartner.store.classify import classifications_as_of
 from tradepartner.store.delistings import DELISTED, LISTED, TRANSFERRED, listing_ends_as_of
+from tradepartner.store.listing_selection import prefer_current_listing
 from tradepartner.store.master import securities_as_of
 
 #: ADR 0006 rules in order; a rule's number is its position plus one.
@@ -333,10 +334,8 @@ def _current_listings(
     """Per security, its listing row with the latest `valid_from` on or
     before `session`, with `status` and `end_session` at `t`.
 
-    When the rows of one security share that latest `valid_from` (one class
-    filed on two exchanges, #1574), the tie goes to a row whose `exchange` is
-    in `universe.exchanges`, whatever order the names sort in; with no such
-    row, `listing_ends_as_of`'s frame order still decides the tie.
+    On a same-day tie, a genuine delisting remains visible; otherwise a line
+    live at `session` wins, then a venue in `universe.exchanges`.
 
     Each listing also carries `on_listed_exchange` (T196, #1682 lever A):
     whether any row of the security at or before `session`, whatever its
@@ -350,16 +349,7 @@ def _current_listings(
         if row["exchange"] in exchanges and _is_live(row, session):
             on_list.add(row["security_id"])
         held = current.get(row["security_id"])
-        newer = held is None or row["valid_from"] > held["valid_from"]
-        # A same-day tie (#1574): prefer a venue on the universe's list over
-        # one off it, so the tie does not turn on how the names sort.
-        tie_to_universe = (
-            held is not None
-            and row["valid_from"] == held["valid_from"]
-            and row["exchange"] in exchanges
-            and held["exchange"] not in exchanges
-        )
-        if newer or tie_to_universe:
+        if prefer_current_listing(row, held, session, exchanges):
             current[row["security_id"]] = row
     return {sid: {**row, "on_listed_exchange": sid in on_list} for sid, row in current.items()}
 

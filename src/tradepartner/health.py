@@ -565,6 +565,7 @@ from tradepartner.store.index_members import (
     normalize_ticker,
     resolve,
 )
+from tradepartner.store.listing_selection import prefer_current_listing
 from tradepartner.store.master import (
     _norm_title,
     first_session,
@@ -3479,7 +3480,7 @@ def _current_from(listings: pl.DataFrame, session: date) -> dict[str, dict[str, 
         if row["valid_from"] > session:
             continue
         held = current.get(row["security_id"])
-        if held is None or row["valid_from"] > held["valid_from"]:
+        if prefer_current_listing(row, held, session):
             current[row["security_id"]] = row
     return current
 

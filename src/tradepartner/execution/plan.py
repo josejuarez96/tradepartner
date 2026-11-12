@@ -118,6 +118,7 @@ from tradepartner.store.journal import (
     RebalanceEventRow,
     SignalRow,
 )
+from tradepartner.store.listing_selection import prefer_current_listing
 from tradepartner.store.schema import (
     DELISTED_REASON,
     EXCLUDE_NAME_REASON,
@@ -1702,9 +1703,10 @@ def decisions_from(
 
 def current_listings(listings: pl.DataFrame, day: date) -> dict[str, dict[str, Any]]:
     """Per security, its listing row with the latest `valid_from` on or before `day`
-    (the first in frame order on a tie, as `universe_as_of` reads it). The one
-    tie rule planning, the wrapper, the run, reconcile_run and the window's
-    flatness check share (#534, #705). A row with no `valid_from` is always
+    (a delisted row first on a tie, otherwise a live row before a withdrawn
+    line). This rule is shared by planning, the wrapper, the run,
+    reconcile_run and the window's flatness check (#534, #705); universe
+    additionally prefers a configured venue on equal-rank ties. A row with no `valid_from` is always
     current but never beats a dated row."""
     current: dict[str, dict[str, Any]] = {}
     for row in listings.iter_rows(named=True):
@@ -1712,9 +1714,6 @@ def current_listings(listings: pl.DataFrame, day: date) -> dict[str, dict[str, A
         if valid_from is not None and valid_from > day:
             continue
         held = current.get(row["security_id"])
-        if held is None or (
-            valid_from is not None
-            and (held["valid_from"] is None or valid_from > held["valid_from"])
-        ):
+        if prefer_current_listing(row, held, day):
             current[row["security_id"]] = row
     return current
