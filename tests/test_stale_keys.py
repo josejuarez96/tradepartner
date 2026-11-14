@@ -207,3 +207,20 @@ def test_cli_exits_0_when_nothing_is_stale(tmp_path: Path, monkeypatch: pytest.M
     result = CliRunner().invoke(app, ["stale-keys"])
     assert result.exit_code == 0, result.output
     assert "no stale keys" in result.output
+
+
+def test_a_kept_successor_superseded_by_a_later_id_of_its_cik_is_stale(tmp_path: Path) -> None:
+    ids = ["0000000002@2021-08-09", "0000000002@2021-07-01", "0000000003@2020-01-02"]
+    with _conn(tmp_path / "s.duckdb", ids) as conn:
+        found = sk.stale_keys(
+            conn,
+            accepted_relistings=[],
+            keep_successors=["0000000002@2021-08-09", "0000000003@2020-01-02"],
+            dividends=[],
+            listings=[],
+            spinoffs=[],
+        )
+    assert [(f.source, f.security_id) for f in found] == [
+        (sk.KEEP_SUCCESSORS, "0000000002@2021-08-09")
+    ]
+    assert "superseded" in found[0].detail

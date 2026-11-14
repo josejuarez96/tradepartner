@@ -95,4 +95,14 @@ def stale_keys(
         check(ACCEPTED_RELISTINGS, entry, entry)
     for entry in keep_successors:
         check(KEEP_SUCCESSORS, entry, entry)
+        # `master-retract` never retracts a kept id, so after a rebuild re-derives the
+        # successor under a new date the old id stays live: flag it when its CIK holds
+        # another live `<cik>@<date>` id.
+        if entry in live and "@" in entry:
+            cik = entry.split("@", 1)[0]
+            others = sorted(i for i in live if i.startswith(f"{cik}@") and i != entry)
+            if others:
+                found.append(
+                    StaleKey(KEEP_SUCCESSORS, entry, f"superseded: {cik} also holds {others}")
+                )
     return tuple(found)
