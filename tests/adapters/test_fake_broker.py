@@ -300,6 +300,16 @@ def test_get_order_reads_the_current_state() -> None:
     assert broker.get_order("co-1") == filled
 
 
+def test_get_order_by_broker_id_reads_the_order_in_any_state() -> None:
+    broker, _ = make_broker(auto_fill=False)
+    submitted = broker.submit(make_request())
+    assert submitted.broker_order_id is not None
+    filled = broker.simulate_fill("co-1")
+    assert broker.get_order_by_broker_id(submitted.broker_order_id) == filled
+    with pytest.raises(UnknownOrderError):
+        broker.get_order_by_broker_id("nope")
+
+
 def test_open_orders_lists_every_non_terminal_order_in_submission_order() -> None:
     broker, _ = make_broker(auto_fill=False)
     for n in range(4):
