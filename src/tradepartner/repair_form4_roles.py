@@ -6,10 +6,12 @@ import hashlib
 import json
 import uuid
 import zipfile
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+import duckdb
 
 from tradepartner.adapters.edgar_insider_bulk import (
     _OWNER_COLUMNS,
@@ -19,7 +21,14 @@ from tradepartner.adapters.edgar_insider_bulk import (
 )
 from tradepartner.config import Settings
 from tradepartner.ingest import SourceRun, write_run
-from tradepartner.repair import REPAIR, REPAIRED, release_refusal
+from tradepartner.repair import (
+    REPAIR,
+    REPAIRED,
+    RepairRefused,
+    known_dates,
+    refuse_inside_open_window,
+    release_refusal,
+)
 from tradepartner.store.db import open_for_write, open_read_only, utc_now
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -188,6 +197,7 @@ def repair_form4_roles(
         if len(changes) != expect_rows:
             raise RoleRepairRefused(f"found {len(changes)} rows; expected {expect_rows}")
         if not dry_run and changes:
+            _refuse_in_window(conn, [key for _, key in changes])
             at = ensure_tz_aware_utc(clock(), field_name="clock")
             conn.execute(
                 "CREATE TEMP TABLE _form4_role_changes ("
@@ -227,3 +237,21 @@ def repair_form4_roles(
                 REPAIR,
             )
         return len(changes)
+
+
+def _refuse_in_window(
+    conn: duckdb.DuckDBPyConnection, keys: Sequence[tuple[str, str, int]]
+) -> None:
+    """Refuse, before any write, rows known inside an open paper window (#3330)."""
+    found = [
+        conn.execute(
+            "SELECT known_at FROM sec_form4_transactions "
+            "WHERE accession = ? AND filer_cik = ? AND line_no = ?",
+            list(key),
+        ).fetchone()
+        for key in keys
+    ]
+    try:
+        refuse_inside_open_window(conn, known_dates(row[0] for row in found if row is not None))
+    except RepairRefused as exc:
+        raise RoleRepairRefused(str(exc)) from exc

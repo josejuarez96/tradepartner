@@ -1683,7 +1683,7 @@ def _refetch_month(
 ) -> SourceRun:
     """One month (or the one span) of `refetch_actions`; adds the rows it
     moved to `totals` and names each row written in `written`."""
-    from tradepartner.repair import release_refusal
+    from tradepartner.repair import RepairRefused, refuse_inside_open_window, release_refusal
 
     prepared: dict[str, Any] = {}
     started = ensure_tz_aware_utc(clock(), field_name="clock()")
@@ -1707,6 +1707,10 @@ def _refetch_month(
     def write(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
         if not dry_run and (why := release_refusal(conn, release)) is not None:
             raise RefetchRefused(why)
+        try:  # a refetch rewrites past reads of its months (#3330), dry runs too
+            refuse_inside_open_window(conn, [a.ex_date for a in prepared["actions"]])
+        except RepairRefused as exc:
+            raise RefetchRefused(str(exc)) from exc
         before = _action_counts(conn)
         stats: dict[str, int] = {}
         stamp = ensure_tz_aware_utc(clock(), field_name="clock()")

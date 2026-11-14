@@ -14,6 +14,7 @@ from typing import Any
 import duckdb
 import polars as pl
 import pytest
+from conftest import open_paper_window
 from typer.testing import CliRunner
 
 from tradepartner import cli, repair
@@ -2256,3 +2257,55 @@ def test_a_repair_without_an_open_release_still_refuses_and_retracts_nothing(
     with pytest.raises(RepairRefused, match="no release is open"):
         _delete_bars(store, expect=(3, 1), release=REL)
     assert _retracted(store) == []
+
+
+# --- #3330: a repair that changes past reads refuses inside an open paper window ---
+
+WINDOW_START = datetime(2021, 5, 28, 14, tzinfo=UTC)  # first session 2021-05-28
+
+
+def test_resolution_repair_refuses_inside_an_open_paper_window(store: Settings) -> None:
+    open_paper_window(store, WINDOW_START)
+    before = _bars(store)
+    with pytest.raises(RepairRefused, match="open paper window"):
+        repair_resolution(store, clock=lambda: RUN, expect=(3, 1), release=REL)
+    assert _bars(store) == before
+    assert _rows(store, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+    assert repair_resolution(store, clock=lambda: RUN, dry_run=True).bar_rows == 3
+
+
+def test_delete_bars_refuses_inside_an_open_paper_window(store: Settings) -> None:
+    open_paper_window(store, WINDOW_START)
+    before = _bars(store)
+    with pytest.raises(RepairRefused, match="open paper window"):
+        _delete_bars(store, expect=(3, 1), release=REL)
+    assert _bars(store) == before
+    assert _rows(store, "SELECT count(*) FROM corporate_actions") == [(2,)]
+    assert _rows(store, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+def test_delete_bars_before_the_window_still_runs(store: Settings) -> None:
+    open_paper_window(store, datetime(2021, 6, 16, 14, tzinfo=UTC))
+    _delete_bars(store, expect=(3, 1), release=REL)
+    assert _rows(store, "SELECT count(*) FROM ingestion_runs") == [(1,)]
+
+
+def test_dividend_repair_refuses_inside_an_open_paper_window(dividends: Settings) -> None:
+    open_paper_window(dividends, datetime(2021, 6, 14, 14, tzinfo=UTC))
+    with pytest.raises(RepairRefused, match="open paper window"):
+        _retract(dividends, expect=1, release=REL)
+    assert _actions(dividends) == ALL_ACTIONS
+    assert _rows(dividends, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+def test_the_helper_passes_with_no_window_and_refuses_on_or_after_its_first_session(
+    store: Settings,
+) -> None:
+    with duckdb.connect(store.store.path, read_only=True) as conn:
+        repair.refuse_inside_open_window(conn, [date(2030, 1, 2)])  # no window open
+    open_paper_window(store, WINDOW_START)
+    with duckdb.connect(store.store.path, read_only=True) as conn:
+        repair.refuse_inside_open_window(conn, [date(2021, 5, 27)])  # before it
+        repair.refuse_inside_open_window(conn, [])
+        with pytest.raises(RepairRefused, match="first session 2021-05-28"):
+            repair.refuse_inside_open_window(conn, [date(2021, 5, 28)])
