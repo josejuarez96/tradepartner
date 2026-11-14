@@ -6998,32 +6998,35 @@ def _stored_sessions(
     `session` are held to that (the window a daily run can re-fetch, from
     `alpaca.max_catchup_sessions`); an older session with any bar stays stored,
     so history thinner than today's share is not re-fetched."""
-    rows = conn.execute(
-        "SELECT session, list(DISTINCT security_id) FROM prices_daily "
-        "WHERE session <= ? GROUP BY session",
-        [session],
-    ).fetchall()
+    stored = {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT session FROM prices_daily WHERE session <= ?", [session]
+        ).fetchall()
+    }
     if reference is None:
-        return {row[0] for row in rows}
+        return stored
     wanted = set(names)
-    first: dict[str, date] = {}
-    for day, held in sorted(rows, key=lambda row: row[0]):
-        for sid in held:
-            first.setdefault(sid, day)
     sessions = all_sessions()
     oldest = sessions[max(0, bisect_left(sessions, session) - recent)]
+    # Name lists are read only for the window, never the whole history.
+    rows = conn.execute(
+        "SELECT session, list(DISTINCT security_id) FROM prices_daily "
+        "WHERE session >= ? AND session <= ? GROUP BY session",
+        [oldest, session],
+    ).fetchall()
     # The names still trading: those with a bar inside the window. A name dark
     # since before it is not "missing" from a session (the daily check leaves
     # dark names out of its share too, #784).
-    active: set[str] = set().union(
-        *(wanted.intersection(held) for day, held in rows if day >= oldest)
-    )
-    starts = sorted(day for sid, day in first.items() if sid in active)
-    whole: set[date] = set()
+    active: set[str] = set().union(*(wanted.intersection(held) for _, held in rows))
+    firsts = conn.execute(
+        "SELECT min(session) FROM prices_daily WHERE session <= ? "
+        "AND security_id IN (SELECT unnest(?)) GROUP BY security_id",
+        [session, sorted(active)],
+    ).fetchall()
+    starts = sorted(row[0] for row in firsts)
+    whole = {day for day in stored if day < oldest}
     for day, held in rows:
-        if day < oldest:
-            whole.add(day)
-            continue
         if reference not in held:
             continue
         base = bisect_right(starts, day)
