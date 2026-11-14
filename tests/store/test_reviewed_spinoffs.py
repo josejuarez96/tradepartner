@@ -211,3 +211,25 @@ def test_the_ex_date_parent_fallback_does_not_resolve_a_symbol_nobody_holds() ->
     parsed = parse_corporate_actions({"spin_offs": [_msgk_row()]}, resolver.resolve)
     assert parsed.actions == ()
     assert ("MSGK", EX) in parsed.unresolved
+
+
+def test_a_parent_split_echo_on_a_reviewed_spinoff_ex_date_is_refused() -> None:
+    """The feed has the parent's split echo (0.5) but no spin-off row: the
+    reviewed spin-off adjusts it, so the split must not adjust it twice."""
+    feed = {
+        "forward_splits": [
+            {
+                "id": "echo",
+                "symbol": "MSGS",
+                "ex_date": "2026-10-27",
+                "process_date": "2026-10-28",
+                "new_rate": 1,
+                "old_rate": 2,
+            }
+        ]
+    }
+    source = _source(feed)
+    got = source.corporate_actions([PARENT], date(2026, 10, 1), date(2026, 10, 31))
+    assert [a.action_type for a in got] == [ActionType.SPINOFF]
+    assert source.last_actions_report is not None
+    assert source.last_actions_report.spinoff_echo_splits_refused

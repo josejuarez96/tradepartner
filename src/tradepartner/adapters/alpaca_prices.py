@@ -3754,7 +3754,25 @@ class AlpacaPriceSource(PriceSource):
         # #3058: a spin-off is not a split. A split row of a security on the
         # ex-date of its own spin-off in this answer is that spin-off's echo;
         # a reviewed identity with its reviewed values is one judged so.
-        spin_parents = set(parsed.spinoff_parents)
+        # #3392: a reviewed spin-off of a requested child or parent whose
+        # ex-date is in the window; the feed's row of the same identity wins.
+        fed = {
+            (a.security_id, a.source_action_id)
+            for a in parsed.actions
+            if a.action_type is ActionType.SPINOFF
+        }
+        added = [
+            r.action
+            for r in self._reviewed_spinoffs
+            if start <= r.ex_date <= end
+            and (r.child_security_id in ids or r.parent_security_id in ids)
+            and r.identity not in fed
+        ]
+        # A parent split on a reviewed spin-off's ex-date is its echo too.
+        spin_parents = {
+            *parsed.spinoff_parents,
+            *((r.source_action_id or "", r.ex_date) for r in added),
+        }
         echo_refused: list[str] = []
         reviewed_spin_refused = 0
         # The reviewed key uses exact stored DOUBLE amounts, as in
@@ -3794,18 +3812,6 @@ class AlpacaPriceSource(PriceSource):
                     reviewed_spin_refused += 1
                 else:
                     kept.append(a)
-        # #3392: a reviewed spin-off of a requested child or parent whose
-        # ex-date is in the window; the feed's row of the same identity wins.
-        fed = {
-            (a.security_id, a.source_action_id) for a in kept if a.action_type is ActionType.SPINOFF
-        }
-        added = [
-            r.action
-            for r in self._reviewed_spinoffs
-            if start <= r.ex_date <= end
-            and (r.child_security_id in ids or r.parent_security_id in ids)
-            and r.identity not in fed
-        ]
         kept.extend(added)
         aliased = tuple(
             f"{a.security_id} {a.action_type.value} {a.ex_date.isoformat()} under "
