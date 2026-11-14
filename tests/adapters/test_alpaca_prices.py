@@ -65,13 +65,16 @@ def _listing(
     valid_from: date,
     class_title: str | None = None,
     provenance: str | None = None,
+    known_at: datetime | None = None,
 ) -> dict[str, object]:
-    row = {
+    row: dict[str, object] = {
         "security_id": security_id,
         "ticker": ticker,
         "valid_from": valid_from,
         "class_title": class_title,
     }
+    if known_at is not None:  # #3291: the filing's own stamp orders a same-day pair
+        row["known_at"] = known_at
     if provenance is not None:  # #1597: a listing read from a filing's own names
         row["provenance"] = provenance
     return row
@@ -214,6 +217,68 @@ class TestResolver:
         assert resolver.symbols("0001337298", day, date(2024, 5, 31)) == []
         assert (resolver.report.same_day_securities, resolver.report.same_day_listings) == (1, 2)
         assert resolver.report.same_day_typos == 0
+
+    def test_a_same_day_pair_is_decided_by_the_later_filing(self) -> None:
+        # #3291 (Aeva, 0001789029): the SPAC's 06:33 filing of 2021-06-02
+        # lists IPV, the 17:01 one lists AEVA. Nothing was held before, so
+        # it is no typo; the later filing is the rename and wins the day.
+        day = date(2021, 6, 2)
+        aeva = "0001789029"
+        resolver = ListingResolver(
+            [
+                _listing(aeva, "IPV", day, known_at=datetime(2021, 6, 2, 6, 33, tzinfo=UTC)),
+                _listing(aeva, "AEVA", day, known_at=datetime(2021, 6, 2, 17, 1, tzinfo=UTC)),
+                _listing(aeva, "AEVA", date(2025, 3, 20)),
+            ]
+        )
+        assert resolver.resolve("AEVA", day) == aeva
+        assert resolver.resolve("AEVA", date(2026, 11, 6)) == aeva
+        assert resolver.resolve("IPV", day) is None
+        assert (resolver.report.same_day_securities, resolver.report.same_day_listings) == (0, 0)
+
+    def test_a_same_day_pair_whose_later_filing_is_unconfirmed_stays_unassigned(self) -> None:
+        # #3291 (quant-auditor): the later filing may be a slip naming
+        # another company's ticker; without a next row under it, no winner.
+        day = date(2021, 6, 2)
+        sid = "0001789029"
+        early, late = (
+            datetime(2021, 6, 2, 6, 33, tzinfo=UTC),
+            datetime(2021, 6, 2, 17, 1, tzinfo=UTC),
+        )
+        for rest in ([], [_listing(sid, "IPV", date(2022, 1, 3))]):
+            resolver = ListingResolver(
+                [
+                    _listing(sid, "IPV", day, known_at=early),
+                    _listing(sid, "AEVA", day, known_at=late),
+                    *rest,
+                ]
+            )
+            assert resolver.resolve("AEVA", day) is None
+
+    def test_a_same_day_pair_with_an_unstamped_row_stays_unassigned(self) -> None:
+        day = date(2021, 6, 2)
+        sid = "0001789029"
+        resolver = ListingResolver(
+            [
+                _listing(sid, "IPV", day),
+                _listing(sid, "AEVA", day, known_at=datetime(2021, 6, 2, 17, 1, tzinfo=UTC)),
+                _listing(sid, "AEVA", date(2025, 3, 20)),
+            ]
+        )
+        assert resolver.resolve("AEVA", date(2026, 11, 6)) is None
+
+    def test_a_same_day_pair_filed_at_one_moment_stays_unassigned(self) -> None:
+        # #3291: a tie on `known_at` (or no stamp) shows nothing; as before.
+        day = date(2021, 6, 2)
+        stamp = datetime(2021, 6, 2, 17, 1, tzinfo=UTC)
+        resolver = ListingResolver(
+            [
+                _listing("0001789029", "IPV", day, known_at=stamp),
+                _listing("0001789029", "AEVA", day, known_at=stamp),
+            ]
+        )
+        assert resolver.resolve("AEVA", day) is None
+        assert (resolver.report.same_day_securities, resolver.report.same_day_listings) == (1, 2)
 
     def test_notes_and_preferred_under_the_common_ticker_are_left_out(self) -> None:
         # Owner rule 1 (#735): JNJ's notes and KSU's preferred list under
