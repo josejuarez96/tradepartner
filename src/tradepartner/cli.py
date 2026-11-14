@@ -51,6 +51,10 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
 - `tradepartner close-gap --reference FILE [--symbol SPY]` (#3077) compares a benchmark's
   stored daily closes with owner-supplied official closes (`session,close` CSV) and exits 1
   on any session off by more than `index_check.max_close_gap`; read-only.
+- `tradepartner stale-keys` (#3387) lists every reviewed or config entry whose security id
+  is no longer in the store (`dividend_reviews.csv`, `listing_reviews.csv`,
+  `spinoff_splits.csv`, `alpaca.accepted_relistings`, `master.keep_successors`); read-only,
+  exits 1 on any hit.
 - `tradepartner index-check [--start YYYY-MM] [--end YYYY-MM] [--out PATH]` runs
   `backtest.index_check_store.run_index_check` (backtest spec
   amendment #1598, plan T245): the whole universe, equal and cap weight, against RSP
@@ -641,6 +645,7 @@ from tradepartner.store import (
 )
 from tradepartner.store import backup as store_backup_module
 from tradepartner.store import migrate as store_migrate
+from tradepartner.store import stale_keys as stale_keys_module
 from tradepartner.store.asof import ASSETS_SOURCE, prices_as_of
 from tradepartner.store.db import (
     StoreLockedError,
@@ -4132,6 +4137,32 @@ def make_app(
             "false",
         ]
         raise typer.Exit(launcher(argv))
+
+    @app.command("stale-keys")
+    def stale_keys_command() -> None:
+        """List reviewed and config entries whose security id left the store (#3387).
+
+        Read-only. Checks dividend_reviews.csv, listing_reviews.csv, spinoff_splits.csv,
+        alpaca.accepted_relistings and master.keep_successors; exits 1 on any hit.
+        """
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            with open_read_only(s) as conn:
+                found = stale_keys_module.stale_keys(
+                    conn,
+                    accepted_relistings=s.alpaca.accepted_relistings,
+                    keep_successors=s.master.keep_successors,
+                )
+        except StoreLockedError as exc:
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
+        if not found:
+            typer.echo("no stale keys")
+            return
+        for item in found:
+            typer.echo(item.line)
+        raise _fail(f"{len(found)} stale keys: re-key each entry to the rebuilt id", 1)
 
     @app.command()
     def export(
