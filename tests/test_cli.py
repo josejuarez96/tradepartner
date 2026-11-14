@@ -2586,12 +2586,12 @@ def test_delete_master_rows_dry_run_then_delete(master_store: tuple[Settings, Pa
     args = ["delete-master-rows", "--manifest", str(manifest), "--release", _MASTER_RELEASE]
     dry = _invoke(settings, [*args, "--dry-run"], edgar_client=client)
     assert dry.exit_code == 0, dry.output
-    assert dry.output.startswith("would delete 1 listings and 0 delistings rows of 1 manifest")
+    assert dry.output.startswith("would retract 1 listings and 0 delistings rows of 1 manifest")
     assert f"listings {_VZ} VZ22A NYSE 2019-10-30" in dry.output
     assert asked and _stored_tickers(settings) == ["VZ", "VZ22A"]
     done = _invoke(settings, args, edgar_client=client)
     assert done.exit_code == 0, done.output
-    assert done.output.startswith("deleted 1 listings")
+    assert done.output.startswith("retracted 1 listings")
     assert _stored_tickers(settings) == ["VZ"]
 
 

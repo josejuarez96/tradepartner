@@ -50,6 +50,8 @@ from tradepartner.ingest import (
 )
 from tradepartner.store.asof import facts_as_of
 from tradepartner.store.db import insert_row, open_for_write
+from tradepartner.store.delisting_reasons import delisting_reasons_as_of
+from tradepartner.store.delistings import delistings_with_reasons_as_of
 from tradepartner.store.restamp_precheck import compute_precheck, precheck_file_name
 
 ACME = "0000000001"  # restamped: every filing early by the offset
@@ -350,6 +352,201 @@ def test_the_moved_rows_carry_the_new_stamp_and_none_keeps_the_old(
     )
     assert filed_at == known_at == A_25NSE[1]
     assert ingested_at == MOVED_AT
+
+
+def test_restamped_delisting_keeps_reason_revisions_at_their_own_known_times(
+    settings: Settings, early_store: _Store
+) -> None:
+    old = _early(A_25NSE[1])
+    new = A_25NSE[1]
+    earlier_evidence = old - timedelta(hours=1)
+    later = new + timedelta(days=1)
+    with duckdb.connect(early_store.path) as conn:
+        for known_at, reason in (
+            (earlier_evidence, "bankruptcy"),
+            (old, "voluntary_other"),
+            (later, "unknown"),
+        ):
+            eightk = known_at == earlier_evidence
+            source = "eightk_item" if eightk else "form25_provision"
+            if reason == "unknown":
+                source = "unknown"
+            insert_row(
+                conn,
+                "delisting_reasons",
+                {
+                    "security_id": ACME,
+                    "delisting_form": "25-NSE",
+                    "delisting_class_title": "Common Stock",
+                    "delisting_exchange": "NYSE",
+                    "delisting_filed_at": old,
+                    "reason": reason,
+                    "reason_evidence_form": "8-K" if eightk else "25-NSE",
+                    "reason_evidence_accession": f"{ACME}-19-000099" if eightk else A_25NSE[0],
+                    "reason_source": source,
+                    "reason_known_at": known_at,
+                    "known_at": known_at,
+                    "ingested_at": FIRST_RUN,
+                    "source": "edgar",
+                    "provenance": "filing",
+                },
+            )
+
+    status, message, (result,) = _ingest(
+        settings, _source(acme_early=False), now=RESTAMP_RUN, restamp=_acme_manifest()
+    )
+    assert status == OK, message
+    assert result.refused == {}
+    with duckdb.connect(early_store.path, read_only=True) as conn:
+        for t in (old + timedelta(hours=1), new - timedelta(microseconds=1)):
+            assert delisting_reasons_as_of(conn, t).is_empty()
+            assert delistings_with_reasons_as_of(conn, t).is_empty()
+        for t, expected in ((new, "voluntary_other"), (later, "unknown")):
+            assert delisting_reasons_as_of(conn, t)["reason"].to_list() == [expected]
+            assert delistings_with_reasons_as_of(conn, t)["reason"].to_list() == [expected]
+        assert conn.execute(
+            "SELECT delisting_filed_at, known_at, reason_known_at "
+            "FROM delisting_reasons ORDER BY known_at"
+        ).fetchall() == [
+            (new, earlier_evidence, earlier_evidence),
+            (new, new, new),
+            (new, later, later),
+        ]
+
+
+@pytest.mark.parametrize("evidence_at", ["none", "between", "old"])
+def test_earlier_restamp_moves_or_refuses_reason_revisions(
+    settings: Settings, evidence_at: str
+) -> None:
+    status, message, _ = _ingest(settings, _source(acme_early=False), now=FIRST_RUN)
+    assert status == OK, message
+    old = A_25NSE[1]
+    new = _early(old)
+    eightk_at = new + timedelta(hours=2)
+    with duckdb.connect(settings.store.path) as conn:
+        reason_row = {
+            "security_id": ACME,
+            "delisting_form": "25-NSE",
+            "delisting_class_title": "Common Stock",
+            "delisting_exchange": "NYSE",
+            "delisting_filed_at": old,
+            "reason": "voluntary_other",
+            "reason_evidence_form": "25-NSE",
+            "reason_evidence_accession": A_25NSE[0],
+            "reason_source": "form25_provision",
+            "reason_known_at": old,
+            "known_at": old,
+            "ingested_at": FIRST_RUN,
+            "source": "edgar",
+            "provenance": "filing",
+        }
+        if evidence_at != "old":
+            insert_row(conn, "delisting_reasons", reason_row)
+        if evidence_at != "none":
+            accepted = old if evidence_at == "old" else eightk_at
+            insert_row(
+                conn,
+                "delisting_reasons",
+                {
+                    **reason_row,
+                    "reason": "bankruptcy",
+                    "reason_evidence_form": "8-K",
+                    "reason_evidence_accession": f"{ACME}-19-000099",
+                    "reason_source": "eightk_item",
+                    "reason_known_at": accepted,
+                    "known_at": accepted,
+                },
+            )
+    change = ManifestRow(EXCHANGE, A_25NSE[0], old, new, "sgml", "test")
+    status, message, (result,) = _ingest(
+        settings, _source(acme_early=True), now=RESTAMP_RUN, restamp=[change]
+    )
+    assert status == OK, message
+    if evidence_at != "none":
+        assert "evidence between the corrected stamps" in result.refused[ACME]
+        with duckdb.connect(settings.store.path, read_only=True) as conn:
+            assert conn.execute("SELECT filed_at FROM delistings").fetchall() == [(old,)]
+        return
+    assert result.refused == {}
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        assert delisting_reasons_as_of(conn, new - timedelta(microseconds=1)).is_empty()
+        assert delisting_reasons_as_of(conn, new)["reason"].to_list() == ["voluntary_other"]
+        assert delistings_with_reasons_as_of(conn, new)["reason"].to_list() == ["voluntary_other"]
+        assert conn.execute(
+            "SELECT delisting_filed_at, known_at, reason_known_at "
+            "FROM delisting_reasons ORDER BY known_at"
+        ).fetchall() == [(new, new, new)]
+
+
+def test_later_restamp_refuses_intervening_evidence(
+    settings: Settings, early_store: _Store
+) -> None:
+    old = _early(A_25NSE[1])
+    eightk_at = old + timedelta(hours=2)
+    with duckdb.connect(early_store.path) as conn:
+        insert_row(
+            conn,
+            "delisting_reasons",
+            {
+                "security_id": ACME,
+                "delisting_form": "25-NSE",
+                "delisting_class_title": "Common Stock",
+                "delisting_exchange": "NYSE",
+                "delisting_filed_at": old,
+                "reason": "bankruptcy",
+                "reason_evidence_form": "8-K",
+                "reason_evidence_accession": f"{ACME}-19-000099",
+                "reason_source": "eightk_item",
+                "reason_known_at": eightk_at,
+                "known_at": eightk_at,
+                "ingested_at": FIRST_RUN,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+    status, message, (result,) = _ingest(
+        settings, _source(acme_early=True), now=RESTAMP_RUN, restamp=_acme_manifest()
+    )
+    assert status == OK, message
+    assert "evidence between the corrected stamps" in result.refused[ACME]
+    assert early_store.known_ats("delistings", ACME) == {old}
+
+
+@pytest.mark.parametrize("collision", ["stored", "revisions"])
+def test_restamp_refuses_reason_key_collisions(
+    settings: Settings, early_store: _Store, collision: str
+) -> None:
+    old = _early(A_25NSE[1])
+    new = A_25NSE[1]
+    with duckdb.connect(early_store.path) as conn:
+        knowns = (old, new) if collision == "stored" else (old, old + timedelta(hours=1))
+        for known_at in knowns:
+            insert_row(
+                conn,
+                "delisting_reasons",
+                {
+                    "security_id": ACME,
+                    "delisting_form": "25-NSE",
+                    "delisting_class_title": "Common Stock",
+                    "delisting_exchange": "NYSE",
+                    "delisting_filed_at": new if collision == "stored" and known_at == new else old,
+                    "reason": "voluntary_other",
+                    "reason_evidence_form": "25-NSE",
+                    "reason_evidence_accession": A_25NSE[0],
+                    "reason_source": "form25_provision",
+                    "reason_known_at": known_at,
+                    "known_at": known_at,
+                    "ingested_at": FIRST_RUN,
+                    "source": "edgar",
+                    "provenance": "filing",
+                },
+            )
+    status, message, (result,) = _ingest(
+        settings, _source(acme_early=True), now=RESTAMP_RUN, restamp=_acme_manifest()
+    )
+    assert status == OK, message
+    assert "delisting_reasons:" in result.refused[ACME]
+    assert early_store.known_ats("delistings", ACME) == {old}
 
 
 def test_the_form_25_nse_moves_by_the_exchange_files_cik_not_the_subjects(

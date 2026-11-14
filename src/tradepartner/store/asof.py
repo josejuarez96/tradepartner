@@ -511,9 +511,10 @@ class LiveChains:
     (the hand-over day a predecessor fact is judged against; a successor with
     no such row known at `t` is absent, so every predecessor fact is its
     own). `pre_listing` maps a chained successor with **no** live chain at `t`
-    to the `valid_from` of its first own listing row known at `t`, so the
-    price reads hide its own bars before that session (the rule-9 hole bars a
-    fill wrote, which are its history only once its chain is known). Empty
+    to the `valid_from` of its first own listing row known at `t`, or `date.max`
+    when none is known, so the price reads hide its own bars before that
+    session (the rule-9 hole bars a fill wrote, which are its history only
+    once its chain is known). Empty
     (`bool(LiveChains())` false) when no chain is known at `t`, in which case
     the reads build their pre-#821 SQL, except that `pre_listing` may still be
     non-empty when the store has chain rows that are not live at `t`."""
@@ -646,22 +647,21 @@ def _pre_listing_at(
     """The chained successors whose own bars a price read must hide at `t`:
     every `successor_id` named by a `successor_chains` row (live or not, less
     those with a live chain at `t`), mapped to the earliest `valid_from` its
-    `listings` rows give. Read without a `known_at` filter on purpose: the rule
-    only ever **hides** a bar, never shows one, so a listing row known after
-    `t` cannot leak a later bar into a read; it is what keeps a filled rule-9
-    hole bar hidden before its chain is known. See `LiveChains.pre_listing`."""
+    live `listings` rows known at `t` give, or `date.max` when none is known.
+    An earlier listing learned later can move the boundary backward and
+    unhide a bar, so the listing read must obey its own `known_at` and
+    retraction rules. See `LiveChains.pre_listing`."""
     if not _has_table(conn, _CHAINS_TABLE) or not _has_table(conn, "listings"):
         return {}
     rows = conn.execute(f"SELECT DISTINCT successor_id FROM {_CHAINS_TABLE}").fetchall()
     successors = sorted({str(successor) for (successor,) in rows} - set(chains.pairs.values()))
     if not successors:
         return {}
-    first = conn.execute(
-        "SELECT security_id, MIN(valid_from) FROM listings "
-        "WHERE security_id IN (SELECT unnest(?)) GROUP BY security_id",
-        [successors],
-    ).fetchall()
-    return {str(successor): valid_from for successor, valid_from in first}
+    first = (
+        listings_as_of(conn, t, successors).group_by("security_id").agg(pl.col("valid_from").min())
+    )
+    boundaries = {successor: valid_from for successor, valid_from in first.iter_rows()}
+    return {successor: boundaries.get(successor, date.max) for successor in successors}
 
 
 def _live_chains_at(conn: duckdb.DuckDBPyConnection, t: datetime) -> LiveChains:

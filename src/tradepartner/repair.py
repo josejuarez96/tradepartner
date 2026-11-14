@@ -1792,7 +1792,7 @@ class MasterRowsDeleted:
 
     def summary(self) -> str:
         """One line for the run row and the terminal."""
-        verb = "would delete" if self.dry_run else "deleted"
+        verb = "would retract" if self.dry_run else "retracted"
         return (
             f"{verb} {self.listings} listings and {self.delistings} delistings rows of "
             f"{self.rows} manifest rows; refused {len(self.refused)}; release {self.release}"
@@ -1904,29 +1904,24 @@ def _same_key(a: MasterRowKey, b: MasterRowKey) -> bool:
     return a.table == b.table and _key(a) == _key(b)
 
 
-def _delete_master_row(conn: duckdb.DuckDBPyConnection, row: MasterRowKey) -> int:
-    """Delete the one stored row `row` names; the number deleted."""
-    before = _rows(conn, row.table)
-    if row.table == "listings":
-        conn.execute(
-            "DELETE FROM listings WHERE security_id = ? AND ticker = ? AND exchange = ? "
-            "AND valid_from = ? AND known_at = ? AND class_title IS NOT DISTINCT FROM ?",
-            [
-                row.security_id,
-                row.ticker,
-                row.exchange,
-                row.valid_from,
-                row.known_at,
-                row.class_title,
-            ],
-        )
-    else:
-        conn.execute(
-            "DELETE FROM delistings WHERE security_id = ? AND form = ? AND class_title = ? "
-            "AND exchange = ? AND filed_at = ? AND known_at = ?",
-            [row.security_id, row.form, row.class_title, row.exchange, row.filed_at, row.known_at],
-        )
-    return before - _rows(conn, row.table)
+def _retract_master_rows(
+    conn: duckdb.DuckDBPyConnection, rows: Sequence[MasterRowKey], *, reason: str, release: str
+) -> int:
+    """Retract (ADR 0029, `store.retracted_rows.retract`) the logical keys of
+    `rows`, each key once with every revision, its manifest lines (the revisions'
+    `label()`s, joined) as the rule that judged it; the rows moved."""
+    by_key: dict[tuple[str, tuple[object, ...]], list[str]] = defaultdict(list)
+    for row in rows:
+        by_key[(row.table, _key(row))].append(row.label())
+    moved = 0
+    for table in MASTER_DELETE_TABLES:
+        by_rule: dict[str, list[tuple[Any, ...]]] = defaultdict(list)
+        for (name, key), labels in by_key.items():
+            if name == table:
+                by_rule[" | ".join(sorted(labels))].append(key)
+        for rule, keys in sorted(by_rule.items()):
+            moved += retract(conn, table, keys, reason, release, rule)
+    return moved
 
 
 def delete_master_rows(
@@ -1938,16 +1933,20 @@ def delete_master_rows(
     headers: HeaderLookup,
     clock: Callable[[], datetime] = utc_now,
 ) -> MasterRowsDeleted:
-    """Delete the never-true master rows of a reviewed manifest (spec
+    """Retract the never-true master rows of a reviewed manifest (spec
     amendment 2026-10-14, item 7; #1682 lever B; data-foundation plan T191),
     on `conn`, inside the caller's transaction (`open_for_write`, so a
     refusal or failure rolls everything back); with `dry_run`, check and
-    count them and change nothing.
+    count them and change nothing. The rows move into `retracted_rows`
+    (ADR 0029, #3275, T392) with the reason, the release and the key's
+    manifest lines as the rule, and `restore` puts them back; the tables
+    hold what a delete would have left.
 
     A stored `listings` or `delistings` row that was never right at any
     instant (a note's listing, or its Form 25, on the common's id) has no
-    `known_at` at which a retraction could be stored (the #1613 rule): it is
-    deleted, the release's backup being the history. Each manifest row is
+    `known_at` at which a `retracted` revision could be stored (the #1613
+    rule): it is retracted into `retracted_rows`, every revision of its key
+    with it. Each manifest row is
     **refused** unless:
 
     - exactly one stored row has its key and `known_at`, an EDGAR `filing`
@@ -1967,10 +1966,10 @@ def delete_master_rows(
     A dry run lists every row found and refused. A real run deletes only a
     manifest with no refused row, only inside the open data release
     `release` (`release_refusal`), and raises `RepairRefused` before
-    anything is deleted otherwise; it writes one `ingestion_runs` row
+    anything is retracted otherwise; it writes one `ingestion_runs` row
     (source `edgar`, mode `repair`, status `repaired`) with the counts. A
-    delete that misses its count raises `RuntimeError`, so the caller's
-    transaction rolls back. A delete is not a revision: an as-of read at a
+    retraction that misses its count raises `RuntimeError`, so the caller's
+    transaction rolls back. A retraction is not a revision: an as-of read at a
     `t` before a row's `known_at` is unchanged, and one after it no longer
     sees the row (the delete-only rerun rule of
     `docs/runbooks/data-releases.md` applies to the sweeps that read it)."""
@@ -2004,13 +2003,18 @@ def delete_master_rows(
         return result
     if refused:
         raise RepairRefused(
-            f"{len(refused)} of {len(manifest)} manifest rows refused; nothing deleted:\n"
+            f"{len(refused)} of {len(manifest)} manifest rows refused; nothing retracted:\n"
             + "\n".join(refused)
         )
-    deleted = sum(_delete_master_row(conn, row) for row in passing)
-    if deleted != len(passing):  # never a partial delete
+    moved = _retract_master_rows(
+        conn,
+        passing,
+        reason="delete-master-rows: a master row never right at any instant",
+        release=release,
+    )
+    if moved != len(passing):  # never a partial retraction
         raise RuntimeError(
-            f"delete removed {deleted} rows where the manifest names {len(passing)}; rolled back"
+            f"retraction moved {moved} rows where the manifest names {len(passing)}; rolled back"
         )
     run = SourceRun("edgar", REPAIRED, 0, "", result.summary())
     _write_run(conn, uuid.uuid4().hex, started, clock(), run, REPAIR)
