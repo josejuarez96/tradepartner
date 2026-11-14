@@ -61,6 +61,10 @@ a filing ends only a listing already known at T.
   any title `_is_plain_title` refuses) never ends an untitled
   (`snapshot_static`) listing: that listing cannot show it is the class
   the filing names.
+- **Snapshot dated to its Form 25** (#3292). An untitled (`snapshot_static`)
+  listing whose `valid_from` is on or after the filing session is not ended
+  by it when a bar known at T falls after `effective_on`: the row records a
+  line that traded on (CSQ, SBI). With no such bar it is a delisting.
 - **Debt class** (#2937). A filing whose title names a debt class (a note,
   debenture or bond, no common word: Verizon's "2.375% Notes due 2022") never
   ends a common or untitled listing, only a listing of its own class: once the
@@ -442,7 +446,25 @@ def _ended_listing(
         return None
     if _spares(delisting, target):
         return None
+    if _snapshot_runs_on(target, delisting, session, last_bar):
+        return None
     return target
+
+
+def _snapshot_runs_on(target: Row, delisting: Row, session: date, last_bar: date | None) -> bool:
+    """Whether `target`, an untitled (`snapshot_static`) listing first dated on
+    or after the filing session, shows its line went on (#3292: CSQ's Nasdaq
+    withdrawal of 2007, SBI's NYSE Form 25 of 2017). A snapshot row dated to
+    the Form 25 day is a cover-less record of a line that traded past it,
+    shown by a bar after `effective_on`; without such a bar the filing is the
+    delisting it reads as. `last_bar` is the latest bar known at T, so the
+    reading is the one a run at T would make."""
+    return (
+        target["class_title"] is None
+        and target["valid_from"] >= session
+        and last_bar is not None
+        and last_bar > delisting["effective_on"]
+    )
 
 
 def _on_exchange(siblings: list[Row], session: date) -> bool:
