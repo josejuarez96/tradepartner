@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import csv
 import dataclasses
+import inspect
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ from tradepartner.store import registry
 from tradepartner.store.asof import adjusted_prices_as_of, prices_as_of
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.dividend_reviews import ReviewedGroup
+from tradepartner.store.retracted_rows import restore
 from tradepartner.store.retraction import retraction
 from tradepartner.store.schema import init_schema
 
@@ -1461,7 +1463,7 @@ def test_a_master_dry_run_lists_every_row_and_changes_nothing(vz: Settings) -> N
     result = _delete_master(vz, dry_run=True)
     assert (result.listings, result.delistings, result.refused) == (2, 1, ())
     assert result.summary() == (
-        f"would delete 2 listings and 1 delistings rows of 3 manifest rows; refused 0; "
+        f"would retract 2 listings and 1 delistings rows of 3 manifest rows; refused 0; "
         f"release {REL}"
     )
     assert [line.split(" known_at")[0] for line in result.found] == [
@@ -1475,7 +1477,7 @@ def test_a_master_dry_run_lists_every_row_and_changes_nothing(vz: Settings) -> N
 
 def test_the_delete_removes_only_the_manifest_rows_and_records_the_run(vz: Settings) -> None:
     result = _delete_master(vz)
-    assert not result.dry_run and result.summary().startswith("deleted 2 listings and 1 ")
+    assert not result.dry_run and result.summary().startswith("retracted 2 listings and 1 ")
     assert _master_rows(vz) == [
         ("listings", "VZ", COMMON_KNOWN),
         ("listings", "VZ", RETRACTED_AT),
@@ -1531,7 +1533,7 @@ def test_a_refused_row_is_listed_and_the_real_run_deletes_nothing(
     before = _master_rows(vz)
     dry = _delete_master(vz, manifest, dry_run=True, headers=headers)
     assert dry.refused and all(reason in line for line in dry.refused), dry.refused
-    with pytest.raises(RepairRefused, match="nothing deleted"):
+    with pytest.raises(RepairRefused, match="nothing retracted"):
         _delete_master(vz, manifest, headers=headers)
     assert _master_rows(vz) == before
     assert _rows(vz, "SELECT count(*) FROM ingestion_runs") == [(0,)]
@@ -1547,6 +1549,37 @@ def test_a_master_delete_writes_only_inside_the_open_release_of_its_name(vz: Set
         _delete_master(vz)
     assert len(_master_rows(vz)) == 5
     assert _delete_master(vz, dry_run=True).refused == ()  # a dry run needs no open release
+
+
+def test_a_deleted_master_row_is_retracted_with_its_manifest_line_as_the_rule(
+    vz: Settings,
+) -> None:
+    _delete_master(vz)
+    moved = _rows(
+        vz,
+        "SELECT table_name, row_values['ticker'], row_values['known_at'], reason, release, rule, "
+        "restored_at FROM retracted_rows ORDER BY retraction_id",
+    )
+    assert len(moved) == 3
+    assert {m[0] for m in moved} == {"listings", "delistings"}
+    assert all(m[3].startswith("delete-master-rows") and m[4] == REL for m in moved)
+    assert all(m[6] is None for m in moved)
+    labels = {r.label() for r in _note_manifest()}
+    for m in moved:  # the rule names the manifest line (a key's revisions share one rule)
+        assert any(label in m[5] for label in labels)
+    assert {label for label in labels if any(label in m[5] for m in moved)} == labels
+    # Restoring puts the never-true rows back with their original stamps.
+    with open_for_write(vz) as conn:
+        assert restore(conn, release=REL) == 3
+    assert len(_master_rows(vz)) == 5
+    assert COMMON_KNOWN in {r[2] for r in _master_rows(vz)}
+
+
+def test_the_master_delete_issues_no_delete_on_the_fact_tables() -> None:
+    source = inspect.getsource(repair.delete_master_rows) + inspect.getsource(
+        repair._retract_master_rows
+    )
+    assert "DELETE FROM" not in source
 
 
 def _open_paper_window(settings: Settings, started_at: datetime) -> None:
@@ -1592,10 +1625,10 @@ def test_a_row_known_inside_an_open_window_is_refused(vz: Settings) -> None:
     assert "known inside the open paper window (first session 2026-10-12)" in retraction[0]
 
 
-def test_a_delete_that_misses_its_count_rolls_the_master_back(
+def test_a_retraction_that_misses_its_count_rolls_the_master_back(
     vz: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(repair, "_delete_master_row", lambda conn, row: 0)
+    monkeypatch.setattr(repair, "retract", lambda *args, **kwargs: 0)
     with pytest.raises(RuntimeError, match="rolled back"):
         _delete_master(vz)
     assert len(_master_rows(vz)) == 5
