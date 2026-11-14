@@ -312,11 +312,16 @@ def test_ack_timeout_stays_pending_until_next_run(env: Env, window: PaperWindowR
     assert len(fills) == len(orders) - 1
     assert len(env.alerts("pending_unresolved")) == 1
 
-    second = env.run(at(date(2019, 5, 2)))
-    assert second.status == "ok"
+    # The submit reply confirmed the order (#3335): the coid lookup missing is not
+    # proof the broker never got it, so the next run stops rather than resend.
+    submits = len(env.submits())
+    with pytest.raises(ReconciliationError, match="confirmed by the broker"):
+        env.run(at(date(2019, 5, 2)))
+    assert len(env.submits()) == submits
     assert env.query(
-        "SELECT status FROM reconciliations ORDER BY reconciliation_id DESC LIMIT 1"
-    ) == [("ok",)]
+        "SELECT count(*) FROM order_events WHERE client_order_id = ? AND status = 'cancelled'",
+        [coid],
+    ) == [(0,)]
 
 
 def test_partial_fill_is_journaled_without_completing_the_order(

@@ -2904,6 +2904,26 @@ def unresolved_orders(
     return [o for o in unsettled if o.client_order_id in marked]
 
 
+def _confirmed_broker_ids(
+    connect: Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]],
+    orders: Sequence[OrderRow],
+) -> dict[str, str]:
+    """The broker order id journaled on each of `orders`' `pending_unresolved`
+    event (the submit reply's, #3335); an order whose submit was not confirmed is
+    absent."""
+    if not orders:
+        return {}
+    with connect() as conn:
+        events = order_events_for(
+            conn, window_id=None, client_order_ids=[o.client_order_id for o in orders]
+        )
+    return {
+        e.client_order_id: e.broker_order_id
+        for e in events
+        if e.status == "pending_unresolved" and e.broker_order_id is not None
+    }
+
+
 def settle_pending_unresolved(
     broker: Broker,
     connect: Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]],
@@ -2916,18 +2936,35 @@ def settle_pending_unresolved(
     The broker knows it: an `accepted` event with the broker's order id (the
     collection that follows journals its fills and terminal event). It does not
     (`UnknownOrderError`): `cancelled` with reason `not_received`, so the
-    decision is open again. A read that fails otherwise, or a broker order whose
+    decision is open again, unless the submit reply was journaled on its
+    `pending_unresolved` event (#3335): then the order is read by that broker id
+    among the open orders, and a miss raises `ReconciliationError`. A read that
+    fails otherwise, or a broker order whose
     `symbol`, `side`, `notional` or `quantity` differ from the journal row, raises
     `ReconciliationError` and writes nothing, leaving the order unsettled (a
     `ClockError` keeps its type)."""
     readings: dict[str, Order | None] = {}
+    confirmed = _confirmed_broker_ids(connect, orders)
     for order in orders:
         coid = order.client_order_id
         try:
             got = broker.get_order(coid)
         except UnknownOrderError:
-            readings[coid] = None
-            continue
+            broker_id = confirmed.get(coid)
+            if broker_id is None:
+                readings[coid] = None
+                continue
+            # The submit reply confirmed the order (#3335): a coid miss is a lagging
+            # lookup, never proof the broker never got it. Find it by broker id among
+            # the open orders, else fail closed and leave it unsettled.
+            listed = [o for o in broker.open_orders() if o.broker_order_id == broker_id]
+            if not listed:
+                raise ReconciliationError(
+                    f"pending_unresolved order {coid} was confirmed by the broker "
+                    f"(broker_order_id {broker_id}) but is not found by client_order_id "
+                    "or among the open orders: not closed not_received"
+                ) from None
+            got = listed[0]
         except ClockError:
             raise
         except Exception as exc:

@@ -1933,7 +1933,7 @@ class RiskGatedBroker:
             else:
                 if on_submit is not None:
                     on_submit()
-                if not self._acknowledge(run, request.client_order_id):
+                if not self._acknowledge(run, request.client_order_id, placed.broker_order_id):
                     self._recheck = True
                     self._set_aside.add(request.client_order_id)
                     submitted.append(request.client_order_id)
@@ -2011,13 +2011,17 @@ class RiskGatedBroker:
             )
         return Skip(row.decision_id, row.security_id, reason)
 
-    def _acknowledge(self, run: PaperRunRow, coid: str) -> bool:
+    def _acknowledge(
+        self, run: PaperRunRow, coid: str, confirmed_broker_order_id: str | None = None
+    ) -> bool:
         """Poll `get_order` until the broker knows the order, then journal its
         `accepted` event and check its shape (module docstring); True once
         acknowledged. At `paper.accept_wait_max_seconds` the run's first
         timeout journals one `pending_unresolved` event and one alert and
         returns False; a second raises `AcknowledgementTimeoutError`, the
-        order left `pending`."""
+        order left `pending`. `confirmed_broker_order_id` is the id of the broker's
+        reply to `submit`, journaled on the `pending_unresolved` event so a later
+        run never closes a confirmed order `not_received` (#3335)."""
         paper = self._settings.paper
         deadline = self.read_clock() + timedelta(seconds=paper.accept_wait_max_seconds)
         while True:
@@ -2026,7 +2030,7 @@ class RiskGatedBroker:
             except UnknownOrderError:
                 now = self.read_clock()
                 if now >= deadline:
-                    self._leave_unresolved(run, coid)
+                    self._leave_unresolved(run, coid, confirmed_broker_order_id)
                     return False
                 self._sleep(min(paper.poll_interval_seconds, (deadline - now).total_seconds()))
                 continue
@@ -2047,9 +2051,12 @@ class RiskGatedBroker:
             _refuse_shape(order, Broker.get_order.__name__)
             return True
 
-    def _leave_unresolved(self, run: PaperRunRow, coid: str) -> None:
-        """Journal the run's one `pending_unresolved` event for `coid` and its
-        alert, or raise `AcknowledgementTimeoutError` when the run already has one."""
+    def _leave_unresolved(
+        self, run: PaperRunRow, coid: str, broker_order_id: str | None = None
+    ) -> None:
+        """Journal the run's one `pending_unresolved` event for `coid` (carrying
+        the submit reply's `broker_order_id`, #3335) and its alert, or raise
+        `AcknowledgementTimeoutError` when the run already has one."""
         assert run.run_id is not None
         wait = self._settings.paper.accept_wait_max_seconds
         with self._journal() as conn:
@@ -2072,6 +2079,7 @@ class RiskGatedBroker:
                 OrderEventRow(
                     client_order_id=coid,
                     status=_PENDING_UNRESOLVED,
+                    broker_order_id=broker_order_id,
                     known_at=stamp,
                     ingested_at=stamp,
                 ),
