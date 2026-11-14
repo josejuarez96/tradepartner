@@ -7,7 +7,7 @@ import json
 import re
 import uuid
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import fields, replace
 from datetime import datetime
 from pathlib import Path
@@ -23,7 +23,14 @@ from tradepartner.adapters.form4_bulk_route import request_budget
 from tradepartner.adapters.form4_route import quarter_of, rows_agree
 from tradepartner.config import Settings
 from tradepartner.ingest import SourceRun, _write_run
-from tradepartner.repair import REPAIR, REPAIRED, release_refusal
+from tradepartner.repair import (
+    REPAIR,
+    REPAIRED,
+    RepairRefused,
+    known_dates,
+    refuse_inside_open_window,
+    release_refusal,
+)
 from tradepartner.store.db import open_for_write, open_read_only, utc_now
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -360,6 +367,7 @@ def repair_form4_multi_owner(
         if len(changes) != expect_rows:
             raise MultiOwnerRepairRefused(f"found {len(changes)} rows; expected {expect_rows}")
         if not dry_run and changes:
+            _refuse_in_window(conn, [tuple(e["key"]) for e in changes])
             at = ensure_tz_aware_utc(clock(), field_name="clock")
             conn.execute(
                 "CREATE TEMP TABLE _form4_multi_changes ("
@@ -401,3 +409,21 @@ def repair_form4_multi_owner(
                 REPAIR,
             )
         return len(changes)
+
+
+def _refuse_in_window(
+    conn: duckdb.DuckDBPyConnection, keys: Sequence[tuple[str, str, int]]
+) -> None:
+    """Refuse, before any write, rows known inside an open paper window (#3330)."""
+    found = [
+        conn.execute(
+            "SELECT known_at FROM sec_form4_transactions "
+            "WHERE accession = ? AND filer_cik = ? AND line_no = ?",
+            list(key),
+        ).fetchone()
+        for key in keys
+    ]
+    try:
+        refuse_inside_open_window(conn, known_dates(row[0] for row in found if row is not None))
+    except RepairRefused as exc:
+        raise MultiOwnerRepairRefused(str(exc)) from exc

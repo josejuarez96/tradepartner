@@ -5,15 +5,24 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import duckdb
+
 from tradepartner.adapters.edgar_insider_bulk import read_insider_bulk
 from tradepartner.config import Settings
 from tradepartner.ingest import SourceRun, write_run
-from tradepartner.repair import REPAIR, REPAIRED, release_refusal
+from tradepartner.repair import (
+    REPAIR,
+    REPAIRED,
+    RepairRefused,
+    known_dates,
+    refuse_inside_open_window,
+    release_refusal,
+)
 from tradepartner.repair_form4_roles import sha_file
 from tradepartner.store.db import open_for_write, open_read_only, utc_now
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -172,6 +181,7 @@ def repair_form4_titles(
         if len(changes) != expect_rows:
             raise TitleRepairRefused(f"found {len(changes)} rows; expected {expect_rows}")
         if not dry_run and changes:
+            _refuse_in_window(conn, [key for _, key in changes])
             at = ensure_tz_aware_utc(clock(), field_name="clock")
             conn.execute(
                 "CREATE TEMP TABLE _form4_title_changes ("
@@ -212,3 +222,21 @@ def repair_form4_titles(
                 REPAIR,
             )
         return len(changes)
+
+
+def _refuse_in_window(
+    conn: duckdb.DuckDBPyConnection, keys: Sequence[tuple[str, str, int]]
+) -> None:
+    """Refuse, before any write, rows known inside an open paper window (#3330)."""
+    found = [
+        conn.execute(
+            "SELECT known_at FROM sec_form4_transactions "
+            "WHERE accession = ? AND filer_cik = ? AND line_no = ?",
+            list(key),
+        ).fetchone()
+        for key in keys
+    ]
+    try:
+        refuse_inside_open_window(conn, known_dates(row[0] for row in found if row is not None))
+    except RepairRefused as exc:
+        raise TitleRepairRefused(str(exc)) from exc
