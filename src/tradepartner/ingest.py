@@ -5363,7 +5363,8 @@ class RestampResult:
     def message(self) -> str:
         """The run message's restamp part."""
         moved = ", ".join(
-            f"{t} {self.moved.get(t, 0)}" for t in (*RESTAMP_TABLES, *RESTAMP_ACCESSION_TABLES)
+            f"{t} {self.moved.get(t, 0)}"
+            for t in (*RESTAMP_TABLES, "delisting_reasons", *RESTAMP_ACCESSION_TABLES)
         )
         refused = ", ".join(f"{cik} ({why})" for cik, why in sorted(self.refused.items()))
         return (
@@ -5436,6 +5437,13 @@ def restamp_from_manifest(
     delisting's stamp) and `ingested_at` as its `ingested_at`; nothing else
     changes. A moved `facts` row with a later stored ingest of its accession (or a revision at
     its own) keeps its `ingested_at` (#2970), so a restamp never changes a read after it.
+
+    Every reason revision keyed to a moved delisting follows its `filed_at` to
+    the new stamp. A Form 25 reason known at the old stamp moves to the new
+    stamp; independent evidence keeps its acceptance time, and an as-of read
+    cannot attach it before the corrected filing.
+    A move is refused when independent evidence falls between the old and
+    corrected filing times, since its classification would need a rebuild.
 
     **`filing_index`** (T318b, #2703) has its own match path, on
     `(cik, accession)` with `accepted_at` equal to the old stamp (EDGAR
@@ -5585,6 +5593,24 @@ def restamp_from_manifest(
         "AND m.class_title = t.class_title AND m.exchange = t.exchange "
         f"AND m.old = t.known_at AND m.old = t.filed_at WHERE {_RESTAMPABLE} AND {keep}"
     )
+    # The Form 25's own reason moves with its corrected acceptance. Independent
+    # evidence never moves earlier, and no reason precedes the corrected filing.
+    reason_new_known = (
+        "CASE WHEN r.reason_source IN ('form25_provision', 'form25_text') "
+        "AND r.known_at = m.old THEN m.new "
+        "WHEN r.reason_source = 'eightk_item' THEN r.known_at "
+        "ELSE greatest(r.known_at, m.new) END"
+    )
+    matched_reasons = (
+        "FROM delisting_reasons r JOIN delistings t ON "
+        "r.security_id = t.security_id AND r.delisting_form = t.form "
+        "AND r.delisting_class_title = t.class_title "
+        "AND r.delisting_exchange = t.exchange AND r.delisting_filed_at = t.filed_at "
+        "JOIN _restamp_sids s ON s.security_id = t.security_id "
+        "JOIN _restamp_delisting m ON m.subject = s.cik AND m.form = t.form "
+        "AND m.class_title = t.class_title AND m.exchange = t.exchange "
+        f"AND m.old = t.known_at AND m.old = t.filed_at WHERE {_RESTAMPABLE} AND {keep}"
+    )
     refused: dict[str, str] = {}
     derived: dict[str, str] = {
         "securities": "m.session_moves AND t.security_id LIKE '%@%'",  # a successor's id
@@ -5611,6 +5637,31 @@ def restamp_from_manifest(
             f"(SELECT 1 FROM {table} o WHERE {same_key} AND {target})"
         ).fetchall():
             refused.setdefault(cik, f"{table}: a row is already stored at the new stamp")
+    for (cik,) in conn.execute(
+        "SELECT DISTINCT s.cik "
+        f"{matched_reasons} AND EXISTS (SELECT 1 FROM delisting_reasons o "
+        "WHERE o.security_id = r.security_id AND o.delisting_form = r.delisting_form "
+        "AND o.delisting_class_title = r.delisting_class_title "
+        "AND o.delisting_exchange = r.delisting_exchange "
+        f"AND o.delisting_filed_at = m.new AND o.known_at = {reason_new_known})"
+    ).fetchall():
+        refused.setdefault(cik, "delisting_reasons: a revision is already stored at the new key")
+    for (cik,) in conn.execute(
+        f"SELECT DISTINCT s.cik {matched_reasons} "
+        "AND r.reason_source NOT IN ('form25_provision', 'form25_text') "
+        "AND ((m.new < m.old AND r.known_at >= m.new AND r.known_at <= m.old) "
+        "OR (m.new > m.old AND r.known_at > m.old AND r.known_at < m.new))"
+    ).fetchall():
+        refused.setdefault(cik, "delisting_reasons: evidence between the corrected stamps")
+    for (cik,) in conn.execute(
+        "SELECT any_value(cik) FROM (SELECT DISTINCT s.cik, r.rowid, r.security_id, "
+        "r.delisting_form, "
+        "r.delisting_class_title, r.delisting_exchange, m.new, "
+        f"{reason_new_known} AS new_known {matched_reasons}) "
+        "GROUP BY security_id, delisting_form, delisting_class_title, "
+        "delisting_exchange, new, new_known HAVING count(*) > 1"
+    ).fetchall():
+        refused.setdefault(cik, "delisting_reasons: revisions would share a new key")
     _stage_filing_index_changes(conn, moving, filed)
     for cik, why in _filing_index_refusals(conn, filed).items():
         refused.setdefault(cik, why)
@@ -5625,6 +5676,21 @@ def restamp_from_manifest(
 
     before = {t: _security_ids(conn, t) for t in RESTAMP_TABLES}
     moved: dict[str, int] = {}
+    (reason_count,) = conn.execute(
+        f"SELECT count(DISTINCT r.rowid) {matched_reasons}"
+    ).fetchone() or (0,)
+    moved["delisting_reasons"] = int(reason_count)
+    if reason_count:
+        # The episode key is a stored revision too, even when an 8-K's own
+        # evidence acceptance stays fixed; record this ingest of the new key.
+        conn.execute(
+            "UPDATE delisting_reasons SET delisting_filed_at = u.new, "
+            "known_at = u.new_known, reason_known_at = u.new_known, ingested_at = ? "
+            "FROM (SELECT DISTINCT r.rowid AS rid, m.new AS new, "
+            f"{reason_new_known} AS new_known "
+            f"{matched_reasons}) u WHERE delisting_reasons.rowid = u.rid",
+            [ingested_at],
+        )
     for table in RESTAMP_TABLES:
         (count,) = conn.execute(f"SELECT count(DISTINCT t.rowid) {matched[table]}").fetchone() or (
             0,
