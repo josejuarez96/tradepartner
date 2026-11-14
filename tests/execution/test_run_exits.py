@@ -926,6 +926,51 @@ def test_an_unrelated_stale_order_with_no_bar_does_not_block_a_forced_exit(
     assert env.held().get("TRNS", 0.0) < 1e-6
 
 
+def foreign_book_open_sell(env: Env, made: datetime, security_id: str, symbol: str) -> None:
+    """An open (never-terminal) sell of `security_id` in another book (#3334): a
+    row only, the other book's own account holds the broker side."""
+    run_id = env.latest_run()
+    decision_id = 9_999  # the other book's decision lives in its own window
+    coid = "tp-other-book-open-sell"
+    env.append(
+        OrderRow(
+            client_order_id=coid,
+            decision_id=decision_id,
+            run_id=run_id,
+            session=made.date(),
+            attempt=1,
+            phase="exit",
+            security_id=security_id,
+            symbol=symbol,
+            side="sell",
+            quantity=1.0,
+            book_id="other",
+            sells_in_flight_at_submit=False,
+            known_at=made,
+            ingested_at=made,
+        ),
+        OrderEventRow(client_order_id=coid, status="pending", known_at=made, ingested_at=made),
+    )
+
+
+def test_another_books_open_sell_does_not_suppress_this_books_forced_exit(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """#3334: the exit book's open sells are this book's only; a sell open in
+    book `other` for a name this book holds leaves its delisted exit alone."""
+    bought(env)
+    foreign_book_open_sell(env, at(F_0_PLUS_1, 15, 0), "SEC_TRANSFER", "TRNS")
+    held = env.held()["TRNS"]
+    ended_before(env, MAY_3)
+    outcome = env.run(at(MAY_3))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    # The other book's own decision (run 1) also reads; this run's is the one.
+    mine = [e for e in exits(env, "SEC_TRANSFER") if e[3] == outcome.run_id]
+    assert [e[1] for e in mine] == ["delisted"]
+    orders = [o for o in exit_orders(env, "SEC_TRANSFER") if o[0] != "tp-other-book-open-sell"]
+    assert [o[3] for o in orders] == [pytest.approx(held)]
+
+
 def test_a_held_name_with_no_bar_still_halts_step_7(
     env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -687,7 +687,11 @@ def _exit_book(context: StepContext) -> _ExitBook:
     with open_read_only(context.settings, retry=True) as conn:
         actions = live_actions_as_of(conn, cut)
         journaled = decisions_for(conn, window_id)
-        orders = orders_for(conn, window_id=None)
+        # This book's orders only: another book's open sell is its own account's
+        # (#3334, #2475, as the wrapper's `_own_book_rows`).
+        orders = [
+            o for o in orders_for(conn, window_id=None) if o.book_id == context.window.book_id
+        ]
         events = order_events_for(conn, window_id=None)
         fills = fills_for(conn)
         adjustments = adjustments_for(conn, window_id)
