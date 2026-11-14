@@ -12,6 +12,7 @@ import os
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from tradepartner import calendar as tp_calendar
@@ -370,6 +371,43 @@ def test_env_file_swapped_with_same_size_and_mtime_takes_effect(
     after = env_file.stat()
     assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
     assert tp_calendar.all_sessions()[-1] == date(2032, 12, 31)
+
+
+def test_config_fingerprint_is_stable_until_the_config_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Same token while nothing changed; a new token for an env or `.env` change (#3238)."""
+    env_file = tmp_path / "calendar.env"
+    env_file.write_text("CALENDAR__END=2030-12-31\n")
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(env_file))
+    first = tp_calendar._config_fingerprint()
+    assert tp_calendar._config_fingerprint() == first
+    monkeypatch.setenv("TP_TEST_UNRELATED", "1")
+    second = tp_calendar._config_fingerprint()
+    assert second != first
+    assert tp_calendar._config_fingerprint() == second
+    env_file.write_text("CALENDAR__END=2031-12-31\n")
+    third = tp_calendar._config_fingerprint()
+    assert third not in (first, second)
+    monkeypatch.delenv("TP_TEST_UNRELATED")
+    assert tp_calendar._config_fingerprint() != third
+
+
+def test_session_answers_are_unchanged_by_the_cached_fingerprint() -> None:
+    """Answers across holidays and weekends match a fresh calendar read per call."""
+    days = [date(2024, 1, 1) + (date(2024, 1, 2) - date(2024, 1, 1)) * i for i in range(400)]
+    cal = tp_calendar._get_calendar()
+    for day in days:
+        ts = pd.Timestamp(day)
+        assert tp_calendar.is_session(day) == bool(cal.is_session(ts))
+        assert (
+            tp_calendar.next_session(day)
+            == cal.date_to_session(ts + pd.Timedelta(days=1), "next").date()
+        )
+        assert (
+            tp_calendar.previous_session(day)
+            == cal.date_to_session(ts - pd.Timedelta(days=1), "previous").date()
+        )
 
 
 # --- cadence helpers (strategy-lab spec "Cadence"; T94) ------------------
