@@ -1334,7 +1334,7 @@ class TestSnapshotDatedToItsForm25:
             date(2007, 6, 11),
             _ny(2007, 6, 11, 9, 0),
             date(2007, 6, 21),
-            [date(2007, 6, 8), date(2016, 3, 1), date(2026, 11, 6)],
+            [date(2016, 3, 1), date(2026, 11, 6)],
         )
         assert ends.select("status", "end_session").rows() == [("listed", None)]
 
@@ -1362,6 +1362,25 @@ class TestSnapshotDatedToItsForm25:
             date(2007, 6, 11), _ny(2007, 6, 11, 9, 0), date(2007, 6, 21), [date(2007, 6, 8)]
         )
         assert ends["status"].to_list() == ["delisted"]
+
+    def test_relisting_gap_after_prior_history_still_ends(self) -> None:
+        # Bars exist before the Form 25 and only years after it: two lines.
+        ends = _g3_ends(
+            date(2007, 6, 11),
+            _ny(2007, 6, 11, 9, 0),
+            date(2007, 6, 21),
+            [date(2007, 6, 8), date(2016, 3, 1)],
+        )
+        assert ends["status"].to_list() == ["delisted"]
+
+    def test_bar_inside_the_window_with_prior_history_continues(self) -> None:
+        ends = _g3_ends(
+            date(2007, 6, 11),
+            _ny(2007, 6, 11, 9, 0),
+            date(2007, 6, 21),
+            [date(2007, 6, 8), date(2007, 6, 25), date(2016, 3, 1)],
+        )
+        assert ends["status"].to_list() == ["listed"]
 
     def test_titled_listing_dated_to_the_form_25_still_ends(self) -> None:
         ends = _g3_ends(
