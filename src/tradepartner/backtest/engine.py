@@ -195,6 +195,7 @@ from tradepartner.calendar import (
 from tradepartner.config import Cadence, HypothesisFamily, Settings
 from tradepartner.config_backtest import DELISTING_POLICIES, DelistingPolicy
 from tradepartner.store.delistings import DELISTED
+from tradepartner.store.listing_selection import prefer_current_listing
 from tradepartner.store.registry import EquityRow, RebalanceRow, TrialHandle, WeightRow
 from tradepartner.universe import Universe
 
@@ -613,7 +614,7 @@ def _ended_listings(listing_ends: pl.DataFrame, session: date) -> dict[str, dict
         if valid_from is not None and valid_from > session:
             continue
         held = current.get(row["security_id"])
-        if held is None or (valid_from is not None and (held[0] is None or valid_from > held[0])):
+        if prefer_current_listing(row, held[1] if held is not None else None, session):
             current[row["security_id"]] = (valid_from, row)
     return {
         sid: {
@@ -629,9 +630,9 @@ def _ended(listing_ends: pl.DataFrame, session: date) -> dict[str, date | None]:
     """Securities whose current listing at the read is `delisted`, each with its final
     session (`end_session`, None when it has none).
 
-    The current listing is the row with the latest `valid_from` on or before `session`,
-    as in `universe._current_listings`: a filing ends only the listing it names, so an
-    earlier listing left behind by a ticker change stays `listed` and must not decide.
+    The current listing has the latest `valid_from` on or before `session`.
+    On a same-day tie, a delisted line wins so a stale listed sibling cannot
+    hide a real exit; otherwise a live line wins over a withdrawn line.
     A `transferred` listing (a Form 25 transfer to another exchange, still trading) is
     not an end, the same rule `execution.planning._ended` uses (#555): the business
     keeps trading, just elsewhere -- including in the narrow window where the new

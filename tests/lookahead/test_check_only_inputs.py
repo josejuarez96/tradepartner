@@ -330,3 +330,54 @@ def test_the_run_is_byte_identical_with_the_figi_table_populated_and_empty(
         outputs[variant] = RUNS[name](store, work)
     assert outputs["empty"] == outputs["populated"]
     assert len(outputs["empty"]) > 100  # the run produced something to compare
+
+
+# The identity answer key (#3275, ADR 0029, T394): judges the resolver, is never
+# read by a universe, signal, backtest or research module.
+_ID_KEY_SOURCES = ("backtest/", "research/", "universe.py", "signals/", "signal.py")
+_ID_KEY_NAMING = (
+    re.compile(r"identity_answer_key"),
+    re.compile(r"store\.identity_answer_key\b"),
+)
+
+
+def _id_key_offences(relative: str, text: str) -> list[str]:
+    """Why the module at `relative` imports or names the identity answer key,
+    when it sits on a universe, signal, backtest or research path."""
+    if not relative.startswith(_ID_KEY_SOURCES):
+        return []
+    return [f"{relative}: names the identity answer key" for p in _ID_KEY_NAMING if p.search(text)][
+        :1
+    ]
+
+
+def test_no_universe_signal_backtest_or_research_module_names_the_identity_key() -> None:
+    scanned = [
+        path
+        for path in sorted(_SRC.rglob("*.py"))
+        if path.relative_to(_SRC).as_posix().startswith(_ID_KEY_SOURCES)
+    ]
+    assert scanned  # the scan is not vacuous
+    offences = [
+        offence
+        for path in scanned
+        for offence in _id_key_offences(path.relative_to(_SRC).as_posix(), path.read_text("utf-8"))
+    ]
+    assert offences == []
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ["universe.py", "backtest/run.py", "research/foo.py", "signals/momentum.py"],
+)
+@pytest.mark.parametrize(
+    "text",
+    [
+        "from tradepartner.store.identity_answer_key import load_answer_key\n",
+        "from tradepartner.store import identity_answer_key\n",
+        'PATH = "store/identity_answer_key.toml"\n',
+    ],
+)
+def test_the_identity_key_scan_fails_on_a_planted_import(relative: str, text: str) -> None:
+    assert _id_key_offences(relative, text)
+    assert _id_key_offences("store/identity_check.py", text) == []
