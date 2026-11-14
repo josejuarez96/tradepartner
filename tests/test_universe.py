@@ -774,3 +774,59 @@ def test_a_nyse_class_ticker_matches_its_alpaca_symbol_through_class_symbols(
         alpaca={"class_symbols": {"SPLT": "SPL.T"}},
     )
     assert "SEC_SPLIT_PLAIN" in _members(universe_as_of(fixture_store, _AFTER_SNAPSHOT, mapped))
+
+
+# Rule 7 passes for SEC_TRANSFER through 2019-05 (its shares fact is from 2018-04).
+T_TXSE = datetime(2019, 3, 29, 21, 0, tzinfo=UTC)
+
+
+def _insert_txse_listing(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    """A DDS/TCBI/IBOC-shaped move (#3384): SEC_TRANSFER, already moved to
+    NASDAQ, takes a `TXSE` listing row known 2019-03-04 (a reviewed row, #3293)."""
+    insert_row(
+        fixture_store,
+        "listings",
+        {
+            "security_id": "SEC_TRANSFER",
+            "ticker": "TRNS",
+            "exchange": "TXSE",
+            "class_title": "Common Stock",
+            "valid_from": date(2019, 3, 1),
+            "known_at": datetime(2019, 3, 4, 20, 30, tzinfo=UTC),
+            "ingested_at": datetime(2019, 3, 4, 20, 40, tzinfo=UTC),
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+
+def test_a_txse_listing_row_keeps_the_name_in_the_universe(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """ADR 0006 amendment 2026-11-14 (#3384): TXSE is a listed exchange."""
+    _insert_txse_listing(fixture_store)
+    u = universe_as_of(fixture_store, T_TXSE, _settings())
+    assert _member(u, "SEC_TRANSFER")["exchange"] == "TXSE"
+
+
+def test_a_txse_row_counts_from_its_known_at_with_no_back_dating(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """Before the row's `known_at` the name keeps its NASDAQ line; the row
+    is never read back to its `valid_from`."""
+    _insert_txse_listing(fixture_store)
+    before = universe_as_of(fixture_store, datetime(2019, 3, 1, 21, 0, tzinfo=UTC), _settings())
+    assert _member(before, "SEC_TRANSFER")["exchange"] == "NASDAQ"
+    after = universe_as_of(fixture_store, datetime(2019, 3, 5, 21, 0, tzinfo=UTC), _settings())
+    assert _member(after, "SEC_TRANSFER")["exchange"] == "TXSE"
+
+
+def test_a_registration_storing_the_old_exchange_list_still_drops_a_txse_name(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """A frozen registration keeps its stored `universe.exchanges`: only the
+    live default gains TXSE, so a stored record's rebalance is unchanged."""
+    _insert_txse_listing(fixture_store)
+    old = _settings(exchanges=["NYSE", "NASDAQ", "NYSE_AMERICAN"])
+    excluded = _excluded(universe_as_of(fixture_store, T_TXSE, old))
+    assert excluded["SEC_TRANSFER"] == (2, "exchange", "exchange:TXSE")
