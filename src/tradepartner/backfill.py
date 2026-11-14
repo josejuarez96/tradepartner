@@ -137,13 +137,13 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import duckdb
 
 from tradepartner.adapters.alpaca_prices import ListingResolver, alpaca_symbol
 from tradepartner.adapters.filings import FilingSource
-from tradepartner.adapters.prices import ActionType, PriceSource
+from tradepartner.adapters.prices import ActionType, CorporateAction, PriceSource
 from tradepartner.calendar import is_session, next_session
 from tradepartner.config import Settings
 from tradepartner.ingest import (
@@ -1507,9 +1507,14 @@ def refetch_actions(
     if not dry_run:
         # #3303: a real run asks every month first, as the dry run does, and
         # refuses the whole run before writing if any month would refuse.
-        early = _refuse_ahead(settings, prices, since, windows, release, clock, only, span, allowed)
+        # #3312: the write reuses those answers, so each month is asked once.
+        once = _AskedOnce(prices)
+        asked = cast(PriceSource, once)
+        early = _refuse_ahead(settings, asked, since, windows, release, clock, only, span, allowed)
         if early is not None:
             return early
+        once.replay = True
+        prices = asked
     for window in windows:
         run = _refetch_month(
             settings,
@@ -1537,6 +1542,33 @@ def refetch_actions(
         span,
         tuple(sorted(refused)),
     )
+
+
+class _AskedOnce:
+    """A `PriceSource` that remembers each `corporate_actions` answer while
+    `replay` is False and, once it is True, hands each remembered answer back
+    once (then asks the source as before): the dry pass of a real
+    `refetch_actions` run (#3303) feeds its write (#3312). Every other call
+    goes to the wrapped source."""
+
+    def __init__(self, inner: PriceSource) -> None:
+        self._inner = inner
+        self._kept: dict[tuple[tuple[str, ...], date, date], list[CorporateAction]] = {}
+        self.replay = False
+
+    def corporate_actions(
+        self, security_ids: Sequence[str], start: date, end: date
+    ) -> list[CorporateAction]:
+        key = (tuple(security_ids), start, end)
+        if self.replay and key in self._kept:
+            return self._kept.pop(key)
+        got = self._inner.corporate_actions(security_ids, start, end)
+        if not self.replay:
+            self._kept[key] = list(got)
+        return got
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
 
 
 def _refuse_ahead(
