@@ -1562,8 +1562,9 @@ CREATE TABLE IF NOT EXISTS retracted_rows (
 )
 """
 
-#: The version-49 side table: out of `TABLE_NAMES`, `MASTER_CHECK_TABLE_NAMES`
-#: and the registry and journal tuples, so the look-ahead harness never sees it.
+#: The version-49 side table: listed in `MASTER_CHECK_TABLE_NAMES` (state tables), out
+#: of `TABLE_NAMES` and the registry and journal tuples, so the look-ahead harness never
+#: sees it.
 RETRACTED_ROWS_TABLE_NAMES: tuple[str, ...] = ("retracted_rows",)
 _RETRACTED_ROWS_TABLE_DDL: tuple[str, ...] = (_CREATE_RETRACTED_ROWS,)
 
