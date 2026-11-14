@@ -16,6 +16,7 @@ from tradepartner.adapters import edgar_source
 from tradepartner.config import Settings
 from tradepartner.config_edgar import PRE_2826_STATEMENT_FACTS
 from tradepartner.store import schema
+from tradepartner.store.listing_reviews import reviewed_listings
 
 # Bump when a builder changes its derivation from unchanged inputs. Cache and
 # schema versions below are read from their owners at call time, never copied.
@@ -70,6 +71,11 @@ PER_NAME_KEYS = (
     "edgar.class_member_overrides",
     "edgar.filename_listings_refused",
 )
+
+#: The reviewed listing rows (`store.listing_reviews`, #3293) as a per-name
+#: list outside the settings: an edit to the packaged file touches only the
+#: CIKs its entries name, like an edit to `master.chains`.
+REVIEWED_LISTINGS_KEY = "master.reviewed_listings"
 
 # Hashed, and also stored whole on the run row beside the per-name lists, so a later
 # run knows its base names (#2826). They are not in PER_NAME_KEYS: an edit to them
@@ -171,7 +177,10 @@ def build_fingerprint(settings: Settings) -> BuildFingerprint:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
     return BuildFingerprint(
         hash=hashlib.sha256(encoded).hexdigest(),
-        per_name={key: _setting(settings, key) for key in (*PER_NAME_KEYS, *STORED_STATEMENT_KEYS)},
+        per_name={
+            **{key: _setting(settings, key) for key in (*PER_NAME_KEYS, *STORED_STATEMENT_KEYS)},
+            REVIEWED_LISTINGS_KEY: [row.entry for row in reviewed_listings()],
+        },
     )
 
 

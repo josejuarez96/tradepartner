@@ -1,0 +1,7 @@
+security_id,ticker,exchange,class_title,valid_from,known_at,accession,reason,issue
+0000028917,DDS,TXSE,,2026-09-30,2026-09-30T20:58:51+00:00,0002054847-26-000023,Texas Stock Exchange CERT approves Dillard's common stock for listing; the NYSE Form 25 of 2026-10-05 withdraws the NYSE line,#3293
+0001077428,TCBI,TXSE,,2026-10-07,2026-10-07T21:22:27+00:00,0002054847-26-000035,Texas Stock Exchange CERT approves Texas Capital Bancshares common stock; the Nasdaq Form 25 of 2026-10-07 withdraws the Nasdaq line,#3293
+0000315709,IBOC,TXSE,,2026-10-13,2026-10-13T18:35:24+00:00,0002054847-26-000041,Texas Stock Exchange CERT approves International Bancshares common stock; the Nasdaq Form 25 of 2026-10-16 withdraws the Nasdaq line,#3293
+0001173382,CAE,NASDAQ,,2026-07-22,2026-07-22T21:11:15+00:00,0001354457-26-000724,Nasdaq CERT approves CAE common shares; the NYSE Form 25 of 2026-07-22 withdraws the NYSE line,#3293
+0001953575,CNL,NASDAQ,,2026-08-10,2026-08-10T21:11:41+00:00,0001354457-26-000773,Nasdaq CERT approves Collective Mining common shares; the NYSE American Form 25 of 2026-08-10 withdraws that line,#3293
+0000828146,LINK,NASDAQ,,2021-03-24,2021-03-24T19:10:45+00:00,0001354457-21-000405,Nasdaq CERT of 2021-03-24 (8-A12B 0001104659-21-040060 of 2021-03-23) relists Interlink common stock after the Nasdaq Form 25 of 2019-02-04,#3293
