@@ -651,6 +651,10 @@ COVERAGE_REFERENCE_NAMES = "coverage_reference_names"
 #: The index answer key's rule (#1682, T189b): reported from the
 #: `coverage_reference` block's `index_members`, never from `INTEGRITY_RULES`.
 INDEX_MEMBERS_MISSING = "index_members_missing"
+#: The freshness rule (#3329): the store has no price bars or is more than
+#: `health.max_stale_sessions` sessions behind. Reported by `check_failures`
+#: only, so the verdict line and the page keep describing the lag in words.
+STORE_STALE = "store_stale"
 #: The session-hole rule (#1575): an XNYS session in the universe history
 #: window whose `prices_daily` row count is below
 #: `health.min_session_rows_share` of the previous session's.
@@ -2490,6 +2494,8 @@ class HealthReport:
     )
     #: Delisting reasons and their evidence (plan T329); report-only.
     delisting_reasons: DelistingReasonsHealth | None = None
+    #: `health.max_stale_sessions` at report time (#3329), read by `check_failures`.
+    max_stale_sessions: int = 1
 
     @property
     def failures(self) -> tuple[str, ...]:
@@ -2515,6 +2521,17 @@ class HealthReport:
     def ok(self) -> bool:
         """True when nothing in `failures` fails."""
         return not self.failures
+
+    @property
+    def check_failures(self) -> tuple[str, ...]:
+        """What `health --check` fails on: `failures`, then `store_stale` when
+        the store has no price bars or is more than `health.max_stale_sessions`
+        sessions behind (#3329)."""
+        stale = stale_sessions(self)
+        limit = self.max_stale_sessions
+        if stale is None or stale > limit:
+            return (*self.failures, STORE_STALE)
+        return self.failures
 
 
 #: When the scheduled ingest runs (America/New_York). Source: the launchd plist in
@@ -2649,6 +2666,7 @@ def health_report(
         borrow=_borrow_report(conn, t, session, settings),
         mergers=_mergers_report(conn, t, ingests),
         delisting_reasons=delisting_reasons_report(conn, t, listings),
+        max_stale_sessions=settings.health.max_stale_sessions,
         figi_types=_figi_types_report(conn, t, session, settings, current, classes),
         duplicate_dividends=dividends,
         implausible_form4_dates=int(

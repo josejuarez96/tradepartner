@@ -1008,6 +1008,29 @@ def test_health_prints_the_report_and_check_passes_on_the_fixture_store(
     assert checked.exit_code == 0, checked.output
 
 
+def test_health_check_fails_a_stale_store(tmp_path: Path, fixture_store_path: Path) -> None:
+    """#3329: a store N sessions behind (past `health.max_stale_sessions`) must not print OK."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    late = T_END + timedelta(days=7)  # 2020-07-07 evening: 4 sessions behind
+    failed = _invoke(settings, ["health", "--check"], clock=lambda: late)
+    assert failed.exit_code == 1, failed.output
+    assert "store_stale" in failed.output
+    assert "health: OK" not in failed.output
+    lenient = _settings(tmp_path, store=fixture_store_path, health={"max_stale_sessions": 5})
+    assert _invoke(lenient, ["health", "--check"], clock=lambda: late).exit_code == 0
+
+
+def test_health_check_fails_an_empty_store(tmp_path: Path) -> None:
+    """#3329: a store with no price bars fails `--check`."""
+    settings = _settings(tmp_path)
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+    failed = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert failed.exit_code == 1, failed.output
+    assert "store_stale" in failed.output
+    assert "health: OK" not in failed.output
+
+
 def test_health_prints_the_delisting_reasons_and_mergers_blocks(
     tmp_path: Path, fixture_store_path: Path
 ) -> None:

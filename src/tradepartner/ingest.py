@@ -6790,7 +6790,7 @@ def _fetch_prices(
             fetch, listed, static_only, may_count, reference = _price_names(
                 conn, read_at, session, settings
             )
-            missed = _missed_sessions(conn, settings, session)
+            missed = _missed_sessions(conn, settings, session, reference, fetch)
             if missed:
                 # #1572: a name delisted inside the gap is fetched for the missed
                 # sessions it still traded on (its last bars), never for `session`.
@@ -6980,34 +6980,85 @@ _PLAIN_INGEST_STEP = (
 )
 
 
-def _stored_sessions(conn: duckdb.DuckDBPyConnection, session: date) -> set[date]:
-    """The `prices_daily` sessions at or before `session` holding a bar of any
-    security (#1572)."""
-    return {
-        row[0]
-        for row in conn.execute(
-            "SELECT DISTINCT session FROM prices_daily WHERE session <= ?", [session]
-        ).fetchall()
-    }
+def _stored_sessions(
+    conn: duckdb.DuckDBPyConnection,
+    session: date,
+    reference: str | None = None,
+    names: Collection[str] = (),
+    limit: float = 1.0,
+    recent: int = 0,
+) -> set[date]:
+    """The `prices_daily` sessions at or before `session` the store holds
+    whole (#1572, #3329). Without `reference` that is every session holding a
+    bar of any security. With it, a session counts as stored only when the
+    reference symbol has a bar and no more than `limit`
+    (`ingest.max_missing_share`) of `names` (those with a bar on or before
+    that session, so a later listing is not missing earlier) lack one: a stray
+    bar must not hide a missed session. Only the `recent` sessions before
+    `session` are held to that (the window a daily run can re-fetch, from
+    `alpaca.max_catchup_sessions`); an older session with any bar stays stored,
+    so history thinner than today's share is not re-fetched."""
+    rows = conn.execute(
+        "SELECT session, list(DISTINCT security_id) FROM prices_daily "
+        "WHERE session <= ? GROUP BY session",
+        [session],
+    ).fetchall()
+    if reference is None:
+        return {row[0] for row in rows}
+    wanted = set(names)
+    first: dict[str, date] = {}
+    for day, held in sorted(rows, key=lambda row: row[0]):
+        for sid in held:
+            first.setdefault(sid, day)
+    starts = sorted(day for sid, day in first.items() if sid in wanted)
+    sessions = all_sessions()
+    oldest = sessions[max(0, bisect_left(sessions, session) - recent)]
+    whole: set[date] = set()
+    for day, held in rows:
+        if day < oldest:
+            whole.add(day)
+            continue
+        if reference not in held:
+            continue
+        base = bisect_right(starts, day)
+        present = len(wanted.intersection(held))
+        if base and (base - present) / base > limit:
+            continue
+        whole.add(day)
+    return whole
 
 
 def _missed_sessions(
-    conn: duckdb.DuckDBPyConnection, settings: Settings, session: date
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    session: date,
+    reference: str | None = None,
+    names: Collection[str] = (),
 ) -> list[date]:
     """The XNYS sessions after the store's first stored bar and before
     `session` that the store lacks, oldest first (#1572): what a daily run
     must leave stored to report `ok`. Empty on a store with no prices at
     all and on one complete through the previous session. The expected
-    session is not here: every run fetches it.
+    session is not here: every run fetches it. With `reference` and the
+    fetched `names`, a session counts as stored only when it is whole
+    (`_stored_sessions`, #3329); a first bar alone starts the span.
 
     More than `alpaca.max_catchup_sessions` of them is a lapse this path
     must not paper over: `_Stale` names them and the `--backfill --since`
     command that clears them (`backfill.backfill`)."""
-    stored = _stored_sessions(conn, session)
-    if not stored:
+    anything = _stored_sessions(conn, session)
+    if not anything:
         return []
+    stored = _stored_sessions(
+        conn,
+        session,
+        reference,
+        names,
+        settings.ingest.max_missing_share,
+        settings.alpaca.max_catchup_sessions,
+    )
     sessions = all_sessions()
-    span = sessions[bisect_right(sessions, min(stored)) : bisect_left(sessions, session)]
+    span = sessions[bisect_right(sessions, min(anything)) : bisect_left(sessions, session)]
     missed = [day for day in span if day not in stored]
     bound = settings.alpaca.max_catchup_sessions
     if len(missed) > bound:
