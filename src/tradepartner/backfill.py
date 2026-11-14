@@ -1481,7 +1481,9 @@ def refetch_actions(
     counts are the run's. Halts at the first month that is not `filled`.
 
     A `collision` row (#3246: a new id on a security, type and ex-date that
-    already holds a live identity, so the event would apply twice) is
+    already holds a live identity, so the event would apply twice; #3304:
+    also a new event that repeats a live one, same ex-date, type and amount
+    or ratio, on another id of the same CIK) is
     refused unless its dividend is a `distinct` group of the reviewed list
     (`store.dividend_reviews`) or its `(security, ex-date)` is in
     `allow_collisions`: a dry run lists it in `ActionsRefetch.refused`; a
@@ -1724,8 +1726,10 @@ def _rows_written(
     with the exact stored amount (#3074 review). The tag is `revision` when
     the row's identity (#108: the source id, else security, type and
     ex-date) was stored before; `collision` when it is new but another live
-    identity of the security already holds that type and ex-date (a source
-    re-issuing an event under a new id would apply it twice); else `new`.
+    identity of the security already holds that type and ex-date, or (#3304)
+    a live event stored before this write on another id of the same CIK
+    holds that type, ex-date and amount or ratio (a source re-issuing an
+    event under a new id would apply it twice); else `new`.
     Returns the lines to write and the lines refused (#3246): a live
     `collision` that `allowed` (`_allowed_collisions`) does not cover."""
     allow_pairs, distinct = allowed
@@ -1741,6 +1745,10 @@ def _rows_written(
             QUALIFY row_number() OVER (
                 PARTITION BY security_id, key ORDER BY ingested_at DESC, known_at DESC
             ) = 1
+        ),
+        ciks AS (
+            SELECT security_id, cik FROM securities
+            QUALIFY row_number() OVER (PARTITION BY security_id ORDER BY known_at DESC) = 1
         )
         SELECT w.security_id, w.action_type, w.ex_date, w.ratio_or_amount, w.cancelled,
                w.known_at,
@@ -1753,7 +1761,16 @@ def _rows_written(
                    SELECT 1 FROM latest l
                    WHERE l.security_id = w.security_id AND l.action_type = w.action_type
                      AND l.ex_date = w.ex_date AND l.key <> w.key AND NOT l.cancelled
-               ) AS collision,
+               ) AS same_id,
+               EXISTS (
+                   SELECT 1 FROM latest l
+                   JOIN ciks lc ON lc.security_id = l.security_id
+                   WHERE lc.cik = (SELECT cik FROM ciks WHERE security_id = w.security_id)
+                     AND l.security_id <> w.security_id AND l.action_type = w.action_type
+                     AND l.ex_date = w.ex_date AND NOT l.cancelled
+                     AND abs(l.ratio_or_amount - w.ratio_or_amount) < 1e-9
+                     AND l.ingested_at < w.ingested_at
+               ) AS same_cik,
                (
                    SELECT count(*) FROM latest l
                    WHERE l.security_id = w.security_id AND l.action_type = w.action_type
@@ -1766,7 +1783,8 @@ def _rows_written(
     ).fetchall()
     lines: list[str] = []
     blocked: list[str] = []
-    for sid, kind, ex, amount, cancelled, known_at, revision, collision, live in rows:
+    for sid, kind, ex, amount, cancelled, known_at, revision, same_id, same_cik, live in rows:
+        collision = same_id or same_cik
         tag = "revision" if revision else "collision" if collision else "new"
         line = (
             f"{tag} {sid} {kind} {ex} {amount!r}{' cancelled' if cancelled else ''} "
@@ -1776,7 +1794,7 @@ def _rows_written(
             # A reviewed group was judged as exactly two identities: a third is not covered.
             kind == ActionType.DIVIDEND
             and (sid, ex, float(amount)) in distinct
-            and live <= REVIEWED_IDENTITIES
+            and (live <= REVIEWED_IDENTITIES or not same_id)
         )
         if tag == "collision" and not cancelled and not covered:
             blocked.append(line)
