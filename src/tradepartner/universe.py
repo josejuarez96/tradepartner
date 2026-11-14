@@ -391,6 +391,13 @@ def _listing_reason(listing: dict[str, Any] | None, session: date, exchanges: li
     """Why a listing fails rule 2, or `""` if it passes."""
     if listing is None:
         return "not_listed"
+    # A row naming no ticker "ends the previous span" (#3363): it holds
+    # nothing, so it never counts as a live listing (#3383). Imported here
+    # because `adapters.alpaca_prices` imports this module.
+    from tradepartner.adapters.alpaca_prices import is_placeholder_ticker
+
+    if is_placeholder_ticker(str(listing.get("ticker") or "")):
+        return "not_listed"
     status, end = listing["status"], listing["end_session"]
     if status == DELISTED:
         return "delisted"
