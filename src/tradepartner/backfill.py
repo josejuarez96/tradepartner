@@ -1545,15 +1545,18 @@ def refetch_actions(
 
 
 class _AskedOnce:
-    """A `PriceSource` that remembers each `corporate_actions` answer while
-    `replay` is False and, once it is True, hands each remembered answer back
-    once (then asks the source as before): the dry pass of a real
-    `refetch_actions` run (#3303) feeds its write (#3312). Every other call
-    goes to the wrapped source."""
+    """A `PriceSource` that remembers each `corporate_actions` answer, with
+    the source's `resolution_summary()` after it, while `replay` is False
+    and, once it is True, hands each remembered answer back once (then asks
+    the source as before): the dry pass of a real `refetch_actions` run
+    (#3303) feeds its write (#3312). `resolution_summary()` follows the last
+    answer given, remembered or fresh, so each month reports its own counts.
+    Every other call goes to the wrapped source."""
 
     def __init__(self, inner: PriceSource) -> None:
         self._inner = inner
-        self._kept: dict[tuple[tuple[str, ...], date, date], list[CorporateAction]] = {}
+        self._kept: dict[tuple[tuple[str, ...], date, date], tuple[list[CorporateAction], str]] = {}
+        self._replayed: str | None = None
         self.replay = False
 
     def corporate_actions(
@@ -1561,11 +1564,18 @@ class _AskedOnce:
     ) -> list[CorporateAction]:
         key = (tuple(security_ids), start, end)
         if self.replay and key in self._kept:
-            return self._kept.pop(key)
+            got, self._replayed = self._kept.pop(key)
+            return got
+        self._replayed = None
         got = self._inner.corporate_actions(security_ids, start, end)
         if not self.replay:
-            self._kept[key] = list(got)
+            self._kept[key] = (list(got), self._inner.resolution_summary())
         return got
+
+    def resolution_summary(self) -> str:
+        if self.replay and self._replayed is not None:
+            return self._replayed
+        return self._inner.resolution_summary()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)

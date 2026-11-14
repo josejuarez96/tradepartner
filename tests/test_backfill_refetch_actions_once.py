@@ -7,6 +7,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from test_backfill_refetch_actions import (
@@ -66,3 +67,28 @@ def test_a_refused_run_asks_each_month_once_and_writes_nothing(settings: Setting
     assert not result.ok and len(result.refused) == 1
     assert set(_asks(prices).values()) == {1}
     assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(1,)]
+
+
+def test_each_replayed_month_reports_its_own_resolution_summary(settings: Settings) -> None:
+    prices = _committed(settings)
+    _open_release(settings)
+    prices.actions = [_dividend(), _dividend(JUNE_EX, action_id="acme-q2-jun")]
+    month = {"now": ""}
+    real = prices.corporate_actions
+
+    def asking(ids: Any, start: date, end: date) -> Any:
+        month["now"] = f"counts for {start:%Y-%m}"
+        return real(ids, start, end)
+
+    prices.corporate_actions = asking  # type: ignore[method-assign]
+    prices.resolution_summary = lambda: month["now"]  # type: ignore[method-assign]
+    _refetch(settings, prices, since=date(2019, 5, 1), through=date(2019, 6, 28))
+    messages = [
+        m
+        for (m,) in _rows(
+            settings,
+            "SELECT message FROM ingestion_runs WHERE mode = 'actions_refetch' "
+            "AND status = 'filled' ORDER BY chunk_cursor",
+        )
+    ]
+    assert "counts for 2019-05" in messages[0] and "counts for 2019-06" in messages[1]
