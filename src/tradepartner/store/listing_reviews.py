@@ -13,7 +13,8 @@ is point in time: a build whose `ingested_at` precedes the acceptance leaves
 the row out. A row whose security the build does not hold is left out and
 counted, never invented. A key the build already derives is not written twice.
 
-Columns: `security_id`, `ticker`, `exchange` (a `normalize_exchange` code),
+Columns: `security_id`, `ticker`, `exchange` (a `normalize_exchange` code, or `TXSE`,
+which no parser reads yet),
 `class_title` (may be empty: untitled, as a snapshot row), `valid_from`
 (a session), `known_at` (UTC, the filing's acceptance), `accession` (the
 filing, EDGAR form `##########-##-######`), `reason`, `issue` (`#n`).

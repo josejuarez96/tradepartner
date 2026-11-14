@@ -111,9 +111,11 @@ def test_packaged_file_cites_each_row_to_its_filing() -> None:
         assert row.valid_from == session_of(row.known_at)
 
 
-def test_texas_stock_exchange_names_normalize_to_one_code() -> None:
-    for name in ("Texas Stock Exchange LLC", "TEXAS STOCK EXCHANGE", "TXSE"):
-        assert normalize_exchange(name) == "TXSE"
+def test_txse_is_a_code_only_the_reviewed_rows_use() -> None:
+    """The parsers do not read the Texas Stock Exchange (a parser change needs a
+    cache-version bump); `TXSE` is only the exchange tag of the reviewed rows."""
+    assert normalize_exchange("Texas Stock Exchange LLC") != "TXSE"
+    assert normalize_exchange("TXSE") == "TXSE"
 
 
 def test_fingerprint_names_each_reviewed_entry_with_its_cik() -> None:

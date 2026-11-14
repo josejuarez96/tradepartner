@@ -441,11 +441,6 @@ DELISTING_HTML_VERSION = 1
 FORM25_EVIDENCE_VERSION = 1
 #: The filename-listing extract cache (`filename/v1/<cik>.json`, T184b, #1597):
 #: names, prefix and 12(b) class/exchange pairs only, never a document.
-#: #3293's `TXSE` exchange code shipped without a bump: a bump moves `filename/v1`
-#: in the raw-archive plan and changes the build hash. A cover 12(b) table cached
-#: since 2026-09-30 that names the Texas Stock Exchange (TCBI's 10-Q of 2026-10-22)
-#: has no TXSE pair, and a cached cover page holds the old slug, until re-read;
-#: the reviewed rows of `store/listing_reviews.csv` supply those listings meanwhile.
 FILENAME_VERSION = 1
 #: Bumped when the layout of `check_failures`'s full-list file changes (#884).
 FILING_FAILURES_LIST_VERSION = 1
