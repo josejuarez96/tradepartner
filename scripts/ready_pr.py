@@ -181,6 +181,13 @@ SAFETY_PREFIXES = (
     "src/tradepartner/research/labeling/",
     # the off-Mac ping sends to a URL kept in config
     "src/tradepartner/heartbeat.py",
+    # modules that unwrap a secret (#3319 safety review)
+    "src/tradepartner/research/models.py",
+    "src/tradepartner/adapters/fred_raw.py",
+    "src/tradepartner/adapters/openfigi_raw.py",
+    "src/tradepartner/store/raw_archive_config.py",
+    # runs the override write and the localhost bind check
+    "src/tradepartner/dashboard/app.py",
     # the dashboard kill-switch pages and override test (#773, #2337)
     "src/tradepartner/dashboard/book_page.py",
     "src/tradepartner/dashboard/override_page.py",
@@ -218,7 +225,6 @@ NO_REVIEW_PATHS = (
     "src/tradepartner/__init__.py",
     "src/tradepartner/adapters/__init__.py",
     "src/tradepartner/dashboard/__init__.py",
-    "src/tradepartner/dashboard/app.py",
     "src/tradepartner/dashboard/backtest_page.py",
     "src/tradepartner/dashboard/header.py",
     "src/tradepartner/dashboard/health_page.py",

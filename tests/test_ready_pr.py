@@ -261,6 +261,19 @@ def test_every_src_module_is_reviewed_unless_explicitly_exempt() -> None:
         assert not ready_pr.required_reviews([path]), f"{path} is reviewed; drop the exemption"
 
 
+def test_every_src_module_that_unwraps_a_secret_requires_the_safety_review() -> None:
+    """#3319: secrets are never left to a quant-only review."""
+    out = subprocess.run(
+        ["git", "-C", str(REPO), "grep", "-l", "get_secret_value", "--", "src"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    assert len(out) > 5
+    for path in out:
+        assert "safety-reviewer" in ready_pr.required_reviews([path]), path
+
+
 def test_research_repair_and_llm_input_paths_require_their_reviews() -> None:
     quant = {"quant-auditor"}
     for path in (
