@@ -244,6 +244,51 @@ def test_every_review_prefix_exists_on_the_tree_unless_planned() -> None:
         assert not _on_tree(prefix), f"{prefix} exists now; drop it from PLANNED_PREFIXES"
 
 
+def test_every_src_module_is_reviewed_unless_explicitly_exempt() -> None:
+    """#3319: a new src module needs a review by default; exemptions are a visible list."""
+    files = subprocess.run(
+        ["git", "-C", str(REPO), "ls-files", "src"], check=True, capture_output=True, text=True
+    ).stdout.split()
+    modules = [f for f in files if f.endswith(".py")]
+    assert len(modules) > 100
+    unreviewed = [f for f in modules if not ready_pr.required_reviews([f])]
+    assert set(unreviewed) <= set(ready_pr.NO_REVIEW_PATHS), (
+        "these src files need a review prefix in scripts/ready_pr.py, or an entry in "
+        "NO_REVIEW_PATHS: " + ", ".join(sorted(set(unreviewed) - set(ready_pr.NO_REVIEW_PATHS)))
+    )
+    for path in ready_pr.NO_REVIEW_PATHS:
+        assert path in modules, f"{path} is gone; drop it from NO_REVIEW_PATHS"
+        assert not ready_pr.required_reviews([path]), f"{path} is reviewed; drop the exemption"
+
+
+def test_every_src_module_that_unwraps_a_secret_requires_the_safety_review() -> None:
+    """#3319: secrets are never left to a quant-only review."""
+    out = subprocess.run(
+        ["git", "-C", str(REPO), "grep", "-l", "get_secret_value", "--", "src"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    assert len(out) > 5
+    for path in out:
+        assert "safety-reviewer" in ready_pr.required_reviews([path]), path
+
+
+def test_research_repair_and_llm_input_paths_require_their_reviews() -> None:
+    quant = {"quant-auditor"}
+    for path in (
+        "src/tradepartner/research/gates.py",
+        "src/tradepartner/repair_form4_roles.py",
+        "src/tradepartner/retract.py",
+        "src/tradepartner/adapters/form4_route.py",
+    ):
+        assert ready_pr.required_reviews([path]) == quant, path
+    assert ready_pr.required_reviews(["src/tradepartner/research/labeling/job.py"]) == {
+        "quant-auditor",
+        "safety-reviewer",
+    }
+
+
 def test_edgar_source_requires_the_quant_audit() -> None:
     # it fetches the filing text the store keeps (#382, owner decision 2026-10-04)
     assert ready_pr.required_reviews(["src/tradepartner/adapters/edgar_source.py"]) == {
