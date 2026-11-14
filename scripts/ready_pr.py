@@ -134,6 +134,25 @@ QUANT_PREFIXES = (
     "src/tradepartner/ingest",
     "src/tradepartner/backfill.py",
     "src/tradepartner/health",
+    "src/tradepartner/diskfloor.py",
+    # the data adapters the first lists missed (#3319)
+    "src/tradepartner/adapters/accession_rows.py",
+    "src/tradepartner/adapters/borrow.py",
+    "src/tradepartner/adapters/daily_index.py",
+    "src/tradepartner/adapters/form4_",
+    "src/tradepartner/adapters/fred_",
+    "src/tradepartner/adapters/index_reconcile.py",
+    "src/tradepartner/adapters/openfigi",
+    "src/tradepartner/adapters/rates.py",
+    "src/tradepartner/adapters/stamp_",
+    "src/tradepartner/corpus/",
+    # the research package: event studies, gates and the labeling job (#3319)
+    "src/tradepartner/research/",
+    # store repairs and retractions rewrite stored facts (#3319)
+    "src/tradepartner/repair",
+    "src/tradepartner/retract.py",
+    "src/tradepartner/action_retract.py",
+    "src/tradepartner/close_gap.py",
     "src/tradepartner/backtest/",
     "src/tradepartner/execution/",
     # the Lab page's child-process modules register and run hypotheses (#2304)
@@ -158,6 +177,10 @@ SAFETY_PREFIXES = (
     "src/tradepartner/execution/",
     "src/tradepartner/errors.py",
     "src/tradepartner/llm/",
+    # the real LLM input path: Claude calls and the spend ceiling (#3319)
+    "src/tradepartner/research/labeling/",
+    # the off-Mac ping sends to a URL kept in config
+    "src/tradepartner/heartbeat.py",
     # the dashboard kill-switch pages and override test (#773, #2337)
     "src/tradepartner/dashboard/book_page.py",
     "src/tradepartner/dashboard/override_page.py",
@@ -186,6 +209,26 @@ SAFETY_PREFIXES = (
     ".pre-commit-config.yaml",
     "pyproject.toml",
     "uv.lock",
+)
+# src files that need no specialist review, listed on purpose (#3319). Any other
+# `src/**/*.py` must match a prefix above (tests/test_ready_pr.py), so a new module is
+# reviewed by default and exempting one is a visible edit here. Package markers and the
+# dashboard's read-only display pages only.
+NO_REVIEW_PATHS = (
+    "src/tradepartner/__init__.py",
+    "src/tradepartner/adapters/__init__.py",
+    "src/tradepartner/dashboard/__init__.py",
+    "src/tradepartner/dashboard/app.py",
+    "src/tradepartner/dashboard/backtest_page.py",
+    "src/tradepartner/dashboard/header.py",
+    "src/tradepartner/dashboard/health_page.py",
+    "src/tradepartner/dashboard/home_page.py",
+    "src/tradepartner/dashboard/ops_page.py",
+    "src/tradepartner/dashboard/performance_page.py",
+    "src/tradepartner/dashboard/research_page.py",
+    "src/tradepartner/dashboard/theme.py",
+    "src/tradepartner/dashboard/trades_page.py",
+    "src/tradepartner/dashboard/trials_page.py",
 )
 LOCAL_CHECKS: tuple[tuple[str, ...], ...] = (
     ("uv", "run", "ruff", "check", "."),
