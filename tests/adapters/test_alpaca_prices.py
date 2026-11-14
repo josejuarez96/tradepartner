@@ -236,6 +236,37 @@ class TestResolver:
         assert resolver.resolve("IPV", day) is None
         assert (resolver.report.same_day_securities, resolver.report.same_day_listings) == (0, 0)
 
+    def test_a_same_day_pair_whose_later_filing_is_unconfirmed_stays_unassigned(self) -> None:
+        # #3291 (quant-auditor): the later filing may be a slip naming
+        # another company's ticker; without a next row under it, no winner.
+        day = date(2021, 6, 2)
+        sid = "0001789029"
+        early, late = (
+            datetime(2021, 6, 2, 6, 33, tzinfo=UTC),
+            datetime(2021, 6, 2, 17, 1, tzinfo=UTC),
+        )
+        for rest in ([], [_listing(sid, "IPV", date(2022, 1, 3))]):
+            resolver = ListingResolver(
+                [
+                    _listing(sid, "IPV", day, known_at=early),
+                    _listing(sid, "AEVA", day, known_at=late),
+                    *rest,
+                ]
+            )
+            assert resolver.resolve("AEVA", day) is None
+
+    def test_a_same_day_pair_with_an_unstamped_row_stays_unassigned(self) -> None:
+        day = date(2021, 6, 2)
+        sid = "0001789029"
+        resolver = ListingResolver(
+            [
+                _listing(sid, "IPV", day),
+                _listing(sid, "AEVA", day, known_at=datetime(2021, 6, 2, 17, 1, tzinfo=UTC)),
+                _listing(sid, "AEVA", date(2025, 3, 20)),
+            ]
+        )
+        assert resolver.resolve("AEVA", date(2026, 11, 6)) is None
+
     def test_a_same_day_pair_filed_at_one_moment_stays_unassigned(self) -> None:
         # #3291: a tie on `known_at` (or no stamp) shows nothing; as before.
         day = date(2021, 6, 2)

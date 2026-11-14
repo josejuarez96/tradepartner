@@ -2306,7 +2306,8 @@ def _clean_rows(rows: Sequence[_Row]) -> tuple[list[_Row], date | None, int, int
 def _later_filing(rows: list[_Row], day: date) -> list[_Row] | None:
     """`rows` less the equity rows of `day` filed before the day's latest
     filing (#3291), or `None` when that leaves the pair standing: a row
-    with no stamp, or two tickers filed at the latest moment, shows nothing."""
+    with no stamp, two tickers filed at the latest moment, or no next equity
+    row under the later filing's ticker (nothing confirms it), shows nothing."""
     today = [r for r in rows if r.day == day and r.kind == EQUITY]
     stamps = [r.known_at for r in today]
     if any(stamp is None for stamp in stamps):
@@ -2314,6 +2315,10 @@ def _later_filing(rows: list[_Row], day: date) -> list[_Row] | None:
     latest = max(s for s in stamps if s is not None)
     if len({r.ticker for r in today if r.known_at == latest}) > 1:
         return None
+    winner = next(r.ticker for r in today if r.known_at == latest)
+    after = next((r for r in rows if r.day > day and r.kind == EQUITY), None)
+    if after is None or after.ticker != winner:
+        return None  # the later filing may itself be a slip: nothing confirms it
     return [r for r in rows if not (r in today and r.known_at != latest)]
 
 
