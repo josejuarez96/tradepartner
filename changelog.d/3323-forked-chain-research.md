@@ -1,3 +1,3 @@
-- Research reads raise ForkedChainError on a predecessor with two live successor chains (#3323)
+- Backtest runs refuse a predecessor with two live successor chains (#3323)
 ### Added
-- Research (as-of) reads now fail closed, like execution, when a predecessor has two live successor chains at T (#3323).
+- A backtest run (`StoreProvider` with `refuse_forked_chains`) now raises `ForkedChainError` when a read names a predecessor with two live successor chains at T; as-of readers and paper planning are unchanged (#3323).
