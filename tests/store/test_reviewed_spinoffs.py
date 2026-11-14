@@ -11,8 +11,8 @@ from tradepartner.adapters.alpaca_prices import (
     ListingResolver,
     parse_corporate_actions,
 )
-from tradepartner.adapters.prices import ActionType
-from tradepartner.calendar import previous_session
+from tradepartner.adapters.prices import ActionType, spinoff_known_at_floor
+from tradepartner.calendar import previous_session, session_open
 from tradepartner.config import Settings
 from tradepartner.store.reviewed_spinoffs import (
     ReviewedSpinoff,
@@ -22,12 +22,12 @@ from tradepartner.store.reviewed_spinoffs import (
 
 HEADER = "child_security_id,parent_security_id,ex_date,ratio,known_at,accession,evidence,issue\n"
 GOOD = (
-    "0002132873,0001636519,2026-10-27,0.5,2026-10-27T20:24:08+00:00,"
-    "0001193125-26-434274,why,#3392\n"
+    "0002132873,0001636519,2026-10-27,0.5,2026-09-30T20:39:29+00:00,"
+    "0001193125-26-409143,why,#3392\n"
 )
 CHILD, PARENT = "0002132873", "0001636519"
 EX = date(2026, 10, 27)
-ACCEPTED = datetime(2026, 10, 27, 20, 24, 8, tzinfo=UTC)  # 16:24:08 Eastern, EDGAR index
+ACCEPTED = datetime(2026, 9, 30, 20, 39, 29, tzinfo=UTC)  # 8-K 16:39:29 Eastern, EDGAR index
 
 
 def test_packaged_row_is_the_msgr_distribution_cited_to_the_oct_27_8k() -> None:
@@ -36,12 +36,25 @@ def test_packaged_row_is_the_msgr_distribution_cited_to_the_oct_27_8k() -> None:
     assert row.ex_date == EX
     assert row.ratio == 0.5  # one MSGR per two parent shares (8-K of 2026-09-30)
     assert row.known_at == ACCEPTED
-    assert row.accession == "0001193125-26-434274"
+    assert row.accession == "0001193125-26-409143"
     assert row.issue == "#3392"
     action = row.action
     assert action.action_type is ActionType.SPINOFF
     assert (action.security_id, action.source_action_id) == (CHILD, PARENT)
     assert (action.ex_date, action.ratio_or_amount, action.known_at) == (EX, 0.5, ACCEPTED)
+
+
+def test_the_action_is_known_before_the_ex_date_open_and_not_before_the_8k() -> None:
+    """The 9-30 8-K announced the ratio and distribution: a backtest at the
+    2026-10-27 open must know the action. The writer raises the stamp to the
+    spin-off floor (close before the ex-date), still before that open."""
+    (row,) = reviewed_spinoffs()
+    stamp = row.action.known_at
+    floor = spinoff_known_at_floor(EX)
+    assert floor is not None
+    assert max(stamp, floor) <= session_open(EX)
+    assert stamp == datetime(2026, 9, 30, 20, 39, 29, tzinfo=UTC)
+    assert stamp > datetime(2026, 9, 30, 20, 39, 28, tzinfo=UTC)  # nothing earlier than acceptance
 
 
 def test_good_row_parses() -> None:
@@ -56,9 +69,9 @@ def test_good_row_parses() -> None:
         GOOD.replace("2026-10-27,0.5", "2026-10-25,0.5"),  # a Sunday: not a session
         GOOD.replace(",0.5,", ",0,"),
         GOOD.replace(",0.5,", ",nan,"),
-        GOOD.replace("20:24:08+00:00", "20:24:08"),  # naive
-        GOOD.replace("20:24:08+00:00", "16:24:08-04:00"),  # not UTC
-        GOOD.replace("0001193125-26-434274", "bad"),
+        GOOD.replace("20:39:29+00:00", "20:39:29"),  # naive
+        GOOD.replace("20:39:29+00:00", "16:39:29-04:00"),  # not UTC
+        GOOD.replace("0001193125-26-409143", "bad"),
         GOOD.replace("#3392", "3392"),
         GOOD.replace("0002132873,0001636519", "0002132873,0002132873"),  # self spin-off
         GOOD.replace(",why,", ",,"),
