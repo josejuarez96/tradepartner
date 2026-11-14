@@ -510,7 +510,9 @@ def run_hypothesis(
     if refused:
         return _close(store, handle, cast(Status, decision.outcome), decision.message)
     try:
-        with StoreProvider(partial(open_read_only, store), handle, params) as provider:
+        with StoreProvider(
+            partial(open_read_only, store), handle, params, refuse_forked_chains=True
+        ) as provider:
             if decision.outcome == "needs_gap":
                 series = {
                     s: provider.survivorship_gap(read_time(s, cadence)).count_share

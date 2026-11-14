@@ -14,6 +14,7 @@ from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import duckdb
@@ -1377,13 +1378,25 @@ def test_a_forked_predecessor_is_refused_by_the_research_reads(
         with open_read_only(settings) as conn:
             yield conn
 
+    # Paper planning builds its provider without the flag: nothing is refused.
     with StoreProvider(connect, handle, settings) as provider:
+        assert not provider.raw_prices(fork_at, ["0001000011"]).is_empty()
+    with StoreProvider(connect, handle, settings, refuse_forked_chains=True) as provider:
         provider.raw_prices(fork_at - PROBE_EPSILON, ["0001000011"])
         provider.raw_prices(fork_at, ["0001000013"])
         with pytest.raises(ForkedChainError, match="0001000010"):
             provider.raw_prices(fork_at, ["0001000011"])
         with pytest.raises(ForkedChainError, match="0001000099"):
             provider.adjusted_prices(fork_at, ["0001000010"], include_dividends=False)
+        # The universe check reads the step's members (a fork member among them).
+        provider._at(fork_at)  # opens the step; a new `t` would drop the stub universe
+        provider._universe = SimpleNamespace(  # type: ignore[assignment]
+            members=pl.DataFrame({"security_id": ["0001000011"]})
+        )
+        with pytest.raises(ForkedChainError, match="0001000010"):
+            provider.universe(fork_at)
+        with pytest.raises(ForkedChainError, match="0001000010"):
+            provider.merger_exits(fork_at, ["0001000011"])
 
 
 def _open_trial(settings: Settings, tmp_path: Path) -> registry.TrialHandle:
