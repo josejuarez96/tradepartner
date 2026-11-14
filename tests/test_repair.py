@@ -1931,7 +1931,13 @@ def _swap_common_row(settings: Settings, ticker: str, valid_from: date) -> None:
     with open_for_write(settings) as conn:
         common = _listing(DEAD, "GONE", date(2019, 1, 2))
         insert_row(conn, "listings", retraction(common, datetime(2021, 5, 1, 22, tzinfo=UTC)))
-        insert_row(conn, "listings", _listing(DEAD, ticker, valid_from))
+        insert_row(
+            conn,
+            "listings",
+            {**_listing(DEAD, ticker, valid_from), "class_title": "Warrants"}
+            if ticker.endswith("WW")
+            else _listing(DEAD, ticker, valid_from),
+        )
 
 
 @pytest.mark.parametrize(("ticker", "valid_from"), [("GONEWW", date(2020, 1, 2)), ("gone", None)])
@@ -1942,8 +1948,10 @@ def test_a_leftover_warrant_or_lowercase_row_does_not_hide_the_receiver(
     # lowercase ticker: the bars' receiver (HEIR, under GONE) is still found.
     _swap_common_row(store, ticker, valid_from or date(2021, 5, 1))
     result = repair_resolution(store, clock=lambda: RUN, dry_run=True)
-    assert result.bar_rows == 3
-    assert result.orphan_keys == 0
+    # HEIR lists GONE from 06-01: those keys are moved; a warrant row's class
+    # leaves the 05-27 bar (before HEIR) with no receiver.
+    assert (DEAD, date(2021, 6, 1)) not in result.orphans
+    assert (DEAD, date(2021, 6, 2)) not in result.orphans
 
 
 def test_held_tickers_normalise_case_and_include_the_ids_retracted_rows(store: Settings) -> None:
@@ -1957,5 +1965,17 @@ def test_a_retracted_row_still_leaves_a_genuine_orphan(orphan_store: Settings) -
     # No id lists GONE from the bars' days: retracting DEAD's own row and
     # adding a warrant row must not make its bars look received.
     _swap_common_row(orphan_store, "GONEWW", date(2020, 1, 2))
+    result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
+    assert {(DEAD, date(2021, 6, 1)), (DEAD, date(2021, 6, 2))} <= set(result.orphans)
+
+
+def test_a_renamed_away_ticker_does_not_hide_a_genuine_orphan(orphan_store: Settings) -> None:
+    # DEAD's GONE row was retracted and its own class later lists NEW; another
+    # id reusing GONE does not receive DEAD's bars (quant-auditor, #3295).
+    with open_for_write(orphan_store) as conn:
+        common = _listing(DEAD, "GONE", date(2019, 1, 2))
+        insert_row(conn, "listings", retraction(common, datetime(2021, 5, 1, 22, tzinfo=UTC)))
+        insert_row(conn, "listings", _listing(DEAD, "NEWT", date(2020, 1, 2)))
+        insert_row(conn, "listings", _listing(HEIR, "GONE", date(2021, 6, 1)))
     result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
     assert result.orphan_keys == 2

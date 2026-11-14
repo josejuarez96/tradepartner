@@ -353,8 +353,12 @@ def _held_tickers(
     at `at` carry on that session: those of its latest listing starting on or
     before it, else all of its listings (a bar before its first row)."""
     listed: dict[str, list[tuple[date, str]]] = defaultdict(list)
+    live_classes: dict[str, list[tuple[date, str, Any]]] = defaultdict(list)
     for row in listings_as_of(conn, at).iter_rows(named=True):
         listed[row["security_id"]].append((row["valid_from"], _norm(row["ticker"])))
+        live_classes[row["security_id"]].append(
+            (row["valid_from"], _norm(row["ticker"]), row["class_title"])
+        )
 
     retracted: dict[str, set[str]] = defaultdict(set)  # an id's own rows, retracted too
     for sid, ticker in conn.execute(
@@ -367,13 +371,21 @@ def _held_tickers(
     # lowercase ticker is then all that is live. The bars' receiver sits under
     # the withdrawn ticker.
     withdrawn: dict[str, list[tuple[date, str]]] = defaultdict(list)
-    for sid, ticker, valid_from in conn.execute(
-        "SELECT security_id, ticker, valid_from FROM listings WHERE known_at <= ? "
+    for sid, ticker, valid_from, class_title in conn.execute(
+        "SELECT security_id, ticker, valid_from, class_title FROM listings WHERE known_at <= ? "
         "QUALIFY row_number() OVER (PARTITION BY security_id, ticker, exchange, valid_from "
         "ORDER BY known_at DESC, ingested_at DESC) = 1 AND retracted",
         [at],
     ).fetchall():
-        withdrawn[str(sid)].append((valid_from, _norm(str(ticker))))
+        norm = _norm(str(ticker))
+        # A ticker its own class later replaced is a rename, not a withdrawn
+        # common ticker: another id reusing it must not receive this id's bars.
+        if any(
+            d >= valid_from and t != norm and c == class_title
+            for d, t, c in live_classes.get(str(sid), ())
+        ):
+            continue
+        withdrawn[str(sid)].append((valid_from, norm))
 
     def held(security_id: str, day: date) -> Sequence[str]:
         rows = listed.get(security_id, [])
