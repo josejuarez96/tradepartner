@@ -133,7 +133,7 @@ import re
 import time
 import uuid
 from collections import Counter, defaultdict
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -1485,7 +1485,8 @@ def refetch_actions(
     refused unless its dividend is a `distinct` group of the reviewed list
     (`store.dividend_reviews`) or its `(security, ex-date)` is in
     `allow_collisions`: a dry run lists it in `ActionsRefetch.refused`; a
-    real run writes nothing for that month and it ends `failed`."""
+    real run asks every month first (a dry pass, `_refuse_ahead`, #3303) and
+    refuses the whole run before writing any month, ending one `failed` run."""
     if isinstance(since, datetime) or not isinstance(since, date):
         raise TypeError(f"since must be a date, got {since!r}")
     if isinstance(through, datetime) or not isinstance(through, date) or through < since:
@@ -1503,6 +1504,12 @@ def refetch_actions(
     runs: list[SourceRun] = []
     windows = [(since, through)] if span else month_windows(since, through)
     allowed = _allowed_collisions(allow_collisions)
+    if not dry_run:
+        # #3303: a real run asks every month first, as the dry run does, and
+        # refuses the whole run before writing if any month would refuse.
+        early = _refuse_ahead(settings, prices, since, windows, release, clock, only, span, allowed)
+        if early is not None:
+            return early
     for window in windows:
         run = _refetch_month(
             settings,
@@ -1530,6 +1537,62 @@ def refetch_actions(
         span,
         tuple(sorted(refused)),
     )
+
+
+def _refuse_ahead(
+    settings: Settings,
+    prices: PriceSource,
+    since: date,
+    windows: Sequence[tuple[date, date]],
+    release: str,
+    clock: Callable[[], datetime],
+    only: frozenset[str] | None,
+    span: bool,
+    allowed: tuple[frozenset[tuple[str, date]], frozenset[tuple[str, date, float]]],
+) -> ActionsRefetch | None:
+    """The refusal of a real `refetch_actions` run, or None to go ahead (#3303).
+
+    Skips a closed release (the real run refuses it), then runs every window
+    as a dry run (every write and run row rolled back) and collects the
+    collision rows no allow entry or reviewed group covers. Any: the run
+    refuses before writing a month, returned as one `failed` run with the
+    rows in `refused`. A window that fails otherwise (a source error) is
+    left to the real run to report."""
+    from tradepartner.repair import release_refusal
+
+    with _read(settings) as conn:
+        if release_refusal(conn, release) is not None:
+            return None  # the real run records that refusal, before any fetch
+    totals: Counter[str] = Counter()
+    refused: list[str] = []
+    for window in windows:
+        run = _refetch_month(
+            settings,
+            prices,
+            since,
+            window,
+            release,
+            clock,
+            True,
+            only,
+            totals,
+            [],
+            span,
+            allowed,
+            refused,
+        )
+        if run.status != FILLED:
+            break
+    if not refused:
+        return None
+    message = (
+        f"{len(refused)} collision row(s): a new id on a security, type and ex-date that "
+        f"already holds a live one; nothing written in any month: {'; '.join(sorted(refused))}"
+    )
+    failed = SourceRun(
+        "alpaca", FAILED, 0, f"{ACTIONS_REFETCH};since={since};through={windows[-1][1]}", message
+    )
+    return ActionsRefetch((failed,), False, (), (), span, tuple(sorted(refused)))
 
 
 def _allowed_collisions(

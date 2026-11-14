@@ -332,3 +332,44 @@ def test_the_cli_refuses_a_collision_unless_allowed(
     ok = CliRunner().invoke(app, [*args, "--allow-collision", f"{ACME}:{EX}"])
     assert ok.exit_code == 0, ok.output
     assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(2,)]
+
+
+JUNE_EX = date(2019, 6, 14)
+
+
+def _late_collision(settings: Settings, **kwargs: Any) -> Any:
+    """June's dividend stored; a real run over May..June then finds May new and
+    June re-issued under a new id (#3303: the collision is in the late month)."""
+    prices = _committed(settings)
+    _open_release(settings)
+    prices.actions = [_dividend(JUNE_EX, action_id="acme-q2-jun")]
+    _refetch(settings, prices, since=date(2019, 6, 1), through=THROUGH)
+    prices.actions = [_dividend(), _dividend(JUNE_EX, action_id="acme-q2-jun-reissued")]
+    prices.calls.clear()
+    return _refetch(
+        settings,
+        prices,
+        since=date(2019, 5, 1),
+        through=THROUGH,
+        clock=lambda: AGAIN,
+        **kwargs,
+    )
+
+
+def test_a_late_month_collision_refuses_the_whole_real_run(settings: Settings) -> None:
+    result = _late_collision(settings)
+    line = f"collision {ACME} dividend {JUNE_EX} 0.25 known_at="
+    assert not result.ok and result.runs[-1].status == FAILED
+    assert [r.startswith(line) for r in result.refused] == [True]
+    # May's new row is not written: the earlier month did not commit either.
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(1,)]
+    modes = _rows(
+        settings, "SELECT mode, status FROM ingestion_runs WHERE mode = 'actions_refetch'"
+    )
+    assert modes == [("actions_refetch", "filled")]  # only the setup run's June row
+
+
+def test_a_covered_late_month_collision_lets_the_whole_run_write(settings: Settings) -> None:
+    result = _late_collision(settings, allow_collisions=[(ACME, JUNE_EX)])
+    assert result.ok and result.refused == ()
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(3,)]
