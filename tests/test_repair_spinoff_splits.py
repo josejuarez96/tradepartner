@@ -124,7 +124,7 @@ def test_the_dry_run_counts_and_changes_nothing(splits: Settings) -> None:
     assert (result.entries, result.identities, result.action_rows) == (1, 1, 1)
     assert (result.already_repaired, result.stale, result.ex_dates) == (0, (), (EX,))
     assert result.summary() == (
-        f"would delete 1 spin-off split rows of 1 identities on 1 ex-dates {EX}..{EX}; "
+        f"would retract 1 spin-off split rows of 1 identities on 1 ex-dates {EX}..{EX}; "
         "entries 1, already repaired 0, stale 0"
     )
     assert _actions(splits) == ALL
@@ -144,9 +144,20 @@ def test_the_repair_deletes_every_revision_of_the_listed_identity_only(
     )
     assert (source, status, mode) == ("alpaca", REPAIRED, REPAIR)
     assert message == f"{result.summary()}; release {REL}"
-    assert message.startswith("deleted 2 spin-off split rows of 1 identities")
+    assert message.startswith("retracted 2 spin-off split rows of 1 identities")
     again = _retract(splits, dry_run=True)
     assert (again.identities, again.action_rows, again.already_repaired) == (0, 0, 1)
+    # Retracted, not deleted (T390, ADR 0029): both revisions are kept, with the entry.
+    kept = _rows(
+        splits,
+        "SELECT table_name, release, reason, rule, restored_at FROM retracted_rows "
+        "ORDER BY retraction_id",
+    )
+    assert len(kept) == 2
+    for table, release, reason, rule, restored in kept:
+        assert (table, release, restored) == ("corporate_actions", REL, None)
+        assert reason.startswith("repair-spinoff-splits")
+        assert "s1" in rule and str(EX) in rule
 
 
 def test_after_the_repair_no_read_at_any_t_applies_the_fake_split(splits: Settings) -> None:
@@ -247,7 +258,7 @@ def test_the_repair_spinoff_splits_command(
     base = ["repair-spinoff-splits", "--release", REL]
     dry = runner.invoke(app, [*base, "--dry-run"])
     assert dry.exit_code == 0, dry.output
-    assert dry.output.startswith("would delete 1 spin-off split rows")
+    assert dry.output.startswith("would retract 1 spin-off split rows")
     assert runner.invoke(app, ["repair-spinoff-splits", "--dry-run"]).exit_code == (cli.USAGE_ERROR)
     assert runner.invoke(app, base).exit_code == cli.USAGE_ERROR  # no count
     other = runner.invoke(
@@ -258,7 +269,7 @@ def test_the_repair_spinoff_splits_command(
     assert _actions(splits) == ALL
     done = runner.invoke(app, [*base, "--expect-action-rows", "1"])
     assert done.exit_code == 0, done.output
-    assert done.output.startswith("deleted 1 spin-off split rows")
+    assert done.output.startswith("retracted 1 spin-off split rows")
     assert _actions(splits) == [(OTHER, "split", "g")]
 
 
