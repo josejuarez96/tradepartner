@@ -104,7 +104,7 @@ import math
 import traceback
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any, Final, Literal, cast
@@ -131,6 +131,7 @@ from tradepartner.backtest.provider import DataProvider
 from tradepartner.backtest.results import write_results
 from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.store_provider import StoreProvider
+from tradepartner.calendar import session_close
 from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import ENGINE_FAMILIES, Cadence, Settings, get_settings
 from tradepartner.store import lab_registry, lab_schema, registry, schema
@@ -307,6 +308,28 @@ def _close(
     return RunOutcome(handle.trial_id, status, error=error)
 
 
+def _refuse_incomplete_holdout(
+    conn: duckdb.DuckDBPyConnection, slug: str, sessions: Sequence[date], now: datetime
+) -> None:
+    """Raise `ValueError` when a holdout spend's window reaches a rebalance session whose
+    close is after `now` or after the store's last stored price session (#3328): the
+    run would burn the family's exam over months that do not exist yet."""
+    row = conn.execute("SELECT max(session) FROM prices_daily").fetchone()
+    last_stored: date | None = row[0] if row is not None else None
+    for session in sessions:
+        if session_close(session) > now:
+            why = f"its close is after {now.isoformat()}"
+        elif last_stored is None or session > last_stored:
+            why = f"the store's last price session is {last_stored}"
+        else:
+            continue
+        raise ValueError(
+            f"{slug}: refused_incomplete_holdout: the holdout window is not complete; "
+            f"the first missing month is {session:%Y-%m} (rebalance {session}; {why}); "
+            "no trial was opened and no holdout was spent"
+        )
+
+
 def _gap_values(decision: Decision, frozen: Frozen, series: dict[date, float]) -> dict[str, object]:
     """The gap at the time of an override, JSON-safe (a NaN share is stored as null)."""
     return {
@@ -375,6 +398,7 @@ def run_hypothesis(
     kind: Literal["tracking"] | None = None,
     keep_marking_frames: bool = False,
     measured_cost_bps: float | None = None,
+    now: datetime | None = None,
 ) -> RunOutcome:
     """Run `slug`'s latest registration over `[start, end]` as one trial and return
     its `RunOutcome` (module docstring).
@@ -403,6 +427,12 @@ def run_hypothesis(
     ADR 0023), all before any trial exists. The trial's `note` is the shock tag
     (`placebo.shock_note`: `placebo=<mode> seed=<n>`, `signal_delay=<d>`), then `; ` and
     the `note` given; at the defaults exactly the `note` given.
+
+    A holdout spend whose window has a rebalance session closing after `now` (default
+    the current instant) or after the store's last stored price session raises
+    `ValueError("<slug>: refused_incomplete_holdout: ...")` naming the first missing
+    month, before any trial exists: a forward holdout is never spent before its months
+    are complete (#3328).
 
     The results keep no step's marking frame unless `keep_marking_frames` (#1417:
     nothing written reads them, and over a long daily run they grow without bound);
@@ -465,6 +495,10 @@ def run_hypothesis(
         cutoff = read_time(sessions[-1], cadence) if sessions else None
         refused = decision.outcome not in ("run", "needs_gap")
         holdout = decision.kind == "holdout" and not refused
+        if holdout:
+            _refuse_incomplete_holdout(
+                conn, slug, sessions, now if now is not None else datetime.now(UTC)
+            )
         # A refusal is always recorded `in_sample` (it spent nothing), whatever
         # `decision.kind` says: `refused_gap` keeps the holdout `Decision` its gate
         # started from (`holdout.decide`'s `replace(spend, outcome="refused_gap", ...)`),

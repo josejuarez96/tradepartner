@@ -1753,3 +1753,56 @@ def test_a_severe_unknown_shock_and_its_coverage_are_both_counted(
         "n_exit_coverage_unknown": 1,
         "n_exit_coverage_after_read": 0,
     }
+
+
+def test_a_forward_holdout_spend_before_its_months_exist_is_refused_with_no_trial(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3328: the clock is before the window's last rebalance close."""
+    calls = _spy(monkeypatch)
+    before_end = datetime(2019, 8, 29, 12, tzinfo=UTC)
+
+    with pytest.raises(ValueError, match=r"refused_incomplete_holdout.*2019-08"):
+        run_hypothesis(
+            SLUG,
+            *HOLDOUT_WINDOW,
+            OVERRIDE,
+            reasons=OVERRIDE_REASONS,
+            store_path=store,
+            now=before_end,
+        )
+
+    assert calls == []
+    conn = read()
+    assert conn.execute("SELECT count(*) FROM trials").fetchone() == (0,)
+    assert conn.execute(
+        "SELECT count(*) FROM owner_decisions WHERE kind = 'holdout_spend'"
+    ).fetchone() == (0,)
+
+
+def test_a_holdout_spend_past_the_stores_last_session_is_refused_with_no_trial(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _spy(monkeypatch)
+    with open_for_write(_store(store)) as conn:
+        conn.execute("DELETE FROM prices_daily WHERE session > DATE '2019-07-31'")
+
+    with pytest.raises(ValueError, match=r"refused_incomplete_holdout.*2019-08"):
+        run_hypothesis(SLUG, *HOLDOUT_WINDOW, OVERRIDE, reasons=OVERRIDE_REASONS, store_path=store)
+
+    assert calls == []
+    assert read().execute("SELECT count(*) FROM trials").fetchone() == (0,)
+
+
+def test_a_complete_holdout_window_still_spends(store: Path, read: Read) -> None:
+    outcome = run_hypothesis(
+        SLUG,
+        *HOLDOUT_WINDOW,
+        OVERRIDE,
+        reasons=OVERRIDE_REASONS,
+        store_path=store,
+        now=datetime(2019, 9, 3, tzinfo=UTC),
+    )
+
+    assert outcome.status == "ok"
+    assert _row(read(), "trials", outcome.trial_id)["kind"] == "holdout"
