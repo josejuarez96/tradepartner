@@ -611,6 +611,132 @@ def test_mismatched_pending_body_is_reported_and_never_evicted(rig: Rig) -> None
     assert "unresolved retry files: 1" in lines
 
 
+def _cmd_settings(rig: Rig) -> Settings:
+    return rig.settings.model_copy(
+        update={"edgar": rig.settings.edgar.model_copy(update={"cache_dir": str(rig.cache)})}
+    )
+
+
+def test_a_move_corrupted_before_eviction_is_recorded_mismatched_and_retried(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = body_path(rig.root, _sha(b"dead-a"))
+    real = raw_archive_migrate.evict_uploaded
+
+    def corrupting(settings: Settings, hashes: Sequence[str], icloud: object) -> object:
+        target.write_bytes(b"corrupt")
+        return real(settings, hashes, icloud)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(raw_archive_migrate, "evict_uploaded", corrupting)
+    first = rig.run()
+    monkeypatch.setattr(raw_archive_migrate, "evict_uploaded", real)
+    path = f"{DEAD}/a.json"
+    assert first.states[path] == "mismatched"
+    assert first.count("mismatched") == 1
+    assert target not in rig.icloud.evicted
+    assert target.read_bytes() == b"corrupt"
+    assert raw_archive_migrate.pending_evictions(rig.cache)  # not a clean move
+    second = rig.run()
+    assert (second.retried, second.retry_mismatched) == (1, 1)
+    target.write_bytes(b"dead-a")  # the owner repairs the body
+    third = rig.run()
+    assert (third.retried, third.retry_evicted) == (1, 1)
+    assert target in rig.icloud.evicted
+    assert raw_archive_migrate.pending_evictions(rig.cache) == {}
+
+
+class FailingEvictICloud(FakeICloud):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = True
+
+    def evict(self, path: Path) -> None:
+        if self.fail:
+            raise raw_archive.RawArchiveICloudError("evict failed")
+        super().evict(path)
+
+
+def test_an_evict_error_is_recorded_evict_failed_and_retried_next_run(rig: Rig) -> None:
+    rig.icloud = FailingEvictICloud()
+    first = rig.run()
+    assert first.count("evict_failed") == 2
+    assert first.backup_count("evict_failed") == 1
+    assert first.count("moved") == 0
+    assert sum(len(v) for v in raw_archive_migrate.pending_evictions(rig.cache).values()) == 3
+    rig.icloud.fail = False
+    second = rig.run()
+    assert (second.retried, second.retry_evicted) == (3, 3)
+    assert raw_archive_migrate.pending_evictions(rig.cache) == {}
+    assert rig.run().retried == 0
+
+
+def test_a_status_error_is_recorded_status_failed(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(_paths: Sequence[Path]) -> Mapping[Path, ItemStatus]:
+        raise raw_archive.RawArchiveICloudError("status failed")
+
+    monkeypatch.setattr(rig.icloud, "status", broken)
+    first = rig.run()
+    assert first.count("status_failed") == 2
+    assert first.backup_count("status_failed") == 1
+    monkeypatch.undo()
+    second = rig.run()
+    assert (second.retried, second.retry_evicted) == (3, 3)
+
+
+def test_a_backup_corrupted_before_eviction_is_recorded_mismatched(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = body_path(rig.root, _sha(b"stamp"))
+    real = raw_archive_migrate.evict_uploaded
+
+    def corrupting(settings: Settings, hashes: Sequence[str], icloud: object) -> object:
+        if target.exists():
+            target.write_bytes(b"corrupt")
+        return real(settings, hashes, icloud)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(raw_archive_migrate, "evict_uploaded", corrupting)
+    first = rig.run()
+    assert first.backup_states["stamps/v1/0001.json"] == "mismatched"
+    assert first.backup_count("mismatched") == 1
+    assert target not in rig.icloud.evicted
+    assert raw_archive_migrate.pending_evictions(rig.cache)
+
+
+def test_the_command_reports_first_pass_eviction_failures_and_exits_on_a_mismatch(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store import archive_cmd
+
+    target = body_path(rig.root, _sha(b"dead-a"))
+    real = raw_archive_migrate.evict_uploaded
+
+    def corrupting(settings: Settings, hashes: Sequence[str], icloud: object) -> object:
+        if target.exists():
+            target.write_bytes(b"corrupt")
+        return real(settings, hashes, icloud)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(raw_archive_migrate, "evict_uploaded", corrupting)
+    lines, corrupt = archive_cmd.migrate_cache_checked(_cmd_settings(rig), rig.icloud, apply=True)
+    text = "\n".join(lines)
+    assert corrupt
+    assert "mismatched 1" in text
+    assert "unresolved retry files: 1" in text
+    assert "moved 0" in text
+
+
+def test_the_command_reports_an_evict_error_without_flagging_corruption(rig: Rig) -> None:
+    from tradepartner.store import archive_cmd
+
+    rig.icloud = FailingEvictICloud()
+    lines, corrupt = archive_cmd.migrate_cache_checked(_cmd_settings(rig), rig.icloud, apply=True)
+    text = "\n".join(lines)
+    assert not corrupt
+    assert "evict_failed 2" in text
+    assert "unresolved retry files: 3" in text
+
+
 def test_retry_counts_distinct_paths_across_journals(rig: Rig) -> None:
     from tradepartner.store import archive_cmd
 
