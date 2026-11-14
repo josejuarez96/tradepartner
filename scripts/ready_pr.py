@@ -395,10 +395,8 @@ def missing_reviews(required: set[str], comments: Sequence[str]) -> list[str]:
     return sorted(r for r in required if latest.get(r) != "pass")
 
 
-def tick_reviewer_boxes(
-    body: str, required: set[str], comments: Sequence[str]
-) -> tuple[str, list[str], list[str], list[str], dict[str, str]]:
-    """Return the edited body, other boxes, changed lines, missing SHAs, and review SHAs."""
+def review_shas(comments: Sequence[str]) -> dict[str, str]:
+    """Each agent's latest verdict comment's ``reviewed at <sha>``, if that comment has one."""
     reviewed_at: dict[str, str] = {}
     for comment in comments:
         verdict = VERDICT_RE.match(comment)
@@ -409,6 +407,14 @@ def tick_reviewer_boxes(
                 reviewed_at[agent] = sha.group(1)
             else:
                 reviewed_at.pop(agent, None)
+    return reviewed_at
+
+
+def tick_reviewer_boxes(
+    body: str, required: set[str], comments: Sequence[str]
+) -> tuple[str, list[str], list[str], list[str], dict[str, str]]:
+    """Return the edited body, other boxes, changed lines, missing SHAs, and review SHAs."""
+    reviewed_at = review_shas(comments)
     # Only boxes outside fenced code blocks count, and only the template's own reviewer
     # line is ticked, and only when exactly one such line is unticked (#1823).
     lines = body.splitlines(keepends=True)
@@ -1035,16 +1041,13 @@ def ready(
             "latest PASS review comment needs `reviewed at <sha>` before ticking the "
             "reviewer box: " + ", ".join(missing_sha)
         )
-    if ticked:
-        for agent in sorted(required):
-            sha = reviewed_at[agent]
-            if not r.git_ok("merge-base", "--is-ancestor", sha, "HEAD") or agent in (
-                required_reviews(_own_changes_since(r, main_ref, sha, touched))
-            ):
-                raise ReadyError(
-                    f"{agent} review no longer covers the current head; rerun it before "
-                    "ticking the reviewer box"
-                )
+    # Every run, not only the one that ticks the box: commits pushed after a ticked PASS
+    # still need a review of the new code (#3318).
+    if stale := review_covers_head(r, main_ref, required, reviewed_at, touched):
+        raise ReadyError(
+            f"{', '.join(stale)} review no longer covers the current head; rerun it "
+            "before marking ready"
+        )
     for line in ticked:
         say(f"reviewer box: {line}")
     if ticked and not dry_run:
@@ -1097,7 +1100,9 @@ def _own_patch(r: Runner, main_ref: str, ref: str, path: str) -> list[str]:
     return [HUNK_RE.sub("@@ @@", ln) for ln in out.splitlines() if not ln.startswith("index ")]
 
 
-def _own_changes_since(r: Runner, main_ref: str, sha: str, touched: Sequence[str]) -> list[str]:
+def _own_changes_since(
+    r: Runner, main_ref: str, sha: str, touched: Sequence[str], head: str = "HEAD"
+) -> list[str]:
     """PR-owned paths whose own change differs between the reviewed ``sha`` and ``HEAD``.
 
     A path counts only if it changed in ``sha..HEAD`` and is in the PR's diff against
@@ -1107,16 +1112,43 @@ def _own_changes_since(r: Runner, main_ref: str, sha: str, touched: Sequence[str
     Paths no reviewer gates (docs/plans, changelog.d) are dropped by ``required_reviews``.
     """
     out: list[str] = []
-    for path in r.git("diff", "--no-renames", "--name-only", "-z", f"{sha}..HEAD").split("\0"):
+    for path in r.git("diff", "--no-renames", "--name-only", "-z", f"{sha}..{head}").split("\0"):
         if not path or path not in touched:
             continue
-        if r.git("ls-tree", sha, "--", path) == r.git("ls-tree", "HEAD", "--", path):
+        if r.git("ls-tree", sha, "--", path) == r.git("ls-tree", head, "--", path):
             continue
-        if r.git("diff", "--numstat", sha, "HEAD", "--", path).startswith("-\t-"):
+        if r.git("diff", "--numstat", sha, head, "--", path).startswith("-\t-"):
             out.append(path)  # binary: no line patch to compare
-        elif _own_patch(r, main_ref, sha, path) != _own_patch(r, main_ref, "HEAD", path):
+        elif _own_patch(r, main_ref, sha, path) != _own_patch(r, main_ref, head, path):
             out.append(path)
     return out
+
+
+def review_covers_head(
+    r: Runner,
+    main_ref: str,
+    required: set[str],
+    reviewed_at: Mapping[str, str],
+    touched: Sequence[str],
+    head: str = "HEAD",
+) -> list[str]:
+    """Required reviewers whose ``reviewed at`` commit no longer covers ``head`` (#3318).
+
+    A review covers the head when its commit is an ancestor of ``head`` and no PR-owned
+    path a reviewer gates changed since, so a merge of main that touches none of the PR's
+    own files still passes (#1851). A reviewer with no recorded commit, or one the clone
+    cannot see, is stale: fail closed.
+    """
+    stale: list[str] = []
+    for agent in sorted(required):
+        sha = reviewed_at.get(agent)
+        if (
+            not sha
+            or not r.git_ok("merge-base", "--is-ancestor", sha, head)
+            or agent in required_reviews(_own_changes_since(r, main_ref, sha, touched, head))
+        ):
+            stale.append(agent)
+    return stale
 
 
 def _merge_main(r: Runner, main_ref: str, say: Callable[[str], None]) -> None:
