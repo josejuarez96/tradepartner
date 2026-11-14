@@ -257,7 +257,7 @@ class _PausingProvider(StoreProvider):
         timing: _Timing,
     ) -> None:
         self._timing = timing
-        super().__init__(connect, handle, frozen_settings)
+        super().__init__(connect, handle, frozen_settings, refuse_forked_chains=True)
 
     def _at(self, t: datetime) -> duckdb.DuckDBPyConnection:
         if self._conn is None or self._step_t != t:

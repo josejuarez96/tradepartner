@@ -154,6 +154,9 @@ from tradepartner.store.asof import (
     statement_facts_as_of,
     unvalued_spin_offs_as_of,
 )
+from tradepartner.store.asof import (
+    refuse_forked_chains as refuse_forks_at,
+)
 from tradepartner.store.benchmarks import benchmark_security_ids
 from tradepartner.store.classify import classifications_as_of
 from tradepartner.store.db import StoreLockedError
@@ -273,6 +276,8 @@ class StoreProvider:
         handle: registry.TrialHandle,
         frozen_settings: Settings,
         registry_connect: Connect | None = None,
+        *,
+        refuse_forked_chains: bool = False,
     ) -> None:
         if not isinstance(handle, registry.TrialHandle):
             raise TypeError(
@@ -286,6 +291,9 @@ class StoreProvider:
                 "ones, so this run would not use its frozen calendar"
             )
         self._connect = connect
+        #: A backtest run refuses a read through a forked chain (#3323); paper
+        #: planning keeps its own per-name handling and leaves this off.
+        self._refuse_forks = refuse_forked_chains
         self.handle = handle
         self.settings = frozen_settings
         self._dividend_reviews = reviewed_groups()
@@ -348,7 +356,15 @@ class StoreProvider:
 
     def universe(self, t: datetime) -> Universe:
         t = check_t(t)
-        return self._step_universe(t)
+        universe = self._step_universe(t)
+        self._refuse_forks_at(t, universe.members["security_id"].to_list())
+        return universe
+
+    def _refuse_forks_at(self, t: datetime, ids: Sequence[str]) -> None:
+        """`ForkedChainError` for a forked chain among `ids` when this provider was
+        opened to refuse them (a backtest run, #3323)."""
+        if self._refuse_forks:
+            refuse_forks_at(self._at(t), t, ids)
 
     def chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
         """The live successor chains known at `t` (#821, T187b): the
@@ -366,6 +382,7 @@ class StoreProvider:
         sessions_from: date | None = None,
     ) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
+        self._refuse_forks_at(t, wanted)
         return adjusted_prices_as_of(
             self._at(t),
             t,
@@ -390,6 +407,7 @@ class StoreProvider:
 
     def raw_prices(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
+        self._refuse_forks_at(t, wanted)
         return prices_as_of(self._at(t), t, wanted, traded_only=True)
 
     def listing_ends(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
@@ -522,6 +540,7 @@ class StoreProvider:
 
     def merger_exits(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
+        self._refuse_forks_at(t, wanted)
         conn = self._at(t)
         # `mergers_as_of` also keeps rows matched only by their acquirer; drop them.
         mergers = mergers_as_of(conn, t, wanted).filter(pl.col("security_id").is_in(wanted))
@@ -532,6 +551,7 @@ class StoreProvider:
             pl.col("acquirer_security_id").replace(chains).alias(_ACQUIRER_KEY)
         )
         acquirers = sorted(set(mergers[_ACQUIRER_KEY].drop_nulls().to_list()))
+        self._refuse_forks_at(t, [*acquirers, *mergers["acquirer_security_id"].drop_nulls()])
         # Bound the acquirers' bars to the earliest effective date: only those dates join.
         first = mergers["effective_date"].min()
         sessions_from = first if isinstance(first, date) else None
