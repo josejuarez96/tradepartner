@@ -386,7 +386,7 @@ def test_config_fingerprint_is_stable_until_the_config_changes(
     second = tp_calendar._config_fingerprint()
     assert second != first
     assert tp_calendar._config_fingerprint() == second
-    env_file.write_text("CALENDAR__END=2031-12-31\n")
+    env_file.write_text("CALENDAR__END=2031-12-31\n# edited, so the size differs\n")
     third = tp_calendar._config_fingerprint()
     assert third not in (first, second)
     monkeypatch.delenv("TP_TEST_UNRELATED")
