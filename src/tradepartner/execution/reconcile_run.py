@@ -2904,7 +2904,7 @@ def unresolved_orders(
     return [o for o in unsettled if o.client_order_id in marked]
 
 
-def _confirmed_broker_ids(
+def confirmed_broker_ids(
     connect: Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]],
     orders: Sequence[OrderRow],
 ) -> dict[str, str]:
@@ -2922,6 +2922,20 @@ def _confirmed_broker_ids(
         for e in events
         if e.status == "pending_unresolved" and e.broker_order_id is not None
     }
+
+
+def read_confirmed(broker: Broker, coid: str, broker_order_id: str) -> Order:
+    """The open order the submit reply confirmed (#3335), found by its broker id and
+    `client_order_id` when the coid lookup misses. A confirmed order is never
+    closed `not_received`: a miss raises `ReconciliationError`."""
+    for listed in broker.open_orders():
+        if listed.broker_order_id == broker_order_id and listed.client_order_id == coid:
+            return listed
+    raise ReconciliationError(
+        f"pending_unresolved order {coid} was confirmed by the broker "
+        f"(broker_order_id {broker_order_id}) but is not found by client_order_id "
+        "or among the open orders: not closed not_received"
+    )
 
 
 def settle_pending_unresolved(
@@ -2944,7 +2958,7 @@ def settle_pending_unresolved(
     `ReconciliationError` and writes nothing, leaving the order unsettled (a
     `ClockError` keeps its type)."""
     readings: dict[str, Order | None] = {}
-    confirmed = _confirmed_broker_ids(connect, orders)
+    confirmed = confirmed_broker_ids(connect, orders)
     for order in orders:
         coid = order.client_order_id
         try:
@@ -2954,17 +2968,7 @@ def settle_pending_unresolved(
             if broker_id is None:
                 readings[coid] = None
                 continue
-            # The submit reply confirmed the order (#3335): a coid miss is a lagging
-            # lookup, never proof the broker never got it. Find it by broker id among
-            # the open orders, else fail closed and leave it unsettled.
-            listed = [o for o in broker.open_orders() if o.broker_order_id == broker_id]
-            if not listed:
-                raise ReconciliationError(
-                    f"pending_unresolved order {coid} was confirmed by the broker "
-                    f"(broker_order_id {broker_id}) but is not found by client_order_id "
-                    "or among the open orders: not closed not_received"
-                ) from None
-            got = listed[0]
+            got = read_confirmed(broker, coid, broker_id)
         except ClockError:
             raise
         except Exception as exc:

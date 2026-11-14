@@ -174,7 +174,9 @@ from tradepartner.execution.reconcile import BREAKS, OK
 from tradepartner.execution.reconcile_run import (
     StatedBeforeTrueUp,
     command_session,
+    confirmed_broker_ids,
     frozen_risk,
+    read_confirmed,
     reconcile_now,
     verify_frozen_sha256,
 )
@@ -368,17 +370,23 @@ def _settle(
     stamps: _MonotonicStamps,
 ) -> tuple[tuple[str, str], ...]:
     """Acknowledge each `pending` order the broker knows, or cancel it
-    `not_received` (module docstring, step 4)."""
+    `not_received` (module docstring, step 4). An order whose submit reply was
+    journaled (#3335) is read by its broker id, and a miss raises
+    `ReconciliationError`, writing nothing."""
     if not pending:
         return ()
     events: list[OrderEventRow] = []
     settled: list[tuple[str, str]] = []
     readings: dict[str, Order | None] = {}
+    confirmed = confirmed_broker_ids(connect, pending)
     for order in pending:
+        coid = order.client_order_id
         try:
-            readings[order.client_order_id] = broker.get_order(order.client_order_id)
+            readings[coid] = broker.get_order(coid)
         except UnknownOrderError:
-            readings[order.client_order_id] = None
+            broker_id = confirmed.get(coid)
+            # The submit reply confirmed it (#3335): never closed `not_received`.
+            readings[coid] = None if broker_id is None else read_confirmed(broker, coid, broker_id)
     stamp = stamps.next(clock, "settle order_events")
     for order in pending:
         reading = readings[order.client_order_id]

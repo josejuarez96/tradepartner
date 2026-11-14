@@ -107,7 +107,7 @@ from tradepartner.execution.window import stop as window_stop
 from tradepartner.execution.wrapper import WRITE_FAILED_EXIT_CODE
 from tradepartner.store import registry
 from tradepartner.store.asof import live_actions_as_of
-from tradepartner.store.db import open_read_only
+from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
     AdjustmentRow,
     OverrideRow,
@@ -1561,6 +1561,35 @@ def test_a_confirmed_order_open_at_the_broker_settles_from_its_broker_id(
         ("pending_unresolved", None),
         ("accepted", None),
     ]
+
+
+def test_paper_resume_does_not_close_a_confirmed_order_not_received(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """#3335: `paper resume` is how an owner releases a halted window, so it too
+    reads a confirmed order by its broker id and refuses rather than closing it
+    `not_received` (which would let the next run resend it)."""
+    coid, _ = _unresolved_buy(env)
+    with pytest.raises(ReconciliationError, match="confirmed by the broker"):
+        _resume(env)
+    assert _events(env, coid) == [("pending", None), ("pending_unresolved", None)]
+
+
+def test_an_unresolved_order_with_no_journaled_broker_id_still_closes_not_received(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Journals written before #3335 carry no broker id on `pending_unresolved`:
+    the old `not_received` close still applies to them."""
+    coid, _ = _unresolved_buy(env)
+    with open_for_write(env.settings) as conn:
+        conn.execute(
+            "UPDATE order_events SET broker_order_id = NULL "
+            "WHERE client_order_id = ? AND status = 'pending_unresolved'",
+            [coid],
+        )
+    nxt = env.run(at(F_0_PLUS_1))
+    assert nxt.status == "ok", env.result(env.latest_run())
+    assert _events(env, coid)[-1] == ("cancelled", "not_received")
 
 
 def test_a_confirmed_order_whose_coid_lookup_lags_is_not_closed_not_received_or_resent(
