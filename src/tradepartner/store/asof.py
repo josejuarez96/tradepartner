@@ -503,6 +503,48 @@ def chained_read_ids(
     return ids, forked
 
 
+class ForkedChainError(ValueError):
+    """A research or backtest read named a predecessor with more than one live
+    successor chain at `t` (#3323). Which successor holds its history is never
+    guessed, so the run refuses (execution fails closed through
+    `chained_read_ids`' second map)."""
+
+
+def forked_chains(
+    conn: duckdb.DuckDBPyConnection, t: datetime, security_ids: Iterable[str] | None = None
+) -> dict[str, tuple[str, ...]]:
+    """Each predecessor of more than one live chain known at `t`, with its
+    successors sorted (#3323). With `security_ids`, only the forks naming one of
+    them as predecessor or successor; `None` returns every fork. Never raises:
+    `ForkedChainError` is the caller's refusal, and a report (the health check)
+    may read a forked store."""
+    successors: dict[str, set[str]] = {}
+    for predecessor, successor in live_chains(conn, t):
+        successors.setdefault(predecessor, set()).add(successor)
+    wanted = None if security_ids is None else set(security_ids)
+    return {
+        pred: tuple(sorted(found))
+        for pred, found in sorted(successors.items())
+        if len(found) > 1 and (wanted is None or wanted & {pred, *found})
+    }
+
+
+def refuse_forked_chains(
+    conn: duckdb.DuckDBPyConnection, t: datetime, security_ids: Iterable[str]
+) -> None:
+    """Raise `ForkedChainError` naming each forked predecessor among
+    `security_ids` (as predecessor or successor) at `t` (#3323)."""
+    forked = forked_chains(conn, t, security_ids)
+    if forked:
+        raise ForkedChainError(
+            "; ".join(
+                f"{pred}: more than one live successor chain known at {t.isoformat()} "
+                f"({', '.join(found)}), so its history cannot be filed"
+                for pred, found in forked.items()
+            )
+        )
+
+
 @dataclass(frozen=True)
 class LiveChains:
     """The chains a single chain-aware read applies (#821, T187b): `pairs`
