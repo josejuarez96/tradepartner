@@ -65,14 +65,27 @@ def _env_view() -> dict[bytes, bytes] | dict[str, str]:
     return dict(os.environ)
 
 
+_env_file_memo: tuple[str | None, str] | None = None
+
+
 def _env_file_state() -> tuple[object, ...]:
-    """The `.env` file's path, inode, size, mtime and ctime (one `stat`)."""
-    path = _default_env_file()
+    """The `.env` file's path, inode, size, mtime and ctime (one `stat`).
+
+    `_default_env_file()` resolves symlinks (several syscalls) on every call, so
+    its answer is memoised per `TRADEPARTNER_ENV_FILE` value; the path it names
+    is still `stat`-ed every time."""
+    global _env_file_memo
+    override = os.environ.get("TRADEPARTNER_ENV_FILE")
+    memo = _env_file_memo
+    if memo is None or memo[0] != override:
+        memo = (override, str(_default_env_file()))
+        _env_file_memo = memo
+    path = memo[1]
     try:
-        stat = path.stat()
+        stat = os.stat(path)
     except OSError:
-        return (str(path), None)
-    return (str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        return (path, None)
+    return (path, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
 
 def _config_fingerprint() -> int:
