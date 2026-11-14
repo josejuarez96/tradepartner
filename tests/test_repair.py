@@ -1919,3 +1919,43 @@ def test_a_retracted_class_id_is_moved_only_by_its_own_ticker(orphan_store: Sett
     assert ("0000000089:class-a", date(2021, 6, 1)) in result.found.bars
     assert (cls, date(2021, 6, 1)) in result.orphans  # ZZZZ: nobody receives it
     assert ("0000000089:class-a", date(2021, 6, 1)) not in result.orphans  # GONE: base/heir
+
+
+# --- #3290: the orphan test reads the id's own former ticker ---
+
+
+def _swap_common_row(settings: Settings, ticker: str, valid_from: date) -> None:
+    """Retract DEAD's GONE row and leave only a live `ticker` row, the shape
+    master-retract plus an EDGAR write leaves (a warrant row, a lowercase
+    ticker): the id's common ticker is now a retracted row."""
+    with open_for_write(settings) as conn:
+        common = _listing(DEAD, "GONE", date(2019, 1, 2))
+        insert_row(conn, "listings", retraction(common, datetime(2021, 5, 1, 22, tzinfo=UTC)))
+        insert_row(conn, "listings", _listing(DEAD, ticker, valid_from))
+
+
+@pytest.mark.parametrize(("ticker", "valid_from"), [("GONEWW", date(2020, 1, 2)), ("gone", None)])
+def test_a_leftover_warrant_or_lowercase_row_does_not_hide_the_receiver(
+    store: Settings, ticker: str, valid_from: date | None
+) -> None:
+    # The common row is retracted and the live row is a warrant or a raw
+    # lowercase ticker: the bars' receiver (HEIR, under GONE) is still found.
+    _swap_common_row(store, ticker, valid_from or date(2021, 5, 1))
+    result = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert result.bar_rows == 3
+    assert result.orphan_keys == 0
+
+
+def test_held_tickers_normalise_case_and_include_the_ids_retracted_rows(store: Settings) -> None:
+    _swap_common_row(store, "gone", date(2021, 5, 1))
+    with duckdb.connect(store.store.path, read_only=True) as conn:
+        held = repair._held_tickers(conn, RUN)
+    assert held(DEAD, date(2021, 6, 1)) == ["GONE"]
+
+
+def test_a_retracted_row_still_leaves_a_genuine_orphan(orphan_store: Settings) -> None:
+    # No id lists GONE from the bars' days: retracting DEAD's own row and
+    # adding a warrant row must not make its bars look received.
+    _swap_common_row(orphan_store, "GONEWW", date(2020, 1, 2))
+    result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
+    assert result.orphan_keys == 2
