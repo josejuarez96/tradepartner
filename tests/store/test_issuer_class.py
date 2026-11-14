@@ -263,7 +263,7 @@ class TestStore:
         )
         schema.init_schema(conn)
         assert conn.execute("SELECT issuer_class FROM classifications").fetchall() == [(None,)]
-        assert schema.CURRENT_SCHEMA_VERSION == 48
+        assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RETRACTED_ROWS_VERSION + 1
 
     def test_an_incremental_ingest_stamps_a_new_tag_at_its_run_never_earlier(self) -> None:
         """Without `--rebuild-classifications`, a tag that changes behind stored
