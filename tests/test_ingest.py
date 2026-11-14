@@ -3627,7 +3627,7 @@ def test_shares_after_new_equity_go_to_the_successor(settings: Settings) -> None
     rows, unmatched = fact_rows([before, after], master, classes, ingested_at=ingested_at)
     assert [(r["security_id"], r["value"]) for r in rows] == [
         (cik, 49_000_000),
-        (f"{cik}@2020-11-05", 83_000_000),
+        (f"{cik}@2020-10-27", 83_000_000),
     ]
     assert unmatched == ()
 

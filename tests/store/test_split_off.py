@@ -104,8 +104,8 @@ def test_a_ticker_the_new_issuer_takes_only_after_the_relisting_is_not_dropped()
     # page the successor was the only holder and stays.
     build = build_master(_braves(ticker_reuse=True), _settings(), ingested_at=INGESTED_AT)
     assert {s.security_id for s in build.successions} == {
-        f"{OLD}@2023-08-04",
-        f"{OLD}@2023-08-04-2",
+        f"{OLD}@2023-07-31",
+        f"{OLD}@2023-07-31-2",
     }
 
 
