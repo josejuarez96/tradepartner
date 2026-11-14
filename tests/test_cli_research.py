@@ -127,6 +127,9 @@ def live(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("SEC_EDGAR_USER_AGENT", USER_AGENT)
     monkeypatch.setenv("ALPACA_API_KEY", ALPACA_KEY)
     monkeypatch.setenv("ALPACA_API_SECRET", ALPACA_SECRET)
+    # The register/open commands refuse a store that does not exist (#3332), so the
+    # live store starts as an existing, empty file that they initialise.
+    duckdb.connect(str(store)).close()
     return store
 
 
@@ -518,7 +521,8 @@ def test_experiments_scrubs_a_secret_in_a_run_message(open_run: int) -> None:
     assert "abandoned" in out.stdout
 
 
-def test_experiments_without_a_store_exits_1() -> None:
+def test_experiments_without_a_store_exits_1(live: Path) -> None:
+    live.unlink()
     out = _cli("experiments")
     assert out.exit_code == 1
 
