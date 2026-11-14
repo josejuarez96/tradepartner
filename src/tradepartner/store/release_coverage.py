@@ -5,10 +5,11 @@ A count check proves a repair's size, not that it is right: nothing else notices
 a liquid security losing months of bars. This compares the distinct
 `prices_daily` sessions per `security_id` in a release's pre-release backup
 (attached read-only) with the current store and lists every security that lost
-more than a threshold of sessions. A lost session is "moved" when another
+sessions. A lost session is "moved" when another
 `security_id` gained a bar for the same session that equals the lost bar (same
-volume, OHLC within a relative tolerance), as a merge into a successor id does. The check fails
-when any security's *unmoved* loss exceeds the threshold. It writes nothing.
+volume, OHLC within a relative tolerance with an absolute floor at price 1),
+as a merge into a successor id does. The caller checks per-security and total
+unmoved losses against configured thresholds. It writes nothing.
 """
 
 from __future__ import annotations
@@ -21,6 +22,10 @@ import duckdb
 
 _ALIAS = re.compile(r"[a-z_][a-z0-9_]*")
 _MAX_SUCCESSORS = 3
+
+
+class ReleaseCoverageError(RuntimeError):
+    """A release backup lacks a table required for the coverage check."""
 
 
 @dataclass(frozen=True)
@@ -46,10 +51,9 @@ def release_coverage(
     conn: duckdb.DuckDBPyConnection,
     *,
     backup_alias: str,
-    max_lost_sessions: int,
     price_tolerance: float = 1e-6,
 ) -> list[SessionLoss]:
-    """Every security whose lost sessions exceed `max_lost_sessions`, by id.
+    """Every security with lost sessions, by id.
 
     `conn` is read-only on the current store with the backup attached read-only
     as `backup_alias`. Only distinct sessions count, so a revised bar (a second
@@ -58,6 +62,18 @@ def release_coverage(
     if _ALIAS.fullmatch(backup_alias) is None:
         raise ValueError(f"bad backup alias {backup_alias!r}")
     bk = backup_alias
+    present = {
+        row[0]
+        for row in conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_catalog = ? AND table_schema = 'main'",
+            [bk],
+        ).fetchall()
+    }
+    missing = {"prices_daily", "securities", "listings"} - present
+    if missing:
+        names = ", ".join(sorted(missing))
+        raise ReleaseCoverageError(f"backup missing required table(s): {names}")
     rows = conn.execute(
         f"""
         WITH bb AS (
@@ -94,7 +110,6 @@ def release_coverage(
                    flatten(list(m.successors) FILTER (WHERE m.session IS NOT NULL)) AS succ
             FROM lost l LEFT JOIN moved m USING (security_id, session)
             GROUP BY l.security_id
-            HAVING count(*) > ?
         )
         SELECT a.security_id, a.first, a.last, a.lost, a.moved, a.succ,
                coalesce(
@@ -109,7 +124,7 @@ def release_coverage(
                     WHERE s.security_id = a.security_id))
         FROM agg a ORDER BY a.lost DESC, a.security_id
         """,
-        [price_tolerance] * 4 + [max_lost_sessions],
+        [price_tolerance] * 4,
     ).fetchall()
     out: list[SessionLoss] = []
     for sid, first, last, lost, moved, succ, name, ticker in rows:
