@@ -1565,6 +1565,7 @@ def _refuse_ahead(
             return None  # the real run records that refusal, before any fetch
     totals: Counter[str] = Counter()
     refused: list[str] = []
+    unchecked = ""
     for window in windows:
         run = _refetch_month(
             settings,
@@ -1582,13 +1583,19 @@ def _refuse_ahead(
             refused,
         )
         if run.status != FILLED:
+            unchecked = f"{run.chunk_cursor}: {run.message}"
             break
-    if not refused:
+    if not refused and not unchecked:
         return None
-    message = (
-        f"{len(refused)} collision row(s): a new id on a security, type and ex-date that "
-        f"already holds a live one; nothing written in any month: {'; '.join(sorted(refused))}"
-    )
+    message = "nothing written in any month"
+    if refused:
+        message = (
+            f"{len(refused)} collision row(s): a new id on a security, type and ex-date that "
+            f"already holds a live one; {message}: {'; '.join(sorted(refused))}"
+        )
+    if unchecked:
+        # A month that could not be asked leaves later months unchecked: refuse, don't half-write.
+        message += f"; a month could not be checked ({unchecked})"
     failed = SourceRun(
         "alpaca", FAILED, 0, f"{ACTIONS_REFETCH};since={since};through={windows[-1][1]}", message
     )

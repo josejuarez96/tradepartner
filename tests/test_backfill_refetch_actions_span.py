@@ -373,3 +373,14 @@ def test_a_covered_late_month_collision_lets_the_whole_run_write(settings: Setti
     result = _late_collision(settings, allow_collisions=[(ACME, JUNE_EX)])
     assert result.ok and result.refused == ()
     assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(3,)]
+
+
+def test_a_month_the_dry_pass_cannot_check_refuses_the_whole_real_run(settings: Settings) -> None:
+    prices = _committed(settings)
+    _open_release(settings)
+    prices.actions = [_dividend(), _dividend(JUNE_EX, action_id="acme-q2-jun")]
+    prices.fail_in = date(2019, 6, 1)
+    result = _refetch(settings, prices, since=date(2019, 5, 1), through=THROUGH)
+    assert not result.ok and result.runs[-1].status == FAILED
+    assert "could not be checked" in result.runs[-1].message
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(0,)]
