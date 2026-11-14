@@ -680,18 +680,19 @@ def _live_chains_at(
     exchange matched by the successor's earliest such row (as
     `store.master.build_chains`). Raises `ForkedChainError` when a predecessor
     has more than one live successor at `t` and the read asks for it or one of
-    its successors (`security_ids`; `None` asks for every id) (#3323)."""
+    its successors (`security_ids`). A read for every id (`None`) cannot
+    attribute a fork to a name, so it keeps the store-wide behaviour rather
+    than halting ingest and every run on one fork (#3323; the execution path
+    fails closed per name through `chained_read_ids`)."""
     pairs = live_chains(conn, t)
     if not pairs:
         return _NO_CHAINS
     successors: dict[str, list[str]] = {}
     for predecessor, successor in pairs:
         successors.setdefault(predecessor, []).append(successor)
-    wanted = None if security_ids is None else set(security_ids)
+    wanted = set(security_ids or ())
     forked = {
-        pred: succ
-        for pred, succ in successors.items()
-        if len(succ) > 1 and (wanted is None or wanted & {pred, *succ})
+        pred: succ for pred, succ in successors.items() if len(succ) > 1 and wanted & {pred, *succ}
     }
     if forked:
         raise ForkedChainError(

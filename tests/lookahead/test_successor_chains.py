@@ -835,5 +835,5 @@ def test_a_fork_does_not_stop_a_read_of_unrelated_ids(
     assert set(other["security_id"].unique().to_list()) == {"0001000013"}
     with pytest.raises(ForkedChainError):
         prices_as_of(chain_fixture_store, _FORK_KNOWN_AT, [_PREDECESSOR])
-    with pytest.raises(ForkedChainError):
-        prices_as_of(chain_fixture_store, _FORK_KNOWN_AT, None)
+    # A read for every id cannot name the fork, so it does not halt on it.
+    assert not prices_as_of(chain_fixture_store, _FORK_KNOWN_AT, None).is_empty()
