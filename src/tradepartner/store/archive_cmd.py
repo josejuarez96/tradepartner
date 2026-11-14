@@ -169,9 +169,17 @@ def _store_write_lock_free(settings: Settings) -> Iterator[None]:
 
 def migrate_cache(settings: Settings, icloud: ICloudItems, *, apply: bool) -> list[str]:
     """The dry-run plan, or the run's summary with `apply` (module docstring)."""
+    return migrate_cache_checked(settings, icloud, apply=apply)[0]
+
+
+def migrate_cache_checked(
+    settings: Settings, icloud: ICloudItems, *, apply: bool
+) -> tuple[list[str], bool]:
+    """`migrate_cache`'s lines and whether any archived body failed verification
+    (`mismatched`, now or on a retry), which the command turns into a non-zero exit."""
     cache_dir = cache_dir_of(settings)
     if not apply:
-        return _dry_run(settings, cache_dir)
+        return _dry_run(settings, cache_dir), False
     require_archive_root(settings)
     with _store_write_lock_free(settings):
         result = migrate.apply_migration(settings, cache_dir, icloud)
@@ -180,6 +188,9 @@ def migrate_cache(settings: Settings, icloud: ICloudItems, *, apply: bool) -> li
         for state in (
             "evicted",
             "pending_upload",
+            "mismatched",
+            "evict_failed",
+            "status_failed",
             "moved",
             "duplicate",
             "duplicate_kept",
@@ -188,7 +199,15 @@ def migrate_cache(settings: Settings, icloud: ICloudItems, *, apply: bool) -> li
     )
     backed = ", ".join(
         f"{state} {result.backup_count(state)}"
-        for state in ("evicted", "pending_upload", "backed_up", "changed")
+        for state in (
+            "evicted",
+            "pending_upload",
+            "mismatched",
+            "evict_failed",
+            "status_failed",
+            "backed_up",
+            "changed",
+        )
     )
     pending_total = len(_pending_paths(cache_dir))
     lines = [
@@ -207,7 +226,12 @@ def migrate_cache(settings: Settings, icloud: ICloudItems, *, apply: bool) -> li
     ):
         if count:
             lines.append(f"retry {state}: {count}")
-    return lines
+    corrupt = bool(
+        result.count("mismatched") or result.backup_count("mismatched") or result.retry_mismatched
+    )
+    if corrupt:
+        lines.append("INTEGRITY: an archived body does not match its hash; it was not evicted")
+    return lines, corrupt
 
 
 def restore(settings: Settings, icloud: ICloudItems, *, path: str, run: str | None) -> list[str]:

@@ -95,7 +95,16 @@ def test_wrong_header_is_refused() -> None:
 
 def test_packaged_file_cites_each_row_to_its_filing() -> None:
     rows = reviewed_listings()
-    assert {row.ticker for row in rows} == {"DDS", "TCBI", "IBOC", "CAE", "CNL", "LINK", "MSGR"}
+    assert {row.ticker for row in rows} == {
+        "DDS",
+        "TCBI",
+        "IBOC",
+        "CAE",
+        "CNL",
+        "LINK",
+        "MSGK",
+        "MSGR",
+    }
     assert {row.ticker: row.exchange for row in rows} == {
         "DDS": "TXSE",
         "TCBI": "TXSE",
@@ -103,10 +112,11 @@ def test_packaged_file_cites_each_row_to_its_filing() -> None:
         "CAE": "NASDAQ",
         "CNL": "NASDAQ",
         "LINK": "NASDAQ",
+        "MSGK": "NYSE",
         "MSGR": "NYSE",
     }
     for row in rows:
-        assert row.issue == ("#3392" if row.ticker == "MSGR" else "#3293")
+        assert row.issue == {"MSGK": "#3391", "MSGR": "#3392"}.get(row.ticker, "#3293")
         assert normalize_exchange(row.exchange) == row.exchange
         # A listing starts on the session of the filing that states it.
         assert row.valid_from == session_of(row.known_at)
@@ -335,6 +345,61 @@ def test_relisting_on_the_same_exchange_keeps_the_old_line_to_its_last_bar() -> 
         ("2016-03-01", DELISTED, date(2021, 3, 23)),
         ("2021-03-24", LISTED, None),
     ]
+
+
+# --- MSGK (#3391) --------------------------------------------------------
+
+MSGK_CIK = "0001636519"
+MSGK_8K_ACCEPTED = _utc(2026, 10, 27, 20, 24, 8)  # 16:24:08 Eastern, EDGAR index and submissions
+
+
+def _msgk_source() -> FixtureFilingSource:
+    """MSGS on NYSE since 2020; the first cover page naming MSGK is the 2026-11-06 10-Q."""
+    old, new = _utc(2020, 5, 8, 20), _utc(2026, 11, 6, 12)
+    return FixtureFilingSource(
+        index=[
+            FilingIndexEntry(MSGK_CIK, "MSG Knickerbockers", "10-K", "0001636519-20-000001", old),
+            FilingIndexEntry(MSGK_CIK, "MSG Knickerbockers", "10-Q", "0001636519-26-000001", new),
+        ],
+        cover_pages=[
+            CoverPage(
+                MSGK_CIK,
+                "0001636519-20-000001",
+                old,
+                (CoverListing("Class A Common Stock", "MSGS", "NYSE"),),
+            ),
+            CoverPage(
+                MSGK_CIK,
+                "0001636519-26-000001",
+                new,
+                (CoverListing("Class A Common Stock", "MSGK", "NYSE"),),
+            ),
+        ],
+    )
+
+
+def test_msgk_row_is_cited_to_the_oct_27_8k() -> None:
+    (row,) = [r for r in reviewed_listings() if r.ticker == "MSGK"]
+    assert row.security_id == MSGK_CIK
+    assert row.valid_from == date(2026, 10, 27)
+    assert row.known_at == MSGK_8K_ACCEPTED
+    assert row.accession == "0001193125-26-434274"
+
+
+def test_msgk_span_starts_oct_27_and_nothing_shows_before_the_8k() -> None:
+    row = next(r for r in reviewed_listings() if r.ticker == "MSGK")
+    conn = _store()
+    write_master(conn, build_master(_msgk_source(), SETTINGS, ingested_at=NOW))
+    after = listings_as_of(conn, MSGK_8K_ACCEPTED)
+    msgk = after.filter(after["ticker"] == "MSGK")
+    assert msgk["valid_from"].to_list() == [date(2026, 10, 27)]
+    assert msgk["known_at"].to_list() == [row.known_at]
+    # One second earlier the 8-K is not yet accepted: no MSGK row exists at all.
+    early = listings_as_of(conn, MSGK_8K_ACCEPTED - timedelta(seconds=1))
+    assert "MSGK" not in early["ticker"].to_list()
+    # Later, the 11-06 cover-page row is still stored; the span starts at the earlier 10-27.
+    late = listings_as_of(conn, NOW)
+    assert min(late.filter(late["ticker"] == "MSGK")["valid_from"].to_list()) == date(2026, 10, 27)
 
 
 # --- MSGR (#3392) --------------------------------------------------------

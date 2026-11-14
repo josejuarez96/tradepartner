@@ -3001,6 +3001,25 @@ def test_migrate_cache_apply_then_restore_round_trips_the_bytes(arch: _ArchiveRi
     assert (arch.cache / arch.dead).stat().st_mtime_ns == mtime
 
 
+def test_migrate_cache_apply_exits_non_zero_on_a_corrupt_archived_body(
+    arch: _ArchiveRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store import raw_archive, raw_archive_migrate
+
+    real = raw_archive_migrate.evict_uploaded
+
+    def corrupting(settings: Any, hashes: Sequence[str], icloud: Any) -> Any:
+        raw_archive.body_path(arch.root, hashes[0]).write_bytes(b"corrupt")
+        return real(settings, hashes, icloud)
+
+    monkeypatch.setattr(raw_archive_migrate, "evict_uploaded", corrupting)
+    result = arch.run("migrate-cache", "--apply")
+
+    assert result.exit_code == 1, result.output
+    assert "mismatched" in result.output
+    assert "INTEGRITY" in result.output
+
+
 @pytest.mark.parametrize("path", ["nothing/here", "stamps/v1/0001.json"])
 def test_restore_refuses_with_a_plain_message_and_writes_nothing(
     arch: _ArchiveRig, path: str
