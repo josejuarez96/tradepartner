@@ -185,7 +185,7 @@ SAFETY_PREFIXES = (
     "src/tradepartner/research/models.py",
     "src/tradepartner/adapters/fred_raw.py",
     "src/tradepartner/adapters/openfigi_raw.py",
-    "src/tradepartner/store/raw_archive_config.py",
+    "src/tradepartner/store/raw_arch",
     # runs the override write and the localhost bind check
     "src/tradepartner/dashboard/app.py",
     # the dashboard kill-switch pages and override test (#773, #2337)
