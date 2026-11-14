@@ -1502,16 +1502,23 @@ def _split_offs(builder: _Builder, delistings: Mapping[str, Sequence[DelistingFi
             if row["provenance"] != "filing":
                 continue
             pair_rows = builder.filed_pairs[(row["ticker"], row["exchange"])]
-            had_it = any(
-                security_cik(o["security_id"]) == cik
+            held = [
+                o["valid_from"]
+                for o in pair_rows
+                if security_cik(o["security_id"]) == cik
                 and o["security_id"] not in successors
                 and o["valid_from"] < row["valid_from"]
+            ]
+            # The other issuer took the pair after the old issuer last held it
+            # (an unrelated holder years before is no split-off), on facts
+            # known by the day of the old issuer's page.
+            taken = bool(held) and any(
+                security_cik(o["security_id"]) != cik
+                and max(held) < o["valid_from"] <= row["valid_from"]
+                and o["known_at"].date() <= row["known_at"].date()
                 for o in pair_rows
             )
-            taken = any(
-                security_cik(o["security_id"]) != cik and o["valid_from"] <= row["valid_from"]
-                for o in pair_rows
-            )
+            had_it = bool(held)
             if had_it and taken:
                 drop.add(id(row))
     if drop:
@@ -1542,7 +1549,8 @@ def _split_offs(builder: _Builder, delistings: Mapping[str, Sequence[DelistingFi
         last = rows[-1]
         cik = security_cik(sid)
         if last["provenance"] != "filing" or any(
-            f.exchange == last["exchange"] for f in delistings.get(cik, ())
+            f.exchange == last["exchange"] and session_of(f.accepted_at) >= last["valid_from"]
+            for f in delistings.get(cik, ())
         ):
             continue
         later = [

@@ -178,3 +178,52 @@ def test_a_class_with_a_form_25_is_left_to_it() -> None:
         if is_placeholder_ticker(str(r["ticker"]))
         and r["security_id"].endswith("a-live-common-stock")
     ]
+
+
+def test_an_unrelated_holder_years_earlier_is_no_split_off() -> None:
+    other = "0000900400"
+    source = FixtureFilingSource(
+        index=[
+            _filing(other, "Old Co", "10-K", _at(2005, 3, 1)),
+            _filing(OLD, "Zed Co", "10-K", _at(2016, 3, 1)),
+            _filing(OLD, "Zed Co", "8-A12B", _at(2020, 5, 29)),
+        ],
+        cover_pages=[
+            _cover(other, _at(2005, 4, 1), ("Common Stock", "ZZZ", "Nasdaq")),
+            _cover(OLD, _at(2016, 4, 1), ("Common Stock", "ZZZ", "Nasdaq")),
+            _cover(OLD, _at(2023, 4, 1), ("Common Stock", "ZZZ", "Nasdaq")),
+        ],
+        delistings=[
+            DelistingFiling(
+                OLD, "25-NSE", "Common Stock", "Nasdaq", "25-z", _at(2020, 6, 1), date(2020, 6, 11)
+            )
+        ],
+    )
+    build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+    assert len(build.successions) == 1
+
+
+def test_a_row_known_later_does_not_drop_an_earlier_known_one() -> None:
+    # The new issuer's pair starts first but is only known after the old page.
+    source = _braves()
+    pages = [p for cik in (OLD, NEW) for p in source.cover_pages(cik) if cik != NEW]
+    pages += [_cover(NEW, _at(2023, 8, 20), A, C)]
+    late = FixtureFilingSource(
+        index=list(source.filing_index()), cover_pages=pages, delistings=source.delistings()
+    )
+    build = build_master(late, _settings(), ingested_at=INGESTED_AT)
+    # valid_from 2023-08-20 is after the relisting page: nothing to drop.
+    assert build.successions
+
+
+def test_a_form_25_of_another_class_does_not_block_the_end() -> None:
+    old = _braves(stale_old_page=False)
+    live = _live()
+    source = FixtureFilingSource(
+        index=[*old.filing_index(), *live.filing_index()],
+        cover_pages=[*live.cover_pages(OLD), *old.cover_pages(OLD)[:2], *live.cover_pages(HOLD)],
+        delistings=old.delistings(),
+    )
+    build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+    ends = [r for r in build.listings if is_placeholder_ticker(str(r["ticker"]))]
+    assert len(ends) == 2

@@ -20,10 +20,11 @@ from tradepartner.store.listing_reviews import reviewed_listings
 
 # Bump when a builder changes its derivation from unchanged inputs. Cache and
 # schema versions below are read from their owners at call time, never copied.
+# 9: #3363, split-off tracking classes (stale relistings dropped, dropped classes end);
 # 8: #3190, a class conflict fails closed with no pre-cover 10-K;
 # 7: #3076, issuer_class tags and rule 8 waits for a SIC or periodic report;
 # 6: #3084, issuer HTML Form 25s and unit/comma class titles; 5: #3056
-BUILD_RULES_VERSION = 8
+BUILD_RULES_VERSION = 9
 
 HASHED_SETTINGS_KEYS = (
     "benchmarks",
