@@ -95,7 +95,16 @@ def test_wrong_header_is_refused() -> None:
 
 def test_packaged_file_cites_each_row_to_its_filing() -> None:
     rows = reviewed_listings()
-    assert {row.ticker for row in rows} == {"DDS", "TCBI", "IBOC", "CAE", "CNL", "LINK", "MSGK"}
+    assert {row.ticker for row in rows} == {
+        "DDS",
+        "TCBI",
+        "IBOC",
+        "CAE",
+        "CNL",
+        "LINK",
+        "MSGK",
+        "MSGR",
+    }
     assert {row.ticker: row.exchange for row in rows} == {
         "DDS": "TXSE",
         "TCBI": "TXSE",
@@ -104,9 +113,10 @@ def test_packaged_file_cites_each_row_to_its_filing() -> None:
         "CNL": "NASDAQ",
         "LINK": "NASDAQ",
         "MSGK": "NYSE",
+        "MSGR": "NYSE",
     }
     for row in rows:
-        assert row.issue == ("#3391" if row.ticker == "MSGK" else "#3293")
+        assert row.issue == {"MSGK": "#3391", "MSGR": "#3392"}.get(row.ticker, "#3293")
         assert normalize_exchange(row.exchange) == row.exchange
         # A listing starts on the session of the filing that states it.
         assert row.valid_from == session_of(row.known_at)
@@ -390,3 +400,43 @@ def test_msgk_span_starts_oct_27_and_nothing_shows_before_the_8k() -> None:
     # Later, the 11-06 cover-page row is still stored; the span starts at the earlier 10-27.
     late = listings_as_of(conn, NOW)
     assert min(late.filter(late["ticker"] == "MSGK")["valid_from"].to_list()) == date(2026, 10, 27)
+
+
+# --- MSGR (#3392) --------------------------------------------------------
+
+MSGR_CIK = "0002132873"
+MSGR_8K_ACCEPTED = _utc(2026, 10, 27, 20, 24, 8)  # the parent's 8-K, 16:24:08 Eastern
+
+
+def _msgr_source() -> FixtureFilingSource:
+    """Only the 2026-11-06 10-Q cover page names MSGR on the NYSE."""
+    new = _utc(2026, 11, 6, 12, 40, 46)
+    return FixtureFilingSource(
+        index=[FilingIndexEntry(MSGR_CIK, "MSG Rangers", "10-Q", "0001628280-26-071325", new)],
+        cover_pages=[
+            CoverPage(
+                MSGR_CIK,
+                "0001628280-26-071325",
+                new,
+                (CoverListing("Class A Common Stock", "MSGR", "NYSE"),),
+            )
+        ],
+    )
+
+
+def test_msgr_row_is_cited_to_the_oct_27_8k() -> None:
+    (row,) = [r for r in reviewed_listings() if r.ticker == "MSGR"]
+    assert row.security_id == MSGR_CIK
+    assert row.valid_from == date(2026, 10, 27)
+    assert row.known_at == MSGR_8K_ACCEPTED
+    assert row.accession == "0001193125-26-434274"
+
+
+def test_msgr_regular_way_span_starts_oct_27_not_at_the_cover_page() -> None:
+    conn = _store()
+    write_master(conn, build_master(_msgr_source(), SETTINGS, ingested_at=NOW))
+    after = listings_as_of(conn, MSGR_8K_ACCEPTED)
+    msgr = after.filter(after["ticker"] == "MSGR")
+    assert msgr["valid_from"].to_list() == [date(2026, 10, 27)]
+    early = listings_as_of(conn, MSGR_8K_ACCEPTED - timedelta(seconds=1))
+    assert "MSGR" not in early["ticker"].to_list()
