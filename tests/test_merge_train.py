@@ -55,6 +55,7 @@ def _pr(**overrides: object) -> object:
         "body": BODY,
         "fragment_texts": (FRAGMENT,),
         "unresolved_threads": 0,
+        "stale_reviews": (),
     }
     fields.update(overrides)
     return mt.PullRequest(**fields)
@@ -661,6 +662,7 @@ class FakeRunner:
             "body": f"Closes #{number}\n\n- [x] done\n",
             "fragment_texts": (FRAGMENT,),
             "unresolved_threads": 0,
+            "stale_reviews": (),
             "title": f"PR {number}",
         }
         fields.update(pr_overrides)
@@ -2360,3 +2362,17 @@ def test_shell_runner_pr_data_stops_on_an_unreadable_or_incomplete_thread_read(
     `STOPPED:` (fail closed), never counts as zero unresolved threads."""
     with pytest.raises(mt.StoppedError, match=match):
         _real_pr_data(tmp_path, monkeypatch, pages, [])
+
+
+def test_a_review_that_no_longer_covers_the_head_is_ineligible() -> None:
+    """#3318: (i2) refuses a stale review, an unread one, and passes a covered one."""
+    verdict = (_c("safety-reviewer: PASS\nreviewed at " + "b" * 40),)
+    stale = _pr(stale_reviews=("safety-reviewer",))
+    reason = _eligible(stale, paths=SAFETY_PATHS, comments=verdict)
+    assert reason is not None
+    assert reason.startswith("(i2)")
+    assert "no longer covers" in reason
+    unread = _pr(stale_reviews=None)
+    assert (_eligible(unread, paths=SAFETY_PATHS, comments=verdict) or "").startswith("(i2)")
+    covered = _pr(stale_reviews=(), labels=("owner-ok",))
+    assert _eligible(covered, paths=SAFETY_PATHS, comments=verdict) is None

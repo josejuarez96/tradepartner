@@ -182,6 +182,9 @@ class PullRequest:
     # #731, req 1 (j): how many of the PR's review threads are unresolved, read from GitHub
     # at build time. None means they were never read, which is ineligible (fail closed).
     unresolved_threads: int | None = None
+    # #3318, req 1 (i2): the required reviewers whose `reviewed at` commit no longer covers
+    # `head`, read at build time. None means never read, which is ineligible (fail closed).
+    stale_reviews: tuple[str, ...] | None = None
 
     @property
     def owner(self) -> str:
@@ -254,6 +257,11 @@ def eligibility(
         return "(h) fragment missing, or no CHANGELOG bullet"
     if reviews := ready_pr.missing_reviews(ready_pr.required_reviews(diff_paths), bodies):
         return f"(i) review without a latest PASS: {', '.join(reviews)}"
+    if ready_pr.required_reviews(diff_paths):
+        if pr.stale_reviews is None:
+            return "(i2) review coverage of the head not read"
+        if pr.stale_reviews:
+            return f"(i2) review no longer covers the current head: {', '.join(pr.stale_reviews)}"
     if pr.unresolved_threads is None:
         return "(j) review threads not read"
     if pr.unresolved_threads:
@@ -1380,6 +1388,19 @@ _THREADS_QUERY = (
 ADVISORY_REVIEW_BOTS = ("greptile-apps", "greptile-apps[bot]")
 
 
+class _RootGit:
+    """The two git calls `ready_pr.review_covers_head` makes, run in the train's clone."""
+
+    def __init__(self, runner: ShellRunner) -> None:
+        self._runner = runner
+
+    def git(self, *args: str) -> str:
+        return self._runner._git_out(self._runner.root, *args)
+
+    def git_ok(self, *args: str) -> bool:
+        return self._runner._git(self._runner.root, *args, check=False).returncode == 0
+
+
 class ShellRunner:
     """Real git, gh and the filesystem. Thin: every rule lives in the functions above."""
 
@@ -1524,7 +1545,21 @@ class ShellRunner:
             self._git_out(self.root, "show", f"{pr.head}:{path}")
             for path in ready_pr.own_changelog_fragments(pr.branch, paths, deleted)
         )
-        pr = replace(pr, fragment_texts=texts, unresolved_threads=self._unresolved_threads(number))
+        required = ready_pr.required_reviews(paths)
+        stale = ready_pr.review_covers_head(
+            _RootGit(self),
+            "origin/main",
+            required,
+            ready_pr.review_shas([c.body for c in comments if c.author == pr.owner]),
+            paths,
+            pr.head,
+        )
+        pr = replace(
+            pr,
+            fragment_texts=texts,
+            unresolved_threads=self._unresolved_threads(number),
+            stale_reviews=tuple(stale),
+        )
         return PrData(pr, comments, self._head_checks(number), paths)
 
     def _unresolved_threads(self, number: int) -> int:
