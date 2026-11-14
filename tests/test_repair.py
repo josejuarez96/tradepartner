@@ -4,6 +4,7 @@ delisted security), in one recorded transaction."""
 
 from __future__ import annotations
 
+import csv
 import dataclasses
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -2039,10 +2040,11 @@ def test_a_real_run_summary_says_retracted(store: Settings) -> None:
     assert result.summary().startswith("retracted 3 bar rows")
 
 
-def test_a_retraction_that_would_take_another_sources_revision_rolls_back(
+def test_a_key_that_holds_another_sources_revision_is_listed_and_refused(
     store: Settings,
 ) -> None:
-    """`retract` moves every revision of a key; the delete spared other sources."""
+    """`retract` moves every revision of a key; the old delete spared other sources.
+    The dry run lists the extra row; the real run refuses before moving anything."""
     with open_for_write(store) as conn:
         insert_row(
             conn,
@@ -2050,81 +2052,126 @@ def test_a_retraction_that_would_take_another_sources_revision_rolls_back(
             _bar(DEAD, date(2021, 6, 2), source="fixture", known=datetime(2021, 6, 4, tzinfo=UTC)),
         )
     before = _bars(store)
-    with pytest.raises(RuntimeError, match="rolled back"):
+    dry = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert len(dry.wider) == 1 and "fixture revision" in dry.wider[0]
+    assert "2021-06-02" in dry.wider[0] and any("WIDER" in line for line in dry.lines())
+    assert "1 extra rows held by the same keys" in dry.summary()
+    with pytest.raises(RepairRefused, match="extra rows would be retracted"):
         repair_resolution(store, clock=lambda: RUN, expect=(3, 1), release=REL)
     assert _bars(store) == before
     assert _retracted(store) == []
 
 
-def test_pre_t388_listing_end_is_recorded_and_the_apa_line_withdrawal_retracts_nothing(
-    settings: Settings,
-) -> None:
-    """The same Form 25 shape on two securities: DEAD's only line ends (its bars
-    are retracted with the end recorded); APA's NYSE Chicago line ends while its
-    NYSE listing stays (T388), so no bar is retracted."""
-    apa = "0000000088"
+def test_a_redated_spinoff_identity_retracts_in_one_call(store: Settings) -> None:
+    child, ex = "0000000003", date(2021, 6, 15)
+    with open_for_write(store) as conn:
+        insert_row(conn, "listings", _listing(child, "CHILD", date(2021, 6, 1)))
+        for day in (ex, ex + timedelta(days=1)):
+            insert_row(
+                conn,
+                "corporate_actions",
+                {
+                    **_dividend(child, day),
+                    "action_type": "spinoff",
+                    "ratio_or_amount": 0.25,
+                    "source_action_id": DEAD,
+                    "known_at": session_close(day),
+                },
+            )
+    dry = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    repair_resolution(store, clock=lambda: RUN, expect=(dry.bar_rows, dry.action_rows), release=REL)
+    spin = [r for r in _retracted(store) if "parent" in r[4]]
+    assert len(spin) == 2
+
+
+def _load_apa(settings: Settings) -> None:
+    """T388's fixture (`tests/fixtures/form25_withdrawals`) into the store."""
+    folder = Path(__file__).parent / "fixtures" / "form25_withdrawals"
+
+    def rows(name: str) -> list[dict[str, str]]:
+        with (folder / name).open(newline="") as handle:
+            return list(csv.DictReader(handle))
+
+    def utc(text: str) -> datetime:
+        return datetime.fromisoformat(text.replace("+0000", "+00:00"))
+
     with open_for_write(settings) as conn:
         init_schema(conn)
-        insert_row(conn, "listings", _listing(apa, "APAX", date(2019, 1, 2)))
-        insert_row(conn, "listings", {**_listing(apa, "APAX", date(2019, 1, 2)), "exchange": "CHX"})
-        insert_row(
-            conn,
-            "delistings",
-            {
-                "security_id": apa,
-                "form": "25-NSE",
-                "class_title": "Common Stock",
-                "exchange": "CHX",
-                "filed_at": FILED,
-                "effective_on": EFFECTIVE,
-                "known_at": FILED,
-                "ingested_at": RUN,
-                "source": "edgar",
-                "provenance": "filing",
-            },
-        )
-        for day in (date(2021, 5, 27), date(2021, 6, 1), date(2021, 6, 2)):
-            insert_row(conn, "prices_daily", _bar(apa, day))
-    _build_into(settings)
-    repair_resolution(settings, clock=lambda: RUN, expect=(3, 1), release=REL)
-    sids = {r[1] for r in _retracted(settings) if r[0] == "prices_daily"}
-    assert sids == {DEAD}
-    assert len(_rows(settings, f"SELECT 1 FROM prices_daily WHERE security_id = '{apa}'")) == 3
-
-
-def _build_into(settings: Settings) -> None:
-    """The `store` fixture's rows on a store that already holds other rows."""
-    with open_for_write(settings) as conn:
-        for row in (
-            _listing(DEAD, "GONE", date(2019, 1, 2)),
-            _listing(HEIR, "GONE", date(2021, 6, 1)),
-        ):
-            insert_row(conn, "listings", row)
-        insert_row(
-            conn,
-            "delistings",
-            {
-                "security_id": DEAD,
-                "form": "25-NSE",
-                "class_title": "Common Stock",
-                "exchange": "NYSE",
-                "filed_at": FILED,
-                "effective_on": EFFECTIVE,
-                "known_at": FILED,
-                "ingested_at": RUN,
-                "source": "edgar",
-                "provenance": "filing",
-            },
-        )
-        for row in (
-            _bar(DEAD, date(2021, 5, 27)),
-            _bar(DEAD, date(2021, 6, 1), close=25.0),
-            _bar(DEAD, date(2021, 6, 1), close=26.0, known=datetime(2021, 6, 3, tzinfo=UTC)),
-            _bar(DEAD, date(2021, 6, 2), close=25.5),
-        ):
-            insert_row(conn, "prices_daily", row)
-        insert_row(conn, "corporate_actions", _dividend(DEAD, date(2021, 6, 15)))
+        for r in rows("listings.csv"):
+            insert_row(
+                conn,
+                "listings",
+                {
+                    **{k: r[k] for k in ("security_id", "ticker", "exchange")},
+                    **{k: r[k] for k in ("source", "provenance")},
+                    "class_title": r["class_title"] or None,
+                    "valid_from": date.fromisoformat(r["valid_from"]),
+                    "known_at": utc(r["known_at"]),
+                    "ingested_at": utc(r["ingested_at"]),
+                    "retracted": r["retracted"] == "True",
+                },
+            )
+        for r in rows("delistings.csv"):
+            insert_row(
+                conn,
+                "delistings",
+                {
+                    **{k: r[k] for k in ("security_id", "form", "class_title", "exchange")},
+                    **{k: r[k] for k in ("source", "provenance")},
+                    "filed_at": utc(r["filed_at"]),
+                    "effective_on": date.fromisoformat(r["effective_on"]),
+                    "known_at": utc(r["known_at"]),
+                    "ingested_at": utc(r["ingested_at"]),
+                },
+            )
+        for r in rows("bars.csv"):
+            insert_row(
+                conn,
+                "prices_daily",
+                _bar(r["security_id"], date.fromisoformat(r["session"]), close=float(r["close"])),
+            )
     _open_release(settings)
+
+
+APA_ID = "0000006769"
+
+
+def test_the_apa_fixture_retracts_no_apa_bar_once_the_rule_is_right(settings: Settings) -> None:
+    """T388's fixture (the sitting copy's Apache rows): its NYSE and NYSE Chicago
+    Form 25s are line withdrawals, so a real run retracts none of APA's bars."""
+    _load_apa(settings)
+    dry = repair_resolution(settings, clock=lambda: RUN, dry_run=True)
+    assert APA_ID not in dry.found.securities
+    repair_resolution(
+        settings,
+        clock=lambda: RUN,
+        expect=(dry.bar_rows, dry.action_rows),
+        release=REL,
+        allow_orphans=dry.orphan_keys,
+    )
+    assert APA_ID not in {r[1] for r in _retracted(settings)}
+
+
+def test_the_pre_t388_verdict_retracts_apas_bars_with_the_end_recorded(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store import delistings
+
+    _load_apa(settings)
+    monkeypatch.setattr(delistings, "_withdrawn", lambda *a, **k: None)  # the old reading
+    dry = repair_resolution(settings, clock=lambda: RUN, dry_run=True)
+    assert APA_ID in dry.found.securities
+    repair_resolution(
+        settings,
+        clock=lambda: RUN,
+        expect=(dry.bar_rows, dry.action_rows),
+        release=REL,
+        allow_orphans=dry.orphan_keys,
+    )
+    rules = {r[4] for r in _retracted(settings) if r[1] == APA_ID and r[0] == "prices_daily"}
+    assert rules
+    for rule in rules:
+        assert "delisted end" in rule and "(25" in rule and "Chicago" in rule.title()
 
 
 def test_delete_bars_retracts_with_the_range_as_its_rule(store: Settings) -> None:
