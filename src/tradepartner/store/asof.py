@@ -604,7 +604,9 @@ def _chain_parent(alias: str = "t") -> str:
 
 
 @contextmanager
-def _chains_registered(conn: duckdb.DuckDBPyConnection, t: datetime) -> Iterator[LiveChains]:
+def _chains_registered(
+    conn: duckdb.DuckDBPyConnection, t: datetime, security_ids: Sequence[str] | None = None
+) -> Iterator[LiveChains]:
     """Expose the live chains known at `t` to SQL as `_CHAINS_VIEW` (its
     `predecessor_id`, `successor_id` and `handover`) and the chained
     successors whose own bars stay hidden *and* have no live chain at `t` as
@@ -614,7 +616,7 @@ def _chains_registered(conn: duckdb.DuckDBPyConnection, t: datetime) -> Iterator
     once here, and the hand-over day is derived from the listings known at `t`
     (the successor's first listing row under the predecessor's ticker and
     exchange)."""
-    chains = _live_chains_at(conn, t)
+    chains = _live_chains_at(conn, t, security_ids)
     pre_listing = _pre_listing_at(conn, t, chains)
     if not chains.pairs and not pre_listing:
         yield _NO_CHAINS
@@ -670,19 +672,27 @@ def _pre_listing_at(
     return {successor: boundaries.get(successor, date.max) for successor in successors}
 
 
-def _live_chains_at(conn: duckdb.DuckDBPyConnection, t: datetime) -> LiveChains:
+def _live_chains_at(
+    conn: duckdb.DuckDBPyConnection, t: datetime, security_ids: Sequence[str] | None = None
+) -> LiveChains:
     """`live_chains(t)` with each successor's hand-over day, read from the
     listings known at `t`: the predecessor's last listing row's ticker and
     exchange matched by the successor's earliest such row (as
     `store.master.build_chains`). Raises `ForkedChainError` when a predecessor
-    has more than one live successor at `t` (#3323)."""
+    has more than one live successor at `t` and the read asks for it or one of
+    its successors (`security_ids`; `None` asks for every id) (#3323)."""
     pairs = live_chains(conn, t)
     if not pairs:
         return _NO_CHAINS
     successors: dict[str, list[str]] = {}
     for predecessor, successor in pairs:
         successors.setdefault(predecessor, []).append(successor)
-    forked = {pred: succ for pred, succ in successors.items() if len(succ) > 1}
+    wanted = None if security_ids is None else set(security_ids)
+    forked = {
+        pred: succ
+        for pred, succ in successors.items()
+        if len(succ) > 1 and (wanted is None or wanted & {pred, *succ})
+    }
     if forked:
         raise ForkedChainError(
             "; ".join(
@@ -857,7 +867,7 @@ def live_actions_as_of(
     the same event; no store holds both today (#2147).
     """
     t = _validate_t(t)
-    with _chains_registered(conn, t) as chains:
+    with _chains_registered(conn, t, security_ids) as chains:
         params: list[Any] = [t]
         if chains:
             security_filter = _security_filter(security_ids, params, column=_chain_id())
@@ -925,7 +935,7 @@ def prices_as_of(
     wins a shared session.
     """
     t = _validate_t(t)
-    with _chains_registered(conn, t) as chains:
+    with _chains_registered(conn, t, security_ids) as chains:
         frame = _latest_as_of(
             conn,
             "prices_daily",
@@ -1064,7 +1074,7 @@ def price_jumps_as_of(
     t = _validate_t(t)
     settings = settings if settings is not None else get_settings()
     cfg = settings.universe
-    with _chains_registered(conn, t) as chains:
+    with _chains_registered(conn, t, security_ids) as chains:
         params: list[Any] = [t]
         hide = chains.hide_sql("b")
         if chains:
@@ -1299,7 +1309,7 @@ def facts_as_of(
     """
     t = _validate_t(t)
     partition = ", ".join(_FACT_KEY)
-    with _chains_registered(conn, t) as chains:
+    with _chains_registered(conn, t, security_ids) as chains:
         if chains:
             assert chains is not None
             params: list[Any] = [t]
@@ -2268,7 +2278,7 @@ def adjusted_prices_as_of(
         else None
     )
     with (
-        _chains_registered(conn, t) as chains,
+        _chains_registered(conn, t, security_ids) as chains,
         _dividend_gate_registered(conn, gate) as gated,
     ):
         common_ctes, params = _adjusted_params(
@@ -2417,7 +2427,7 @@ def dropped_dividends_as_of(
         else _dividend_gate(conn, t, security_ids, dividend_reviews)
     )
     with (
-        _chains_registered(conn, t) as chains,
+        _chains_registered(conn, t, security_ids) as chains,
         _dividend_gate_registered(conn, gate) as gated,
     ):
         common_ctes, params = _adjusted_params(
@@ -2461,7 +2471,7 @@ def unvalued_spin_offs_as_of(
     does (a non-positive or non-finite ratio or child close).
     """
     t = _validate_t(t)
-    with _chains_registered(conn, t) as chains:
+    with _chains_registered(conn, t, security_ids) as chains:
         common_ctes, params = _adjusted_params(
             t,
             security_ids,

@@ -822,3 +822,18 @@ def test_a_fork_known_later_does_not_affect_earlier_reads(
     assert (_PREDECESSOR, "0001000099") not in live_chains(chain_fixture_store, t)
     merged = prices_as_of(chain_fixture_store, t, [_SUCCESSOR])
     assert set(merged["security_id"].unique().to_list()) == {_SUCCESSOR}
+
+
+def test_a_fork_does_not_stop_a_read_of_unrelated_ids(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The raise is scoped to the ids the read asks for (and their fork's members)."""
+    from tradepartner.store.asof import ForkedChainError
+
+    _fork(chain_fixture_store)
+    other = prices_as_of(chain_fixture_store, _FORK_KNOWN_AT, ["0001000013"])
+    assert set(other["security_id"].unique().to_list()) == {"0001000013"}
+    with pytest.raises(ForkedChainError):
+        prices_as_of(chain_fixture_store, _FORK_KNOWN_AT, [_PREDECESSOR])
+    with pytest.raises(ForkedChainError):
+        prices_as_of(chain_fixture_store, _FORK_KNOWN_AT, None)
