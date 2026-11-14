@@ -851,7 +851,7 @@ def compare(
             bands[order.security_id].widen(sign * shares)
             cash_band.widen(-sign * notional)
 
-    mismatches += _order_mismatches(open_orders, lagging, order_id_prefix)
+    mismatches += _order_mismatches(open_orders, lagging, order_id_prefix, q_tol, cash_tol)
     # A lagging order's fills are the broker's, each booked to the cent like a
     # journaled one, so each lagging order counts as (at least) one fill in the
     # bound (#2996): a bare `paper reconcile` after a stop run's sells fill, before
@@ -1743,8 +1743,25 @@ def _lag(
     return unjournaled, max(notional, 0.0)
 
 
+def _size_differs(broker: float | None, journal: float | None, tolerance: float) -> bool:
+    """Whether a broker order's size (quantity or notional) differs from its
+    journal row's by more than `tolerance`. Fails closed (#3336): a missing or
+    non-finite value on either side, or one side set and not the other, differs."""
+    if broker is None and journal is None:
+        return False
+    if broker is None or journal is None:
+        return True
+    if not (math.isfinite(broker) and math.isfinite(journal)):
+        return True
+    return abs(broker - journal) > tolerance
+
+
 def _order_mismatches(
-    open_orders: Sequence[Order], lagging: Sequence[JournalOpenOrder], prefix: str
+    open_orders: Sequence[Order],
+    lagging: Sequence[JournalOpenOrder],
+    prefix: str,
+    quantity_tolerance: float,
+    cash_tolerance: float,
 ) -> list[Mismatch]:
     own = prefix + _ID_SEPARATOR
     journal = {item.order.client_order_id: item for item in lagging}
@@ -1759,6 +1776,16 @@ def _order_mismatches(
             kind, detail = "unexplained_open_order", "own open order the journal does not hold open"
         elif (order.symbol, order.side.value) != (item.order.symbol, item.order.side):
             kind, detail = "open_order_differs", "open order differs from its journal row"
+        elif _size_differs(order.quantity, item.order.quantity, quantity_tolerance):
+            kind, detail = (
+                "open_order_differs",
+                (f"quantity {order.quantity} differs from journal row {item.order.quantity}"),
+            )
+        elif _size_differs(order.notional, item.order.notional, cash_tolerance):
+            kind, detail = (
+                "open_order_differs",
+                (f"notional {order.notional} differs from journal row {item.order.notional}"),
+            )
         elif (shape := order_shape_violation(order)) is not None:
             kind, detail = "open_order_differs", f"{shape.rule}: {shape.detail}"
         else:
