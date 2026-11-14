@@ -57,8 +57,9 @@ def test_every_listed_setting_changes_hash(key: str) -> None:
 # `BUILD_RULES_VERSION` 6 with `DELISTING_HTML_VERSION` in the cache names, then
 # #3076's `BUILD_RULES_VERSION` 7 and `CURRENT_SCHEMA_VERSION` 48 (`classifications.issuer_class`),
 # then #3106's Form 25 cap (hashed setting only; no rules or cache version bump),
-# then #3190's `BUILD_RULES_VERSION` 8 (at 7 the hash is d55d7410...dec8145).
-MAIN_DEFAULT_HASH = "5c00edf75ffcc3c2d1f0406c50c2b175e3c2935bc9ee6be8d1d4befec0e07e1b"
+# then #3190's `BUILD_RULES_VERSION` 8 (at 7 the hash is d55d7410...dec8145), then
+# T389's `CURRENT_SCHEMA_VERSION` 49 (`retracted_rows`; at 48 the hash is 5c00edf7...e07e1b).
+MAIN_DEFAULT_HASH = "9e881b8364b14e68757b18547ce8d92065235788bc5c02350a7052fd7a56f932"
 
 
 def test_hash_at_defaults_equals_the_hex_pinned_from_main() -> None:
