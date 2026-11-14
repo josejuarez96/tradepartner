@@ -3549,7 +3549,11 @@ def test_filename_evidence_is_fetched_before_freeze_only_when_enabled(
     # #3076's key (which it reads at its table default `[]`).
     pinned = Settings(
         _env_file=None,
-        universe={"exclude_sic_ranges": [[4900, 4999]], "exclude_issuer_classes": []},
+        universe={
+            "exclude_sic_ranges": [[4900, 4999]],
+            "exclude_issuer_classes": [],
+            "exchanges": ["NYSE", "NASDAQ", "NYSE_AMERICAN"],
+        },
     )
     params = hypothesis.frozen_params(parsed, pinned)
     assert frozen.fingerprint("momentum", params, parsed.in_sample_start) == (

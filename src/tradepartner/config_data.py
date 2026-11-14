@@ -241,7 +241,10 @@ class UniverseConfig(_ClosedConfig):
     """ADR 0006 universe-construction thresholds, rules 1-8, in order."""
 
     security_types: list[str] = Field(default_factory=lambda: ["common"])
-    exchanges: list[str] = Field(default_factory=lambda: ["NYSE", "NASDAQ", "NYSE_AMERICAN"])
+    # Rule 2. TXSE (Texas Stock Exchange) joined 2026-11-14 (ADR 0006 amendment, #3384).
+    exchanges: list[str] = Field(
+        default_factory=lambda: ["NYSE", "NASDAQ", "NYSE_AMERICAN", "TXSE"]
+    )
     # Rule 3, a per-hypothesis choice; default none (ADR 0006 amendment 2026-10-11,
     # #1540). Frozen in each registration (guard a); shape-checked below.
     exclude_sic_ranges: tuple[tuple[int, int], ...] = ()

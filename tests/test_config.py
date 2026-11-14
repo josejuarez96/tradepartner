@@ -909,7 +909,7 @@ def test_execution_fill_price_rejects_invalid_value() -> None:
 def test_universe_defaults() -> None:
     u = _settings().universe
     assert u.security_types == ["common"]
-    assert u.exchanges == ["NYSE", "NASDAQ", "NYSE_AMERICAN"]
+    assert u.exchanges == ["NYSE", "NASDAQ", "NYSE_AMERICAN", "TXSE"]
     assert u.min_price == 5
     assert u.liquidity_rule_enabled is True
     assert u.min_median_dollar_volume == 5_000_000
