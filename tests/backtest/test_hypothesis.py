@@ -448,6 +448,47 @@ def test_frozen_values_survive_environment_overrides(
     assert read(hypothesis.load_frozen(conn, SLUG)) == registered
 
 
+@pytest.mark.parametrize(
+    ("env", "read"),
+    [
+        ("STRATEGY__PLACEBO", lambda s: s.strategy.placebo),
+        ("STRATEGY__SIGNAL_DELAY_SESSIONS", lambda s: s.strategy.signal_delay_sessions),
+        ("STRATEGY__HOLD_TOP_FRACTION", lambda s: s.strategy.hold_top_fraction),
+    ],
+)
+def test_inert_strategy_section_is_not_taken_from_live_settings(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    env: str,
+    read: object,
+) -> None:
+    """#3322: a profitability run takes no live `strategy.*` value (the section is inert
+    for it): the run's effective params sit at the model defaults and its fingerprint
+    is the env-clean run's."""
+    assert callable(read)
+    record = _register(conn, PROF_FIXTURE, settings)
+    clean = read(hypothesis.load_frozen(conn, PROF_SLUG, settings=settings))
+    values = {
+        "STRATEGY__PLACEBO": "shuffle",
+        "STRATEGY__SIGNAL_DELAY_SESSIONS": "2",
+        "STRATEGY__HOLD_TOP_FRACTION": "0.2",
+    }
+    monkeypatch.setenv(env, values[env])
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "no.env"))
+    live = Settings()
+    assert read(live) != clean, "the override must change the live value"
+    loaded = hypothesis.load_frozen(conn, PROF_SLUG, settings=live)
+    assert read(loaded) == clean
+    assert loaded.strategy == type(loaded.strategy)()
+    assert frozen.fingerprint(
+        "profitability",
+        hypothesis.frozen_params_of(loaded, family="profitability"),
+        record.in_sample_start,
+    ) == frozen.fingerprint("profitability", record.params, record.in_sample_start)
+
+
 def test_load_frozen_refuses_tampered_params(
     conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
@@ -574,7 +615,8 @@ def test_profitability_registration_ignores_live_strategy_settings(
     conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
     """An unchanged B3-style file re-registers as a no-op whatever the live momentum
-    keys, and a run of it keeps the live `strategy.*` it never reads."""
+    keys, and a run of it takes the `strategy.*` model defaults, not the live values
+    (#3322: the engine reads that section whatever the family)."""
     first = _register(conn, PROF_FIXTURE, settings)
     live = settings.model_copy(
         update={"strategy": settings.strategy.model_copy(update={"top_fraction": 0.5})}
@@ -584,7 +626,7 @@ def test_profitability_registration_ignores_live_strategy_settings(
     assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (1,)
     loaded = hypothesis.load_frozen(conn, PROF_SLUG, settings=live)
     assert loaded.profitability.top_fraction == 0.2
-    assert loaded.strategy.top_fraction == 0.5
+    assert loaded.strategy == type(loaded.strategy)()
     assert hypothesis.frozen_hash_matches(loaded, first.params_sha256, family="profitability")
     assert hypothesis.frozen_params_of(loaded, family="profitability") == first.params
 
@@ -676,7 +718,7 @@ def test_h1_twin_registered_before_t85_still_loads_and_verifies(
 ) -> None:
     """H1's fixture twin, stored before T85 (no `profitability.*`; the pre-lab twin, as
     the owner's H1 is, also without `schedule.*`), loads at its stored hash with the
-    section's live values, `frozen_hash_matches` (what `record_results` checks) holds,
+    section's model defaults, `frozen_hash_matches` (what `record_results` checks) holds,
     and `hypothesis register` on the unchanged file writes nothing new."""
     parsed = hypothesis.parse_file(FIXTURE)
     # #3076: a registration from before these entries predates the issuer-class key
@@ -707,7 +749,8 @@ def test_h1_twin_registered_before_t85_still_loads_and_verifies(
         update={"profitability": settings.profitability.model_copy(update={"top_fraction": 0.5})}
     )
     loaded = hypothesis.load_frozen(conn, SLUG, settings=live)
-    assert loaded.profitability.top_fraction == 0.5  # live: momentum never reads it
+    # Momentum never reads the section: model defaults, not live (#3322).
+    assert loaded.profitability == type(loaded.profitability)()
     assert registry.get_hypothesis(conn, SLUG).params_sha256 == record.params_sha256
     assert hypothesis.frozen_hash_matches(loaded, record.params_sha256, family="momentum")
     if dropped == ("profitability.",):
