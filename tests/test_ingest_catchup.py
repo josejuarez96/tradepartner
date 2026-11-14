@@ -26,6 +26,7 @@ from test_ingest import (
     NOW,
     SESSION,
     SPY,
+    _bar,
     _delisting,
     _filings,
     _Prices,
@@ -38,6 +39,7 @@ from tradepartner.adapters.prices import Bar, bar_known_at
 from tradepartner.calendar import next_session, previous_session
 from tradepartner.config import Settings
 from tradepartner.ingest import OK, STALE, IngestResult
+from tradepartner.store.db import insert_row, open_for_write
 
 # The run's expected session and the sessions before it, by the XNYS calendar:
 # 2019-06-28 is a Friday, so 06-22 and 06-23 (a Saturday and a Sunday) are not
@@ -199,6 +201,50 @@ def test_a_caught_up_session_that_comes_back_thin_fails_the_run(
     assert f"--backfill --since {D2.isoformat()}" in run.message
     assert "then one plain `tradepartner ingest --source alpaca`" in run.message
     assert _sessions_stored(read) == {D3, D1}
+
+
+def test_a_session_with_one_stray_bar_is_still_missed(settings: Settings) -> None:
+    # #3329: a session holding a bar of one security only (no reference bar, nearly
+    # every name missing) is not stored, so the run fetches it again.
+    _store(settings, [D3, D1])
+    with open_for_write(settings) as conn:
+        insert_row(conn, "prices_daily", _bar(ACME, D2, NOW))
+    prices = _Prices()
+    run = _alpaca(settings, prices).runs[-1]
+    assert run.status == OK, run.message
+    assert ("bars", tuple(sorted(IDS)), D2, D2) in prices.calls
+    assert f"catch-up: 1 session ({D2.isoformat()})" in run.message
+
+
+def test_a_session_missing_more_than_the_share_is_missed(
+    settings: Settings,
+) -> None:
+    # #3329: with the reference bar held, a session missing a share of names above
+    # ingest.max_missing_share is missed; at or under it the session stays stored.
+    _store(settings, [D3, D1])
+    with open_for_write(settings) as conn:
+        for sid in (SPY, ACME):  # 2 of 4 names held: 50% missing, over the 5% share
+            insert_row(conn, "prices_daily", _bar(sid, D2, NOW))
+    prices = _Prices()
+    assert _alpaca(settings, prices).runs[-1].status == OK
+    assert ("bars", tuple(sorted(IDS)), D2, D2) in prices.calls
+
+
+def test_a_dark_name_does_not_make_complete_sessions_missed(settings: Settings) -> None:
+    # #3329 (quant-auditor): a name with no bar inside the window is not "missing".
+    _store(settings, [D7])
+    _seed_prices(settings, _sessions(D6, D1), [sid for sid in IDS if sid != ACME], NOW)
+    prices = _Prices()
+    result = _alpaca(settings, prices)
+    assert result.runs[-1].status == OK, result.runs[-1].message
+    assert [c for c in prices.calls if c[0] == "bars"] == [("bars", tuple(sorted(IDS)), D, D)]
+
+
+def test_a_session_whole_enough_stays_stored(settings: Settings) -> None:
+    _store(settings, [D3, D2, D1])
+    prices = _Prices()
+    assert _alpaca(settings, prices).runs[-1].status == OK
+    assert [c for c in prices.calls if c[0] == "bars"] == [("bars", tuple(sorted(IDS)), D, D)]
 
 
 def test_a_name_delisted_inside_the_gap_gets_its_missed_bars(

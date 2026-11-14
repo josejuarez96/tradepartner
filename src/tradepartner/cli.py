@@ -4105,9 +4105,10 @@ def make_app(
             warnings += 1
             typer.echo(f"warning: {disk_warning}", err=True)
         if check:
-            failures = len(report.failures)
+            failed = report.check_failures
+            failures = len(failed)
             if failures:
-                typer.echo(f"health check failed: {', '.join(report.failures)}", err=True)
+                typer.echo(f"health check failed: {', '.join(failed)}", err=True)
             typer.echo(
                 "health: OK"
                 if not failures and not warnings

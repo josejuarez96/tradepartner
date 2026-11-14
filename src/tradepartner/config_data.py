@@ -352,6 +352,10 @@ class HealthConfig(_ClosedConfig):
     """
 
     min_session_rows_share: float = Field(default=0.0, ge=0.0, le=1.0)
+    # #3329: `health --check` fails once the store has no price bars or its last bar is
+    # more than this many sessions before the last completed one, and any lag at all
+    # fails unless it is the one session before tonight's scheduled ingest.
+    max_stale_sessions: int = Field(default=0, ge=0)
     # #2454: `health` warns once the store's disk has less free space than this many GB,
     # well above `ingest.min_free_disk_gb` and `paper.min_free_disk_gb` so there is time
     # to act. 0 turns the warning off.
