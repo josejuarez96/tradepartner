@@ -3884,7 +3884,7 @@ def make_app(
             bool, typer.Option(help="check and list the rows and change nothing")
         ] = False,
     ) -> None:
-        """Delete a reviewed manifest's never-true listings and delistings rows (#1682)."""
+        """Retract a reviewed manifest's never-true listings and delistings rows (#1682)."""
         if _blank_text(release):
             raise _fail(
                 "a master-row delete names its data release: pass --release <name>", USAGE_ERROR
