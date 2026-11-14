@@ -367,8 +367,13 @@ def apply_migration(
     for path, intent in list(intents.items()):  # an interrupted run's open intents
         if path not in states:
             settled(path, _settle(settings, cache_dir, icloud, intent, None))
+    manifest_written = any(r["op"] == "manifest" for r in records)
     for planned in plan.files:
-        if planned.klass is MigrationClass.MOVE and planned.path not in intents:
+        if (
+            planned.klass is MigrationClass.MOVE
+            and planned.path not in intents
+            and not manifest_written
+        ):
             sha = _sha256_file(cache_dir / planned.path)
             intent = _intent(planned, sha)
             _append(journal, intent)
@@ -393,7 +398,7 @@ def apply_migration(
                     states[path] = "pending_upload"
         _append(journal, {"op": "evicted", "states": states})
     elif intents:
-        states = next(r for r in _read_lines(journal) if r["op"] == "evicted")["states"]
+        states.update(next(r for r in _read_lines(journal) if r["op"] == "evicted")["states"])
     for record in _read_lines(journal):
         if record["op"] == "retry_eviction":
             states.update({p: state for p, state in record["states"].items() if p in states})

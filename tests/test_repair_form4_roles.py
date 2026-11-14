@@ -13,6 +13,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from conftest import open_paper_window
 from typer.testing import CliRunner
 
 from tradepartner import cli
@@ -249,4 +250,14 @@ def test_cli_refuses_another_process_store_lock(settings: Settings, tmp_path: Pa
         proc.terminate()
         proc.wait(timeout=10)
     assert _row(settings) == (False, False, False, False, OLD, OLD, OLD)
+    assert _runs(settings) == []
+
+
+def test_refuses_rows_known_inside_an_open_paper_window(settings: Settings, tmp_path: Path) -> None:
+    _, manifest = _fixture(settings, tmp_path)
+    open_paper_window(settings, datetime(2021, 1, 4, 14, tzinfo=UTC))
+    before = _row(settings)
+    with pytest.raises(RoleRepairRefused, match="open paper window"):
+        repair_form4_roles(settings, manifest, "roles-2691", 1, clock=lambda: NOW)
+    assert _row(settings) == before
     assert _runs(settings) == []

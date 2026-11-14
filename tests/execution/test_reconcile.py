@@ -2504,3 +2504,51 @@ def test_a_repeated_activity_id_in_one_read_is_refused() -> None:
             1_000.0,
             explanations=_explanations(activities=duplicated),
         )
+
+
+def _size_run(
+    row_kwargs: dict[str, float], broker_kwargs: dict[str, float | None]
+) -> Reconciliation:
+    row = _order_row("tp-20261007-SEC_A-buy-1", "SEC_A", "buy", **row_kwargs)
+    reading = _reading(row, OrderStatus.ACCEPTED)
+    return _run(
+        _ledger(SEC_A=1.0),
+        _positions(AAA=1.0),
+        1_000.0,
+        open_orders=[replace(reading, **broker_kwargs)],  # type: ignore[arg-type]
+        journal_open=[
+            JournalOpenOrder(
+                row,
+                pending=False,
+                journaled_quantity=0.0,
+                journaled_notional=0.0,
+                reading=reading,
+            )
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("row_kwargs", "broker_kwargs"),
+    [
+        ({"quantity": 100.0}, {"quantity": 200.0}),
+        ({"notional": 100.0}, {"notional": 200.0}),
+        ({"quantity": 100.0}, {"quantity": None, "notional": 100.0}),
+        ({"notional": 100.0}, {"notional": None, "quantity": 100.0}),
+    ],
+    ids=["qty-double", "notional-double", "qty-to-notional", "notional-to-qty"],
+)
+def test_an_own_open_order_of_another_size_differs_from_its_row(
+    row_kwargs: dict[str, float], broker_kwargs: dict[str, float | None]
+) -> None:
+    """#3336: a broker open order whose quantity or notional is not its journal
+    row's (beyond the config tolerance, or unreadable) is `open_order_differs`."""
+    result = _size_run(row_kwargs, broker_kwargs)
+    assert _kinds(result) == ["open_order_differs"]
+    (mismatch,) = result.mismatches
+    assert "quantity" in mismatch.detail or "notional" in mismatch.detail
+
+
+def test_an_own_open_order_of_the_same_size_within_tolerance_passes() -> None:
+    assert _kinds(_size_run({"quantity": 100.0}, {})) == []
+    assert _kinds(_size_run({"notional": 100.0}, {"notional": 100.004})) == []
