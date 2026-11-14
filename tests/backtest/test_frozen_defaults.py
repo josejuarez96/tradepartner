@@ -412,7 +412,12 @@ def _before(params: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
 #: (ADR 0006 amendment 2026-10-11, #1540, property 6); the live default is now `[]`.
 #: Likewise #3076's issuer classes: those records predate the key, which they read at
 #: its table default `[]` while the live default excludes BDCs, MLPs and foreign filers.
-_PINNED_UNIVERSE = {"exclude_sic_ranges": [[4900, 4999]], "exclude_issuer_classes": []}
+#: And #3384's exchange list: the records store the three venues, the live default adds TXSE.
+_PINNED_UNIVERSE = {
+    "exclude_sic_ranges": [[4900, 4999]],
+    "exclude_issuer_classes": [],
+    "exchanges": ["NYSE", "NASDAQ", "NYSE_AMERICAN"],
+}
 
 
 def _defaults_settings() -> Settings:
