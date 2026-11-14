@@ -1510,12 +1510,13 @@ def _split_offs(builder: _Builder, delistings: Mapping[str, Sequence[DelistingFi
                 and o["valid_from"] < row["valid_from"]
             ]
             # The other issuer took the pair after the old issuer last held it
-            # (an unrelated holder years before is no split-off), on facts
-            # known by the day of the old issuer's page.
+            # (an unrelated holder years before is no split-off), on a fact
+            # known by the old issuer's page (the instant: a later-known row never
+            # deletes an earlier-known one).
             taken = bool(held) and any(
                 security_cik(o["security_id"]) != cik
                 and max(held) < o["valid_from"] <= row["valid_from"]
-                and o["known_at"].date() <= row["known_at"].date()
+                and o["known_at"] <= row["known_at"]
                 for o in pair_rows
             )
             had_it = bool(held)

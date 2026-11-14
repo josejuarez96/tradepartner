@@ -207,12 +207,12 @@ def test_a_row_known_later_does_not_drop_an_earlier_known_one() -> None:
     # The new issuer's pair starts first but is only known after the old page.
     source = _braves()
     pages = [p for cik in (OLD, NEW) for p in source.cover_pages(cik) if cik != NEW]
-    pages += [_cover(NEW, _at(2023, 8, 20), A, C)]
+    pages += [_cover(NEW, _at(2023, 8, 4, 23), A, C)]  # same session, known 2.5 h later
     late = FixtureFilingSource(
         index=list(source.filing_index()), cover_pages=pages, delistings=source.delistings()
     )
     build = build_master(late, _settings(), ingested_at=INGESTED_AT)
-    # valid_from 2023-08-20 is after the relisting page: nothing to drop.
+    # Same start session, but known after the old page: the row stays.
     assert build.successions
 
 
