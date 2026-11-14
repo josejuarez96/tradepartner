@@ -2304,11 +2304,15 @@ def _run_group(
             for variant in group:
                 _rename_chained(variant, chains)
         own = [_marking_ids(variant, benchmarks) for variant in group]
+        marking_bounds = {
+            variant.trial_id: _marking_bound(variant, step_end, family, marked)
+            for variant, (_, marked, _) in zip(group, own, strict=True)
+        }
         t_prev = read_time(cast(Plan, group[0].plan).session, cadence)
         view.share(
             ("marking_prices", t),
             [
-                (marked, _marking_bound(variant, step_end, family, marked))
+                (marked, marking_bounds[variant.trial_id])
                 for variant, (_, marked, _) in zip(group, own, strict=True)
             ],
         )
@@ -2341,6 +2345,7 @@ def _run_group(
                     next_plans.get(variant.trial_id),
                     family,
                     chains,
+                    marking_bounds[variant.trial_id],
                 )
             except _ReadError:
                 raise
@@ -2449,14 +2454,17 @@ def _marking_bound(
     bounds = [stale, plan.session]
     bounds.extend(variant.last_stitched[sid] for sid in marked if sid in variant.last_stitched)
     if family in ("momentum", "combined"):
+        anchors: dict[date, date] = {}
 
         def formation(session: date) -> date:
-            return anchor_sessions(
-                session,
-                settings.strategy.formation_months,
-                settings.strategy.skip_months,
-                settings.schedule.signal_anchor,
-            )[0]
+            if session not in anchors:
+                anchors[session] = anchor_sessions(
+                    session,
+                    settings.strategy.formation_months,
+                    settings.strategy.skip_months,
+                    settings.schedule.signal_anchor,
+                )[0]
+            return anchors[session]
 
         bounds.append(formation(plan.session))
     for book in variant.books:
@@ -2467,8 +2475,8 @@ def _marking_bound(
             for holding in book.benchmarks.values()
             if holding.marked_at is not None
         )
-        if family in ("momentum", "combined"):
-            bounds.extend(formation(since) for since in book.held_since.values())
+        if family in ("momentum", "combined") and book.held_since:
+            bounds.append(formation(min(book.held_since.values())))
     return min(bounds)
 
 
@@ -2481,6 +2489,7 @@ def _variant_step(
     next_plan: Plan | None,
     family: HypothesisFamily,
     chains: Sequence[tuple[str, str]],
+    marking_bound: date,
 ) -> None:
     """One variant's step through `step_end` from the shared reads, restricted to its
     own ids: carry, fill, value and exit every level, then take `next_plan`. `index` is
@@ -2490,7 +2499,6 @@ def _variant_step(
     cadence = params.schedule.rebalance_cadence
     t, t_prev = read_time(step_end, cadence), read_time(plan.session, cadence)
     ids, marked, ever_held = (list(part) for part in _marking_ids(variant, benchmarks))
-    marking_bound = _marking_bound(variant, step_end, family, marked)
     frame = view.marking_prices(t, marked, marking_bound)
     raw = view.raw_prices(t, marked)
     listings = _ended_listings(view.listing_ends(t, ids), step_end)
