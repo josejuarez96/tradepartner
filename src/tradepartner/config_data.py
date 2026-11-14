@@ -99,8 +99,10 @@ class StoreConfig(_ClosedConfig):
     def _validate_path(cls, value: str) -> str:
         # `duckdb.connect("")` and ":memory:" open a throwaway in-memory DB, and
         # `Path("").exists()` is True, so a blank path would pass the missing check.
-        if not value.strip() or value.strip().lower() == ":memory:":
-            raise ValueError("path must be a file path, not blank or ':memory:' (#3331)")
+        if not value.strip() or value.strip().lower().startswith(":memory:"):
+            raise ValueError(
+                "path must be a file path, not blank or an in-memory ':memory:' name (#3331)"
+            )
         return value
 
     @field_validator("memory_limit")

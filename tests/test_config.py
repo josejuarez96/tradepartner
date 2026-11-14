@@ -3906,7 +3906,7 @@ def test_gap_count_share_threshold_is_a_share(value: float) -> None:
         Settings(_env_file=None, gap={"count_share_threshold": value})
 
 
-@pytest.mark.parametrize("value", ["", "   ", ":memory:", " :MEMORY: "])
+@pytest.mark.parametrize("value", ["", "   ", ":memory:", " :MEMORY: ", ":memory:paper"])
 def test_store_path_refuses_blank_and_memory(value: str) -> None:
     with pytest.raises(ValidationError, match="path"):
         Settings(_env_file=None, store={"path": value})
@@ -3923,3 +3923,17 @@ def test_repo_default_settings_still_load() -> None:
     assert settings.store.path
     assert settings.universe.top_n_by_cap > 0
     assert 0 <= settings.ingest.max_missing_share <= 1
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("universe", "liquidity_window", 0),
+        ("universe", "min_price", -1),
+        ("ingest", "settle_delay_minutes", -1),
+        ("gap", "missing_tail_sessions", -1),
+    ],
+)
+def test_other_counts_refuse_nonsense(section: str, key: str, value: int) -> None:
+    with pytest.raises(ValidationError, match=key):
+        Settings(_env_file=None, **{section: {key: value}})
