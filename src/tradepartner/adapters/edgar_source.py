@@ -421,10 +421,6 @@ FSN_VERSION = 7
 #: 5: #1675 (split contexts keep each class's symbol; quotes stripped; same release);
 #: 6: `cover_split_contexts` backed out (owner, same release, pending #1682).
 #: 7: `cover_split_contexts` back on, with `class_member_link` (release `rederive-1682`, T198).
-#: #3293's `TXSE` exchange code shipped without a bump: only a document naming
-#: the Texas Stock Exchange (a venue that began listing in 2025-26) reads
-#: differently, and none was cached before a name listed there; a bump would
-#: re-download every cover page.
 COVER_VERSION = 7
 #: As `COVER_VERSION`, for per-document `parse_sgml_header` results (T11d).
 HEADER_VERSION = 1
@@ -445,7 +441,11 @@ DELISTING_HTML_VERSION = 1
 FORM25_EVIDENCE_VERSION = 1
 #: The filename-listing extract cache (`filename/v1/<cik>.json`, T184b, #1597):
 #: names, prefix and 12(b) class/exchange pairs only, never a document.
-FILENAME_VERSION = 1
+#: 2: #3293, the `TXSE` exchange code: a 12(b) table naming the Texas Stock Exchange
+#: (TCBI's 10-Q of 2026-10-22) read no pair before it. `COVER_VERSION` is not
+#: bumped (a bump re-downloads every cover page): a cover page cached since
+#: 2026-09-30 that names the venue holds its slug until its CIK is touched.
+FILENAME_VERSION = 2
 #: Bumped when the layout of `check_failures`'s full-list file changes (#884).
 FILING_FAILURES_LIST_VERSION = 1
 
