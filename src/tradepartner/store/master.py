@@ -194,6 +194,7 @@ from tradepartner.store.filename_listings import (
     normalize_ticker,
 )
 from tradepartner.store.journal import CLOSING_STOP_STATES
+from tradepartner.store.listing_reviews import ReviewedListing, reviewed_listings
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 _EDGAR = "edgar"
@@ -244,6 +245,11 @@ class MasterBuild:
     #: listing row (#3057): the refusals with their reasons; the rows that
     #: passed are in `listings` (`provenance = 'snapshot'`).
     rename_refusals: tuple[RenameRefusal, ...] = ()
+    #: Reviewed listing rows (`store.listing_reviews`, #3293) the build left
+    #: out, as `(entry, reason)`: `not_yet_known` (the cited filing was
+    #: accepted after `ingested_at`) or `no_security` (the build holds no
+    #: such security). A row the build derives itself is left out silently.
+    reviewed_skipped: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1452,8 +1458,14 @@ def build_master(
     ingested_at: datetime,
     earlier_fetches: Sequence[CompanySnapshotEntry] = (),
     renames: Sequence[RenameChange] = (),
+    reviewed: Sequence[ReviewedListing] | None = None,
 ) -> MasterBuild:
     """`securities` and `listings` rows for every issuer CIK and benchmark.
+
+    `reviewed` are the reviewed listing rows (`store.listing_reviews`, #3293;
+    the packaged file when `None`): each is written as a `filing` listing
+    known at its cited filing's acceptance, once the build holds its
+    security and `ingested_at` has reached that acceptance.
 
     `renames` are the stored `symbol_changes` (`stored_rename_changes`,
     #3057): a change whose new ticker no cover page or fetch row starts by
@@ -1571,6 +1583,9 @@ def build_master(
             provenance="snapshot",
         )
 
+    reviewed_skipped = _reviewed_listings(
+        builder, reviewed_listings() if reviewed is None else reviewed, ingested_at
+    )
     listed = {row["security_id"] for row in builder.listings}
     return MasterBuild(
         securities=tuple(builder.securities),
@@ -1588,7 +1603,34 @@ def build_master(
         filename_enabled=settings.edgar.filename_listings,
         filename_conflict_ciks=tuple(filename_conflict_ciks),
         rename_refusals=rename_refusals,
+        reviewed_skipped=reviewed_skipped,
     )
+
+
+def _reviewed_listings(
+    builder: _Builder, rows: Iterable[ReviewedListing], ingested_at: datetime
+) -> tuple[tuple[str, str], ...]:
+    """Write each reviewed row the build can hold; return the ones it cannot."""
+    held = {row["security_id"] for row in builder.securities}
+    skipped: list[tuple[str, str]] = []
+    for review in rows:
+        if review.known_at > ingested_at:
+            skipped.append((review.entry, "not_yet_known"))
+        elif review.security_id not in held:
+            skipped.append((review.entry, "no_security"))
+        elif not any(
+            (row["security_id"], row["ticker"], row["exchange"], row["valid_from"]) == review.key
+            for row in builder.cik_listings(security_cik(review.security_id))
+        ):
+            builder.listing(
+                review.security_id,
+                review.ticker,
+                review.exchange,
+                review.class_title,
+                review.valid_from,
+                review.known_at,
+            )
+    return tuple(skipped)
 
 
 def build_chains(

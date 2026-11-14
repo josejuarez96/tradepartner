@@ -3294,6 +3294,7 @@ def _statement_backfill_start(
     resume point from this digest's `partial` rows written after it."""
     from tradepartner.store.build_fingerprint import (
         PER_NAME_KEYS,
+        REVIEWED_LISTINGS_KEY,
         additive_statement_change,
         build_fingerprint,
     )
@@ -3322,7 +3323,10 @@ def _statement_backfill_start(
         return _BackfillStart(change.refusal)
     stored = cursor.get("per_name") or {}
     current = build_fingerprint(settings).per_name
-    if any(stored.get(key) != current[key] for key in PER_NAME_KEYS):
+    if any(
+        stored.get(key, [] if key == REVIEWED_LISTINGS_KEY else None) != current[key]
+        for key in (*PER_NAME_KEYS, REVIEWED_LISTINGS_KEY)
+    ):
         # Outside the hash, so T365a lets it through; the final row would absorb
         # it and the next nightly would never touch its CIKs.
         return _BackfillStart(

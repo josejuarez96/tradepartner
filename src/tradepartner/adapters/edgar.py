@@ -232,6 +232,7 @@ _EXCHANGES: dict[str, str] = {
             "NYSE ALTERNEXT US",
             "NYSE ALTERNEXT US LLC",
         ),
+        "TXSE": ("TXSE", "TEXAS STOCK EXCHANGE", "TEXAS STOCK EXCHANGE LLC"),
         "NYSE_ARCA": ("NYSEARCA", "NYSE ARCA", "NYSE ARCA INC", "NYSE ARCA LLC"),
         "CBOE_BZX": (
             "CBOEBZX",
