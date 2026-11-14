@@ -6,6 +6,7 @@ import ast
 import dataclasses
 import itertools
 import math
+import pickle
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
@@ -127,6 +128,98 @@ def _rows(result: BacktestResult, session: date) -> Any:
 
 
 class TestReads:
+    def test_marking_bound_is_computed_once_per_step(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        original_bound = engine._marking_bound
+        original_anchor = engine.anchor_sessions
+        bounds = 0
+        anchors = 0
+        held_months_by_step: list[set[tuple[int, int]]] = []
+
+        def counted_anchor(*args: Any, **kwargs: Any) -> tuple[date, date]:
+            nonlocal anchors
+            anchors += 1
+            return original_anchor(*args, **kwargs)
+
+        def counted_bound(*args: Any, **kwargs: Any) -> date:
+            nonlocal bounds
+            bounds += 1
+            variant = cast(engine._Variant, args[0])
+            held_months_by_step.append(
+                {
+                    (since.year, since.month)
+                    for book in variant.books
+                    for since in book.held_since.values()
+                }
+            )
+            return original_bound(*args, **kwargs)
+
+        monkeypatch.setattr(engine, "anchor_sessions", counted_anchor)
+        monkeypatch.setattr(engine, "_marking_bound", counted_bound)
+        _run(_provider(), levels=(0.0, 15.0, 30.0, 100.0))
+        steps = len(rebalance_sessions(T0, T3)) - 1
+        assert bounds == steps
+        assert any(len(months) >= 2 for months in held_months_by_step)
+        # The plan and each distinct earliest held date need at most one anchor
+        # per step, regardless of names or cost levels.
+        assert anchors <= 2 * steps
+
+    def test_marking_bound_change_keeps_fixture_result_bytes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        optimized = _run(_provider(), levels=(0.0, 15.0, 30.0))
+        original_bound = engine._marking_bound
+
+        # Keep this pre-fix algorithm independent of the production helper: it is
+        # the reference for the fixture's byte-for-byte result comparison.
+        def per_name_bound(
+            variant: engine._Variant,
+            step_end: date,
+            family: HypothesisFamily,
+            marked: Sequence[str],
+        ) -> date:
+            plan = cast(engine.Plan, variant.plan)
+            settings = variant.settings
+            sessions = all_sessions()
+            at = engine.bisect.bisect_right(sessions, step_end) - 1
+            stale = sessions[max(0, at - settings.backtest.stale_exit_sessions)]
+            bounds = [stale, plan.session]
+            bounds.extend(
+                variant.last_stitched[sid] for sid in marked if sid in variant.last_stitched
+            )
+            if family in ("momentum", "combined"):
+                bounds.append(
+                    engine.anchor_sessions(
+                        plan.session,
+                        settings.strategy.formation_months,
+                        settings.strategy.skip_months,
+                        settings.schedule.signal_anchor,
+                    )[0]
+                )
+            for book in variant.books:
+                bounds.extend(book.marked_at.values())
+                bounds.extend(book.held_since.values())
+                bounds.extend(
+                    holding.marked_at
+                    for holding in book.benchmarks.values()
+                    if holding.marked_at is not None
+                )
+                if family in ("momentum", "combined"):
+                    bounds.extend(
+                        engine.anchor_sessions(
+                            since,
+                            settings.strategy.formation_months,
+                            settings.strategy.skip_months,
+                            settings.schedule.signal_anchor,
+                        )[0]
+                        for since in book.held_since.values()
+                    )
+            return min(bounds)
+
+        monkeypatch.setattr(engine, "_marking_bound", per_name_bound)
+        reference = _run(_provider(), levels=(0.0, 15.0, 30.0))
+        monkeypatch.setattr(engine, "_marking_bound", original_bound)
+        assert pickle.dumps(optimized) == pickle.dumps(reference)
+
     def test_only_rebalance_closes_are_read(self) -> None:
         provider = _provider()
         _run(provider)
