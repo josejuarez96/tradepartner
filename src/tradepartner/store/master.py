@@ -798,6 +798,12 @@ class _Builder:
         self.successions: list[Succession] = []
         self.class_titles: dict[tuple[str, str], ClassTitle] = {}  # first per (id, title)
         self.shown: list[ShownSpan] = []
+        #: Each CIK's cover-page acceptances, in the order built (#3363).
+        self.pages: dict[str, list[datetime]] = defaultdict(list)
+        #: `listings` by class id, and the `filing` ones by (ticker, exchange),
+        #: kept as rows are made so `_split_offs` never walks them all (#3363).
+        self.class_rows: dict[str, list[Row]] = defaultdict(list)
+        self.filed_pairs: dict[tuple[str, str], list[Row]] = defaultdict(list)
 
     def security(
         self,
@@ -835,6 +841,9 @@ class _Builder:
             "valid_from": valid_from,
         } | _row(known_at, self.ingested_at, source, provenance)
         self.listings.append(row)
+        self.class_rows[security_id].append(row)
+        if provenance == "filing":
+            self.filed_pairs[(ticker, exchange)].append(row)
         self._listings_by_cik[security_cik(security_id)].append(row)
 
     def cik_listings(self, cik: str) -> Sequence[Row]:
@@ -867,6 +876,7 @@ class _Builder:
         for page in sorted(pages, key=lambda p: (p.accepted_at, p.accession)):
             while events and events[0][0] < page.accepted_at:
                 self._event(first, classes, events.pop(0), marks)
+            self.pages[cik].append(page.accepted_at)
             known_at = max(page.accepted_at, first.accepted_at)
             valid_from = session_of(page.accepted_at)
             shown: dict[str, set[tuple[str, str]]] = defaultdict(set)
@@ -1445,6 +1455,113 @@ def _filing_index_for_forms(source: FilingSource, forms: Collection[str]) -> lis
     return [entry for entry in source.filing_index() if entry.form in forms]
 
 
+#: The ticker of a row that ends a class's span (#3363): a placeholder, which
+#: holds nothing and "still ends the security's previous span"
+#: (`adapters.alpaca_prices`), exactly as a cover page naming no ticker does.
+SPLIT_OFF_END_TICKER = "N/A"
+
+
+def _split_offs(builder: _Builder, delistings: Mapping[str, Sequence[DelistingFiling]]) -> None:
+    """Tracking stock split off into another issuer (#3363, #3288 G6).
+
+    When a class's ticker on an exchange is listed by a **different** CIK
+    from a cover page (or filing) of its own, two shapes follow, and both
+    are rules, not reviewed rows:
+
+    1. *Stale relisting.* The old issuer's Form 25 ended the class, then a
+       later cover page of the old issuer lists the same pair again, which
+       the #820 rule read as new equity (a repair successor, with an 8-A12B
+       in the window: Liberty Media's BATRA and BATRK on 2023-08-04). The
+       other issuer's row starts on or before that page, so the old issuer's
+       row is dropped, and with it a successor left with no row (its
+       `securities` row, its `Succession`, its class titles and shown
+       spans). Rows the other issuer starts later are not touched.
+    2. *Dropped class.* The old issuer has no Form 25 on the exchange, the
+       other issuer's row starts after the class's last listing row, and the
+       old issuer has since filed a cover page that no longer shows the class
+       (Liberty Media's LLYVA and LLYVK, 2025-12-16). The class's span ends
+       where the other issuer's row starts: an end row (`SPLIT_OFF_END_TICKER`)
+       on the class, `known_at` the later of the other issuer's row and that
+       first page without the class. With no such page the old issuer may
+       still list it, and nothing ends.
+
+    Only rows of provenance `filing` count, on either side: a companies
+    snapshot's first-seen date is not when a ticker changed hands.
+    """
+    successors = {s.security_id for s in builder.successions}
+    drop: set[int] = set()
+    for sid in successors:
+        cik = security_cik(sid)
+        for row in builder.class_rows.get(sid, ()):
+            if row["provenance"] != "filing":
+                continue
+            pair_rows = builder.filed_pairs[(row["ticker"], row["exchange"])]
+            had_it = any(
+                security_cik(o["security_id"]) == cik
+                and o["security_id"] not in successors
+                and o["valid_from"] < row["valid_from"]
+                for o in pair_rows
+            )
+            taken = any(
+                security_cik(o["security_id"]) != cik and o["valid_from"] <= row["valid_from"]
+                for o in pair_rows
+            )
+            if had_it and taken:
+                drop.add(id(row))
+    if drop:
+        dropped = {r["security_id"] for r in builder.listings if id(r) in drop}
+        builder.listings = [r for r in builder.listings if id(r) not in drop]
+        for sid in dropped:
+            builder.class_rows[sid] = [r for r in builder.class_rows[sid] if id(r) not in drop]
+        for pair, rows in builder.filed_pairs.items():
+            builder.filed_pairs[pair] = [r for r in rows if id(r) not in drop]
+        gone = {sid for sid in dropped if not builder.class_rows[sid]}
+        builder.securities = [r for r in builder.securities if r["security_id"] not in gone]
+        builder.successions = [s for s in builder.successions if s.security_id not in gone]
+        builder.shown = [s for s in builder.shown if s.security_id not in gone]
+        builder.class_titles = {k: v for k, v in builder.class_titles.items() if k[0] not in gone}
+        builder._listings_by_cik.clear()
+        for r in builder.listings:
+            builder._listings_by_cik[security_cik(r["security_id"])].append(r)
+
+    last_shown: dict[str, datetime] = {}
+    for span in builder.shown:
+        last_shown[span.security_id] = max(
+            span.last_at, last_shown.get(span.security_id, span.last_at)
+        )
+    for sid, shown_at in last_shown.items():
+        rows = sorted(builder.class_rows[sid], key=lambda r: (r["valid_from"], r["known_at"]))
+        if not rows:
+            continue
+        last = rows[-1]
+        cik = security_cik(sid)
+        if last["provenance"] != "filing" or any(
+            f.exchange == last["exchange"] for f in delistings.get(cik, ())
+        ):
+            continue
+        later = [
+            q
+            for q in builder.filed_pairs[(last["ticker"], last["exchange"])]
+            if security_cik(q["security_id"]) != cik
+            and q["valid_from"] > last["valid_from"]
+            and q["known_at"] > shown_at
+        ]
+        after = [at for at in builder.pages.get(cik, ()) if at > shown_at]
+        if not later or not after:
+            continue
+        q = min(later, key=lambda r: (r["valid_from"], r["known_at"]))
+        end = {
+            "security_id": sid,
+            "ticker": SPLIT_OFF_END_TICKER,
+            "exchange": last["exchange"],
+            "class_title": None,
+            "valid_from": q["valid_from"],
+        } | _row(max(q["known_at"], min(after)), builder.ingested_at, _EDGAR, "filing")
+        builder.listings.append(end)
+        builder.class_rows[sid].append(end)
+        builder._listings_by_cik[cik].append(end)
+
+
 def build_master(
     source: FilingSource,
     settings: Settings,
@@ -1553,6 +1670,8 @@ def build_master(
             builder.benchmark(found[0])
         else:
             missing.append(ticker)
+
+    _split_offs(builder, delistings)
 
     # One walk of every listing, only when a name change is to be judged.
     rename_rows, rename_refusals = (
