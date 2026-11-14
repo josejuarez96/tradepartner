@@ -1312,6 +1312,96 @@ def test_derive_listing_ends_skips_amendment_after_counted_form_25() -> None:
     ]
 
 
+# --- #3292 (G3): a snapshot listing dated to its own Form 25 day ----------
+
+
+def _g3_ends(
+    row_from: date, filed: datetime, effective: date, bars: list[date], title: str | None = None
+) -> pl.DataFrame:
+    sid = "CSQLIKE"
+    listings = pl.DataFrame([{**_row(sid, "CSQ", "NASDAQ", row_from, title)}])
+    form = {**_delisting(sid, "NASDAQ", filed), "effective_on": effective}
+    bar_df = pl.DataFrame({"security_id": [sid] * len(bars), "session": bars})
+    return derive_listing_ends(listings, pl.DataFrame([form]), bar_df, transfer_window_sessions=10)
+
+
+class TestSnapshotDatedToItsForm25:
+    """CSQ and SBI: the only listing is a `snapshot_static` row whose
+    `valid_from` is the Form 25 day, and the security trades on for years."""
+
+    def test_csq_shape_reads_as_continuing(self) -> None:
+        ends = _g3_ends(
+            date(2007, 6, 11),
+            _ny(2007, 6, 11, 9, 0),
+            date(2007, 6, 21),
+            [date(2016, 3, 1), date(2026, 11, 6)],
+        )
+        assert ends.select("status", "end_session").rows() == [("listed", None)]
+
+    def test_sbi_shape_reads_as_continuing(self) -> None:
+        ends = _g3_ends(
+            date(2017, 11, 6),
+            _ny(2017, 11, 6, 9, 0),
+            date(2017, 11, 16),
+            [date(2017, 11, 3), date(2017, 11, 20), date(2018, 5, 1)],
+        )
+        assert ends.select("status", "end_session").rows() == [("listed", None)]
+
+    def test_no_bar_after_effective_day_still_ends(self) -> None:
+        ends = _g3_ends(
+            date(2007, 6, 11),
+            _ny(2007, 6, 11, 9, 0),
+            date(2007, 6, 21),
+            [date(2007, 6, 8), date(2007, 6, 20)],
+        )
+        assert ends.select("status", "end_session").rows() == [("delisted", date(2007, 6, 20))]
+
+    def test_bar_not_yet_known_is_not_evidence(self) -> None:
+        # Point in time: a later bar absent from the T-restricted input.
+        ends = _g3_ends(
+            date(2007, 6, 11), _ny(2007, 6, 11, 9, 0), date(2007, 6, 21), [date(2007, 6, 8)]
+        )
+        assert ends["status"].to_list() == ["delisted"]
+
+    def test_relisting_gap_after_prior_history_still_ends(self) -> None:
+        # Bars exist before the Form 25 and only years after it: two lines.
+        ends = _g3_ends(
+            date(2007, 6, 11),
+            _ny(2007, 6, 11, 9, 0),
+            date(2007, 6, 21),
+            [date(2007, 6, 8), date(2016, 3, 1)],
+        )
+        assert ends["status"].to_list() == ["delisted"]
+
+    def test_bar_inside_the_window_with_prior_history_continues(self) -> None:
+        ends = _g3_ends(
+            date(2007, 6, 11),
+            _ny(2007, 6, 11, 9, 0),
+            date(2007, 6, 21),
+            [date(2007, 6, 8), date(2007, 6, 25), date(2016, 3, 1)],
+        )
+        assert ends["status"].to_list() == ["listed"]
+
+    def test_titled_listing_dated_to_the_form_25_still_ends(self) -> None:
+        ends = _g3_ends(
+            date(2007, 6, 11),
+            _ny(2007, 6, 11, 9, 0),
+            date(2007, 6, 21),
+            [date(2007, 6, 8), date(2016, 3, 1)],
+            title="Common Stock",
+        )
+        assert ends["status"].to_list() == ["delisted"]
+
+    def test_snapshot_older_than_the_form_25_still_ends(self) -> None:
+        ends = _g3_ends(
+            date(2001, 1, 2),
+            _ny(2007, 6, 11, 9, 0),
+            date(2007, 6, 21),
+            [date(2007, 6, 8), date(2016, 3, 1)],
+        )
+        assert ends["status"].to_list() == ["delisted"]
+
+
 # --- #2927: each filing reads its CIK's rows, grouped once per build --------
 
 

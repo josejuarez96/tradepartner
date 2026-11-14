@@ -62,6 +62,9 @@ rows (`security_id`, `ticker`, `valid_from`, `class_title`):
   class of the company already holds the ticker never holds it, not even
   after that class moves on (a Class B listed under the Class A's ticker);
   it shadows other companies like a non-equity span;
+- a security's own rows naming two tickers on one day, none held before,
+  are decided by the later filing (`known_at`) when the stamps differ
+  (#3291, Aeva's IPV then AEVA); a tie or an unstamped row stays a pair;
 - two spans of one ticker starting on the same day, of two securities,
   are **ambiguous**: the ticker resolves to nothing while they are the
   latest, and the run goes on. Not so a repair successor (`<cik>@<date>`)
@@ -910,6 +913,7 @@ class _Row:
     kind: str  # EQUITY or the non-equity kind; "placeholder" for no ticker
     written: str | None = None  # an unreadable ticker read as `ticker` (#844)
     filing_name: bool = False  # read from a filing's own file names (#1597)
+    known_at: datetime | None = None  # when the row's filing was known (#3291)
 
 
 _PLACEHOLDER = "placeholder"
@@ -1069,6 +1073,7 @@ class ListingResolver:
                     ticker,
                     kind,
                     filing_name=row.get("provenance") == _FILING_NAME,
+                    known_at=row.get("known_at"),
                 )
             )
         self._by_ticker: dict[str, list[TickerSpan]] = defaultdict(list)
@@ -2298,6 +2303,25 @@ def _clean_rows(rows: Sequence[_Row]) -> tuple[list[_Row], date | None, int, int
     return out, pair_day, typos, ignored
 
 
+def _later_filing(rows: list[_Row], day: date) -> list[_Row] | None:
+    """`rows` less the equity rows of `day` filed before the day's latest
+    filing (#3291), or `None` when that leaves the pair standing: a row
+    with no stamp, two tickers filed at the latest moment, or no next equity
+    row under the later filing's ticker (nothing confirms it), shows nothing."""
+    today = [r for r in rows if r.day == day and r.kind == EQUITY]
+    stamps = [r.known_at for r in today]
+    if any(stamp is None for stamp in stamps):
+        return None
+    latest = max(s for s in stamps if s is not None)
+    if len({r.ticker for r in today if r.known_at == latest}) > 1:
+        return None
+    winner = next(r.ticker for r in today if r.known_at == latest)
+    after = next((r for r in rows if r.day > day and r.kind == EQUITY), None)
+    if after is None or after.ticker != winner:
+        return None  # the later filing may itself be a slip: nothing confirms it
+    return [r for r in rows if not (r in today and r.known_at != latest)]
+
+
 def _drop_same_day_typos(rows: Sequence[_Row]) -> tuple[list[_Row], date | None]:
     """A security's sorted rows less each same-day typo (#819), and the
     first same-day pair day left, or `None`.
@@ -2306,14 +2330,20 @@ def _drop_same_day_typos(rows: Sequence[_Row]) -> tuple[list[_Row], date | None]
     the security's row just before that day (an equity row), the others
     are a cover page's slip (FutureFuel naming Ford's `F` beside its own
     `FF`): their rows are dropped and the security keeps its ticker. A pair
-    with no such ticker stays a pair."""
+    with no such ticker is decided by the later filing when the rows carry
+    different `known_at` stamps (#3291: Aeva's IPV at 06:33, AEVA at 17:01
+    of 2021-06-02); otherwise it stays a pair."""
     kept = list(rows)
     while (day := _same_day_pair(kept)) is not None:
         before = [r for r in kept if r.day < day]
         held = before[-1].ticker if before and before[-1].kind == EQUITY else None
         tickers = {r.ticker for r in kept if r.day == day and r.kind == EQUITY}
         if not is_same_day_typo(held, tickers):
-            return kept, day
+            later = _later_filing(kept, day)
+            if later is None:
+                return kept, day
+            kept = later
+            continue
         kept = [r for r in kept if not (r.day == day and r.kind == EQUITY and r.ticker != held)]
     return kept, None
 
