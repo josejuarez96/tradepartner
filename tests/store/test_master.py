@@ -3136,3 +3136,16 @@ class TestNotesOnlyIssuer:
         by_ticker = {r["ticker"]: r["security_id"] for r in build.listings}
         assert by_ticker["FC"] == self.CIK
         assert by_ticker["FC30"] != self.CIK
+
+    def test_a_snapshot_before_the_notes_first_page_is_not_given_the_later_note_id(self) -> None:
+        source = FixtureFilingSource(
+            index=[_filing(self.CIK, "Finance Co", "10-K", _at(2015, 3, 1))],
+            cover_pages=[
+                _cover(self.CIK, _at(2020, 3, 1), ("2.5% Senior Notes due 2030", "FC30", "NYSE"))
+            ],
+            snapshot=[_snap(self.CIK, "Finance Co", "FC30", "NYSE", _at(2019, 6, 1))],
+        )
+        build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+        known = {r["security_id"]: r["known_at"] for r in build.securities}
+        for row in build.listings:
+            assert row["known_at"] >= known[row["security_id"]]

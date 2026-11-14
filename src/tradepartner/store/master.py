@@ -1151,7 +1151,14 @@ class _Builder:
             cls = next((c for c in listed if entry.ticker in {k for k, _ in c.pairs_at(t)}), None)
             same_fetch = sum(1 for e in entries if e.fetched_at == t)
             if cls is None and not listed and same_fetch == 1:
-                cls = classes[0]  # a CIK with no cover page yet and one ticker
+                # A CIK with no cover page yet and one ticker. A note class
+                # (a suffixed id, #3390) not yet known at `t` is no home for it.
+                first_cls = classes[0]
+                if (
+                    first_cls.security_id == primary_security_id(entry.cik)
+                    or first_cls.known_at <= t
+                ):
+                    cls = first_cls
             if cls is None:
                 self.unmatched.append(entry)
                 continue
