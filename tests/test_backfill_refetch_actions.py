@@ -15,6 +15,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from conftest import open_paper_window
 from test_backfill import SINCE, _backfill, _History
 from test_ingest import ACME, NOW
 
@@ -216,3 +217,18 @@ def test_spin_offs_are_left_to_their_own_path(settings: Settings) -> None:
     )
     result = _refetch(settings, prices, dry_run=True)
     assert result.added == (("dividend", 1),)
+
+
+def test_a_real_run_refuses_inside_an_open_paper_window_and_writes_nothing(
+    settings: Settings,
+) -> None:
+    prices = _committed(settings)
+    _open_release(settings)
+    open_paper_window(settings, datetime(2019, 5, 14, 14, tzinfo=UTC))
+    result = _refetch(settings, prices)
+    assert not result.ok
+    assert "open paper window" in " ".join(r.message for r in result.runs)
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(0,)]
+    assert _rows(settings, f"SELECT count(*) FROM ingestion_runs WHERE status = '{FILLED}'") == [
+        (0,)
+    ]

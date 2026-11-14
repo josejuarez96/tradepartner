@@ -244,6 +244,51 @@ def test_every_review_prefix_exists_on_the_tree_unless_planned() -> None:
         assert not _on_tree(prefix), f"{prefix} exists now; drop it from PLANNED_PREFIXES"
 
 
+def test_every_src_module_is_reviewed_unless_explicitly_exempt() -> None:
+    """#3319: a new src module needs a review by default; exemptions are a visible list."""
+    files = subprocess.run(
+        ["git", "-C", str(REPO), "ls-files", "src"], check=True, capture_output=True, text=True
+    ).stdout.split()
+    modules = [f for f in files if f.endswith(".py")]
+    assert len(modules) > 100
+    unreviewed = [f for f in modules if not ready_pr.required_reviews([f])]
+    assert set(unreviewed) <= set(ready_pr.NO_REVIEW_PATHS), (
+        "these src files need a review prefix in scripts/ready_pr.py, or an entry in "
+        "NO_REVIEW_PATHS: " + ", ".join(sorted(set(unreviewed) - set(ready_pr.NO_REVIEW_PATHS)))
+    )
+    for path in ready_pr.NO_REVIEW_PATHS:
+        assert path in modules, f"{path} is gone; drop it from NO_REVIEW_PATHS"
+        assert not ready_pr.required_reviews([path]), f"{path} is reviewed; drop the exemption"
+
+
+def test_every_src_module_that_unwraps_a_secret_requires_the_safety_review() -> None:
+    """#3319: secrets are never left to a quant-only review."""
+    out = subprocess.run(
+        ["git", "-C", str(REPO), "grep", "-l", "get_secret_value", "--", "src"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    assert len(out) > 5
+    for path in out:
+        assert "safety-reviewer" in ready_pr.required_reviews([path]), path
+
+
+def test_research_repair_and_llm_input_paths_require_their_reviews() -> None:
+    quant = {"quant-auditor"}
+    for path in (
+        "src/tradepartner/research/gates.py",
+        "src/tradepartner/repair_form4_roles.py",
+        "src/tradepartner/retract.py",
+        "src/tradepartner/adapters/form4_route.py",
+    ):
+        assert ready_pr.required_reviews([path]) == quant, path
+    assert ready_pr.required_reviews(["src/tradepartner/research/labeling/job.py"]) == {
+        "quant-auditor",
+        "safety-reviewer",
+    }
+
+
 def test_edgar_source_requires_the_quant_audit() -> None:
     # it fetches the filing text the store keeps (#382, owner decision 2026-10-04)
     assert ready_pr.required_reviews(["src/tradepartner/adapters/edgar_source.py"]) == {
@@ -573,7 +618,7 @@ class FakeRunner:
         deleted: Sequence[str] = (),
         main_files: dict[str, str] | None = None,
         body: str = BODY_OK,
-        comments: Sequence[str] = ("quant-auditor: PASS",),
+        comments: Sequence[str] = ("quant-auditor: PASS\nreviewed at abc1234def",),
         checks_after: Sequence[str | tuple[ready_pr.CheckRun, ...]] = ("success",),
         draft: bool = True,
         dirty: bool = False,
@@ -1151,7 +1196,7 @@ def test_dry_run_prints_reviewer_box_change_without_writing(
 
 
 def test_reviewer_box_needs_the_reviewed_sha_to_annotate_pass() -> None:
-    r = FakeRunner(body=BODY_OK + TEMPLATE_BOX + "\n")
+    r = FakeRunner(body=BODY_OK + TEMPLATE_BOX + "\n", comments=("quant-auditor: PASS",))
     with pytest.raises(ready_pr.ReadyError, match="reviewed at"):
         ready_pr.ready(r, 69, dry_run=True)
     assert r.edited_bodies == []
@@ -1600,7 +1645,13 @@ def test_a_deleted_module_falls_back_to_the_full_suite() -> None:
 def test_tests_runs_only_the_mapped_tests_unless_full_tests(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    targeted = FakeRunner(test_sources=SOURCES)
+    targeted = FakeRunner(
+        test_sources=SOURCES,
+        comments=(
+            "quant-auditor: PASS\nreviewed at abc1234def",
+            "safety-reviewer: PASS\nreviewed at abc1234def",
+        ),
+    )
     assert ready_pr.ready(targeted, 69, dry_run=True, run_tests=True) == 0
     assert targeted.checks_run[-1] == (
         *ready_pr.PYTEST_CHECK,
@@ -1608,18 +1659,28 @@ def test_tests_runs_only_the_mapped_tests_unless_full_tests(
     )
     assert "targeted" in capsys.readouterr().out
 
-    full = FakeRunner(test_sources=SOURCES)
+    full = FakeRunner(
+        test_sources=SOURCES,
+        comments=(
+            "quant-auditor: PASS\nreviewed at abc1234def",
+            "safety-reviewer: PASS\nreviewed at abc1234def",
+        ),
+    )
     assert ready_pr.ready(full, 69, dry_run=True, full_tests=True) == 0
     assert full.checks_run[-1] == ready_pr.PYTEST_CHECK
     assert "--full-tests" in capsys.readouterr().out
 
     unclear = FakeRunner(test_sources=SOURCES, touched=["uv.lock", "changelog.d/69-x.md"])
-    unclear._pr = ready_pr.Pr(69, "feat/69-x", "main", True, BODY_OK, ("safety-reviewer: PASS",))
+    unclear._pr = ready_pr.Pr(
+        69, "feat/69-x", "main", True, BODY_OK, ("safety-reviewer: PASS\nreviewed at abc1234def",)
+    )
     assert ready_pr.ready(unclear, 69, dry_run=True, run_tests=True) == 0
     assert unclear.checks_run[-1] == ready_pr.PYTEST_CHECK
 
     ci_only = FakeRunner(touched=[".github/ISSUE_TEMPLATE/bug.yml", "changelog.d/69-x.md"])
-    ci_only._pr = ready_pr.Pr(69, "feat/69-x", "main", True, BODY_OK, ("safety-reviewer: PASS",))
+    ci_only._pr = ready_pr.Pr(
+        69, "feat/69-x", "main", True, BODY_OK, ("safety-reviewer: PASS\nreviewed at abc1234def",)
+    )
     assert ready_pr.ready(ci_only, 69, dry_run=True) == 0
     assert not _ran_suite(ci_only)
     assert "CI runs the full suite" in capsys.readouterr().out
@@ -1820,3 +1881,55 @@ def test_a_new_ledger_is_loaded_and_checked_as_appended_to_nothing() -> None:
     assert ready_pr.exam_ledger_refusal(None, LEDGER_MAIN) is None
     passed = LEDGER_MAIN + LEDGER_ENTRY.format(outcome="passed", window_id=7)
     assert "appended as passed" in (ready_pr.exam_ledger_refusal(None, passed) or "")
+
+
+def test_an_already_ticked_box_is_rechecked_against_the_head() -> None:
+    """#3318: a src commit after a PASS and a ticked box still needs a fresh review."""
+    r = FakeRunner(
+        body=BODY_OK + TICKED_BOX + "\n",
+        comments=("quant-auditor: PASS\nreviewed at abc1234def",),
+        since_review_touched=["src/tradepartner/store/asof.py"],
+        own_patch_at_review="+a",
+        own_patch_at_head="+a\n+new",
+    )
+    with pytest.raises(ready_pr.ReadyError, match="review no longer covers"):
+        ready_pr.ready(r, 69, dry_run=True)
+
+
+def test_review_covers_head_real_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#3318 on real git: an own src commit stales a review, a main-only merge does not."""
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(tmp_path), *args], check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    def commit(path: str, text: str, msg: str) -> None:
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_text(text)
+        git("add", path)
+        git("commit", "-m", msg)
+
+    git("init", "-b", "main")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.com")
+    git("commit", "--allow-empty", "-m", "base")
+    git("switch", "-c", "feature")
+    own = "src/tradepartner/store/asof.py"
+    commit(own, "one\n", "own")
+    reviewed = git("rev-parse", "HEAD")
+    runner = ready_pr.ShellRunner(tmp_path)
+    touched = [own]
+    required = {"quant-auditor"}
+    shas = {"quant-auditor": reviewed}
+    assert ready_pr.review_covers_head(runner, "main", required, shas, touched) == []
+    git("switch", "main")
+    commit("other.txt", "x\n", "main moves")
+    git("switch", "feature")
+    git("merge", "--no-edit", "main")
+    assert ready_pr.review_covers_head(runner, "main", required, shas, touched) == []
+    commit(own, "two\n", "own again")
+    assert ready_pr.review_covers_head(runner, "main", required, shas, touched) == ["quant-auditor"]
+    assert ready_pr.review_covers_head(runner, "main", required, {}, touched) == ["quant-auditor"]

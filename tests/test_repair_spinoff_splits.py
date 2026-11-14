@@ -14,6 +14,7 @@ from typing import Any
 import duckdb
 import polars as pl
 import pytest
+from conftest import open_paper_window
 from typer.testing import CliRunner
 
 from tradepartner import cli, repair
@@ -291,4 +292,13 @@ def test_a_repair_that_misses_its_count_rolls_back(
     with pytest.raises(RuntimeError, match="rolled back"):
         _retract(splits, expect=1, release=REL)
     assert _actions(splits) == ALL
+    assert _rows(splits, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+def test_the_split_repair_refuses_inside_an_open_paper_window(splits: Settings) -> None:
+    open_paper_window(splits, datetime(2020, 3, 30, 14, tzinfo=UTC))
+    before = _rows(splits, "SELECT count(*) FROM corporate_actions")
+    with pytest.raises(RepairRefused, match="open paper window"):
+        _retract(splits, expect=1, release=REL)
+    assert _rows(splits, "SELECT count(*) FROM corporate_actions") == before
     assert _rows(splits, "SELECT count(*) FROM ingestion_runs") == [(0,)]

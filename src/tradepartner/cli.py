@@ -4250,6 +4250,8 @@ def make_app(
             raise _fail("--reason must not be blank", USAGE_ERROR)
         if not file.is_file():
             raise _input_fail(f"no hypothesis file at {file}", settings)
+        if (missing := _store_missing(s)) is not None:
+            raise missing
         decision_id: int | None = None
         try:
             with open_for_write(s) as conn:
@@ -4866,6 +4868,8 @@ def make_app(
         s = settings()
         if not file.is_file():
             raise _input_fail(f"no experiment file at {file}", settings)
+        if (missing := _store_missing(s)) is not None:
+            raise missing
         try:
             parsed = parse_experiment_file(file, _experiments_dir(s), settings=s)
             with open_for_write(s) as conn:
@@ -4924,6 +4928,8 @@ def make_app(
         if configurations is not None and configurations < 1:
             raise _fail("--configurations must be at least 1", USAGE_ERROR)
         s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
         run_config = _read_config(config, s)
         try:
             with open_for_write(s) as conn:
@@ -5361,6 +5367,8 @@ def make_app(
         assert start is not None and end is not None
         s = settings()
         explicit_sealed = tuple(sealed or ())
+        if (missing := _store_missing(s)) is not None:
+            raise missing
         try:
             if not path.exists():
                 raise ExperimentFileError(f"no export at {path}")
