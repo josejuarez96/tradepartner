@@ -777,3 +777,48 @@ def test_a_spin_off_before_the_chain_is_known_keeps_the_stored_parent(
     row = _spinoff_row(chain_fixture_store, _CHAIN_KNOWN_AT - PROBE_EPSILON)
     assert row["source_action_id"] == _PREDECESSOR
     assert row["security_id"] == _SPIN_CHILD
+
+
+# --- a forked predecessor fails closed in research reads (#3323) ------------------------
+
+_FORK_KNOWN_AT = datetime.fromisoformat("2020-06-01T20:30:00+00:00")
+
+
+def _fork(conn: duckdb.DuckDBPyConnection) -> None:
+    """A second live successor for `_PREDECESSOR`, known from `_FORK_KNOWN_AT`."""
+    from tradepartner.store.db import insert_row
+
+    insert_row(
+        conn,
+        "successor_chains",
+        _chain_row(
+            _FORK_KNOWN_AT,
+            _FORK_KNOWN_AT,
+            successor_id="0001000099",
+            evidence_accession="0001000099-24-000001",
+        ),
+    )
+
+
+def test_a_forked_predecessor_raises_in_every_research_read_from_the_fork(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    from tradepartner.store.asof import ForkedChainError
+
+    _fork(chain_fixture_store)
+    for read in (prices_as_of, facts_as_of, live_actions_as_of, adjusted_prices_as_of):
+        with pytest.raises(ForkedChainError, match=_PREDECESSOR) as info:
+            read(chain_fixture_store, _FORK_KNOWN_AT, [_SUCCESSOR])  # type: ignore[operator]
+        assert "0001000099" in str(info.value) and _SUCCESSOR in str(info.value)
+
+
+def test_a_fork_known_later_does_not_affect_earlier_reads(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """No look-ahead: before the second chain's `known_at` the single chain resolves."""
+    _fork(chain_fixture_store)
+    t = _FORK_KNOWN_AT - PROBE_EPSILON
+    assert (_PREDECESSOR, _SUCCESSOR) in live_chains(chain_fixture_store, t)
+    assert (_PREDECESSOR, "0001000099") not in live_chains(chain_fixture_store, t)
+    merged = prices_as_of(chain_fixture_store, t, [_SUCCESSOR])
+    assert set(merged["security_id"].unique().to_list()) == {_SUCCESSOR}

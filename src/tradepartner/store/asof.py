@@ -503,6 +503,12 @@ def chained_read_ids(
     return ids, forked
 
 
+class ForkedChainError(ValueError):
+    """A predecessor has more than one live successor chain at `t` (#3323).
+    Which successor holds its history is never guessed: a chain-aware research
+    read raises, as execution does (`chained_read_ids`' second map)."""
+
+
 @dataclass(frozen=True)
 class LiveChains:
     """The chains a single chain-aware read applies (#821, T187b): `pairs`
@@ -668,10 +674,23 @@ def _live_chains_at(conn: duckdb.DuckDBPyConnection, t: datetime) -> LiveChains:
     """`live_chains(t)` with each successor's hand-over day, read from the
     listings known at `t`: the predecessor's last listing row's ticker and
     exchange matched by the successor's earliest such row (as
-    `store.master.build_chains`)."""
+    `store.master.build_chains`). Raises `ForkedChainError` when a predecessor
+    has more than one live successor at `t` (#3323)."""
     pairs = live_chains(conn, t)
     if not pairs:
         return _NO_CHAINS
+    successors: dict[str, list[str]] = {}
+    for predecessor, successor in pairs:
+        successors.setdefault(predecessor, []).append(successor)
+    forked = {pred: succ for pred, succ in successors.items() if len(succ) > 1}
+    if forked:
+        raise ForkedChainError(
+            "; ".join(
+                f"{pred}: more than one live successor chain known at {t.isoformat()} "
+                f"({', '.join(sorted(succ))}), so its history cannot be filed"
+                for pred, succ in sorted(forked.items())
+            )
+        )
     listings = listings_as_of(conn, t).select("security_id", "ticker", "exchange", "valid_from")
     by_security: dict[str, list[tuple[str, str, date]]] = {}
     for security_id, ticker, exchange, valid_from in listings.iter_rows():
