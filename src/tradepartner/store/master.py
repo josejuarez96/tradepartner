@@ -1530,6 +1530,10 @@ def _split_offs(builder: _Builder, delistings: Mapping[str, Sequence[DelistingFi
             if row["provenance"] != "filing":
                 continue
             pair_rows = builder.filed_pairs[(row["ticker"], row["exchange"])]
+            # The session of the page that listed the pair again, not the row's
+            # own start: a successor's row starts at its 8-A12B (#3362), before
+            # that page.
+            page_session = session_of(row["known_at"])
             held = [
                 o["valid_from"]
                 for o in pair_rows
@@ -1543,7 +1547,7 @@ def _split_offs(builder: _Builder, delistings: Mapping[str, Sequence[DelistingFi
             # deletes an earlier-known one).
             taken = bool(held) and any(
                 security_cik(o["security_id"]) != cik
-                and max(held) < o["valid_from"] <= row["valid_from"]
+                and max(held) < o["valid_from"] <= page_session
                 and o["known_at"] <= row["known_at"]
                 for o in pair_rows
             )
