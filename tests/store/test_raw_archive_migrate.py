@@ -220,6 +220,66 @@ def test_an_interrupted_run_resumes_to_the_uninterrupted_end_state(
     assert got[0] == want[0] and got[1] == want[1]  # nothing lost, nothing archived twice
 
 
+def test_resume_after_eviction_records_a_new_move_and_closes_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    r = Rig(tmp_path)
+    old = f"{DEAD}/a.json"
+    new = f"{DEAD}/new.json"
+    r.put(old, b"old")
+
+    def stop(name: str) -> None:
+        if name == "evict":
+            raise Boom
+
+    monkeypatch.setattr(raw_archive_migrate, "_step", stop)
+    with pytest.raises(Boom):
+        r.run()
+    r.put(new, b"new")
+    monkeypatch.setattr(raw_archive_migrate, "_step", lambda _name: None)
+
+    result = r.run()
+
+    assert result.states[old] == "evicted"
+    assert result.states[new] in {"moved", "evicted"}
+    assert not (r.cache / new).exists()
+    assert body_path(r.root, _sha(b"new")).read_bytes() == b"new"
+    assert {record["path"] for record in r.index()} == {old, new}
+    manifest = json.loads((r.root / "manifests" / result.manifest_sha256).read_text())
+    assert {file["path"] for file in manifest["files"]} == {old, new}
+    assert (r.cache / "_archived" / "journal-r1.jsonl").exists()
+    assert not (r.cache / "_archived" / "journal.jsonl").exists()
+
+
+def test_resume_after_manifest_leaves_new_file_for_the_next_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    r = Rig(tmp_path)
+    old = f"{DEAD}/a.json"
+    new = f"{DEAD}/new.json"
+    r.put(old, b"old")
+
+    def stop(name: str) -> None:
+        if name == "manifest":
+            raise Boom
+
+    monkeypatch.setattr(raw_archive_migrate, "_step", stop)
+    with pytest.raises(Boom):
+        r.run()
+    r.put(new, b"new")
+    monkeypatch.setattr(raw_archive_migrate, "_step", lambda _name: None)
+
+    first = r.run()
+    assert (r.cache / new).read_bytes() == b"new"
+    assert {record["path"] for record in r.index()} == {old}
+    first_manifest = json.loads((r.root / "manifests" / first.manifest_sha256).read_text())
+    assert {file["path"] for file in first_manifest["files"]} == {old}
+
+    second = r.run(run_id="r2")
+    assert second.states[new] == "evicted"
+    assert {record["path"] for record in r.index()} == {old, new}
+
+
 def test_an_intent_with_neither_source_nor_body_stops_the_run(rig: Rig) -> None:
     journal = rig.cache / "_archived" / "journal.jsonl"
     journal.parent.mkdir()
