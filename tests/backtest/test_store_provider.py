@@ -1329,6 +1329,63 @@ def test_chains_reads_the_live_successor_chains(tmp_path: Path, store: Store) ->
         assert provider.chains(_CHAIN_KNOWN_AT) == (("0001000010", "0001000011"),)
 
 
+def test_a_forked_predecessor_is_refused_by_the_research_reads(
+    tmp_path: Path, store: Store
+) -> None:
+    """#3323: a predecessor with two live successors at `t` refuses the reads that
+    name it (or a successor) with `ForkedChainError`; before the second chain is
+    known, and for unrelated ids, the reads go through."""
+    from lookahead.harness import PROBE_EPSILON
+
+    from tradepartner.store.asof import ForkedChainError, forked_chains
+
+    path = tmp_path / "fork.duckdb"
+    settings = _settings(path)
+    fork_at = datetime(2020, 6, 1, 20, 30, tzinfo=UTC)
+    conn = duckdb.connect(str(path))
+    try:
+        configure_connection(conn)
+        schema.init_schema(conn)
+        load_universe_fixtures(conn, UNIVERSE_DIR)
+        load_chain_overlay(conn)
+        insert_row(
+            conn,
+            "successor_chains",
+            {
+                "predecessor_id": "0001000010",
+                "successor_id": "0001000099",
+                "evidence_accession": "0001000099-24-000001",
+                "evidence_form": "8-K12B",
+                "retracted": False,
+                "withdrawn_known_at": None,
+                "known_at": fork_at,
+                "ingested_at": fork_at,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+        assert forked_chains(conn, fork_at - PROBE_EPSILON) == {}
+        assert forked_chains(conn, fork_at) == {"0001000010": ("0001000011", "0001000099")}
+        assert forked_chains(conn, fork_at, ["0001000013"]) == {}
+        assert forked_chains(conn, fork_at, ["0001000099"]) != {}
+    finally:
+        conn.close()
+    handle = _open_trial(settings, tmp_path)
+
+    @contextmanager
+    def connect() -> Iterator[duckdb.DuckDBPyConnection]:
+        with open_read_only(settings) as conn:
+            yield conn
+
+    with StoreProvider(connect, handle, settings) as provider:
+        provider.raw_prices(fork_at - PROBE_EPSILON, ["0001000011"])
+        provider.raw_prices(fork_at, ["0001000013"])
+        with pytest.raises(ForkedChainError, match="0001000010"):
+            provider.raw_prices(fork_at, ["0001000011"])
+        with pytest.raises(ForkedChainError, match="0001000099"):
+            provider.adjusted_prices(fork_at, ["0001000010"], include_dividends=False)
+
+
 def _open_trial(settings: Settings, tmp_path: Path) -> registry.TrialHandle:
     """A real `TrialHandle` recorded in `settings`'s store."""
     with open_for_write(settings) as conn:

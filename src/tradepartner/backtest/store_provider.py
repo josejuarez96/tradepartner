@@ -151,6 +151,7 @@ from tradepartner.store.asof import (
     mergers_as_of,
     prices_as_of,
     rates_as_of,
+    refuse_forked_chains,
     statement_facts_as_of,
     unvalued_spin_offs_as_of,
 )
@@ -348,7 +349,9 @@ class StoreProvider:
 
     def universe(self, t: datetime) -> Universe:
         t = check_t(t)
-        return self._step_universe(t)
+        universe = self._step_universe(t)
+        refuse_forked_chains(self._at(t), t, universe.members["security_id"].to_list())
+        return universe
 
     def chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
         """The live successor chains known at `t` (#821, T187b): the
@@ -366,6 +369,7 @@ class StoreProvider:
         sessions_from: date | None = None,
     ) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
+        refuse_forked_chains(self._at(t), t, wanted)
         return adjusted_prices_as_of(
             self._at(t),
             t,
@@ -390,6 +394,7 @@ class StoreProvider:
 
     def raw_prices(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
+        refuse_forked_chains(self._at(t), t, wanted)
         return prices_as_of(self._at(t), t, wanted, traded_only=True)
 
     def listing_ends(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:

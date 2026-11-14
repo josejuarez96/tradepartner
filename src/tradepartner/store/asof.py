@@ -504,9 +504,45 @@ def chained_read_ids(
 
 
 class ForkedChainError(ValueError):
-    """A predecessor has more than one live successor chain at `t` (#3323).
-    Which successor holds its history is never guessed: a chain-aware research
-    read raises, as execution does (`chained_read_ids`' second map)."""
+    """A research or backtest read named a predecessor with more than one live
+    successor chain at `t` (#3323). Which successor holds its history is never
+    guessed, so the run refuses (execution fails closed through
+    `chained_read_ids`' second map)."""
+
+
+def forked_chains(
+    conn: duckdb.DuckDBPyConnection, t: datetime, security_ids: Iterable[str] | None = None
+) -> dict[str, tuple[str, ...]]:
+    """Each predecessor of more than one live chain known at `t`, with its
+    successors sorted (#3323). With `security_ids`, only the forks naming one of
+    them as predecessor or successor; `None` returns every fork. Never raises:
+    `ForkedChainError` is the caller's refusal, and a report (the health check)
+    may read a forked store."""
+    successors: dict[str, set[str]] = {}
+    for predecessor, successor in live_chains(conn, t):
+        successors.setdefault(predecessor, set()).add(successor)
+    wanted = None if security_ids is None else set(security_ids)
+    return {
+        pred: tuple(sorted(found))
+        for pred, found in sorted(successors.items())
+        if len(found) > 1 and (wanted is None or wanted & {pred, *found})
+    }
+
+
+def refuse_forked_chains(
+    conn: duckdb.DuckDBPyConnection, t: datetime, security_ids: Iterable[str]
+) -> None:
+    """Raise `ForkedChainError` naming each forked predecessor among
+    `security_ids` (as predecessor or successor) at `t` (#3323)."""
+    forked = forked_chains(conn, t, security_ids)
+    if forked:
+        raise ForkedChainError(
+            "; ".join(
+                f"{pred}: more than one live successor chain known at {t.isoformat()} "
+                f"({', '.join(found)}), so its history cannot be filed"
+                for pred, found in forked.items()
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -604,9 +640,7 @@ def _chain_parent(alias: str = "t") -> str:
 
 
 @contextmanager
-def _chains_registered(
-    conn: duckdb.DuckDBPyConnection, t: datetime, security_ids: Sequence[str] | None = None
-) -> Iterator[LiveChains]:
+def _chains_registered(conn: duckdb.DuckDBPyConnection, t: datetime) -> Iterator[LiveChains]:
     """Expose the live chains known at `t` to SQL as `_CHAINS_VIEW` (its
     `predecessor_id`, `successor_id` and `handover`) and the chained
     successors whose own bars stay hidden *and* have no live chain at `t` as
@@ -616,7 +650,7 @@ def _chains_registered(
     once here, and the hand-over day is derived from the listings known at `t`
     (the successor's first listing row under the predecessor's ticker and
     exchange)."""
-    chains = _live_chains_at(conn, t, security_ids)
+    chains = _live_chains_at(conn, t)
     pre_listing = _pre_listing_at(conn, t, chains)
     if not chains.pairs and not pre_listing:
         yield _NO_CHAINS
@@ -672,36 +706,14 @@ def _pre_listing_at(
     return {successor: boundaries.get(successor, date.max) for successor in successors}
 
 
-def _live_chains_at(
-    conn: duckdb.DuckDBPyConnection, t: datetime, security_ids: Sequence[str] | None = None
-) -> LiveChains:
+def _live_chains_at(conn: duckdb.DuckDBPyConnection, t: datetime) -> LiveChains:
     """`live_chains(t)` with each successor's hand-over day, read from the
     listings known at `t`: the predecessor's last listing row's ticker and
     exchange matched by the successor's earliest such row (as
-    `store.master.build_chains`). Raises `ForkedChainError` when a predecessor
-    has more than one live successor at `t` and the read asks for it or one of
-    its successors (`security_ids`). A read for every id (`None`) cannot
-    attribute a fork to a name, so it keeps the store-wide behaviour rather
-    than halting ingest and every run on one fork (#3323; the execution path
-    fails closed per name through `chained_read_ids`)."""
+    `store.master.build_chains`)."""
     pairs = live_chains(conn, t)
     if not pairs:
         return _NO_CHAINS
-    successors: dict[str, list[str]] = {}
-    for predecessor, successor in pairs:
-        successors.setdefault(predecessor, []).append(successor)
-    wanted = set(security_ids or ())
-    forked = {
-        pred: succ for pred, succ in successors.items() if len(succ) > 1 and wanted & {pred, *succ}
-    }
-    if forked:
-        raise ForkedChainError(
-            "; ".join(
-                f"{pred}: more than one live successor chain known at {t.isoformat()} "
-                f"({', '.join(sorted(succ))}), so its history cannot be filed"
-                for pred, succ in sorted(forked.items())
-            )
-        )
     listings = listings_as_of(conn, t).select("security_id", "ticker", "exchange", "valid_from")
     by_security: dict[str, list[tuple[str, str, date]]] = {}
     for security_id, ticker, exchange, valid_from in listings.iter_rows():
@@ -868,7 +880,7 @@ def live_actions_as_of(
     the same event; no store holds both today (#2147).
     """
     t = _validate_t(t)
-    with _chains_registered(conn, t, security_ids) as chains:
+    with _chains_registered(conn, t) as chains:
         params: list[Any] = [t]
         if chains:
             security_filter = _security_filter(security_ids, params, column=_chain_id())
@@ -936,7 +948,7 @@ def prices_as_of(
     wins a shared session.
     """
     t = _validate_t(t)
-    with _chains_registered(conn, t, security_ids) as chains:
+    with _chains_registered(conn, t) as chains:
         frame = _latest_as_of(
             conn,
             "prices_daily",
@@ -1075,7 +1087,7 @@ def price_jumps_as_of(
     t = _validate_t(t)
     settings = settings if settings is not None else get_settings()
     cfg = settings.universe
-    with _chains_registered(conn, t, security_ids) as chains:
+    with _chains_registered(conn, t) as chains:
         params: list[Any] = [t]
         hide = chains.hide_sql("b")
         if chains:
@@ -1310,7 +1322,7 @@ def facts_as_of(
     """
     t = _validate_t(t)
     partition = ", ".join(_FACT_KEY)
-    with _chains_registered(conn, t, security_ids) as chains:
+    with _chains_registered(conn, t) as chains:
         if chains:
             assert chains is not None
             params: list[Any] = [t]
@@ -2279,7 +2291,7 @@ def adjusted_prices_as_of(
         else None
     )
     with (
-        _chains_registered(conn, t, security_ids) as chains,
+        _chains_registered(conn, t) as chains,
         _dividend_gate_registered(conn, gate) as gated,
     ):
         common_ctes, params = _adjusted_params(
@@ -2428,7 +2440,7 @@ def dropped_dividends_as_of(
         else _dividend_gate(conn, t, security_ids, dividend_reviews)
     )
     with (
-        _chains_registered(conn, t, security_ids) as chains,
+        _chains_registered(conn, t) as chains,
         _dividend_gate_registered(conn, gate) as gated,
     ):
         common_ctes, params = _adjusted_params(
@@ -2472,7 +2484,7 @@ def unvalued_spin_offs_as_of(
     does (a non-positive or non-finite ratio or child close).
     """
     t = _validate_t(t)
-    with _chains_registered(conn, t, security_ids) as chains:
+    with _chains_registered(conn, t) as chains:
         common_ctes, params = _adjusted_params(
             t,
             security_ids,
