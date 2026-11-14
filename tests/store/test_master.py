@@ -1479,7 +1479,7 @@ class TestNewEquityAfterForm25:
         build = build_master(
             self._source(registered=_at(2020, 10, 27)), _settings(), ingested_at=INGESTED_AT
         )
-        successor = f"{cik}@2020-11-05"
+        successor = f"{cik}@2020-10-28"
         assert build.successions == (Succession(cik, successor, _at(2020, 11, 5)),)
         assert [(r["security_id"], r["known_at"]) for r in build.securities] == [
             (cik, _at(2018, 3, 1)),
@@ -1487,7 +1487,7 @@ class TestNewEquityAfterForm25:
         ]
         assert [(r["security_id"], r["valid_from"]) for r in build.listings] == [
             (cik, date(2019, 8, 1)),
-            (successor, date(2020, 11, 5)),
+            (successor, date(2020, 10, 28)),
         ]
         # The Form 25 still ends the old security: a successor known after
         # the filing is never its candidate.
@@ -1501,13 +1501,13 @@ class TestNewEquityAfterForm25:
         )
         resolver = ListingResolver(build.listings)
         assert resolver.resolve("CRC", date(2020, 7, 30)) == cik
-        assert resolver.resolve("CRC", date(2020, 11, 5)) == f"{cik}@2020-11-05"
-        assert resolver.resolve("CRC", date(2021, 6, 1)) == f"{cik}@2020-11-05"
+        assert resolver.resolve("CRC", date(2020, 10, 28)) == f"{cik}@2020-10-28"
+        assert resolver.resolve("CRC", date(2021, 6, 1)) == f"{cik}@2020-10-28"
         # Each security's bars sit on one side of the gap only, so a return
         # (close over the security's previous close) never spans it.
-        sessions = [date(2020, 7, 29), date(2020, 7, 30), date(2020, 11, 5), date(2020, 11, 6)]
+        sessions = [date(2020, 7, 29), date(2020, 7, 30), date(2020, 10, 28), date(2020, 11, 6)]
         owners = [resolver.resolve("CRC", day) for day in sessions]
-        assert owners == [cik, cik, f"{cik}@2020-11-05", f"{cik}@2020-11-05"]
+        assert owners == [cik, cik, f"{cik}@2020-10-28", f"{cik}@2020-10-28"]
 
     def test_a_registration_just_before_the_form_25_counts(self) -> None:
         # WOLF: 8-A12B 2025-09-26, Form 25 2025-09-29 effective 2025-10-09,
@@ -1569,7 +1569,7 @@ class TestNewEquityAfterForm25:
                 assert read(full, t).equals(read(partial, t)), f"{read.__name__} T={t!r}"
             partial.close()
         before = securities_as_of(full, _at(2020, 11, 5) - PROBE_EPSILON)
-        assert f"{self.CIK}@2020-11-05" not in _ids(before)
+        assert f"{self.CIK}@2020-10-28" not in _ids(before)
         full.close()
 
     def test_a_delisted_successor_is_ended_by_its_own_form_25(self) -> None:
@@ -1588,7 +1588,7 @@ class TestNewEquityAfterForm25:
         )
         build = build_master(source, _settings(), ingested_at=INGESTED_AT)
         delistings = build_delistings([first, second], build, ingested_at=INGESTED_AT)
-        assert [r["security_id"] for r in delistings.delistings] == [cik, f"{cik}@2020-11-05"]
+        assert [r["security_id"] for r in delistings.delistings] == [cik, f"{cik}@2020-10-28"]
         assert delistings.unmatched == ()
 
     @pytest.mark.parametrize("registered_back", [True, False])
@@ -1656,12 +1656,54 @@ class TestNewEquityAfterForm25:
         build = build_master(
             self._gpor(registered=_at(2021, 5, 17)), _settings(), ingested_at=INGESTED_AT
         )
-        successor = f"{cik}@2021-08-09"
+        # #3362: the successor starts the session after the 8-A12B (the
+        # relisting's own evidence), not at the late cover page; it is still
+        # known only from that page.
+        successor = f"{cik}@2021-05-18"
         assert build.successions == (Succession(cik, successor, _at(2021, 8, 9)),)
-        assert [(r["security_id"], r["exchange"], r["valid_from"]) for r in build.listings] == [
-            (cik, "NASDAQ", date(2019, 8, 2)),
-            (successor, "NYSE", date(2021, 8, 9)),
+        assert [
+            (r["security_id"], r["exchange"], r["valid_from"], r["known_at"])
+            for r in build.listings
+        ] == [
+            (cik, "NASDAQ", date(2019, 8, 2), _at(2019, 8, 2)),
+            (successor, "NYSE", date(2021, 5, 18), _at(2021, 8, 9)),
         ]
+        resolver = ListingResolver(build.listings)
+        assert resolver.resolve("GPR", date(2021, 5, 18)) == successor
+        assert resolver.resolve("GPR", date(2021, 5, 17)) != successor
+
+    def test_a_same_exchange_relisting_starts_at_its_registration(self) -> None:
+        # HTZ (#3362): Form 25 on NYSE, 8-A12B for the new equity, a cover
+        # page months later on the same exchange. The successor starts the
+        # session after the 8-A12B, so no session is left without an owner.
+        cik = self.CIK
+        source = FixtureFilingSource(
+            index=[
+                _filing(cik, "Htz Co", "10-K", _at(2018, 3, 1)),
+                _filing(cik, "Htz Co", "8-A12B", _at(2021, 11, 8)),
+            ],
+            cover_pages=[
+                _cover(cik, _at(2019, 8, 2), ("Common Stock", "HTZ", "NYSE")),
+                _cover(cik, _at(2022, 2, 23), ("Common Stock", "HTZ", "NYSE")),
+            ],
+            delistings=[
+                DelistingFiling(
+                    cik,
+                    "25-NSE",
+                    "Common Stock",
+                    "NYSE",
+                    "25-htz",
+                    _at(2020, 10, 30),
+                    date(2020, 11, 9),
+                )
+            ],
+        )
+        build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+        successor = f"{cik}@2021-11-09"
+        assert build.successions == (Succession(cik, successor, _at(2022, 2, 23)),)
+        resolver = ListingResolver(build.listings)
+        assert resolver.resolve("HTZ", date(2021, 11, 9)) == successor
+        assert resolver.resolve("HTZ", date(2022, 2, 22)) == successor
 
     def test_a_registration_before_the_delisting_took_effect_is_a_transfer(self) -> None:
         # The same shape with the 8-A12B before the effective day is an
@@ -1701,7 +1743,7 @@ class TestNewEquityAfterForm25:
                 assert read(full, t).equals(read(partial, t)), f"{read.__name__} T={t!r}"
             partial.close()
         before = securities_as_of(full, _at(2021, 8, 9) - PROBE_EPSILON)
-        assert f"{self.CIK}@2021-08-09" not in _ids(before)
+        assert f"{self.CIK}@2021-05-18" not in _ids(before)
         full.close()
 
     def test_a_late_amendment_never_delists_the_successor(self) -> None:
@@ -1724,7 +1766,7 @@ class TestNewEquityAfterForm25:
         )
         assert ends.select("security_id", "status").rows() == [
             (cik, DELISTED),
-            (f"{cik}@2020-11-05", LISTED),
+            (f"{cik}@2020-10-28", LISTED),
         ]
 
 
@@ -2045,7 +2087,7 @@ class TestListingEvidenceAfterForm25:
             ),
             forms=(("15-12B", _at(2020, 10, 1)), ("8-A12B", _at(2020, 10, 27))),
         )
-        assert [s.security_id for s in build.successions] == [f"{cik}@2020-11-05"]
+        assert [s.security_id for s in build.successions] == [f"{cik}@2020-10-28"]
 
 
 def test_filename_first_page_classes_match_the_cik_not_only_the_second() -> None:

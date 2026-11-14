@@ -412,6 +412,20 @@ def _new_equity(stop: _Stop, until: datetime, marks: _Marks) -> bool:
     return _registered(stop, until, marks) and not _deregistered(stop, until, marks)
 
 
+def _registration_start(floor: date, until: datetime, marks: _Marks) -> date | None:
+    """The session after the earliest 8-A12B accepted from `floor` to `until`:
+    the first session the new equity can trade, which the relisting's own
+    registration shows before any cover page does (#3362: HTZ, GPOR, GTX).
+    Uses only filings accepted by `until`, the cover page that settles it."""
+    days = [
+        at.astimezone(_EXCHANGE_TZ).date()
+        for form in _NEW_REGISTRATION_FORMS
+        for at in marks.get(form, ())
+        if floor <= session_of(at) and at <= until
+    ]
+    return next_session(min(days)) if days else None
+
+
 _Pairs = frozenset[tuple[str, str]]
 
 
@@ -892,7 +906,14 @@ class _Builder:
                     relisted = True
                     old_exchange, old_stop = elsewhere
                     del cls.ended[old_exchange]
-                    start = max(valid_from, old_stop.after, old_stop.effective_after)
+                    registered = _registration_start(
+                        old_stop.effective_after, page.accepted_at, marks
+                    )
+                    start = max(
+                        min(valid_from, registered or valid_from),
+                        old_stop.after,
+                        old_stop.effective_after,
+                    )
                     cls = self._successor(first, cls, start, classes, known_at)
                     starts[(cls.security_id, item.exchange)] = start
                 elif stop is not None and (cls.security_id, item.exchange) not in starts:
@@ -905,7 +926,14 @@ class _Builder:
                         del cls.ended[item.exchange]
                         start = max(valid_from, stop.after)
                         if new_equity:
-                            start = max(start, stop.effective_after)
+                            registered = _registration_start(
+                                stop.window_start, page.accepted_at, marks
+                            )
+                            start = max(
+                                min(valid_from, registered or valid_from),
+                                stop.after,
+                                stop.effective_after,
+                            )
                             cls = self._successor(first, cls, start, classes, known_at)
                         starts[(cls.security_id, item.exchange)] = start
                 start = starts.get((cls.security_id, item.exchange), valid_from)
