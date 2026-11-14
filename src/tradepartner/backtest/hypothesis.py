@@ -1075,7 +1075,8 @@ def load_frozen(
 ) -> Settings:
     """`Settings` for a run of `slug`'s latest registration: its frozen values (read
     through `frozen.frozen_values`) over the live `settings` (default: loaded config)
-    for every other key, the family's inert sections included. Refuses a
+    for every other key, except the family's inert sections, which are reset to their
+    model defaults, never live (#3322). Refuses a
     `NOT_YET_APPLIED_KEYS` value other than its default.
     `UnknownHypothesis` for an unregistered slug."""
     record = registry.get_hypothesis(conn, slug)
@@ -1104,7 +1105,19 @@ def load_frozen(
             "applies it yet; it cannot run"
         )
     live = settings if settings is not None else get_settings()
-    return _overlay(live, values)
+    return _overlay(_reset_inert(live, inert), values)
+
+
+def _reset_inert(settings: Settings, inert: frozenset[str]) -> Settings:
+    """`settings` with each section in `inert` at its model defaults (#3322). The engine
+    reads `strategy.*` (placebo, signal delay, buffer) whatever the family, so a family
+    that does not list the section must not inherit live values the fingerprint omits."""
+    values = settings.model_dump()
+    for section in inert:
+        current = getattr(settings, section, None)
+        if isinstance(current, BaseModel):
+            values[section] = type(current)().model_dump()
+    return Settings.model_validate(values)
 
 
 @dataclass(frozen=True)

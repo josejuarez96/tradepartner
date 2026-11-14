@@ -453,12 +453,12 @@ def run_hypothesis(
                 slug, measured_cost_bps, params, tracking=tracking, decision=decision
             )
         shock = frozen_values(hypothesis)
-        if shock.get("strategy.placebo", "none") != "none" and (
-            tracking or decision.kind == "holdout"
-        ):
+        # The effective params, not `frozen_values`: a family whose `strategy` section is
+        # inert stores no placebo key, but the engine reads `params.strategy` (#3322).
+        if params.strategy.placebo != "none" and (tracking or decision.kind == "holdout"):
             # A fake signal never spends a holdout or feeds a tracking book (ADR 0023).
             raise ValueError(
-                f"{slug}: refused_placebo: strategy.placebo is {shock['strategy.placebo']!r}; "
+                f"{slug}: refused_placebo: strategy.placebo is {params.strategy.placebo!r}; "
                 "a placebo file runs in sample only, never on the holdout or as a tracking run"
             )
         sessions = gap_sessions(window, cadence)
