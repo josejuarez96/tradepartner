@@ -5263,11 +5263,13 @@ def make_app(
         use. No SEC request, no store row."""
         s = settings()
         try:
-            lines = archive_cmd.migrate_cache(s, icloud(s), apply=apply_)
+            lines, corrupt = archive_cmd.migrate_cache_checked(s, icloud(s), apply=apply_)
         except archive_cmd.REFUSALS as exc:
             raise _fail(_scrubbed(f"migrate-cache refused: {_describe(exc)}", s), 1) from None
         for line in lines:
             _echo_scrubbed(line, s)
+        if corrupt:
+            raise typer.Exit(1)
 
     @archive_app.command("restore")
     def archive_restore(
