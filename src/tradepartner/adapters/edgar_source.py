@@ -421,6 +421,10 @@ FSN_VERSION = 7
 #: 5: #1675 (split contexts keep each class's symbol; quotes stripped; same release);
 #: 6: `cover_split_contexts` backed out (owner, same release, pending #1682).
 #: 7: `cover_split_contexts` back on, with `class_member_link` (release `rederive-1682`, T198).
+#: #3293's `TXSE` exchange code shipped without a bump: only a document naming
+#: the Texas Stock Exchange (a venue that began listing in 2025-26) reads
+#: differently, and none was cached before a name listed there; a bump would
+#: re-download every cover page.
 COVER_VERSION = 7
 #: As `COVER_VERSION`, for per-document `parse_sgml_header` results (T11d).
 HEADER_VERSION = 1

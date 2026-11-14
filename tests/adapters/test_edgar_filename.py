@@ -179,6 +179,9 @@ class TestCover12bExchanges:
             ("NASDAQ National Market", "NASDAQ"),
             ("The NASDAQ Stock Market LLC (NASDAQ Global Select Market)", "NASDAQ"),
             ("NYSE MKT LLC", "NYSE_AMERICAN"),
+            ("Texas Stock Exchange LLC", "TXSE"),
+            ("The Texas Stock Exchange", "TXSE"),
+            ("TXSE", "TXSE"),
             # The cover page and the Form 25 spelling is already exact.
             ("New York Stock Exchange", "NYSE"),
             ("Nasdaq Stock Market LLC", "NASDAQ"),
