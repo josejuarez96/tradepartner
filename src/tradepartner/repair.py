@@ -819,23 +819,27 @@ def release_refusal(conn: duckdb.DuckDBPyConnection, release: str) -> str | None
 def refuse_inside_open_window(
     conn: duckdb.DuckDBPyConnection, affected_sessions: Iterable[date]
 ) -> None:
-    """Raise `RepairRefused` when an open paper window's first session
-    (`restamp_precheck.window_first_session`) is on or before any of
+    """Raise `RepairRefused` when any paper window is open and
     `affected_sessions`, the dates of the rows a repair or backfill is about
-    to rewrite, retract or add back-dated (#3330). The window's runs read the
-    store from that session on, so a past read must not move under it (the
-    rule `delete_master_rows` applies per row). No window open, or no affected
-    session, passes. Call it on the write connection before any write."""
+    to rewrite or retract, is not empty (#3330, quant-auditor on #3359).
+
+    A window's runs read the store at read instants from its first session on
+    (`restamp_precheck.read_instants`). A row dated inside the window may be
+    read or not yet; a row dated before it was read by every run, so changing
+    either moves a past read. The per-row `known_at` test of
+    `delete_master_rows` therefore refuses every affected row here, and the
+    date test is moot: any open window refuses any non-empty repair. No window
+    open, or nothing affected, passes. Call it on the write connection before
+    any write."""
     first = window_first_session(conn)
-    if first is None:
+    dates = sorted(set(affected_sessions))
+    if first is None or not dates:
         return
-    inside = sorted({d for d in affected_sessions if d >= first})
-    if inside:
-        raise RepairRefused(
-            f"an open paper window (first session {first}) reads the store: {len(inside)} "
-            f"affected dates from {inside[0]} are inside it; nothing written, wait for the "
-            "window to close"
-        )
+    raise RepairRefused(
+        f"an open paper window (first session {first}) reads the store and the repair "
+        f"changes {len(dates)} dates from {dates[0]}; nothing written, wait for the "
+        "window to close"
+    )
 
 
 def known_dates(instants: Iterable[datetime]) -> list[date]:

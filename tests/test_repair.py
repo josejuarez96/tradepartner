@@ -2284,10 +2284,12 @@ def test_delete_bars_refuses_inside_an_open_paper_window(store: Settings) -> Non
     assert _rows(store, "SELECT count(*) FROM ingestion_runs") == [(0,)]
 
 
-def test_delete_bars_before_the_window_still_runs(store: Settings) -> None:
+def test_delete_bars_dated_before_the_window_is_refused_too(store: Settings) -> None:
+    # The window's runs read these bars: a past read must not move under it.
     open_paper_window(store, datetime(2021, 6, 16, 14, tzinfo=UTC))
-    _delete_bars(store, expect=(3, 1), release=REL)
-    assert _rows(store, "SELECT count(*) FROM ingestion_runs") == [(1,)]
+    with pytest.raises(RepairRefused, match="open paper window"):
+        _delete_bars(store, expect=(3, 1), release=REL)
+    assert _rows(store, "SELECT count(*) FROM ingestion_runs") == [(0,)]
 
 
 def test_dividend_repair_refuses_inside_an_open_paper_window(dividends: Settings) -> None:
@@ -2298,14 +2300,14 @@ def test_dividend_repair_refuses_inside_an_open_paper_window(dividends: Settings
     assert _rows(dividends, "SELECT count(*) FROM ingestion_runs") == [(0,)]
 
 
-def test_the_helper_passes_with_no_window_and_refuses_on_or_after_its_first_session(
+def test_the_helper_passes_with_no_window_or_nothing_affected(
     store: Settings,
 ) -> None:
     with duckdb.connect(store.store.path, read_only=True) as conn:
         repair.refuse_inside_open_window(conn, [date(2030, 1, 2)])  # no window open
     open_paper_window(store, WINDOW_START)
     with duckdb.connect(store.store.path, read_only=True) as conn:
-        repair.refuse_inside_open_window(conn, [date(2021, 5, 27)])  # before it
         repair.refuse_inside_open_window(conn, [])
-        with pytest.raises(RepairRefused, match="first session 2021-05-28"):
-            repair.refuse_inside_open_window(conn, [date(2021, 5, 28)])
+        for day in (date(2021, 5, 27), date(2021, 5, 28)):  # before it, on it
+            with pytest.raises(RepairRefused, match="first session 2021-05-28"):
+                repair.refuse_inside_open_window(conn, [day])
