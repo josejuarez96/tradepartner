@@ -373,6 +373,7 @@ from tradepartner.store.delistings import (
     listing_ends_as_of,
 )
 from tradepartner.store.filing_index import snapshot_id as index_snapshot_id
+from tradepartner.store.listing_selection import prefer_current_listing
 from tradepartner.store.master import (
     ChainCandidate,
     MasterBuild,
@@ -491,7 +492,7 @@ def ingest_openfigi(
                 if row["valid_from"] > session:
                     continue
                 old = current.get(sid)
-                if old is None or row["valid_from"] > old["valid_from"]:
+                if prefer_current_listing(row, old, session):
                     current[sid] = row
             for sid, row in sorted(current.items()):
                 status, end = row["status"], row["end_session"]
@@ -7339,9 +7340,7 @@ def _price_names(
         sid = row["security_id"]
         _first_listed(earliest, row, settings)
         held = current.get(sid)
-        if row["valid_from"] <= session and (
-            held is None or row["valid_from"] > held["valid_from"]
-        ):
+        if row["valid_from"] <= session and prefer_current_listing(row, held, session):
             current[sid] = row
     kinds = {
         row["security_id"]: row["security_type"]

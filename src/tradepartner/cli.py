@@ -649,7 +649,12 @@ from tradepartner.store.db import (
     utc_now,
 )
 from tradepartner.store.lab_schema import LabNotInitialised
-from tradepartner.store.release_coverage import failing, format_loss, release_coverage
+from tradepartner.store.release_coverage import (
+    ReleaseCoverageError,
+    failing,
+    format_loss,
+    release_coverage,
+)
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 USAGE_ERROR = 2
@@ -4450,8 +4455,8 @@ def make_app(
     ) -> None:
         """Read-only: list securities that lost trading days since the release's backup.
 
-        Exits 1 when a loss above `store.release_max_lost_sessions` was not moved to
-        another security id (#3274). Writes nothing.
+        Exits 1 when unmoved loss exceeds either the per-security or store-wide
+        configured threshold (#3274, #3280). Writes nothing.
         """
         s = settings()
         if (missing := _store_missing(s)) is not None:
@@ -4474,19 +4479,25 @@ def make_app(
                 losses = release_coverage(
                     conn,
                     backup_alias="bk",
-                    max_lost_sessions=threshold,
                     price_tolerance=s.store.release_move_price_tolerance,
                 )
         except StoreLockedError as exc:
             raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
+        except ReleaseCoverageError as exc:
+            raise _fail(_scrubbed(f"ReleaseCoverageError: {exc}", s), 1) from None
+        total = sum(loss.unmoved for loss in losses)
+        total_limit = s.store.release_max_total_lost_sessions
+        visible = [loss for loss in losses if loss.lost > threshold]
         for loss in losses:
-            typer.echo(format_loss(loss))
+            if loss in visible or (total > total_limit and loss.unmoved > 0):
+                typer.echo(format_loss(loss))
         bad = failing(losses, max_lost_sessions=threshold)
         typer.echo(
-            f"release {name}: {len(losses)} security(ies) lost more than {threshold} sessions, "
-            f"{len(bad)} not moved"
+            f"release {name}: {len(visible)} security(ies) lost more than {threshold} sessions, "
+            f"{len(bad)} not moved; {total} total unmoved sessions "
+            f"(limit {total_limit})"
         )
-        if bad:
+        if bad or total > total_limit:
             raise typer.Exit(1)
 
     @release_app.command("record")

@@ -155,6 +155,40 @@ def test_loss_at_or_below_threshold_passes(tmp_path: Path) -> None:
     assert "0 security(ies) lost more than 5 sessions" in out
 
 
+def test_small_losses_across_securities_exceed_store_total(tmp_path: Path) -> None:
+    s = Settings(
+        _env_file=None,
+        store={
+            "path": str(tmp_path / "store.duckdb"),
+            "lock_retry_seconds": 0,
+            "release_max_lost_sessions": 5,
+            "release_max_total_lost_sessions": 4,
+        },
+    )
+    _seed(s)
+    _backup_and_open(s, tmp_path)
+    _edit(s, "DELETE FROM prices_daily WHERE session >= ?", [_days(20)[18]])
+    code, out = _coverage(s)
+    assert code == 1, out
+    assert "6 total unmoved sessions" in out
+    for sid in ("A", "B", "C"):
+        assert f"{sid} " in out
+
+
+def test_missing_backup_table_is_named_refusal(tmp_path: Path) -> None:
+    s = _settings(tmp_path)
+    _seed(s)
+    backup = _backup_and_open(s, tmp_path)
+    with duckdb.connect(str(backup)) as conn:
+        conn.execute("CREATE SCHEMA other")
+        conn.execute("CREATE TABLE other.listings AS SELECT * FROM main.listings")
+        conn.execute("DROP TABLE listings")
+    code, out = _coverage(s)
+    assert code == 1, out
+    assert "ReleaseCoverageError" in out and "listings" in out
+    assert "Traceback" not in out and "Catalog Error" not in out
+
+
 def test_a_revised_bar_is_no_loss(tmp_path: Path) -> None:
     s = _settings(tmp_path)
     _seed(s)
@@ -196,15 +230,37 @@ def test_core_counts_partial_move(tmp_path: Path) -> None:
             _bar(conn, "Z", d, close=9.0)  # unrelated prices: not a move
     with duckdb.connect(s.store.path, read_only=True) as conn:
         conn.execute(f"ATTACH '{backup}' AS bk (READ_ONLY)")
-        losses = release_coverage(conn, backup_alias="bk", max_lost_sessions=5)
+        losses = release_coverage(conn, backup_alias="bk")
     (loss,) = losses
     assert (loss.lost, loss.moved, loss.unmoved, loss.moved_to) == (20, 8, 12, ("C2",))
     assert failing(losses, max_lost_sessions=5) == losses
 
 
-def test_unknown_release_name_is_scrubbed(tmp_path: Path) -> None:
+def test_sub_dollar_move_uses_absolute_price_floor(tmp_path: Path) -> None:
     s = _settings(tmp_path)
     _seed(s)
+    with open_for_write(s) as conn:
+        conn.execute("UPDATE prices_daily SET low = 0.5, close = 0.5 WHERE security_id = 'A'")
+    _backup_and_open(s, tmp_path)
+    with open_for_write(s) as conn:
+        conn.execute("DELETE FROM prices_daily WHERE security_id = 'A'")
+        for d in _days(20):
+            _bar(conn, "A2", d, close=0.50000075)
+    code, out = _coverage(s)
+    assert code == 0, out
+    assert "20 sessions, moved to A2" in out
+
+
+def test_unknown_release_name_is_scrubbed(tmp_path: Path) -> None:
+    secret = "release-name-secret-value"
+    s = Settings(
+        _env_file=None,
+        store={"path": str(tmp_path / "store.duckdb"), "lock_retry_seconds": 0},
+        fred_api_key=secret,
+    )
+    _seed(s)
     app = cli.make_app(settings=lambda: s, clock=lambda: NOW)
-    res = CliRunner().invoke(app, ["decision", "data-release", "coverage", "--name", "x"])
-    assert res.exit_code == 2 and "no release named 'x'" in res.output
+    res = CliRunner().invoke(app, ["decision", "data-release", "coverage", "--name", secret])
+    assert res.exit_code == 2
+    assert "no release named '<scrubbed>'" in res.output
+    assert secret not in res.output

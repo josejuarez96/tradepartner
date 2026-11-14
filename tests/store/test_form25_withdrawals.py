@@ -14,7 +14,7 @@ no id receives (#3264).
 from __future__ import annotations
 
 import csv
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -23,8 +23,12 @@ import polars as pl
 import pytest
 
 from tradepartner.adapters.alpaca_prices import registrant_evidence
+from tradepartner.backtest import engine
 from tradepartner.calendar import session_close
 from tradepartner.config import Settings
+from tradepartner.execution import planning
+from tradepartner.health import _current_from
+from tradepartner.ingest import _price_names
 from tradepartner.repair import misattributed, store_resolver
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.delistings import (
@@ -291,6 +295,104 @@ BARS = [date(2018, 3, d) for d in (8, 9, 12, 13, 14, 15, 16)]
 
 def _dual() -> list[dict[str, Any]]:
     return [_listing(SEC, "AAA", "NYSE", D0), _listing(SEC, "AAA", "NASDAQ", D0)]
+
+
+def test_same_day_nasdaq_withdrawal_keeps_nyse_current_at_each_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    filed = datetime(2020, 3, 2, 21, tzinfo=UTC)
+    session = date(2020, 3, 13)
+    settings = _make(
+        tmp_path,
+        _dual(),
+        [_f25(SEC, "NASDAQ", filed, date(2020, 3, 10))],
+        [date(2020, 3, 9), date(2020, 3, 10), session],
+    )
+    at = session_close(session)
+    with open_for_write(settings) as writer:
+        insert_row(
+            writer,
+            "classifications",
+            {
+                "security_id": SEC,
+                "security_type": "common",
+                "rule": "common_default",
+                "known_at": session_close(D0),
+                "ingested_at": session_close(D0),
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        before = listing_ends_as_of(conn, filed - timedelta(minutes=1), settings)
+        assert _status(before, "NASDAQ") == (LISTED, None)
+        assert engine._ended(before, date(2020, 3, 2)) == {}
+        frame = listing_ends_as_of(conn, at, settings)
+        assert _status(frame, "NASDAQ") == (TRANSFERRED, date(2020, 3, 9))
+        assert _status(frame, "NYSE") == (LISTED, None)
+        for ordered in (frame, frame.reverse()):
+            monkeypatch.setattr(
+                "tradepartner.universe.listing_ends_as_of",
+                lambda _conn, _at, _settings, ordered=ordered: ordered,
+            )
+            monkeypatch.setattr(
+                "tradepartner.ingest.listing_ends_as_of",
+                lambda _conn, _at, _settings, ordered=ordered: ordered,
+            )
+            assert _current_listings(conn, at, session, settings)[SEC]["exchange"] == "NYSE"
+            assert _current_from(ordered, session)[SEC]["exchange"] == "NYSE"
+            assert planning.current_listings(ordered, session)[SEC]["exchange"] == "NYSE"
+            assert engine._ended(ordered, session) == {}
+            fetch, listed, *_ = _price_names(conn, at, session, settings)
+            assert SEC in fetch
+            assert SEC in listed
+
+
+def test_same_day_withdrawal_then_real_delisting_exits_at_later_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    nyse_end = date(2022, 6, 14)
+    settings = _make(
+        tmp_path,
+        _dual(),
+        [_f25(SEC, "NASDAQ", datetime(2020, 3, 2, 21, tzinfo=UTC), date(2020, 3, 10))],
+        [date(2020, 3, 9), date(2020, 3, 10), date(2020, 3, 13)],
+    )
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        frame = listing_ends_as_of(conn, session_close(date(2020, 3, 13)), settings)
+        rows = frame.to_dicts()
+        for row in rows:
+            if row["exchange"] == "NYSE":
+                row["status"] = DELISTED
+                row["end_session"] = nyse_end
+        frame = pl.DataFrame(rows, schema=frame.schema)
+        assert _status(frame, "NASDAQ") == (TRANSFERRED, date(2020, 3, 9))
+        assert _status(frame, "NYSE") == (DELISTED, nyse_end)
+        assert engine._ended(frame, nyse_end) == {SEC: nyse_end}
+        monkeypatch.setattr(
+            planning, "listing_ends_as_of", lambda _conn, _at, _settings, _ids: frame
+        )
+        assert planning._ended(conn, date(2022, 6, 16), [SEC], settings) == {SEC: nyse_end}
+
+
+@pytest.mark.parametrize("filed_exchange", ["NASDAQ", "NYSE"])
+def test_real_delisting_beats_stale_listed_sibling_in_exit_readers(
+    tmp_path: Path, filed_exchange: str
+) -> None:
+    filed = datetime(2020, 3, 2, 21, tzinfo=UTC)
+    ended = date(2020, 3, 9)
+    settings = _make(
+        tmp_path,
+        _dual(),
+        [_f25(SEC, filed_exchange, filed, date(2020, 3, 10))],
+        [ended],
+    )
+    session = date(2020, 3, 13)
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        frame = listing_ends_as_of(conn, session_close(session), settings)
+        assert _status(frame, filed_exchange) == (DELISTED, ended)
+        assert engine._ended(frame, session) == {SEC: ended}
+        assert planning._ended(conn, date(2020, 3, 16), [SEC], settings) == {SEC: ended}
 
 
 def test_a_single_exchange_delisting_still_reads_delisted(tmp_path: Path) -> None:
