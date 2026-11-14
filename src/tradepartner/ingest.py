@@ -7010,9 +7010,15 @@ def _stored_sessions(
     for day, held in sorted(rows, key=lambda row: row[0]):
         for sid in held:
             first.setdefault(sid, day)
-    starts = sorted(day for sid, day in first.items() if sid in wanted)
     sessions = all_sessions()
     oldest = sessions[max(0, bisect_left(sessions, session) - recent)]
+    # The names still trading: those with a bar inside the window. A name dark
+    # since before it is not "missing" from a session (the daily check leaves
+    # dark names out of its share too, #784).
+    active: set[str] = set().union(
+        *(wanted.intersection(held) for day, held in rows if day >= oldest)
+    )
+    starts = sorted(day for sid, day in first.items() if sid in active)
     whole: set[date] = set()
     for day, held in rows:
         if day < oldest:
@@ -7021,7 +7027,7 @@ def _stored_sessions(
         if reference not in held:
             continue
         base = bisect_right(starts, day)
-        present = len(wanted.intersection(held))
+        present = len(active.intersection(held))
         if base and (base - present) / base > limit:
             continue
         whole.add(day)

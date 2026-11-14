@@ -230,6 +230,16 @@ def test_a_session_missing_more_than_the_share_is_missed(
     assert ("bars", tuple(sorted(IDS)), D2, D2) in prices.calls
 
 
+def test_a_dark_name_does_not_make_complete_sessions_missed(settings: Settings) -> None:
+    # #3329 (quant-auditor): a name with no bar inside the window is not "missing".
+    _store(settings, [D7])
+    _seed_prices(settings, _sessions(D6, D1), [sid for sid in IDS if sid != ACME], NOW)
+    prices = _Prices()
+    result = _alpaca(settings, prices)
+    assert result.runs[-1].status == OK, result.runs[-1].message
+    assert [c for c in prices.calls if c[0] == "bars"] == [("bars", tuple(sorted(IDS)), D, D)]
+
+
 def test_a_session_whole_enough_stays_stored(settings: Settings) -> None:
     _store(settings, [D3, D2, D1])
     prices = _Prices()

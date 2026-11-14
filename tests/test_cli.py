@@ -1016,8 +1016,20 @@ def test_health_check_fails_a_stale_store(tmp_path: Path, fixture_store_path: Pa
     assert failed.exit_code == 1, failed.output
     assert "store_stale" in failed.output
     assert "health: OK" not in failed.output
-    lenient = _settings(tmp_path, store=fixture_store_path, health={"max_stale_sessions": 5})
-    assert _invoke(lenient, ["health", "--check"], clock=lambda: late).exit_code == 0
+
+
+def test_health_check_fails_the_morning_after_a_missed_ingest(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """#3329: one session behind passes only before tonight's ingest on the session's own day."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    before = session_close(date(2020, 7, 1)) + timedelta(hours=1)  # 17:00 ET, ingest not due
+    ok = _invoke(settings, ["health", "--check"], clock=lambda: before)
+    assert ok.exit_code == 0, ok.output
+    morning = session_close(date(2020, 7, 1)) + timedelta(hours=17)  # next morning
+    failed = _invoke(settings, ["health", "--check"], clock=lambda: morning)
+    assert failed.exit_code == 1, failed.output
+    assert "store_stale" in failed.output
 
 
 def test_health_check_fails_an_empty_store(tmp_path: Path) -> None:

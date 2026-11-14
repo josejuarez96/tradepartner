@@ -2495,7 +2495,7 @@ class HealthReport:
     #: Delisting reasons and their evidence (plan T329); report-only.
     delisting_reasons: DelistingReasonsHealth | None = None
     #: `health.max_stale_sessions` at report time (#3329), read by `check_failures`.
-    max_stale_sessions: int = 1
+    max_stale_sessions: int = 0
 
     @property
     def failures(self) -> tuple[str, ...]:
@@ -2526,10 +2526,11 @@ class HealthReport:
     def check_failures(self) -> tuple[str, ...]:
         """What `health --check` fails on: `failures`, then `store_stale` when
         the store has no price bars or is more than `health.max_stale_sessions`
-        sessions behind (#3329)."""
+        sessions behind; the one-session gap before tonight's ingest
+        (`stale_gap_expected`) is never a failure (#3329)."""
         stale = stale_sessions(self)
         limit = self.max_stale_sessions
-        if stale is None or stale > limit:
+        if stale is None or (stale > limit and not stale_gap_expected(self)):
             return (*self.failures, STORE_STALE)
         return self.failures
 
