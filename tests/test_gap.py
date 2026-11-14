@@ -641,7 +641,7 @@ _OLD_LAST_BARS = """
 
 
 def test_last_bars_matches_the_two_sort_query(june: duckdb.DuckDBPyConnection) -> None:
-    # #3342: one QUALIFY + arg_max aggregate returns what the two-window query did,
+    # #3342: one arg_max aggregate returns what the two-window query did,
     # including a halt-marker revision hiding an earlier traded revision of a bar.
     from tradepartner.gap import _last_bars
 
@@ -649,6 +649,10 @@ def test_last_bars_matches_the_two_sort_query(june: duckdb.DuckDBPyConnection) -
     store.security("Z", bars=(date(2019, 5, 1), date(2019, 6, 27)), shares=100)
     _bar_at_t(june, "Z", 0, T_JUNE)
     _bar_at_t(june, "Z", 1_000_000, T_JUNE + timedelta(hours=1))
+    # W: traded at T, then a later zero-volume revision hides it (falls back to 06-27).
+    store.security("W", bars=(date(2019, 5, 1), date(2019, 6, 27)), shares=100)
+    _bar_at_t(june, "W", 1_000_000, T_JUNE)
+    _bar_at_t(june, "W", 0, T_JUNE + timedelta(hours=1))
     ids = [r[0] for r in june.execute("SELECT DISTINCT security_id FROM prices_daily").fetchall()]
     for t, session in [
         (T_JUNE, date(2019, 6, 28)),
@@ -660,4 +664,6 @@ def test_last_bars_matches_the_two_sort_query(june: duckdb.DuckDBPyConnection) -
             for sid, day, close in june.execute(_OLD_LAST_BARS, [t, session]).fetchall()
         }
         assert old
-        assert _last_bars(june, t, session, sorted(ids)) == {k: v for k, v in old.items()}
+        if t > T_JUNE and session == date(2019, 6, 28):
+            assert old["W"][0] == date(2019, 6, 27)
+        assert _last_bars(june, t, session, sorted(ids)) == old
