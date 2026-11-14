@@ -620,3 +620,44 @@ def test_a_stale_unclassifiable_name_leaves_its_side_category(
     stale = survivorship_gap(dark, T_JUNE, _settings(stale_listing_sessions=_S_DARK - 1))
     assert "U" not in stale.unclassifiable
     assert _stale(stale)["U"] == (_S_LAST, _S_DARK)
+
+
+_OLD_LAST_BARS = """
+    WITH latest AS (
+        SELECT security_id, session, close, volume, ROW_NUMBER() OVER (
+            PARTITION BY security_id, session ORDER BY known_at DESC
+        ) AS _revision
+        FROM prices_daily
+        WHERE known_at <= ? AND session <= ?
+    ), traded AS (
+        SELECT security_id, session, close, ROW_NUMBER() OVER (
+            PARTITION BY security_id ORDER BY session DESC
+        ) AS _rn
+        FROM latest
+        WHERE _revision = 1 AND volume > 0
+    )
+    SELECT security_id, session, close FROM traded WHERE _rn = 1
+"""
+
+
+def test_last_bars_matches_the_two_sort_query(june: duckdb.DuckDBPyConnection) -> None:
+    # #3342: one QUALIFY + arg_max aggregate returns what the two-window query did,
+    # including a halt-marker revision hiding an earlier traded revision of a bar.
+    from tradepartner.gap import _last_bars
+
+    store = _as_store(june)
+    store.security("Z", bars=(date(2019, 5, 1), date(2019, 6, 27)), shares=100)
+    _bar_at_t(june, "Z", 0, T_JUNE)
+    _bar_at_t(june, "Z", 1_000_000, T_JUNE + timedelta(hours=1))
+    ids = [r[0] for r in june.execute("SELECT DISTINCT security_id FROM prices_daily").fetchall()]
+    for t, session in [
+        (T_JUNE, date(2019, 6, 28)),
+        (T_JUNE + timedelta(hours=1), date(2019, 6, 28)),
+        (T_JUNE, date(2019, 6, 12)),
+    ]:
+        old = {
+            sid: (day, close)
+            for sid, day, close in june.execute(_OLD_LAST_BARS, [t, session]).fetchall()
+        }
+        assert old
+        assert _last_bars(june, t, session, sorted(ids)) == {k: v for k, v in old.items()}
