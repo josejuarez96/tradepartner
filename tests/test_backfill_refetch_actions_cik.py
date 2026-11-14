@@ -148,3 +148,13 @@ def test_a_cancelled_live_event_on_another_id_does_not_collide(settings: Setting
     gone = replace(_div(OLD), cancelled=True)
     result = _then(settings, [gone], [_div(NEW, action_id="d2")])
     assert result.ok and result.refused == ()
+
+
+def test_a_class_added_later_with_an_identical_event_is_refused_unless_allowed(
+    settings: Settings,
+) -> None:
+    """Known fail-closed limit (#3304): a second share class of one CIK whose
+    identical event arrives in a later write looks like a re-key. The
+    caller's allow entry for the class covers it."""
+    refused = _then(settings, [_div(OLD)], [_div(NEW, action_id="d2")])
+    assert not refused.ok
