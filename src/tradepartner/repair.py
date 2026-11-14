@@ -816,6 +816,39 @@ def release_refusal(conn: duckdb.DuckDBPyConnection, release: str) -> str | None
     )
 
 
+def refuse_inside_open_window(
+    conn: duckdb.DuckDBPyConnection, affected_sessions: Iterable[date]
+) -> None:
+    """Raise `RepairRefused` when any paper window is open and
+    `affected_sessions`, the dates of the rows a repair or backfill is about
+    to rewrite or retract, is not empty (#3330, quant-auditor on #3359).
+
+    A window's runs read the store at read instants from its first session on
+    (`restamp_precheck.read_instants`). A row dated inside the window may be
+    read or not yet; a row dated before it was read by every run, so changing
+    either moves a past read. The per-row `known_at` test of
+    `delete_master_rows` therefore refuses every affected row here, and the
+    date test is moot: any open window refuses any non-empty repair. No window
+    open, or nothing affected, passes. Call it on the write connection before
+    any write."""
+    first = window_first_session(conn)
+    dates = sorted(set(affected_sessions))
+    if first is None or not dates:
+        return
+    raise RepairRefused(
+        f"an open paper window (first session {first}) reads the store and the repair "
+        f"changes {len(dates)} dates from {dates[0]}; nothing written, wait for the "
+        "window to close"
+    )
+
+
+def known_dates(instants: Iterable[datetime]) -> list[date]:
+    """The New York dates of `instants`, for `refuse_inside_open_window`."""
+    return [
+        ensure_tz_aware_utc(i, field_name="known_at").astimezone(_NEW_YORK).date() for i in instants
+    ]
+
+
 def _rows(conn: duckdb.DuckDBPyConnection, table: str) -> int:
     row = conn.execute(f"SELECT count(*) FROM {table}").fetchone()
     return 0 if row is None else int(row[0])
@@ -967,6 +1000,10 @@ def repair_resolution(
                     f"not the expected {expect}; nothing retracted, run --dry-run again"
                 )
             _refuse_wider(wider)
+            refuse_inside_open_window(
+                conn,
+                [d for _, d in (*found.bars, *found.actions, *found.spinoffs)],
+            )
             assert release is not None  # checked above
             why_rule = _resolution_rules(conn, started, settings)
             reason = f"repair-resolution at {started.isoformat()}: the resolver no longer assigns"
@@ -1156,6 +1193,7 @@ def delete_bars(
                     f"expected {expect}; nothing retracted, run --dry-run again"
                 )
             _refuse_wider(result.wider)
+            refuse_inside_open_window(conn, (*sessions, *ex_dates))
             assert release is not None  # checked above
             reason = f"repair-bars {security_id} {sessions_from}..{sessions_to}"
             rule = (
@@ -1384,6 +1422,7 @@ def retract_dividends(
                     "nothing retracted, run --dry-run again"
                 )
             _refuse_wider(result.wider)
+            refuse_inside_open_window(conn, result.ex_dates)
             assert release is not None  # checked above
             deleted = _delete_identities(
                 conn,
@@ -1587,6 +1626,7 @@ def retract_spinoff_splits(
                     "nothing retracted, run --dry-run again"
                 )
             _refuse_wider(result.wider)
+            refuse_inside_open_window(conn, result.ex_dates)
             assert release is not None  # checked above
             deleted = _delete_split_identities(
                 conn,

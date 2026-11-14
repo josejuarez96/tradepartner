@@ -794,3 +794,29 @@ def _plenty_of_free_disk(monkeypatch: pytest.MonkeyPatch) -> None:
     from tradepartner import diskfloor
 
     monkeypatch.setattr(diskfloor, "free_bytes", lambda path: 1_000_000_000_000)
+
+
+def open_paper_window(settings: Settings, started_at: datetime, *, window_id: int = 1) -> None:
+    """Insert one open paper window (no stop) started at `started_at`; its
+    first session is the XNYS session on or after that New York date."""
+    from tradepartner.store.db import insert_row, open_for_write
+
+    with open_for_write(settings) as conn:
+        insert_row(
+            conn,
+            "paper_windows",
+            {
+                "window_id": window_id,
+                "hypothesis_id": 1,
+                "first_rebalance_session": started_at.date(),
+                "account_id": "paper",
+                "starting_cash": 100_000.0,
+                "starting_equity": 100_000.0,
+                "code_version": "test",
+                "started_at": started_at,
+                "frozen_json": "{}",
+                "frozen_sha256": "0" * 64,
+                "known_at": started_at,
+                "ingested_at": started_at,
+            },
+        )
