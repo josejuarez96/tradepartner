@@ -3883,3 +3883,43 @@ def test_paper_execution_valid_alternate_accepted() -> None:
         }
     )
     assert s.paper.execution["daily"].alternate_start == date(2026, 11, 23)
+
+
+# --- #3331: shares, counts and the store path refuse nonsense ---
+
+
+@pytest.mark.parametrize("value", [5, -0.1, 1.01])
+def test_ingest_max_missing_share_is_a_share(value: float) -> None:
+    with pytest.raises(ValidationError, match="max_missing_share"):
+        Settings(_env_file=None, ingest={"max_missing_share": value})
+
+
+@pytest.mark.parametrize("value", [-3, 0])
+def test_universe_top_n_by_cap_is_positive(value: int) -> None:
+    with pytest.raises(ValidationError, match="top_n_by_cap"):
+        Settings(_env_file=None, universe={"top_n_by_cap": value})
+
+
+@pytest.mark.parametrize("value", [1.5, -0.01])
+def test_gap_count_share_threshold_is_a_share(value: float) -> None:
+    with pytest.raises(ValidationError, match="count_share_threshold"):
+        Settings(_env_file=None, gap={"count_share_threshold": value})
+
+
+@pytest.mark.parametrize("value", ["", "   ", ":memory:", " :MEMORY: "])
+def test_store_path_refuses_blank_and_memory(value: str) -> None:
+    with pytest.raises(ValidationError, match="path"):
+        Settings(_env_file=None, store={"path": value})
+
+
+def test_store_path_blank_from_env_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STORE__PATH", "")
+    with pytest.raises(ValidationError, match="path"):
+        Settings(_env_file=None)
+
+
+def test_repo_default_settings_still_load() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.store.path
+    assert settings.universe.top_n_by_cap > 0
+    assert 0 <= settings.ingest.max_missing_share <= 1
