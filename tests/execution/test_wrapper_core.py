@@ -314,6 +314,7 @@ def test_the_allowlist_constants_are_pinned() -> None:
         assert allowed == expected
     for name in (
         "GET_ORDER_ALLOWLIST",
+        "GET_ORDER_BY_BROKER_ID_ALLOWLIST",
         "OPEN_ORDERS_ALLOWLIST",
         "FILLS_ALLOWLIST",
         "POSITIONS_ALLOWLIST",

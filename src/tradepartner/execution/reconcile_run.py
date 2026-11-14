@@ -2925,17 +2925,26 @@ def confirmed_broker_ids(
 
 
 def read_confirmed(broker: Broker, coid: str, broker_order_id: str) -> Order:
-    """The open order the submit reply confirmed (#3335), found by its broker id and
-    `client_order_id` when the coid lookup misses. A confirmed order is never
-    closed `not_received`: a miss raises `ReconciliationError`."""
-    for listed in broker.open_orders():
-        if listed.broker_order_id == broker_order_id and listed.client_order_id == coid:
-            return listed
-    raise ReconciliationError(
-        f"pending_unresolved order {coid} was confirmed by the broker "
-        f"(broker_order_id {broker_order_id}) but is not found by client_order_id "
-        "or among the open orders: not closed not_received"
-    )
+    """The order the submit reply confirmed (#3335), read by its broker id (any
+    state, terminal included) when the coid lookup misses. A confirmed order is
+    never closed `not_received`: a miss, a failed lookup or an order carrying
+    another `client_order_id` raises `ReconciliationError` (fail closed)."""
+    try:
+        found = broker.get_order_by_broker_id(broker_order_id)
+    except ClockError:
+        raise
+    except Exception as exc:
+        raise ReconciliationError(
+            f"pending_unresolved order {coid} was confirmed by the broker "
+            f"(broker_order_id {broker_order_id}) but the lookup by that id failed "
+            f"({type(exc).__name__}): not closed not_received"
+        ) from exc
+    if found.client_order_id != coid:
+        raise ReconciliationError(
+            f"pending_unresolved order {coid}: broker_order_id {broker_order_id} "
+            f"belongs to client_order_id {found.client_order_id}"
+        )
+    return found
 
 
 def settle_pending_unresolved(
@@ -2952,7 +2961,7 @@ def settle_pending_unresolved(
     (`UnknownOrderError`): `cancelled` with reason `not_received`, so the
     decision is open again, unless the submit reply was journaled on its
     `pending_unresolved` event (#3335): then the order is read by that broker id
-    among the open orders, and a miss raises `ReconciliationError`. A read that
+    (`read_confirmed`, any state), and a failed lookup raises `ReconciliationError`. A read that
     fails otherwise, or a broker order whose
     `symbol`, `side`, `notional` or `quantity` differ from the journal row, raises
     `ReconciliationError` and writes nothing, leaving the order unsettled (a

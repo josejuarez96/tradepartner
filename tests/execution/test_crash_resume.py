@@ -1514,12 +1514,13 @@ def test_an_unacknowledged_buy_past_the_longer_poll_ends_the_run_ok_pending_unre
     assert reserve == Decimal("33283.40")
 
 
-def test_a_confirmed_order_open_at_the_broker_settles_from_its_broker_id(
-    env: Env, window: PaperWindowRow
+@pytest.mark.parametrize("status", [OrderStatus.ACCEPTED, OrderStatus.EXPIRED])
+def test_a_confirmed_order_settles_from_its_broker_id_in_any_state(
+    env: Env, window: PaperWindowRow, status: OrderStatus
 ) -> None:
-    """#3335: the coid lookup keeps missing, but the order is open at the broker
-    under the broker id the submit reply gave: it is journaled `accepted` with
-    that id, never `not_received`."""
+    """#3335: the coid lookup keeps missing, but the broker knows the order under
+    the broker id the submit reply gave, open or already terminal: it is journaled
+    `accepted` with that id, never `not_received`."""
     coid, _ = _unresolved_buy(env)
     (broker_id,) = env.query(
         "SELECT broker_order_id FROM order_events WHERE client_order_id = ? "
@@ -1530,24 +1531,23 @@ def test_a_confirmed_order_open_at_the_broker_settles_from_its_broker_id(
     [row] = unresolved_orders(env.connect, window.window_id)
 
     class _Lagging:
-        """A broker whose coid lookup misses while the order is open under its id."""
+        """A broker whose coid lookup misses while its id lookup answers."""
 
         def get_order(self, client_order_id: str) -> Order:
             raise UnknownOrderError(client_order_id)
 
-        def open_orders(self) -> list[Order]:
-            return [
-                Order(
-                    client_order_id=row.client_order_id,
-                    symbol=row.symbol,
-                    side=Side(row.side),
-                    notional=row.notional,
-                    quantity=row.quantity,
-                    status=OrderStatus.ACCEPTED,
-                    submitted_at=env.clock.now,
-                    broker_order_id=broker_id,
-                )
-            ]
+        def get_order_by_broker_id(self, broker_order_id: str) -> Order:
+            assert broker_order_id == broker_id
+            return Order(
+                client_order_id=row.client_order_id,
+                symbol=row.symbol,
+                side=Side(row.side),
+                notional=row.notional,
+                quantity=row.quantity,
+                status=status,
+                submitted_at=env.clock.now,
+                broker_order_id=broker_id,
+            )
 
     settled = settle_pending_unresolved(
         _Lagging(),  # type: ignore[arg-type]
@@ -1556,11 +1556,29 @@ def test_a_confirmed_order_open_at_the_broker_settles_from_its_broker_id(
         [row],
     )
     assert settled == (coid,)
-    assert [e for e in _events(env, coid)] == [
+    assert _events(env, coid) == [
         ("pending", None),
         ("pending_unresolved", None),
         ("accepted", None),
     ]
+
+
+def test_a_failed_broker_id_lookup_fails_closed(env: Env, window: PaperWindowRow) -> None:
+    """#3335: a lookup by broker id that errors leaves the order unsettled."""
+    coid, _ = _unresolved_buy(env)
+    assert window.window_id is not None
+    [row] = unresolved_orders(env.connect, window.window_id)
+
+    class _Down:
+        def get_order(self, client_order_id: str) -> Order:
+            raise UnknownOrderError(client_order_id)
+
+        def get_order_by_broker_id(self, broker_order_id: str) -> Order:
+            raise ConnectionError("down")
+
+    with pytest.raises(ReconciliationError, match="lookup by that id failed"):
+        settle_pending_unresolved(_Down(), env.connect, env.clock, [row])  # type: ignore[arg-type]
+    assert _events(env, coid) == [("pending", None), ("pending_unresolved", None)]
 
 
 def test_paper_resume_does_not_close_a_confirmed_order_not_received(

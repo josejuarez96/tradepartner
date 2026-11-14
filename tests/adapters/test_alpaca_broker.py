@@ -889,6 +889,19 @@ def test_get_order_of_an_unknown_id_raises_unknown_order() -> None:
         broker.cancel("never-sent")
 
 
+def test_get_order_by_broker_id_reads_any_state_and_404_is_unknown() -> None:
+    broker, http = _broker()
+    orders = _final_orders()
+    http.route("GET", "/v2/orders/[^/]+", _by_id(orders))
+    broker_id, payload = next(iter(orders.items()))
+    got = broker.get_order_by_broker_id(broker_id)
+    assert got.broker_order_id == broker_id
+    assert got.client_order_id == payload["client_order_id"]
+    with pytest.raises(UnknownOrderError):
+        broker.get_order_by_broker_id("00000000-0000-0000-0000-000000000000")
+    assert http.calls("POST", "/v2/orders") == []
+
+
 def test_open_orders_map_the_recorded_lists() -> None:
     broker, http = _broker()
     http.route("GET", "/v2/orders", (200, _load("open_orders_after")))

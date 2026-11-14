@@ -338,6 +338,7 @@ __all__ = [
     "CRASH_EXIT_CODE",
     "FILLS_ALLOWLIST",
     "GET_ORDER_ALLOWLIST",
+    "GET_ORDER_BY_BROKER_ID_ALLOWLIST",
     "OPEN_ORDERS_ALLOWLIST",
     "POSITIONS_ALLOWLIST",
     "SUBMIT_ALLOWLIST",
@@ -370,6 +371,7 @@ _REFUSAL_REASONS: tuple[tuple[type[Exception], str], ...] = (
 _ALERTED_SKIPS = frozenset(reason for _, reason in _REFUSAL_REASONS)
 CANCEL_ALLOWLIST: tuple[type[Exception], ...] = (OrderNotOpenError,)
 GET_ORDER_ALLOWLIST: tuple[type[Exception], ...] = ()
+GET_ORDER_BY_BROKER_ID_ALLOWLIST: tuple[type[Exception], ...] = ()
 OPEN_ORDERS_ALLOWLIST: tuple[type[Exception], ...] = ()
 FILLS_ALLOWLIST: tuple[type[Exception], ...] = ()
 POSITIONS_ALLOWLIST: tuple[type[Exception], ...] = ()
@@ -387,6 +389,7 @@ ALLOWLISTS: Mapping[str, tuple[type[Exception], ...]] = MappingProxyType(
         Broker.submit.__name__: SUBMIT_ALLOWLIST,
         Broker.cancel.__name__: CANCEL_ALLOWLIST,
         Broker.get_order.__name__: GET_ORDER_ALLOWLIST,
+        Broker.get_order_by_broker_id.__name__: GET_ORDER_BY_BROKER_ID_ALLOWLIST,
         Broker.open_orders.__name__: OPEN_ORDERS_ALLOWLIST,
         Broker.fills.__name__: FILLS_ALLOWLIST,
         Broker.positions.__name__: POSITIONS_ALLOWLIST,
