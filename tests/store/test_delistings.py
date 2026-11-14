@@ -1343,7 +1343,7 @@ class TestSnapshotDatedToItsForm25:
             date(2017, 11, 6),
             _ny(2017, 11, 6, 9, 0),
             date(2017, 11, 16),
-            [date(2017, 11, 3), date(2018, 5, 1)],
+            [date(2017, 11, 3), date(2017, 11, 20), date(2018, 5, 1)],
         )
         assert ends.select("status", "end_session").rows() == [("listed", None)]
 
