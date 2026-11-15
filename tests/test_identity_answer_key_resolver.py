@@ -21,8 +21,9 @@ How an input event becomes rows (fixture assumptions, none of them a key fact):
 - Every bar span -> a bar for each session of it (an open span runs to `T`),
   on the security id equal to the CIK.
 
-All rows are stamped with the cited document's date, so the store at `T`
-holds nothing dated after its citation. Runs with no network and no `.env`.
+Rows are stamped with the event's date (a bar with its session close, a
+Form 25's baseline listing with the baseline date), none after `T`.
+Runs with no network and no `.env`.
 """
 
 from __future__ import annotations
@@ -245,6 +246,7 @@ def _params() -> list[Any]:
             marks.append(
                 pytest.mark.xfail(
                     strict=True,
+                    raises=AssertionError,
                     reason=f"{XFAIL[history.id]}: key inputs incomplete",
                 )
             )
