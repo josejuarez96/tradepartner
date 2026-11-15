@@ -3429,3 +3429,14 @@ def test_record_needs_the_open_release(tmp_path: Path) -> None:
     assert _cov_close(settings).exit_code == 0
     again = _cov_run(settings, "--record")
     assert again.exit_code == 1 and "no release is open" in again.output
+
+
+def test_an_in_place_update_is_a_change_even_at_equal_counts(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_edit(settings, "UPDATE prices_daily SET close = 2.0, high = 2.0 WHERE security_id = 'A'")
+    closed = _cov_close(settings)
+    assert closed.exit_code == 1 and "no coverage record" in closed.output
+    assert _cov_run(settings, "--record").exit_code == 0
+    _cov_edit(settings, "UPDATE prices_daily SET close = 3.0, high = 3.0 WHERE security_id = 'A'")
+    stale = _cov_close(settings)
+    assert stale.exit_code == 1 and "stale" in stale.output

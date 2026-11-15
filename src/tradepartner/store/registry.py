@@ -1954,6 +1954,7 @@ def open_data_release(
         "data_vintage": data_vintage(conn, now),
         "cutoff": now,
         "counts": release_table_counts(conn),
+        "fingerprints": release_table_fingerprints(conn),
     }
     return _write_release(conn, values, reason, made_at=now)
 
@@ -2007,6 +2008,7 @@ def close_data_release(
         "sessions_from": sessions_from,
         "sessions_to": sessions_to,
         "counts": release_table_counts(conn),
+        "fingerprints": release_table_fingerprints(conn),
         "changed_tables": changed,
     }
     return _write_release(conn, values, reason or current.reason, made_at=now)
@@ -2040,6 +2042,21 @@ def release_table_counts(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
     return counts
 
 
+def release_table_fingerprints(conn: duckdb.DuckDBPyConnection) -> dict[str, str]:
+    """An order-free content hash of each `RELEASE_COUNT_TABLES` table (the sum of its
+    row hashes, as text), so an edit in place or an equal-count swap changes it
+    where a row count would not."""
+    out: dict[str, str] = {}
+    for table in RELEASE_COUNT_TABLES:
+        if _has_table(conn, table):
+            row = conn.execute(
+                f"SELECT coalesce(sum(hash(t)::HUGEINT), 0) FROM {table} t"
+            ).fetchone()
+            assert row is not None
+            out[table] = str(row[0])
+    return out
+
+
 def _retracted_tables(conn: duckdb.DuckDBPyConnection, where: str, params: list[str]) -> set[str]:
     if not _has_table(conn, "retracted_rows"):
         return set()
@@ -2051,7 +2068,7 @@ def _retracted_tables(conn: duckdb.DuckDBPyConnection, where: str, params: list[
 
 def release_changed_tables(conn: duckdb.DuckDBPyConnection, before: DataRelease) -> list[str]:
     """The `RELEASE_COUNT_TABLES` the release changed since its `before` row: those
-    whose count differs from the `counts` it recorded, those a row of the release
+    whose count or content fingerprint differs from what it recorded, those a row of the release
     was retracted from, and those a row was restored into. A `before` row without
     `counts` (opened before T393, or imported) cannot say, so every table counts as
     changed and its close needs a passing coverage record. Sorted."""
@@ -2060,6 +2077,10 @@ def release_changed_tables(conn: duckdb.DuckDBPyConnection, before: DataRelease)
         return sorted(RELEASE_COUNT_TABLES)
     now = release_table_counts(conn)
     changed = {t for t in RELEASE_COUNT_TABLES if now.get(t, 0) != recorded.get(t, 0)}
+    prints = before.values.get("fingerprints")
+    if prints is not None:
+        then = release_table_fingerprints(conn)
+        changed |= {t for t in RELEASE_COUNT_TABLES if then.get(t) != prints.get(t)}
     changed |= _retracted_tables(conn, "release = ?", [before.name])
     if now.get("retracted_rows_restored", 0) != recorded.get("retracted_rows_restored", 0):
         changed |= _retracted_tables(conn, "restored_at IS NOT NULL", [])
@@ -2091,6 +2112,7 @@ def record_release_coverage(
         "passed": passed,
         "store_max_ingested_at": store_max_ingested_at(conn),
         "counts": release_table_counts(conn),
+        "fingerprints": release_table_fingerprints(conn),
         "summary": dict(summary),
     }
     return _write_release(
@@ -2123,9 +2145,10 @@ def _require_coverage(
             f"release {current.name!r}: the newest coverage record failed; repair, then "
             "run the check again with --record"
         )
-    if newest.values.get("counts") != release_table_counts(conn) or (
-        newest.store_max_ingested_at != store_max_ingested_at(conn)
-    ):
+    if (
+        newest.values.get("counts") != release_table_counts(conn)
+        or newest.values.get("fingerprints") != release_table_fingerprints(conn)
+    ) or (newest.store_max_ingested_at != store_max_ingested_at(conn)):
         raise ReleaseRefused(
             f"release {current.name!r}: the coverage record is stale (the store changed "
             "after it); run the check again with --record"
