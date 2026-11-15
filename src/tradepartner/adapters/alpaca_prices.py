@@ -158,6 +158,19 @@ Alight's `WPF -> ALIT` and ContextLogic's `WISH -> LOGC` did). A refused
 change leaves the listings' mapping, so it can forgo sessions only the change
 would have given (its own cover page trailing it by more than
 `alpaca.rename_lead_days`, a rival's span in between); it never takes one.
+A change refused because another id of its issuer lists the new ticker (a
+sibling class) still ends its security's equity span under the old ticker on
+the process date (#3471, `ResolverReport.symbol_changes_ended`): Alpaca
+serves the old symbol no bar of it after the change, so the bars a later
+reuser of the symbol trades under it (AlTi's `GLBL -> ALTI` of 2023-01-04
+while its Class A id lists `ALTI`, then another issuer's `GLBL` from
+2024-09-17) never resolve to it. From the process date up to the sibling's
+first row under the new ticker (and the old span's own end) the security holds
+the new ticker, as a followed change would give it (Fortress Value's
+`FVAC -> MP` of 2020-11-18, MP's class id listed from 2021-03-22), unless
+the listings alone give a session of it in that window to another security
+(`_window_takes`, as `_takes` refuses a followed change); from the sibling's
+row on, the new ticker stays the sibling's.
 A change stored on an id with no listing row known at the run (a lost id
 whose rows master-retract withdrew) is carried to the one id of its issuer
 (`_same_issuer`) whose last equity row before `process_date` is under `old`
@@ -568,7 +581,8 @@ class ResolverReport:
     leads clipped to such a hand-over; (#1597) the sessions another
     security lost to a `filing_name` span; and (#1696) the stored symbol
     changes followed, those refused and those matching no listing
-    (`_follow_changes`)."""
+    (`_follow_changes`), and (#3471) the refused ones that still end their
+    old ticker because a sibling class lists the new one."""
 
     placeholder: int = 0
     non_equity: Mapping[str, int] = field(default_factory=dict)
@@ -594,6 +608,7 @@ class ResolverReport:
     symbol_changes_followed: int = 0
     symbol_changes_unmatched: int = 0
     symbol_changes_refused: int = 0
+    symbol_changes_ended: int = 0
     chain_early_starts: int = 0
 
     def summary(self) -> str:
@@ -622,6 +637,8 @@ class ResolverReport:
             f"{self.filename_disputes} sessions another security lost to a filing_name span; "
             f"{self.symbol_changes_followed} symbol changes followed, "
             f"{self.symbol_changes_refused} refused (the new ticker not theirs on the day), "
+            f"{self.symbol_changes_ended} of them ending the old ticker (a sibling class "
+            "lists the new one), "
             f"{self.symbol_changes_unmatched} matching no listing; "
             f"{self.chain_early_starts} chained spans started early (rule 9)"
         )
@@ -1008,19 +1025,47 @@ class ListingResolver:
         # (a sibling class already listing the new ticker, #1696 review): a
         # change only ever adds sessions to its own security.
         refused = 0
+        # #3471: a change refused because another id of its issuer lists the
+        # new ticker (a sibling class, `_sibling_start`) still ends its old
+        # ticker on its security at the process date: Alpaca serves the old
+        # symbol no bar of it after the change, and a later reuser of the
+        # symbol must not price it (GLBL -> ALTI while AlTi's Class A id lists
+        # ALTI, then another issuer's GLBL from 2024-09-17). Up to the
+        # sibling's first row under the new ticker the security trades under
+        # it (FVAC -> MP of 2020-11-18, MP's class id listed from 2021-03-22).
+        ends: set[tuple[str, date, str, str, date | None]] = set()
         base: ListingResolver | None = None
         while True:
-            late, followed = self._build(listings, evidence, changes, **options)
+            late, followed = self._build(listings, evidence, changes, ends=ends, **options)
             if not late and followed:
                 if base is None:
                     base = ListingResolver(listings, evidence, **options)
                 late = {change for change in followed if self._takes(base, change)}
             if not late:
-                break
+                # A window that takes a session of its new ticker from another
+                # security the listings alone give it to is dropped, as a
+                # followed change taking one is refused (#1696); the end stays.
+                windowed = [end for end in ends if end[4] is not None]
+                if windowed and base is None:
+                    base = ListingResolver(listings, evidence, **options)
+                taking = {end for end in windowed if base is not None and _window_takes(base, end)}
+                if not taking:
+                    break
+                ends = (ends - taking) | {(*end[:4], None) for end in taking}
+                continue
             changes = [change for change in changes if change not in late]
             refused += len(late)
+            for security_id, day, old, new in late:
+                sibling = _sibling_start(listings, security_id, new, class_symbols)
+                if sibling is not None:
+                    ends.add((security_id, day, old, new, sibling if sibling > day else None))
+        self._ends = frozenset(ends)  # #3471, for an audit of which changes ended
         if refused:
-            self.report = replace(self.report, symbol_changes_refused=refused)
+            self.report = replace(
+                self.report,
+                symbol_changes_refused=refused,
+                symbol_changes_ended=self._ends_applied,
+            )
         # #3054: each security's listing rows (day, ticker, provenance), for
         # `backdated`, and its first session, the alias's lower bound.
         self._listing_rows: dict[str, list[tuple[date, str, str | None]]] = defaultdict(list)
@@ -1052,6 +1097,7 @@ class ListingResolver:
         evidence: RegistrantEvidence | None,
         changes: list[tuple[str, date, str, str]],
         *,
+        ends: Collection[tuple[str, date, str, str, date | None]] = (),
         rename_lead_days: int,
         accepted_relistings: Collection[str],
         first_sessions: Mapping[str, date] | None,
@@ -1059,12 +1105,21 @@ class ListingResolver:
         last_bar: LastBar | None,
         handover_sessions: int | None,
     ) -> tuple[set[tuple[str, date, str, str]], list[tuple[str, date, str, str]]]:
-        """Build every mapping from `listings` with `changes` followed; the
-        followed changes the built mapping does not honour (to refuse), and
-        every change followed."""
+        """Build every mapping from `listings` with `changes` followed and
+        each of `ends` `(security_id, process_date, old, new, until)` (#3471:
+        a change refused for a sibling class) ending that security's equity
+        span under `old` on the process date, and, with `until`, giving it a
+        span under `new` from that day to the earlier of `until` (the
+        sibling's first row under `new`) and the old span's end; the followed
+        changes the built mapping does not honour (to refuse), and every
+        change followed."""
         changes_of: dict[str, list[tuple[date, str, str]]] = defaultdict(list)
         for security_id, day, before, after in changes:
             changes_of[security_id].append((day, before, after))
+        ends_of: dict[str, list[tuple[date, str, str, date | None]]] = defaultdict(list)
+        for security_id, day, symbol, renamed, until in ends:
+            ends_of[security_id].append((day, symbol, renamed, until))
+        self._ends_applied = 0
         followed: list[tuple[str, date, str, str]] = []
         unmatched = 0
         self._evidence = evidence
@@ -1142,6 +1197,27 @@ class ListingResolver:
                     end if left is None else left,
                     filing_name=all(row.filing_name for row in rows[first:index]),
                 )
+                window: TickerSpan | None = None
+                if kinds == {EQUITY}:
+                    end_at = min(
+                        (
+                            (day, renamed, until)
+                            for day, ended, renamed, until in ends_of.get(security_id, ())
+                            if same_alpaca_symbol(ended, ticker)
+                            and span.covers(day)
+                            and start < day
+                        ),
+                        default=None,
+                    )
+                    if end_at is not None:
+                        day, renamed, until = end_at
+                        if until is not None:
+                            last = until if span.end is None else min(until, span.end)
+                            window = TickerSpan(
+                                security_id, alpaca_symbol(renamed) or renamed, day, last
+                            )
+                        span = replace(span, end=day)
+                        self._ends_applied += 1
                 if left is not None:
                     cut.add(span)
                 kept_spans += kept
@@ -1164,6 +1240,10 @@ class ListingResolver:
                     same_day_listings += index - first
                 else:
                     self._by_ticker[ticker].append(span)
+                if window is not None:  # #3471: the new ticker up to the sibling's row
+                    self._by_security[security_id].append(window)
+                    self._history[security_id].append(window)
+                    self._by_ticker[window.ticker].append(window)
         # A repair successor's row duplicating its predecessor's (#874) holds
         # the ticker alone: the predecessor's span is dropped before any other
         # rule, so it is never a tie (rule 4) nor a rival claim (rule 6). The
@@ -2390,6 +2470,57 @@ def _carry_orphan_changes(
                 security_id = heirs[0]
         out.append((security_id, day, old, new))
     return out
+
+
+def _equity_rows_under(
+    listings: Sequence[Mapping[str, Any]],
+    symbol: str,
+    class_symbols: Mapping[str, str] | None,
+) -> Iterator[tuple[str, date]]:
+    """`(security_id, valid_from)` of each equity row in `listings` under
+    `symbol` (Alpaca's form)."""
+    for row in listings:
+        ticker = str(row["ticker"])
+        if is_placeholder_ticker(ticker) or listing_kind(ticker, row.get("class_title")) != EQUITY:
+            continue
+        if same_alpaca_symbol(master_symbol(row, class_symbols) or ticker, symbol):
+            yield str(row["security_id"]), row["valid_from"]
+
+
+def _sibling_start(
+    listings: Sequence[Mapping[str, Any]],
+    security_id: str,
+    symbol: str,
+    class_symbols: Mapping[str, str] | None,
+) -> date | None:
+    """The first `valid_from` of an equity row under `symbol` in `listings`
+    of another id of `security_id`'s issuer (`_same_issuer`), else `None`
+    (#3471: AlTi's Class A id listing `ALTI` from 2023-04-17 when the bare
+    id's `GLBL -> ALTI` is refused). Pure."""
+    return min(
+        (
+            day
+            for sid, day in _equity_rows_under(listings, symbol, class_symbols)
+            if sid != security_id and _same_issuer(sid, security_id)
+        ),
+        default=None,
+    )
+
+
+def _window_takes(base: ListingResolver, end: tuple[str, date, str, str, date | None]) -> bool:
+    """True when the #3471 window of `end` (`security_id`, day, old, new,
+    until) covers a session, before the run's day, that `base` (the listings
+    alone) gives the new ticker to another security."""
+    security_id, day, _, new, until = end
+    if until is None:
+        return False
+    symbol = alpaca_symbol(new) or new
+    last = min(until - timedelta(days=1), base.run_day)
+    for session in _sessions_through(day, last):
+        owner = base.resolve(symbol, session) or base.lead(symbol, session)
+        if owner not in (None, security_id):
+            return True
+    return False
 
 
 def _last_under(rows: Sequence[tuple[date, str]], day: date, symbol: str) -> bool:

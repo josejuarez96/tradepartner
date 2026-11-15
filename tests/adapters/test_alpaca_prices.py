@@ -5062,11 +5062,101 @@ class TestSymbolChangesBoundSpans:
         resolver = ListingResolver(listings, symbol_changes=[change])
         plain = ListingResolver(listings)
         for day in _sessions(date(2026, 7, 1), date(2026, 10, 9)):
-            for ticker in ("MSW", "PMA"):
-                assert resolver.resolve(ticker, day) == plain.resolve(ticker, day)
+            # #3471: the refused change still ends MSW on the bare id, which
+            # trades as PMA up to the class id's PMA row.
+            window = date(2026, 7, 9) <= day < date(2026, 8, 14)
+            assert resolver.resolve("PMA", day) == (bare if window else plain.resolve("PMA", day))
+            expected = plain.resolve("MSW", day) if day < date(2026, 7, 9) else None
+            assert resolver.resolve("MSW", day) == expected
         assert resolver.resolve("PMA", date(2026, 9, 1)) == klass
         assert resolver.report.symbol_changes_refused == 1
+        assert resolver.report.symbol_changes_ended == 1
         assert resolver.report.symbol_changes_followed == 0
+
+    def test_a_sibling_refused_change_ends_the_old_ticker_on_its_day(self) -> None:
+        # #3471, Cartesian Growth -> AlTi Global (CIK 1838615): GLBL -> ALTI on
+        # 2023-01-04 on the bare id while its Class A id lists ALTI from
+        # 2023-04-17. The change is refused (the class id keeps ALTI), and the
+        # bare id's GLBL span ends on the change's day, so a later reuser's GLBL
+        # bars (2024-09-17 on) never resolve to it. Up to the class id's ALTI
+        # row the bare id trades as ALTI (the window the change follows).
+        bare, klass = "0001838615", "0001838615:class-a-common-stock"
+        listings = [
+            _listing(bare, "GLBL", date(2022, 3, 17), "Class A ordinary shares"),
+            _listing(f"{bare}:warrants", "GLBLW", date(2022, 3, 17), "Warrants"),
+            _listing(klass, "ALTI", date(2023, 4, 17), "Class A Common stock"),
+        ]
+        change = _change(bare, "GLBL", "ALTI", date(2023, 1, 4))
+        resolver = ListingResolver(listings, symbol_changes=[change])
+        assert resolver.report.symbol_changes_refused == 1
+        assert resolver.report.symbol_changes_ended == 1
+        assert "1 of them ending the old ticker" in resolver.report.summary()
+        assert resolver.resolve("GLBL", date(2023, 1, 3)) == bare
+        for day in (date(2023, 1, 4), date(2023, 5, 1), date(2024, 9, 17), date(2026, 11, 13)):
+            assert resolver.resolve("GLBL", day) is None
+            assert resolver.fill_resolve("GLBL", day) is None
+        for day in (date(2023, 1, 4), date(2023, 4, 14)):
+            assert resolver.resolve("ALTI", day) == bare
+            assert resolver.holds(bare, day) and not resolver.holds(klass, day)
+        for day in (date(2023, 4, 17), date(2024, 9, 17), date(2026, 11, 13)):
+            assert resolver.resolve("ALTI", day) == klass
+            assert resolver.holds(klass, day) and not resolver.holds(bare, day)
+        assert resolver.symbols(bare, date(2024, 9, 1), date(2024, 10, 1)) == []
+
+    def test_the_window_before_the_siblings_row_follows_the_change(self) -> None:
+        # #3471 cross-check, Fortress Value -> MP Materials (CIK 1801368):
+        # FVAC -> MP on 2020-11-18 on the bare id, MP's common-stock class id
+        # listed from 2021-03-22. MP's first months are the bare id's under MP,
+        # never nobody's; from the class id's row on, MP is the class id's.
+        bare, klass = "0001801368", "0001801368:common-stock"
+        listings = [
+            _listing(bare, "FVAC", date(2020, 6, 9), "Class A common stock"),
+            _listing(klass, "MP", date(2021, 3, 22), "Common Stock"),
+        ]
+        change = _change(bare, "FVAC", "MP", date(2020, 11, 18))
+        resolver = ListingResolver(listings, symbol_changes=[change])
+        assert resolver.report.symbol_changes_refused == 1
+        assert resolver.report.symbol_changes_ended == 1
+        assert resolver.resolve("FVAC", date(2020, 11, 17)) == bare
+        for day in _sessions(date(2020, 11, 18), date(2021, 3, 19)):
+            assert resolver.resolve("MP", day) == bare
+            assert resolver.resolve("FVAC", day) is None
+        for day in (date(2021, 3, 22), date(2026, 10, 9)):
+            assert resolver.resolve("MP", day) == klass
+            assert not resolver.holds(bare, day)
+        assert resolver.symbols(bare, date(2020, 11, 1), date(2021, 4, 30)) == ["FVAC", "MP"]
+
+    def test_no_window_where_another_issuer_lists_the_new_ticker(self) -> None:
+        # The window never takes another company's sessions of the new ticker.
+        bare, klass, other = "0001801368", "0001801368:common-stock", "0000000077"
+        listings = [
+            _listing(bare, "FVAC", date(2020, 6, 9), "Class A common stock"),
+            _listing(other, "MP", date(2015, 1, 2), "Common Stock"),
+            _listing(klass, "MP", date(2021, 3, 22), "Common Stock"),
+        ]
+        change = _change(bare, "FVAC", "MP", date(2020, 11, 18))
+        resolver = ListingResolver(listings, symbol_changes=[change])
+        assert resolver.resolve("MP", date(2020, 12, 1)) == other
+        assert resolver.resolve("FVAC", date(2020, 12, 1)) is None
+        # An older holder that had left the ticker (VivoPower's VIVO window,
+        # Meridian's VIVO long gone) blocks nothing.
+        moved = [*listings, _listing(other, "MPX", date(2019, 1, 2), "Common Stock")]
+        resolver = ListingResolver(moved, symbol_changes=[change])
+        assert resolver.resolve("MP", date(2020, 12, 1)) == bare
+
+    def test_a_refusal_with_no_sibling_listing_the_new_ticker_keeps_the_old_span(self) -> None:
+        # Only the sibling-class refusal ends the old ticker: a change refused
+        # because another company holds the new ticker leaves the listings.
+        holder = "0000000077"
+        listings = [
+            _listing(self.PKI, "PKI", date(2019, 8, 6), self.TITLE),
+            _listing(holder, "RVTY", date(2020, 1, 2), self.TITLE),
+        ]
+        change = _change(self.PKI, "PKI", "RVTY", self.RENAME)
+        resolver = ListingResolver(listings, symbol_changes=[change])
+        assert resolver.report.symbol_changes_refused == 1
+        assert resolver.report.symbol_changes_ended == 0
+        assert resolver.resolve("PKI", date(2024, 6, 3)) == self.PKI
 
     def test_the_match_reads_the_last_equity_row(self) -> None:
         # A non-equity row after the common's (code-review on #1706) is no
