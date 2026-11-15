@@ -3440,3 +3440,58 @@ def test_an_in_place_update_is_a_change_even_at_equal_counts(tmp_path: Path) -> 
     _cov_edit(settings, "UPDATE prices_daily SET close = 3.0, high = 3.0 WHERE security_id = 'A'")
     stale = _cov_close(settings)
     assert stale.exit_code == 1 and "stale" in stale.output
+
+
+def _cov_retract_unreceived(settings: Settings, days: list[date]) -> None:
+    """A's bars on `days` retracted while B's bar there differs: nobody receives them."""
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "UPDATE prices_daily SET close = 9.0, high = 9.0 "
+            "WHERE security_id = 'B' AND session IN "
+            f"({', '.join(repr(d.isoformat()) for d in days)})"
+        )
+        retract(conn, "prices_daily", [("A", d) for d in days], "orphan", "rel", "line 7")
+
+
+def _cov_approve(settings: Settings, days: list[date]) -> None:
+    with open_for_write(settings) as conn:
+        registry.record_approved_orphans(
+            conn, release="rel", allow_orphans=len(days), keys=[("A", d) for d in days]
+        )
+
+
+def test_the_owner_approved_orphans_are_accepted_and_only_those(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    days = _COV_DAYS[:12]
+    _cov_retract_unreceived(settings, days)
+    _cov_approve(settings, days)
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 0, checked.output
+    assert "accepted by the owner's count 12 on rel" in checked.output
+    assert "NOT RECEIVED" not in checked.output
+    assert _cov_close(settings).exit_code == 0
+
+
+def test_an_unreceived_retraction_outside_the_approved_set_still_fails(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    days = _COV_DAYS[:12]
+    _cov_retract_unreceived(settings, [*days, _COV_DAYS[13]])
+    _cov_approve(settings, days)
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 1, checked.output
+    assert "1 of 13 sessions NOT RECEIVED (2020-01-14..2020-01-14)" in checked.output
+    assert "accepted by the owner's count 12 on rel" in checked.output
+    assert _cov_close(settings).exit_code == 1
+
+
+def test_a_retracted_bar_with_an_empty_price_is_a_named_error(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    with open_for_write(settings) as conn:
+        retract(conn, "prices_daily", [("A", _COV_DAYS[0])], "dup", "rel", "line 1")
+        conn.execute(
+            "UPDATE retracted_rows SET row_values = map_concat(row_values, MAP {'close': ''})"
+        )
+    checked = _cov_run(settings)
+    assert checked.exit_code == 1
+    assert "release refused" in checked.output and "unreadable price or volume" in checked.output
+    assert "Traceback" not in checked.output

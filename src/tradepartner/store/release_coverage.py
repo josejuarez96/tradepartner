@@ -18,6 +18,7 @@ unmoved losses against configured thresholds. It writes nothing.
 from __future__ import annotations
 
 import re
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import date
 
@@ -56,12 +57,15 @@ def release_coverage(
     backup_alias: str,
     price_tolerance: float = 1e-6,
     retraction_release: str | None = None,
+    accepted: Collection[tuple[str, date]] = (),
 ) -> list[SessionLoss]:
     """Every security with lost sessions, by id.
 
     `conn` is read-only on the current store with the backup attached read-only
     as `backup_alias`; `retraction_release` names a release whose unrestored
     `retracted_rows` bars count as moved when another id holds an equal bar.
+    `accepted` bar keys (`security_id`, session) are left out of the losses: the
+    owner-approved orphans of the release (`registry.approved_orphans`).
     Only distinct sessions count, so a revised bar (a second
     `known_at`) is no loss. A security new since the backup has no loss.
     """
@@ -94,6 +98,7 @@ def release_coverage(
         else "SELECT NULL::VARCHAR AS security_id, NULL::DATE AS session WHERE false"
     )
     retr_params = [retraction_release] if "?" in retr else []
+    keys = sorted(accepted)
     rows = conn.execute(
         f"""
         WITH bb AS (
@@ -108,7 +113,9 @@ def release_coverage(
             FROM main.prices_daily GROUP BY security_id, session),
         b AS (SELECT security_id, session FROM bb),
         c AS (SELECT security_id, session FROM cb),
-        lost AS (SELECT * FROM b ANTI JOIN c USING (security_id, session)),
+        acc AS (SELECT unnest(?::VARCHAR[]) AS security_id, unnest(?::DATE[]) AS session),
+        lost AS (SELECT * FROM b ANTI JOIN c USING (security_id, session)
+                 ANTI JOIN acc USING (security_id, session)),
         gained AS (SELECT * FROM c ANTI JOIN b USING (security_id, session)),
         retr AS ({retr}),
         moved AS (
@@ -148,7 +155,7 @@ def release_coverage(
                     WHERE s.security_id = a.security_id))
         FROM agg a ORDER BY a.lost DESC, a.security_id
         """,
-        [*retr_params, *([price_tolerance] * 4)],
+        [[k[0] for k in keys], [k[1] for k in keys], *retr_params, *([price_tolerance] * 4)],
     ).fetchall()
     out: list[SessionLoss] = []
     for sid, first, last, lost, moved, succ, name, ticker in rows:

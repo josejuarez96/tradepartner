@@ -4532,6 +4532,7 @@ def make_app(
                     backup_alias="bk",
                     price_tolerance=s.store.release_move_price_tolerance,
                     retraction_release=name,
+                    accepted=registry.approved_orphans(conn, name)[1],
                 )
                 spans = registry.release_retractions(
                     conn, name, price_tolerance=s.store.release_move_price_tolerance
@@ -4541,6 +4542,8 @@ def make_app(
             raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except ReleaseCoverageError as exc:
             raise _fail(_scrubbed(f"ReleaseCoverageError: {exc}", s), 1) from None
+        except registry.ReleaseRefused as exc:
+            raise _fail(f"release refused: {_scrubbed(str(exc), s)}", 1) from None
         total = sum(loss.unmoved for loss in losses)
         total_limit = s.store.release_max_total_lost_sessions
         visible = [loss for loss in losses if loss.lost > threshold]

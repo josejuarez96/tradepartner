@@ -1447,7 +1447,7 @@ DATA_RELEASE_KIND: Final = "data_release"
 DEVELOPMENT_BOUNDARY_KIND: Final = "development_boundary"
 
 #: A release entry's stage (runbook `docs/runbooks/data-releases.md`, "The record").
-ReleaseStage = Literal["before", "after", "record", "coverage"]
+ReleaseStage = Literal["before", "after", "record", "coverage", "orphans"]
 #: The stages a hand-written import may carry; a `coverage` row (T393) is written
 #: only by `record_release_coverage`.
 RELEASE_STAGES: Final[tuple[ReleaseStage, ...]] = ("before", "after", "record")
@@ -2087,6 +2087,56 @@ def release_changed_tables(conn: duckdb.DuckDBPyConnection, before: DataRelease)
     return sorted(changed & set(RELEASE_COUNT_TABLES))
 
 
+def record_approved_orphans(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    release: str,
+    allow_orphans: int,
+    keys: Iterable[tuple[str, date]],
+) -> int:
+    """Write an `orphans` row against the open release `release`: the bar keys
+    (`security_id`, session) that `repair-resolution` retracted under the owner's exact
+    `--allow-orphans` count, which no id receives (#3265). The coverage check accepts
+    exactly these retracted bars as unreceived (`approved_orphans`) and fails any other.
+    Refuses a name that is not the open release and a count that is not the key count."""
+    current = open_release(conn)
+    if current is None or current.name != release:
+        found = "no release is open" if current is None else f"{current.name!r} is open"
+        raise ReleaseRefused(f"cannot record approved orphans for {release!r}: {found}")
+    ordered = sorted({(str(sid), day) for sid, day in keys})
+    if not ordered or len(ordered) != allow_orphans:
+        raise ReleaseRefused(
+            f"{len(ordered)} orphan keys do not match --allow-orphans {allow_orphans}"
+        )
+    now = utc_now()
+    values = {
+        "name": release,
+        "stage": "orphans",
+        "made_at": now,
+        "allow_orphans": allow_orphans,
+        "keys": [f"{sid}|{day.isoformat()}" for sid, day in ordered],
+    }
+    return _write_release(
+        conn, values, f"owner-approved orphan bars: count {allow_orphans}", made_at=now
+    )
+
+
+def approved_orphans(
+    conn: duckdb.DuckDBPyConnection, release: str
+) -> tuple[int, set[tuple[str, date]]]:
+    """The owner-approved orphan count and bar keys recorded against `release` by
+    `record_approved_orphans` (all its `orphans` rows), or `(0, set())`."""
+    count = 0
+    keys: set[tuple[str, date]] = set()
+    for row in data_releases(conn):
+        if row.stage == "orphans" and row.name == release:
+            count += int(row.values["allow_orphans"])
+            for text in row.values["keys"]:
+                sid, _, day = str(text).rpartition("|")
+                keys.add((sid, date.fromisoformat(day)))
+    return count, keys
+
+
 def record_release_coverage(
     conn: duckdb.DuckDBPyConnection,
     *,
@@ -2169,6 +2219,8 @@ class RetractedSpan:
     days: tuple[date, ...] = ()
     unreceived: tuple[date, ...] = ()
     received_by: tuple[str, ...] = ()
+    accepted: tuple[date, ...] = ()
+    accepted_note: str = ""
 
     def describe(self) -> str:
         """One report line: table, id, count, the reason and rule, and for bars where
@@ -2179,14 +2231,19 @@ class RetractedSpan:
         )
         if self.table != "prices_daily":
             return line
-        if not self.unreceived:
-            return (
-                f"{line}, {self.days[0]}..{self.days[-1]} received by {','.join(self.received_by)}"
+        parts = [line]
+        if self.received_by:
+            parts.append(
+                f"{self.days[0]}..{self.days[-1]} received by {','.join(self.received_by)}"
             )
-        return (
-            f"{line}, {len(self.unreceived)} of {len(self.days)} sessions NOT RECEIVED "
-            f"({self.unreceived[0]}..{self.unreceived[-1]})"
-        )
+        if self.accepted:
+            parts.append(f"{len(self.accepted)} sessions {self.accepted_note}")
+        if self.unreceived:
+            parts.append(
+                f"{len(self.unreceived)} of {len(self.days)} sessions NOT RECEIVED "
+                f"({self.unreceived[0]}..{self.unreceived[-1]})"
+            )
+        return ", ".join(parts)
 
 
 def release_retractions(
@@ -2199,6 +2256,8 @@ def release_retractions(
     store without the table. Reads only."""
     if not _has_table(conn, "retracted_rows"):
         return []
+    approved_count, approved_keys = approved_orphans(conn, name)
+    note = f"accepted by the owner's count {approved_count} on {name}"
     rows = conn.execute(
         "SELECT table_name, row_key, row_values, reason, rule FROM retracted_rows "
         "WHERE release = ? AND restored_at IS NULL ORDER BY retraction_id",
@@ -2217,12 +2276,14 @@ def release_retractions(
         latest = {date.fromisoformat(str(key[1])): values for key, values, _, _ in items}
         days = sorted(latest)
         unreceived: list[date] = []
+        accepted: list[date] = []
         receivers: set[str] = set()
         for day in days:  # one bar per session: its newest retracted revision
             heard = _bar_receivers(conn, sid, day, latest[day], price_tolerance)
             receivers |= set(heard)
-            if not heard:
-                unreceived.append(day)
+            if heard:
+                continue
+            (accepted if (sid, day) in approved_keys else unreceived).append(day)
         out.append(
             RetractedSpan(
                 table,
@@ -2233,6 +2294,8 @@ def release_retractions(
                 tuple(days),
                 tuple(unreceived),
                 tuple(sorted(receivers)[:3]),
+                tuple(accepted),
+                note,
             )
         )
     return out
@@ -2245,8 +2308,14 @@ def _bar_receivers(
     values: Mapping[str, str],
     tolerance: float,
 ) -> list[str]:
-    o, h, lo, cl = (float(values[k]) for k in ("open", "high", "low", "close"))
-    volume = int(float(values["volume"]))
+    try:
+        o, h, lo, cl = (float(values[k]) for k in ("open", "high", "low", "close"))
+        volume = int(float(values["volume"]))
+    except (KeyError, TypeError, ValueError):
+        raise ReleaseRefused(
+            f"retracted bar {sid} {day} has a missing or unreadable price or volume field: "
+            f"{ {k: values.get(k) for k in ('open', 'high', 'low', 'close', 'volume')} }"
+        ) from None
     found = conn.execute(
         """
         SELECT DISTINCT security_id FROM (
