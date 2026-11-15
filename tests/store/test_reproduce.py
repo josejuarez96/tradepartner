@@ -483,3 +483,27 @@ def test_metrics_compare_in_full() -> None:
     assert same == []
     lines = reproduce.compare_metrics({"a": 1.0, "b": 2.0}, {"a": 1.0 + 1e-12, "c": 3.0})
     assert len(lines) == 3 and lines[0].startswith("a:")
+
+
+def test_a_key_retracted_again_after_being_restored_is_not_put_back(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """Out of the table at the start (retracted, restored after, retracted again): the
+    trial never saw it, so the copy must not hold it."""
+    _retract_bar(fixture_store, S - 2 * DAY)
+    retracted_rows.restore(fixture_store, table="prices_daily", key=BAR, at=S + DAY)
+    _retract_bar(fixture_store, S + 2 * DAY)
+    summary = reproduce.restore_for_trial(fixture_store, _facts())
+    assert summary.reinserted == 0
+    assert _bar(fixture_store) == []
+
+
+def test_a_trial_with_no_stored_metrics_is_not_a_pass(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trial = _run()
+    with open_for_write(_settings(store)) as conn:
+        conn.execute("DELETE FROM trial_metrics WHERE trial_id = ?", [trial])
+    result = reproduce.reproduce_trial(trial)
+    assert result.verdict == "not_reproducible"
+    assert "no stored base-level" in result.reasons[0]

@@ -51,7 +51,7 @@ own closed release is the change being undone, so counting it would refuse every
 reproduction). Revisions that withdraw a `securities` or `listings` row
 (`retraction.py`) are already reproducible by `known_at` and are out of this module. A
 store changed by a means that keeps no row (a raw delete outside T390 and T392) reports a
-vintage mismatch.
+vintage mismatch or, when the delete moved no maximum, a `differs`.
 
 This module reads `retracted_rows`, so it is a check-only module: no module under
 `backtest/` other than `run.py`'s `replay_trial` seam, `research/`, `universe.py` or the
@@ -243,7 +243,7 @@ def compare_metrics(
 
 def _ids(conn: duckdb.DuckDBPyConnection, where: str, params: list[Any]) -> list[tuple[int, str]]:
     rows = conn.execute(
-        f"SELECT retraction_id, table_name FROM retracted_rows WHERE {where} "
+        f"SELECT retraction_id, table_name FROM retracted_rows r WHERE {where} "
         "ORDER BY retraction_id",
         params,
     ).fetchall()
@@ -309,8 +309,15 @@ def restore_for_trial(copy_conn: duckdb.DuckDBPyConnection, trial: TrialFacts) -
 
     # Rows retracted after S: put back, in their own transaction (DuckDB may refuse to
     # re-insert a key it deleted in the same one).
-    again_where = "retracted_at > ? AND restored_at IS NULL"
-    again_params: list[Any] = [started]
+    # A revision already out of the table at S (retracted before S, restored after, then
+    # retracted again) was not there for the trial: its later retraction is not put back.
+    again_where = (
+        "retracted_at > ? AND restored_at IS NULL AND NOT EXISTS ("
+        "SELECT 1 FROM retracted_rows r2 WHERE r2.table_name = r.table_name "
+        "AND r2.row_key = r.row_key AND r2.row_values['known_at'] = r.row_values['known_at'] "
+        "AND r2.retracted_at <= ? AND (r2.restored_at IS NULL OR r2.restored_at > ?))"
+    )
+    again_params: list[Any] = [started, started, started]
     if max_ingested is not None:
         again_where += f" AND {ingested} <= ?"
         again_params.append(max_ingested)
@@ -426,7 +433,7 @@ def reproduce_trial(
                 reasons=tuple(reasons),
                 restored=restored,
             )
-        rows = replay_trial(trial_id, copy, holdout_replay=holdout_repeat)
+        rows = replay_trial(trial_id, copy, holdout_replay=holdout_repeat, settings=settings)
         replayed: dict[str, float | None] = {
             r.metric: r.value
             for r in rows
@@ -434,6 +441,15 @@ def reproduce_trial(
         }
         with open_read_only(on_copy) as conn:
             stored = stored_base_strategy_metrics(conn, trial_id)
+        if not stored:
+            return Reproduction(
+                trial_id,
+                "not_reproducible",
+                facts.kind,
+                holdout,
+                reasons=("the trial has no stored base-level strategy metric to compare",),
+                restored=restored,
+            )
         differences = compare_metrics(stored, replayed)
         return Reproduction(
             trial_id,

@@ -621,7 +621,11 @@ def _replay_registry(handle: registry.TrialHandle) -> Iterator[duckdb.DuckDBPyCo
 
 
 def replay_trial(
-    trial_id: int, store_path: Path | str, *, holdout_replay: bool = False
+    trial_id: int,
+    store_path: Path | str,
+    *,
+    holdout_replay: bool = False,
+    settings: Settings | None = None,
 ) -> list[registry.MetricRow]:
     """Run trial `trial_id` again over `store_path` and return the metric rows the run
     produces (T398; ADR 0029, `store.reproduce`). Writes nothing: no `trials`,
@@ -641,7 +645,7 @@ def replay_trial(
     replaying one."""
     from tradepartner.store import reproduce
 
-    live = get_settings()
+    live = settings if settings is not None else get_settings()
     store = _on_store(live, store_path)
     with open_read_only(store) as conn:
         if not reproduce.has_reproduction_marker(conn):
