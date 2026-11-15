@@ -450,6 +450,9 @@ class OpenfigiConfig(_ClosedConfig):
     window_seconds: float | None = Field(default=None, gt=0)
     jobs_per_request: int | None = Field(default=None, ge=1)
     max_disagreements: int | None = Field(default=None, ge=0)
+    #: The identity cross-check's gate (plan T399, #3437): unset, it reports and
+    #: fails nothing.
+    max_identity_disagreements: int | None = Field(default=None, ge=0)
 
     def limits(self, *, keyed: bool) -> tuple[int, float, int]:
         """Mapping API's documented defaults, bounded even when configured."""

@@ -468,6 +468,19 @@ count over it, or the table holding no observation at `t` (a gate never
 passes on a check it did not make), fails; unset (the default), the block
 reports and fails nothing.
 
+**OpenFIGI identity** (`figi_identity`, plan T399, #3437): a check only, never
+a source. `store.figi_identity` compares each security's CIK, listing and
+successor chain, as the store knew them at the observation's exact `known_at`,
+with its latest `openfigi_types` FIGI, composite FIGI and share-class FIGI: one
+share class under one CIK, successors in different share classes, a listed id
+OpenFIGI could not map, one FIGI under two CIKs. `rows` has one row per
+disagreement, `counts` the number per kind, and `cannot_check` states what the
+data cannot show (OpenFIGI's stored ticker is our own query echo and its
+`exch_code` is always `US`). `figi_identity_disagreements` joins
+`HealthReport.failures` only while `openfigi.max_identity_disagreements` is
+set: the rows over it, or no observation at `t`, fails; unset (the default),
+the block reports and fails nothing.
+
 This module holds no threshold; the only numbers in it are 0 and 1, and
 EDGAR's own filing-date cutoff (`EDGAR_FILING_DATE_CUTOFF`).
 """
@@ -557,6 +570,18 @@ from tradepartner.store.dividend_reviews import (
     ReviewedGroup,
     equal_amount_groups,
     reviewed_groups,
+)
+from tradepartner.store.figi_identity import (
+    CANNOT_CHECK as FIGI_CANNOT_CHECK,
+)
+from tradepartner.store.figi_identity import (
+    IDENTITY_SCHEMA as FIGI_IDENTITY_SCHEMA,
+)
+from tradepartner.store.figi_identity import (
+    KINDS as FIGI_KINDS,
+)
+from tradepartner.store.figi_identity import (
+    figi_identity_rows,
 )
 from tradepartner.store.index_members import (
     UNRESOLVED,
@@ -686,6 +711,11 @@ BORROW_STATUS_UNIQUE = "borrow_status_unique"
 #: block, never from `INTEGRITY_RULES`, and only while
 #: `openfigi.max_disagreements` is set.
 FIGI_TYPES_DISAGREEMENTS = "figi_types_disagreements"
+
+#: The OpenFIGI identity rule (plan T399, #3437): reported from the
+#: `figi_identity` block, failing only while
+#: `openfigi.max_identity_disagreements` is set.
+FIGI_IDENTITY_DISAGREEMENTS = "figi_identity_disagreements"
 #: The successor-chain rules (#821, T187c), over raw rows: distinct CIKs,
 #: the row's own stamp order, its stamp against its successor's rows, the
 #: successor listing under the predecessor's ticker, and no predecessor bar
@@ -1933,6 +1963,74 @@ def _figi_types_report(
     )
 
 
+@dataclass(frozen=True, eq=False)
+class FigiIdentity:
+    """The `figi_identity` block at `t` (module docstring, "OpenFIGI identity").
+
+    `rows` is `store.figi_identity`'s frame, one row per disagreement;
+    `observations` how many ids have a stored row known at `t`;
+    `max_identity_disagreements` is `openfigi.max_identity_disagreements` as the
+    block was computed -- only while it is set does the block fail."""
+
+    max_identity_disagreements: int | None
+    observations: int
+    rows: pl.DataFrame
+
+    @property
+    def disagreements(self) -> int:
+        """How many disagreement rows there are."""
+        return self.rows.height
+
+    @property
+    def counts(self) -> dict[str, int]:
+        """Rows per kind, every kind present (0 when none)."""
+        return {kind: self.rows.filter(pl.col("kind") == kind).height for kind in FIGI_KINDS}
+
+    @property
+    def cannot_check(self) -> tuple[str, ...]:
+        """What the stored OpenFIGI data cannot show."""
+        return FIGI_CANNOT_CHECK
+
+    def first_rows(self, count: int) -> pl.DataFrame:
+        """The first `count` rows, in kind order."""
+        return self.rows.head(count)
+
+    @property
+    def checked(self) -> bool:
+        """Whether any observation is known at `t`."""
+        return self.observations > 0
+
+    @property
+    def failed(self) -> bool:
+        """While the threshold is set: nothing observed at `t`, or the rows
+        over it. Never while it is unset."""
+        if self.max_identity_disagreements is None:
+            return False
+        return not self.checked or self.disagreements > self.max_identity_disagreements
+
+    @property
+    def verdict(self) -> str:
+        """`nothing checked`, `<n> disagreements (report-only)`, then
+        `pass (max <m>)` or `fail (max <m>)` while a threshold is set."""
+        if not self.checked:
+            return "nothing checked: fail" if self.failed else "nothing checked"
+        head = f"{self.disagreements} disagreements"
+        if self.max_identity_disagreements is None:
+            return f"{head} (report-only)"
+        verdict = "fail" if self.failed else "pass"
+        return f"{head}: {verdict} (max {self.max_identity_disagreements})"
+
+
+def figi_identity(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings | None = None
+) -> FigiIdentity:
+    """The `figi_identity` block at `t` (module docstring)."""
+    t = _validate_t(t)
+    settings = settings if settings is not None else get_settings()
+    observations, rows = figi_identity_rows(conn, t, settings)
+    return FigiIdentity(settings.openfigi.max_identity_disagreements, observations, rows)
+
+
 _INDEX_SAMPLE_SCHEMA: dict[str, Any] = {
     "session": pl.Date,
     "beyond_key": pl.Boolean,
@@ -2496,6 +2594,10 @@ class HealthReport:
     delisting_reasons: DelistingReasonsHealth | None = None
     #: `health.max_stale_sessions` at report time (#3329), read by `check_failures`.
     max_stale_sessions: int = 0
+    #: The OpenFIGI identity cross-check (plan T399); report-only while unset.
+    figi_identity: FigiIdentity = field(
+        default_factory=lambda: FigiIdentity(None, 0, pl.DataFrame([], schema=FIGI_IDENTITY_SCHEMA))
+    )
 
     @property
     def failures(self) -> tuple[str, ...]:
@@ -2506,7 +2608,8 @@ class HealthReport:
         (`IndexMembersCheck.failed`: only while `coverage.index_max_missing`
         is set), then `figi_types_disagreements` when the `figi_types` block
         failed (`FigiTypes.failed`: only while `openfigi.max_disagreements`
-        is set)."""
+        is set), then `figi_identity_disagreements` when the `figi_identity` block
+        failed (only while `openfigi.max_identity_disagreements` is set)."""
         failed = tuple(check.rule for check in self.integrity if not check.passed)
         block = self.coverage_reference
         if block is not None and block.check_enabled and block.failed:
@@ -2515,6 +2618,8 @@ class HealthReport:
             failed += (INDEX_MEMBERS_MISSING,)
         if self.figi_types.failed:
             failed += (FIGI_TYPES_DISAGREEMENTS,)
+        if self.figi_identity.failed:
+            failed += (FIGI_IDENTITY_DISAGREEMENTS,)
         return failed
 
     @property
@@ -2668,6 +2773,10 @@ def health_report(
         mergers=_mergers_report(conn, t, ingests),
         delisting_reasons=delisting_reasons_report(conn, t, listings),
         max_stale_sessions=settings.health.max_stale_sessions,
+        figi_identity=FigiIdentity(
+            settings.openfigi.max_identity_disagreements,
+            *figi_identity_rows(conn, t, settings),
+        ),
         figi_types=_figi_types_report(conn, t, session, settings, current, classes),
         duplicate_dividends=dividends,
         implausible_form4_dates=int(
