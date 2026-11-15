@@ -13,9 +13,9 @@ retracted from `retracted_rows` (T393, ADR 0029) is also moved when another id
 holds an equal bar for it in the current store, gained or not: the retracted bar
 was a duplicate of the owner's. The caller checks per-security and total
 unmoved losses against configured thresholds. A retracted session whose receiving
-id gained a bar for it (none in the backup) with the same open and close, but another
-volume, high or low, is moved too, counted as a vendor revision (#3432): the vendor
-now serves a different bar for that day. It writes nothing.
+id gained a bar for it (none in the backup) with the same open and close and the same issuer
+(the id's CIK), but another volume, high or low, is moved too, counted as a vendor
+revision (#3432): the vendor now serves a different bar for that day. It writes nothing.
 """
 
 from __future__ import annotations
@@ -142,7 +142,9 @@ def release_coverage(
                        OR EXISTS (SELECT 1 FROM retr r
                                   WHERE r.security_id = l.security_id
                                     AND r.session = l.session)))
-                 OR (EXISTS (SELECT 1 FROM gained g
+                 OR (split_part(split_part(cb.security_id, ':', 1), '@', 1)
+                         = split_part(split_part(l.security_id, ':', 1), '@', 1)
+                     AND EXISTS (SELECT 1 FROM gained g
                              WHERE g.security_id = cb.security_id AND g.session = cb.session)
                      AND EXISTS (SELECT 1 FROM retr r
                                  WHERE r.security_id = l.security_id AND r.session = l.session))

@@ -3374,7 +3374,9 @@ def test_a_retracted_span_no_id_receives_exits_1(tmp_path: Path) -> None:
     assert _cov_close(settings).exit_code == 1
 
 
-def _cov_revised_receiver(settings: Settings, *, open_: float, volume: int) -> None:
+def _cov_revised_receiver(
+    settings: Settings, *, open_: float, volume: int, receiver: str = "A:new"
+) -> None:
     """A retracted and a new id C gaining the same session with another bar; B's bar
     of that session is changed (it was already there: a receiver that held a bar)."""
     with open_for_write(settings) as conn:
@@ -3383,12 +3385,12 @@ def _cov_revised_receiver(settings: Settings, *, open_: float, volume: int) -> N
             "UPDATE prices_daily SET volume = 3 WHERE security_id = 'B' AND session = ?",
             [_COV_DAYS[1]],
         )
-        _cov_security(conn, "C")
-        _cov_bar(conn, "C", _COV_DAYS[1])
+        _cov_security(conn, receiver)
+        _cov_bar(conn, receiver, _COV_DAYS[1])
         conn.execute(
             "UPDATE prices_daily SET open = ?, high = 1.5, low = 0.9, volume = ? "
-            "WHERE security_id = 'C'",
-            [open_, volume],
+            "WHERE security_id = ?",
+            [open_, volume, receiver],
         )
 
 
@@ -3421,6 +3423,16 @@ def test_a_revised_bar_the_receiver_already_held_is_not_a_vendor_revision(tmp_pa
             "WHERE security_id = 'B' AND session = ?",
             [_COV_DAYS[1]],
         )
+    checked = _cov_run(settings)
+    assert checked.exit_code == 1, checked.output
+    assert "1 of 1 sessions NOT RECEIVED" in checked.output
+
+
+def test_an_unrelated_issuers_bar_with_the_same_open_and_close_is_no_revision(
+    tmp_path: Path,
+) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_revised_receiver(settings, open_=1.0, volume=7, receiver="Z")
     checked = _cov_run(settings)
     assert checked.exit_code == 1, checked.output
     assert "1 of 1 sessions NOT RECEIVED" in checked.output

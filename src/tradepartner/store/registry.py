@@ -2373,17 +2373,19 @@ def _revision_receivers(
     if re.fullmatch(r"[a-z_][a-z0-9_]*", backup_alias) is None:
         raise ValueError(f"bad backup alias {backup_alias!r}")
     o, cl = float(values["open"]), float(values["close"])
+    root = sid.split(":")[0].split("@")[0]
     found = conn.execute(
         f"""
         SELECT DISTINCT security_id FROM (
             SELECT security_id, arg_max(open, known_at) AS o, arg_max(close, known_at) AS cl
             FROM prices_daily WHERE session = ? AND security_id <> ? GROUP BY security_id) g
-        WHERE NOT EXISTS (SELECT 1 FROM {backup_alias}.prices_daily b
+        WHERE split_part(split_part(g.security_id, ':', 1), '@', 1) = ?
+          AND NOT EXISTS (SELECT 1 FROM {backup_alias}.prices_daily b
                           WHERE b.security_id = g.security_id AND b.session = ?)
           AND abs(o - ?) <= ? * greatest(1, abs(?))
           AND abs(cl - ?) <= ? * greatest(1, abs(?))
         """,
-        [day, sid, day, o, tolerance, o, cl, tolerance, cl],
+        [day, sid, root, day, o, tolerance, o, cl, tolerance, cl],
     ).fetchall()
     return [str(r[0]) for r in found]
 

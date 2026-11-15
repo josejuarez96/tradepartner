@@ -281,10 +281,10 @@ def test_a_retracted_session_regained_with_another_volume_is_a_vendor_revision(
     backup = _backup_and_open(s, tmp_path)
     with open_for_write(s) as conn:
         retract(conn, "prices_daily", [("A", d) for d in _days(20)], "dup", "rel", "line 1")
-        _master(conn, "A2", "AAA2")
+        _master(conn, "A:new", "AAA2")
         for d in _days(20):
-            _bar(conn, "A2", d)
-        conn.execute("UPDATE prices_daily SET volume = 9, high = 1.5 WHERE security_id = 'A2'")
+            _bar(conn, "A:new", d)
+        conn.execute("UPDATE prices_daily SET volume = 9, high = 1.5 WHERE security_id = 'A:new'")
         # B and C hold A's seeded bar in the backup too; make theirs differ now.
         conn.execute("UPDATE prices_daily SET open = 5 WHERE security_id IN ('B', 'C')")
     with duckdb.connect(s.store.path, read_only=True) as conn:
@@ -293,4 +293,12 @@ def test_a_retracted_session_regained_with_another_volume_is_a_vendor_revision(
         (loss,) = release_coverage(conn, backup_alias="bk", retraction_release="rel")
     assert plain[0].unmoved == 20 and plain[0].revised == 0
     assert (loss.lost, loss.moved, loss.revised, loss.unmoved) == (20, 20, 20, 0)
-    assert "moved to A2 (20 as a vendor revision" in format_loss(loss)
+    assert "moved to A:new (20 as a vendor revision" in format_loss(loss)
+    # The same bars on an id of another issuer are no revision.
+    with open_for_write(s) as conn:
+        conn.execute("UPDATE prices_daily SET security_id = 'Z' WHERE security_id = 'A:new'")
+        _master(conn, "Z", "ZZZ")
+    with duckdb.connect(s.store.path, read_only=True) as conn:
+        conn.execute(f"ATTACH '{backup}' AS bk (READ_ONLY)")
+        (other,) = release_coverage(conn, backup_alias="bk", retraction_release="rel")
+    assert (other.moved, other.unmoved) == (0, 20)
