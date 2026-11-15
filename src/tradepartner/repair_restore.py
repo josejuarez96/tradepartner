@@ -15,14 +15,16 @@ that moved them is overturned. It is a thin, guarded wrapper over
   undone inside its own record). `tradepartner decision data-release close` then
   names the restored sessions, which `RestoreRepaired.close_command` prints, so the
   trials that read them go stale.
-- **Dry run first.** `dry_run` runs the whole restore, every key check included, and
-  rolls it back: it lists the rows and writes nothing. A real run writes only the
+- **Dry run first.** `dry_run` checks the selected rows on a read-only connection:
+  it lists the rows and writes nothing. Insert casts and table constraints are
+  checked by the real run. A real run writes only the
   dry run's row count (`expect`); any other count rolls back.
 - **Refusals** (`RepairRefused`, nothing written): no open release of that name; a
   logical key still held by any revision, or a ticker-session held by another id
   (`RestoreRefused`, which names the offender); nothing to restore; an open paper
   window (`repair.refuse_inside_open_window`: a window's runs read the store, so
-  any non-empty restore waits for it to close). Checked on the dry run too.
+  any non-empty restore waits for it to close). The release check applies to a
+  real run; row and paper-window refusals apply to the dry run too.
 - **No look-ahead.** Each row returns with its original `known_at`, so a read at any
   `t` sees a restored row only if it saw the row before it was retracted.
 - **Recorded.** `retracted_rows.restored_at` is the clock, and one `ingestion_runs`
@@ -51,8 +53,13 @@ from tradepartner.repair import (
     refuse_inside_open_window,
     release_refusal,
 )
-from tradepartner.store.db import open_for_write, utc_now
-from tradepartner.store.retracted_rows import RestoreRefused, restore
+from tradepartner.store.db import open_for_write, open_read_only, utc_now
+from tradepartner.store.retracted_rows import (
+    RestoreRefused,
+    preview_restore,
+    restore,
+    select_restore_ids,
+)
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 _NEW_YORK = ZoneInfo("America/New_York")
@@ -83,10 +90,6 @@ class RestoredRow:
     #: The New York date of `known_at`: a row can be known before its session
     #: (a delisting filed days before `effective_on`), and trials read it from then.
     known_date: date
-
-
-class _DryRunDone(Exception):
-    """Raised inside the transaction after a dry run read its result, to roll back."""
 
 
 @dataclass(frozen=True)
@@ -143,13 +146,13 @@ class RestoreRepaired:
         )
 
 
-def _restored_rows(conn: duckdb.DuckDBPyConnection, restored_at: datetime) -> list[RestoredRow]:
-    """The rows `restore` stamped `restored_at`, read inside its transaction."""
+def _restored_rows(conn: duckdb.DuckDBPyConnection, ids: Sequence[int]) -> list[RestoredRow]:
+    """The selected retractions, read in their original id order."""
     out: list[RestoredRow] = []
     rows = conn.execute(
         "SELECT table_name, row_key, release, row_values FROM retracted_rows "
-        "WHERE restored_at = ? ORDER BY retraction_id",
-        [restored_at],
+        "WHERE retraction_id IN (SELECT unnest(?::BIGINT[])) ORDER BY retraction_id",
+        [list(ids)],
     ).fetchall()
     for table, key, retracted_in, values in rows:
         out.append(
@@ -181,7 +184,7 @@ def repair_restore(
     clock: Callable[[], datetime] = utc_now,
 ) -> RestoreRepaired:
     """Restore retracted rows in one transaction inside the open data release
-    `release` and record the run; with `dry_run`, do all of it and roll it back
+    `release` and record the run; with `dry_run`, preview on a read-only connection
     (module docstring).
 
     Raises `ValueError` for a bad call (no `release`, no selection, a real run
@@ -199,33 +202,41 @@ def repair_restore(
             "not the one that retracted them; nothing restored"
         )
     started = ensure_tz_aware_utc(clock(), field_name="clock()")
-    result: RestoreRepaired | None = None
-    try:
-        with open_for_write(settings) as conn:
-            if not dry_run and (why := release_refusal(conn, release)):
-                raise RepairRefused(f"{why}; nothing restored")
+    if dry_run:
+        with open_read_only(settings) as conn:
             try:
-                restore(conn, release=from_release, table=table, key=key, at=started)
+                ids = preview_restore(conn, release=from_release, table=table, key=key)
             except RestoreRefused as exc:
                 raise RepairRefused(str(exc)) from None
-            rows = _restored_rows(conn, started)
-            if own := sorted({r.retracted_in for r in rows if r.retracted_in == release}):
-                raise RepairRefused(
-                    f"release {own[0]!r} retracted these rows: a restore runs in its own "
-                    "release, not the one that retracted them; nothing restored"
-                )
-            refuse_inside_open_window(conn, [r.session for r in rows])
-            result = RestoreRepaired(release=release, rows=tuple(rows), dry_run=dry_run)
-            if dry_run:
-                raise _DryRunDone
-            if len(rows) != expect:
-                raise RepairRefused(
-                    f"found {len(rows)} rows, not the expected {expect}; "
-                    "nothing restored, run --dry-run again"
-                )
-            run = SourceRun("edgar", REPAIRED, 0, "", result.summary())
-            _write_run(conn, uuid.uuid4().hex, started, clock(), run, REPAIR)
-    except _DryRunDone:
-        pass
-    assert result is not None
+            rows = _restored_rows(conn, ids)
+            _refuse_own_release(rows, release)
+            refuse_inside_open_window(conn, [min(r.session, r.known_date) for r in rows])
+            return RestoreRepaired(release=release, rows=tuple(rows), dry_run=True)
+    with open_for_write(settings) as conn:
+        if why := release_refusal(conn, release):
+            raise RepairRefused(f"{why}; nothing restored")
+        try:
+            ids = select_restore_ids(conn, from_release, table, key)
+            restore(conn, release=from_release, table=table, key=key, at=started)
+        except RestoreRefused as exc:
+            raise RepairRefused(str(exc)) from None
+        rows = _restored_rows(conn, ids)
+        _refuse_own_release(rows, release)
+        refuse_inside_open_window(conn, [min(r.session, r.known_date) for r in rows])
+        result = RestoreRepaired(release=release, rows=tuple(rows), dry_run=False)
+        if len(rows) != expect:
+            raise RepairRefused(
+                f"found {len(rows)} rows, not the expected {expect}; "
+                "nothing restored, run --dry-run again"
+            )
+        run = SourceRun("edgar", REPAIRED, 0, "", result.summary())
+        _write_run(conn, uuid.uuid4().hex, started, clock(), run, REPAIR)
     return result
+
+
+def _refuse_own_release(rows: Sequence[RestoredRow], release: str) -> None:
+    if any(r.retracted_in == release for r in rows):
+        raise RepairRefused(
+            f"release {release!r} retracted these rows: a restore runs in its own "
+            "release, not the one that retracted them; nothing restored"
+        )
