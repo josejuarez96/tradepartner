@@ -16,7 +16,9 @@ store and on that store truncated to `known_at <= read_time(D)`. Everything the 
 run produced (decisions: targets and rebalance rows; orders and fills: weight rows;
 positions: per-session values; cash and equity; delisting exits) must equal the part of
 the longer run that falls at or before D. The longer run's rows after D are read only to
-prove the window is not vacuous. Fixture stores only; the real store is never opened.
+prove the window is not vacuous. Scope: no benchmarks are frozen and the risk-free rates
+read is off in these runs, and the plan made at D itself (filled after D) is left out of
+"up to D" by design. Fixture stores only; the real store is never opened.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import duckdb
@@ -32,6 +34,7 @@ import polars as pl
 import pytest
 
 from lookahead.harness import FIXTURE_UNIVERSE, FixtureTemplate, TruncatedStore
+from lookahead.test_backtest_invariance import _dividend, _revise_bar
 from tradepartner.backtest.engine import BacktestResult, run
 from tradepartner.backtest.schedule import read_time, rebalance_sessions
 from tradepartner.backtest.store_provider import StoreProvider
@@ -281,3 +284,40 @@ def test_a_run_cut_at_d_reads_nothing_known_after_d(runs: Runs) -> None:
             _up_to(runs.longer[level], runs.cut, runs.case.cadence),
             f"{runs.case.cadence}: run(end={runs.cut}) on the store truncated to {when}",
         )
+
+
+def test_a_bar_or_dividend_known_after_d_leaves_the_run_to_d_unchanged(
+    runs: Runs, template: FixtureTemplate
+) -> None:
+    """Teeth for the price and adjustment reads: a revised bar at D and a dividend with
+    ex-date D, on a name held at D's close, both first known an hour after read_time(D),
+    change the longer run but not the run to D (a read time shifted past them would)."""
+    cut, cadence = runs.cut, runs.case.cadence
+    held = (
+        runs.longer[COST_LEVELS[-1]]
+        .position_values.filter((pl.col("session") == cut) & (pl.col("value") > 0))["security_id"]
+        .to_list()
+    )
+    assert held, f"nothing held at close({cut})"
+    known = read_time(cut, cadence) + timedelta(hours=1)
+    conn = template.copy()
+    try:
+        _revise_bar(conn, held[0], cut, known)
+        _dividend(conn, held[0], cut, 5.0, known)
+        handle = _handle(conn, runs.settings, runs.case, runs.long_end)
+        revised = Runs(
+            runs.case, conn, runs.settings, handle, runs.sessions, cut, runs.long_end, {}
+        )
+        got = revised.run(cut)
+        longer = revised.run(runs.long_end)
+    finally:
+        conn.close()
+    for level, result in got.items():
+        _assert_same_up_to_cut(
+            _up_to(result, cut, cadence),
+            _up_to(runs.longer[level], cut, cadence),
+            f"{cadence}: run(end={cut}) with a bar and a dividend known after read_time({cut})",
+        )
+    assert longer[COST_LEVELS[-1]].equity != runs.longer[COST_LEVELS[-1]].equity, (
+        "the late revisions changed nothing even in the longer run"
+    )
