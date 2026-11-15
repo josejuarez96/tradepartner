@@ -288,8 +288,9 @@ class _Opened:
 def _on_store(live: Settings, store_path: Path | str | None) -> Settings:
     if store_path is None:
         return live
-    store = live.store.model_copy(update={"path": str(store_path)})
-    return live.model_copy(update={"store": store})
+    return type(live).model_validate(
+        {**live.model_dump(), "store": {**live.store.model_dump(), "path": str(store_path)}}
+    )
 
 
 def _describe(exc: BaseException) -> str:
