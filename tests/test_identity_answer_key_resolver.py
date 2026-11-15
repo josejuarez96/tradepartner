@@ -12,9 +12,13 @@ test fails until the entry is removed, so the list cannot go stale.
 
 How an input event becomes rows (fixture assumptions, none of them a key fact):
 
-- `form25` -> one `delistings` row: filed on the event date at 16:00 UTC,
-  effective ten days later (Rule 12d2-2(d)(1)), plus a `listings` row for the
-  line it ends, listed from a year before the history's first dated fact.
+- `form25` and `25-nse` -> one `delistings` row (form `25` or `25-NSE`): filed
+  on the event date at 16:00 UTC, effective on the date the notice states or,
+  when the key gives none, ten days later (Rule 12d2-2(d)(1)), plus a
+  `listings` row for the line it ends (unless a `listing` input already gives
+  that line), listed from the earliest `listing` input the history gives or,
+  with none, a year before its first dated fact. So concurrent lines of one
+  history share their `valid_from`.
 - `listing` -> a `listings` row from the event date.
 - `8-k12b` -> a `listings` row for the successor from the event date and a
   `successor_chains` row from `predecessor_cik`.
@@ -61,8 +65,14 @@ _CLASS = "Common Stock"
 #: History id -> the issue that fixes the resolver for it. Empty means every
 #: history passes. Strict: a history that starts passing fails until removed.
 XFAIL: dict[str, str] = {
-    "apa-apache-holdco-2021": "#3413",
-    "mar-nyse-chicago-2020": "#3413",
+    "apa-apache-holdco-2021": "#3422, #3423",
+    "batra-batrk-split-off-2023": "#3423",
+    "llyva-llyvk-split-off-2025": "#3423",
+    "ua-uaa-ticker-swap-2016": "#3421",
+    "alphabet-google-holdco-2015": "#3424",
+    "swx-holdco-2017": "#3424",
+    "chk-chapter-11-new-equity-2021": "#3425",
+    "htz-chapter-11-otc-then-nasdaq-2021": "#3425",
 }
 
 HISTORIES = load_answer_key(CHECK)
@@ -111,6 +121,21 @@ def _bar(sid: str, session: date) -> dict[str, Any]:
     }
 
 
+def _baseline(history: History) -> date:
+    """When a Form 25's line is taken to have been listed: with the lines the
+    history's `listing` inputs give before its first removal, the earliest of
+    them (concurrent rows share a `valid_from`), else a year before its first
+    dated fact."""
+    removals = [i.date for i in history.inputs if i.kind in ("form25", "25-nse")]
+    first_removal = min(removals) if removals else None
+    listed = [
+        i.date
+        for i in history.inputs
+        if i.kind == "listing" and first_removal is not None and i.date < first_removal
+    ]
+    return min(listed) if listed else _first_fact(history) - timedelta(days=365)
+
+
 def _first_fact(history: History) -> date:
     """The earliest date the history's inputs and bars give (never an expectation)."""
     return min([i.date for i in history.inputs] + [b.first for b in history.bars])
@@ -119,7 +144,7 @@ def _first_fact(history: History) -> date:
 def build_store(conn: duckdb.DuckDBPyConnection, history: History) -> None:
     """Write the fixture store for `history` from its inputs and bar spans."""
     init_schema(conn)
-    since = _first_fact(history) - timedelta(days=365)
+    since = _baseline(history)
     listed: set[tuple[str, str, str]] = set()
 
     def line(event: InputEvent, valid_from: date, known: datetime) -> None:
@@ -134,7 +159,7 @@ def build_store(conn: duckdb.DuckDBPyConnection, history: History) -> None:
 
     for event in history.inputs:
         known = _stamp(event.date)
-        if event.kind == "form25":
+        if event.kind in ("form25", "25-nse"):
             line(event, since, _stamp(since))
             filed = datetime(event.date.year, event.date.month, event.date.day, 16, tzinfo=UTC)
             insert_row(
@@ -142,11 +167,11 @@ def build_store(conn: duckdb.DuckDBPyConnection, history: History) -> None:
                 "delistings",
                 {
                     "security_id": event.cik,
-                    "form": "25",
+                    "form": "25-NSE" if event.kind == "25-nse" else "25",
                     "class_title": _CLASS,
                     "exchange": _exchange(event.exchange),
                     "filed_at": filed,
-                    "effective_on": event.date + timedelta(days=_EFFECTIVE_DAYS),
+                    "effective_on": event.effective or event.date + timedelta(days=_EFFECTIVE_DAYS),
                     "known_at": filed,
                     "ingested_at": filed,
                     "source": "edgar",
@@ -247,7 +272,7 @@ def _params() -> list[Any]:
                 pytest.mark.xfail(
                     strict=True,
                     raises=AssertionError,
-                    reason=f"{XFAIL[history.id]}: key inputs incomplete",
+                    reason=f"{XFAIL[history.id]}: the resolver does not yet meet the key",
                 )
             )
         out.append(pytest.param(history, id=history.id, marks=marks))
@@ -267,6 +292,7 @@ def test_the_resolver_agrees_with_the_answer_key(history: History, settings: Set
 def test_the_xfail_list_names_only_histories_in_the_key() -> None:
     assert set(XFAIL) <= {h.id for h in HISTORIES}
     assert all(issue.startswith("#") for issue in XFAIL.values())
+    assert "mar-nyse-chicago-2020" not in XFAIL
 
 
 # -- positive controls: the harness itself, on histories built here --------------

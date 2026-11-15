@@ -10,7 +10,7 @@ universe, signal, backtest or research module imports it (a source scan in
 
 The packaged file `identity_answer_key.toml` holds the histories. A history has
 
-- `inputs`: the events that reach our store (a Form 25, an 8-K12B, a cover-page
+- `inputs`: the events that reach our store (a Form 25 or 25-NSE, an 8-K12B, a cover-page
   listing) as a minimal fixture,
 - `bars`: the sessions that had bars (T387 and T388 read bars as evidence), and
 - `expected`: the outcomes, written down from the cited source alone.
@@ -37,13 +37,17 @@ from datetime import UTC, date, datetime, timedelta
 from importlib import resources
 from typing import Any, Final, Literal
 
+#: `date` is shadowed by the `date` field inside `InputEvent`.
+_Day = date
 _FILE: Final = "identity_answer_key.toml"
 #: Citation kinds. An accession is an EDGAR filing; the others are documents
 #: an exchange or the company published, with a URL.
 CITATION_KINDS: Final = ("accession", "exchange_notice", "company_notice", "press_release")
 _ACCESSION: Final = re.compile(r"^\d{10}-\d{2}-\d{6}$")
 _CIK: Final = re.compile(r"^\d{10}$")
-INPUT_KINDS: Final = ("form25", "8-k12b", "listing")
+INPUT_KINDS: Final = ("form25", "25-nse", "8-k12b", "listing")
+#: Input kinds that remove a line from its exchange (and may carry the removal date).
+DELISTING_KINDS: Final = ("form25", "25-nse")
 EXPECTED_KINDS: Final = ("holds", "bars", "line_end")
 
 ExpectedKind = Literal["holds", "bars", "line_end"]
@@ -73,6 +77,9 @@ class InputEvent:
     ticker: str
     predecessor_cik: str | None
     citation: Citation
+    #: A `form25` or `25-nse`: the day the removal takes effect when the cited
+    #: notice states one; None: not stated, a consumer assumes ten days after `date`.
+    effective: _Day | None = None
 
 
 @dataclass(frozen=True)
@@ -170,7 +177,16 @@ def _date(raw: Any, where: str, name: str) -> date:
 
 _KEYS: Final = {
     "history": {"id", "title", "input", "bars", "expected"},
-    "input": {"kind", "cik", "date", "exchange", "ticker", "predecessor_cik", "cite"},
+    "input": {
+        "kind",
+        "cik",
+        "date",
+        "exchange",
+        "ticker",
+        "predecessor_cik",
+        "effective",
+        "cite",
+    },
     "bars": {"cik", "ticker", "first", "last", "cite"},
     "expected": {"kind", "cik", "first", "last", "ticker", "exchange", "cite"},
     "cite": {"kind", "ref", "date"},
@@ -245,15 +261,22 @@ def parse_key(text: str, check_date: date | None = None) -> tuple[History, ...]:
             if row.get("kind") not in INPUT_KINDS:
                 raise _fail(where, f"kind {row.get('kind')!r} is not one of {INPUT_KINDS}")
             succ = _cik(row, "predecessor_cik", where) if "predecessor_cik" in row else None
+            day = _date(row.get("date"), where, "date")
+            effective = _optional_date(row, "effective", where)
+            if effective is not None and row["kind"] not in DELISTING_KINDS:
+                raise _fail(where, "effective is only a form25 or 25-nse field")
+            if effective is not None and effective < day:
+                raise _fail(where, "effective is before the event date")
             inputs.append(
                 InputEvent(
                     kind=row["kind"],
                     cik=_cik(row, "cik", where),
-                    date=_date(row.get("date"), where, "date"),
+                    date=day,
                     exchange=_text(row, "exchange", where),
                     ticker=_text(row, "ticker", where),
                     predecessor_cik=succ,
                     citation=_citation(row, where, check),
+                    effective=effective,
                 )
             )
         bars: list[BarSpan] = []
