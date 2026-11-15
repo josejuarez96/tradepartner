@@ -31,6 +31,7 @@ from tradepartner.config_edgar import PRE_2826_STATEMENT_FACTS
 from tradepartner.store import journal, registry, schema
 from tradepartner.store.benchmarks import CHECK_ONLY_IDS
 from tradepartner.store.db import insert_row
+from tradepartner.store.retracted_rows import retract
 
 _T0 = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
 _AFTER_CUTOFF = datetime(2026, 9, 28, 20, 0, tzinfo=UTC)  # a session after `_open`'s cutoff
@@ -2819,3 +2820,87 @@ def test_every_held_statement_name_moves_the_trial_vintage(
         ingested = datetime(2024, 6, 28, 1, i, tzinfo=UTC)
         _statement_row(conn, name, known, ingested)
         assert registry.data_vintage(conn, cutoff) == ingested, name
+
+
+# --- the release coverage record (ADR 0029, T393) -------------------------------------
+
+
+def test_the_before_row_records_the_guarded_table_counts(conn: duckdb.DuckDBPyConnection) -> None:
+    _price(conn, "A", _T0, _T0.replace(hour=13))
+    _open_release(conn)
+    opened = registry.open_release(conn)
+    assert opened is not None
+    assert opened.values["counts"]["prices_daily"] == 1
+    assert opened.values["counts"]["retracted_rows"] == 0
+    assert registry.release_changed_tables(conn, opened) == []
+    _price(conn, "B", _T0, _T0.replace(hour=14))
+    assert registry.release_changed_tables(conn, opened) == ["prices_daily"]
+
+
+def test_a_retraction_of_the_release_marks_its_table_changed(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    _price(conn, "A", _T0, _T0.replace(hour=13))
+    _open_release(conn)
+    opened = registry.open_release(conn)
+    assert opened is not None
+    retract(conn, "prices_daily", [("A", _T0.date())], "r", "repair-a", "rule")
+    assert registry.release_changed_tables(conn, opened) == ["prices_daily"]
+
+
+def test_a_before_row_without_counts_treats_every_table_as_changed(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    (group,) = registry.plan_release_import(conn, [_BEFORE])
+    registry.import_release(conn, group)
+    opened = registry.open_release(conn)
+    assert opened is not None and "counts" not in opened.values
+    assert registry.release_changed_tables(conn, opened) == sorted(registry.RELEASE_COUNT_TABLES)
+
+
+def test_coverage_is_enforced_on_request_and_recorded_on_the_after_row(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    backup = tmp_path / "backup.duckdb"
+    backup.write_bytes(b"x")
+    _price(conn, "A", _T0, _T0.replace(hour=13))
+    registry.open_data_release(
+        conn, conn, name="repair-a", backup_path=str(backup), reason="#1 fix"
+    )
+    _price(conn, "B", _T0, _T0.replace(hour=14))
+    days = {"sessions_from": date(2026, 9, 1), "sessions_to": date(2026, 9, 25)}
+    with pytest.raises(registry.ReleaseRefused, match="no coverage record"):
+        registry.close_data_release(conn, name="repair-a", enforce_coverage=True, **days)
+    with pytest.raises(registry.ReleaseRefused, match="cannot record coverage for 'other'"):
+        registry.record_release_coverage(conn, name="other", passed=True, summary={})
+    registry.record_release_coverage(conn, name="repair-a", passed=True, summary={"n": 1})
+    registry.close_data_release(conn, name="repair-a", enforce_coverage=True, **days)
+    after = registry.data_releases(conn)[0]
+    assert after.stage == "after" and after.values["changed_tables"] == ["prices_daily"]
+    assert after.values["counts"]["prices_daily"] == 2
+
+
+def test_the_newest_coverage_record_decides(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    backup = tmp_path / "backup.duckdb"
+    backup.write_bytes(b"x")
+    _price(conn, "A", _T0, _T0.replace(hour=13))
+    registry.open_data_release(conn, conn, name="repair-a", backup_path=str(backup), reason="r")
+    _price(conn, "B", _T0, _T0.replace(hour=14))
+    registry.record_release_coverage(conn, name="repair-a", passed=True, summary={})
+    registry.record_release_coverage(conn, name="repair-a", passed=False, summary={})
+    with pytest.raises(registry.ReleaseRefused, match="coverage record failed"):
+        registry.close_data_release(
+            conn,
+            name="repair-a",
+            sessions_from=date(2026, 9, 1),
+            sessions_to=date(2026, 9, 25),
+            enforce_coverage=True,
+        )
+
+
+def test_the_coverage_helpers_read_only(conn: duckdb.DuckDBPyConnection) -> None:
+    assert registry.release_retractions(conn, "repair-a") == []
+    _price(conn, "A", _T0, _T0.replace(hour=13))
+    assert registry.ownerless_rows(conn) == {"prices_daily": ["A"]}

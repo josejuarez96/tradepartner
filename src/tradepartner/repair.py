@@ -147,7 +147,7 @@ from tradepartner.store.master import (
     stored_rename_changes,
     stored_snapshot_history,
 )
-from tradepartner.store.registry import open_release
+from tradepartner.store.registry import open_release, record_approved_orphans
 from tradepartner.store.restamp_precheck import (
     crossed_instants,
     read_instants,
@@ -1049,6 +1049,10 @@ def repair_resolution(
                 raise RuntimeError(
                     f"repair retracted {moved} rows where it counted "
                     f"{(result.bar_rows, result.action_rows)}; rolled back"
+                )
+            if orphans:  # the owner's exact count: the coverage check accepts exactly these
+                record_approved_orphans(
+                    conn, release=release, allow_orphans=allow_orphans or 0, keys=orphans
                 )
             message = f"{result.summary()}; release {release}"
             run = SourceRun("alpaca", REPAIRED, 0, "", message)

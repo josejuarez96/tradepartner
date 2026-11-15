@@ -8,13 +8,17 @@ a liquid security losing months of bars. This compares the distinct
 sessions. A lost session is "moved" when another
 `security_id` gained a bar for the same session that equals the lost bar (same
 volume, OHLC within a relative tolerance with an absolute floor at price 1),
-as a merge into a successor id does. The caller checks per-security and total
+as a merge into a successor id does. With `retraction_release`, a session the release
+retracted from `retracted_rows` (T393, ADR 0029) is also moved when another id
+holds an equal bar for it in the current store, gained or not: the retracted bar
+was a duplicate of the owner's. The caller checks per-security and total
 unmoved losses against configured thresholds. It writes nothing.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import date
 
@@ -52,11 +56,17 @@ def release_coverage(
     *,
     backup_alias: str,
     price_tolerance: float = 1e-6,
+    retraction_release: str | None = None,
+    accepted: Collection[tuple[str, date]] = (),
 ) -> list[SessionLoss]:
     """Every security with lost sessions, by id.
 
     `conn` is read-only on the current store with the backup attached read-only
-    as `backup_alias`. Only distinct sessions count, so a revised bar (a second
+    as `backup_alias`; `retraction_release` names a release whose unrestored
+    `retracted_rows` bars count as moved when another id holds an equal bar.
+    `accepted` bar keys (`security_id`, session) are left out of the losses: the
+    owner-approved orphans of the release (`registry.approved_orphans`).
+    Only distinct sessions count, so a revised bar (a second
     `known_at`) is no loss. A security new since the backup has no loss.
     """
     if _ALIAS.fullmatch(backup_alias) is None:
@@ -74,6 +84,21 @@ def release_coverage(
     if missing:
         names = ", ".join(sorted(missing))
         raise ReleaseCoverageError(f"backup missing required table(s): {names}")
+    retr = (
+        "SELECT row_key[1] AS security_id, CAST(row_key[2] AS DATE) AS session "
+        "FROM main.retracted_rows WHERE release = ? AND table_name = 'prices_daily' "
+        "AND restored_at IS NULL"
+        if retraction_release is not None
+        and conn.execute(
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_catalog = current_database() AND table_name = 'retracted_rows' "
+            "AND table_schema = 'main'"
+        ).fetchone()
+        == (1,)
+        else "SELECT NULL::VARCHAR AS security_id, NULL::DATE AS session WHERE false"
+    )
+    retr_params = [retraction_release] if "?" in retr else []
+    keys = sorted(accepted)
     rows = conn.execute(
         f"""
         WITH bb AS (
@@ -88,15 +113,21 @@ def release_coverage(
             FROM main.prices_daily GROUP BY security_id, session),
         b AS (SELECT security_id, session FROM bb),
         c AS (SELECT security_id, session FROM cb),
-        lost AS (SELECT * FROM b ANTI JOIN c USING (security_id, session)),
+        acc AS (SELECT unnest(?::VARCHAR[]) AS security_id, unnest(?::DATE[]) AS session),
+        lost AS (SELECT * FROM b ANTI JOIN c USING (security_id, session)
+                 ANTI JOIN acc USING (security_id, session)),
         gained AS (SELECT * FROM c ANTI JOIN b USING (security_id, session)),
+        retr AS ({retr}),
         moved AS (
-            SELECT l.security_id, l.session, min(g.security_id) AS successor,
-                   list(DISTINCT g.security_id) AS successors
+            SELECT l.security_id, l.session, min(cb.security_id) AS successor,
+                   list(DISTINCT cb.security_id) AS successors
             FROM lost l
             JOIN bb ON bb.security_id = l.security_id AND bb.session = l.session
-            JOIN gained g ON g.session = l.session AND g.security_id <> l.security_id
-            JOIN cb ON cb.security_id = g.security_id AND cb.session = g.session
+            JOIN cb ON cb.session = l.session AND cb.security_id <> l.security_id
+             AND (EXISTS (SELECT 1 FROM gained g
+                          WHERE g.security_id = cb.security_id AND g.session = cb.session)
+                  OR EXISTS (SELECT 1 FROM retr r
+                             WHERE r.security_id = l.security_id AND r.session = l.session))
              AND cb.v = bb.v
              AND abs(cb.o - bb.o) <= ? * greatest(1, abs(bb.o))
              AND abs(cb.h - bb.h) <= ? * greatest(1, abs(bb.h))
@@ -124,7 +155,7 @@ def release_coverage(
                     WHERE s.security_id = a.security_id))
         FROM agg a ORDER BY a.lost DESC, a.security_id
         """,
-        [price_tolerance] * 4,
+        [[k[0] for k in keys], [k[1] for k in keys], *retr_params, *([price_tolerance] * 4)],
     ).fetchall()
     out: list[SessionLoss] = []
     for sid, first, last, lost, moved, succ, name, ticker in rows:
