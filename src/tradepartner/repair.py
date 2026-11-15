@@ -339,18 +339,45 @@ def orphan_bars(
     resolver: ListingResolver,
     bar_keys: Iterable[Key],
     tickers: Callable[[str, date], Sequence[str]],
+    holds_bar: Callable[[str, date], bool] = lambda _sid, _day: False,
 ) -> dict[Key, int]:
     """The bar keys among `bar_keys` (each one the resolver does not assign
     to its security) that no id receives (#3265): no ticker the security held
     on the session resolves, for a fill or a bar, to another security. A
-    *moved* key has such an owner. Returns `{key: 1}` per orphan key. Pure."""
+    *moved* key has such an owner. An owner that already holds a stored bar
+    of its own on the session (`holds_bar`) is no receiver (#3455): a refetch
+    lands that owner's bar, never this one (Barrick under Gold.com's AMRK
+    bars). Returns `{key: 1}` per orphan key. Pure."""
     out: dict[Key, int] = {}
     for sid, day in bar_keys:
         owners = {resolver.fill_resolve(t, day) for t in tickers(sid, day)}
         owners |= {resolver.lead(t, day) for t in tickers(sid, day)}
-        if not (owners - {None, sid}):
+        if not any(o is not None and o != sid and not holds_bar(o, day) for o in owners):
             out[(sid, day)] = 1
     return out
+
+
+def _holds_bar(
+    conn: duckdb.DuckDBPyConnection, sources: list[str], stale: Mapping[Key, int]
+) -> Callable[[str, date], bool]:
+    """`(security_id, session)` to whether the store holds a bar of that
+    security there that stays: not one of the `stale` keys this run retracts.
+    Reads every stored bar, like `_Counted` (the same view as `found_bars`)."""
+    cache: dict[Key, bool] = {}
+
+    def holds(sid: str, day: date) -> bool:
+        key = (sid, day)
+        if key not in cache:
+            cache[key] = key not in stale and bool(
+                conn.execute(
+                    "SELECT 1 FROM prices_daily WHERE security_id = ? AND session = ? "
+                    "AND source IN (SELECT unnest(?)) LIMIT 1",
+                    [sid, day, sources],
+                ).fetchone()
+            )
+        return cache[key]
+
+    return holds
 
 
 def _norm(ticker: str) -> str:
@@ -959,7 +986,12 @@ def repair_resolution(
             )
             + _wider_spinoffs(conn, bad_spins)
         )
-        orphans = orphan_bars(resolver, found_bars, _held_tickers(conn, started))
+        orphans = orphan_bars(
+            resolver,
+            found_bars,
+            _held_tickers(conn, started),
+            _holds_bar(conn, bar_sources, found_bars),
+        )
         names = {
             _base_id(str(sid)): str(name)
             for sid, name in conn.execute(
