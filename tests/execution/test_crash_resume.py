@@ -1581,6 +1581,35 @@ def test_a_failed_broker_id_lookup_fails_closed(env: Env, window: PaperWindowRow
     assert _events(env, coid) == [("pending", None), ("pending_unresolved", None)]
 
 
+def test_a_confirmed_broker_id_belonging_to_another_coid_fails_closed(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """A broker-id read-back for another client order cannot acknowledge this one."""
+    coid, _ = _unresolved_buy(env)
+    assert window.window_id is not None
+    [row] = unresolved_orders(env.connect, window.window_id)
+
+    class _WrongCoid:
+        def get_order(self, client_order_id: str) -> Order:
+            raise UnknownOrderError(client_order_id)
+
+        def get_order_by_broker_id(self, broker_order_id: str) -> Order:
+            return Order(
+                client_order_id="another-order",
+                symbol=row.symbol,
+                side=Side(row.side),
+                notional=row.notional,
+                quantity=row.quantity,
+                status=OrderStatus.ACCEPTED,
+                submitted_at=env.clock.now,
+                broker_order_id=broker_order_id,
+            )
+
+    with pytest.raises(ReconciliationError, match="belongs to client_order_id another-order"):
+        settle_pending_unresolved(_WrongCoid(), env.connect, env.clock, [row])  # type: ignore[arg-type]
+    assert _events(env, coid) == [("pending", None), ("pending_unresolved", None)]
+
+
 def test_paper_resume_does_not_close_a_confirmed_order_not_received(
     env: Env, window: PaperWindowRow
 ) -> None:
@@ -1836,7 +1865,54 @@ def test_paper_resume_under_the_switch_settles_it_by_the_read_back(
         "accepted",
         "filled",
     ]
+    accepted_at, raw_json = env.query(
+        "SELECT event_at, raw_json FROM order_events "
+        "WHERE client_order_id = ? AND status = 'accepted'",
+        [coid],
+    )[0]
+    broker_order = env.fake.get_order(coid)
+    assert accepted_at == broker_order.submitted_at
+    assert json.loads(raw_json)["client_order_id"] == coid
+    assert json.loads(raw_json)["broker_order_id"] == broker_order.broker_order_id
     assert len(env.submits()) == submits
+
+
+def test_paper_resume_refuses_a_broker_read_back_with_wrong_order_shape(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A confirmed order with a limit shape cannot be acknowledged or released."""
+    coid, _ = _unresolved_buy(env)
+    assert window.window_id is not None
+    [row] = unresolved_orders(env.connect, window.window_id)
+    (broker_id,) = env.query(
+        "SELECT broker_order_id FROM order_events WHERE client_order_id = ? "
+        "AND status = 'pending_unresolved'",
+        [coid],
+    )[0]
+    switch.engage(
+        env.settings, env.clock, window_id=window.window_id, source="owner", reason="test"
+    )
+
+    def wrong_shape(read_id: str) -> Order:
+        assert read_id == broker_id
+        return Order(
+            client_order_id=coid,
+            symbol=row.symbol,
+            side=Side(row.side),
+            notional=row.notional,
+            quantity=row.quantity,
+            status=OrderStatus.ACCEPTED,
+            submitted_at=env.clock.now,
+            broker_order_id=broker_id,
+            order_type="limit",
+            limit_price=100.0,
+        )
+
+    monkeypatch.setattr(env.fake, "get_order_by_broker_id", wrong_shape)
+    with pytest.raises(ReconciliationError, match=r"refused_order_shape.*order_type"):
+        _resume(env)
+    assert _events(env, coid) == [("pending", None), ("pending_unresolved", None)]
+    assert _engaged(env, window)
 
 
 def test_paper_reconcile_under_the_switch_settles_it_by_the_read_back(
