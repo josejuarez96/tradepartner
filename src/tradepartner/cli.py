@@ -4643,7 +4643,10 @@ def make_app(
                     accepted=registry.approved_orphans(conn, name)[1],
                 )
                 spans = registry.release_retractions(
-                    conn, name, price_tolerance=s.store.release_move_price_tolerance
+                    conn,
+                    name,
+                    price_tolerance=s.store.release_move_price_tolerance,
+                    backup_alias="bk",
                 )
                 ownerless = registry.ownerless_rows(conn)
         except StoreLockedError as exc:

@@ -3374,6 +3374,70 @@ def test_a_retracted_span_no_id_receives_exits_1(tmp_path: Path) -> None:
     assert _cov_close(settings).exit_code == 1
 
 
+def _cov_revised_receiver(
+    settings: Settings, *, open_: float, volume: int, receiver: str = "A:new"
+) -> None:
+    """A retracted and a new id C gaining the same session with another bar; B's bar
+    of that session is changed (it was already there: a receiver that held a bar)."""
+    with open_for_write(settings) as conn:
+        retract(conn, "prices_daily", [("A", _COV_DAYS[1])], "refetched", "rel", "line 1")
+        conn.execute(
+            "UPDATE prices_daily SET volume = 3 WHERE security_id = 'B' AND session = ?",
+            [_COV_DAYS[1]],
+        )
+        _cov_security(conn, receiver)
+        _cov_bar(conn, receiver, _COV_DAYS[1])
+        conn.execute(
+            "UPDATE prices_daily SET open = ?, high = 1.5, low = 0.9, volume = ? "
+            "WHERE security_id = ?",
+            [open_, volume, receiver],
+        )
+
+
+def test_a_vendor_revision_gained_by_another_id_counts_as_moved(tmp_path: Path) -> None:
+    """The refetched bar keeps the open and close but has another volume, high and low
+    (#3432: Alpaca now serves a different bar for 2022-01-24): moved, printed as such."""
+    settings, _ = _cov_open(tmp_path)
+    _cov_revised_receiver(settings, open_=1.0, volume=7)
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 0, checked.output
+    assert "1 sessions refetched as a vendor revision (2020-01-02..2020-01-02)" in checked.output
+    assert "NOT RECEIVED" not in checked.output
+
+
+def test_a_different_bar_gained_with_another_open_is_not_a_revision(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_revised_receiver(settings, open_=2.0, volume=7)
+    checked = _cov_run(settings)
+    assert checked.exit_code == 1, checked.output
+    assert "1 of 1 sessions NOT RECEIVED" in checked.output
+
+
+def test_a_revised_bar_the_receiver_already_held_is_not_a_vendor_revision(tmp_path: Path) -> None:
+    """B held a bar for the session in the backup (a collision, not a gain): unmoved."""
+    settings, _ = _cov_open(tmp_path)
+    with open_for_write(settings) as conn:
+        retract(conn, "prices_daily", [("A", _COV_DAYS[1])], "gone", "rel", "line 1")
+        conn.execute(
+            "UPDATE prices_daily SET volume = 3, high = 1.5 "
+            "WHERE security_id = 'B' AND session = ?",
+            [_COV_DAYS[1]],
+        )
+    checked = _cov_run(settings)
+    assert checked.exit_code == 1, checked.output
+    assert "1 of 1 sessions NOT RECEIVED" in checked.output
+
+
+def test_an_unrelated_issuers_bar_with_the_same_open_and_close_is_no_revision(
+    tmp_path: Path,
+) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_revised_receiver(settings, open_=1.0, volume=7, receiver="Z")
+    checked = _cov_run(settings)
+    assert checked.exit_code == 1, checked.output
+    assert "1 of 1 sessions NOT RECEIVED" in checked.output
+
+
 def test_a_successor_whose_bar_is_missing_that_session_fails(tmp_path: Path) -> None:
     """The resolver assigns the span to B, but B holds no bar for part of it."""
     settings, _ = _cov_open(tmp_path)
