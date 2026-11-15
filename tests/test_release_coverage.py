@@ -302,3 +302,73 @@ def test_a_retracted_session_regained_with_another_volume_is_a_vendor_revision(
         conn.execute(f"ATTACH '{backup}' AS bk (READ_ONLY)")
         (other,) = release_coverage(conn, backup_alias="bk", retraction_release="rel")
     assert (other.moved, other.unmoved) == (0, 20)
+
+
+def _precision_store(
+    tmp_path: Path, old: tuple[float, float, float, float], new: tuple[float, float, float, float]
+) -> tuple[Settings, Path]:
+    """A's bars hold `old` (open, high, low, close, volume 1) in the backup; the release
+    retracts them and A:new (the same issuer) gains `new` with volume 2: the vendor's
+    revised bar of the same sessions (#3465, SNTI/JTAI 2026-11-05)."""
+    from tradepartner.store.retracted_rows import retract
+
+    s = _settings(tmp_path)
+    _seed(s)
+    _edit(
+        s,
+        "UPDATE prices_daily SET open = ?, high = ?, low = ?, close = ? WHERE security_id = 'A'",
+        list(old),
+    )
+    backup = _backup_and_open(s, tmp_path)
+    with open_for_write(s) as conn:
+        retract(conn, "prices_daily", [("A", d) for d in _days(20)], "dup", "rel", "line 1")
+        _master(conn, "A:new", "AAA2")
+        for d in _days(20):
+            _bar(conn, "A:new", d)
+        conn.execute(
+            "UPDATE prices_daily SET open = ?, high = ?, low = ?, close = ?, volume = 2 "
+            "WHERE security_id = 'A:new'",
+            list(new),
+        )
+    return s, backup
+
+
+def _both(s: Settings, backup: Path, decimals: int | None) -> tuple[int, int]:
+    """(unmoved sessions by `release_coverage`, unreceived by `release_retractions`)."""
+    from tradepartner.store import registry
+
+    with duckdb.connect(s.store.path, read_only=True) as conn:
+        conn.execute(f"ATTACH '{backup}' AS bk (READ_ONLY)")
+        (loss,) = release_coverage(
+            conn, backup_alias="bk", retraction_release="rel", price_decimals=decimals
+        )
+        (span,) = registry.release_retractions(
+            conn, "rel", backup_alias="bk", price_decimals=decimals
+        )
+    assert loss.revised == loss.moved and len(span.revised) == 20 - len(span.unreceived)
+    return loss.unmoved, len(span.unreceived)
+
+
+_SNTI_JTAI_OLD = (0.1732, 0.9, 0.8651, 0.8948)
+_SNTI_JTAI_NEW = (0.17325, 0.9, 0.86515, 0.89485)
+
+
+def test_a_bar_the_receiver_holds_at_higher_precision_is_the_same_bar(tmp_path: Path) -> None:
+    """#3465: the retracted bar is the receiver's cut to 4 decimals, with another
+    volume: a vendor revision at the configured precision, unreceived without it."""
+    s, backup = _precision_store(tmp_path, _SNTI_JTAI_OLD, _SNTI_JTAI_NEW)
+    assert _both(s, backup, None) == (20, 20)
+    assert _both(s, backup, 4) == (0, 0)
+
+
+def test_a_whole_unit_at_the_older_precision_is_still_another_price(tmp_path: Path) -> None:
+    """No widening: 0.1733 against 0.1732 differs by one unit of the 4th decimal."""
+    s, backup = _precision_store(tmp_path, _SNTI_JTAI_OLD, (0.1733, 0.9, 0.86515, 0.89485))
+    assert _both(s, backup, 4) == (20, 20)
+
+
+def test_an_older_price_held_at_more_decimals_needs_the_tolerance(tmp_path: Path) -> None:
+    """The rule reads the older row's stored precision: 0.17321 is not on the
+    4-decimal grid, so the receiver's 0.17325 is another price."""
+    s, backup = _precision_store(tmp_path, (0.17321, 0.9, 0.8651, 0.8948), _SNTI_JTAI_NEW)
+    assert _both(s, backup, 4) == (20, 20)

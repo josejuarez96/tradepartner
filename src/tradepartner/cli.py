@@ -4684,6 +4684,7 @@ def make_app(
                     conn,
                     backup_alias="bk",
                     price_tolerance=s.store.release_move_price_tolerance,
+                    price_decimals=s.store.release_move_price_decimals,
                     retraction_release=name,
                     accepted=registry.approved_orphans(conn, name)[1],
                 )
@@ -4691,6 +4692,7 @@ def make_app(
                     conn,
                     name,
                     price_tolerance=s.store.release_move_price_tolerance,
+                    price_decimals=s.store.release_move_price_decimals,
                     backup_alias="bk",
                 )
                 ownerless = registry.ownerless_rows(conn)

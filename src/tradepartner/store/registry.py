@@ -140,6 +140,7 @@ from tradepartner.config_backtest import DelistingFailureReturn
 from tradepartner.config_edgar import PRE_2826_STATEMENT_FACTS
 from tradepartner.store.benchmarks import CHECK_ONLY_IDS
 from tradepartner.store.db import configure_connection, insert_row, utc_now
+from tradepartner.store.release_coverage import price_match_sql
 from tradepartner.store.schema import (
     REBALANCE_COUNT_COLUMNS,
     REBALANCE_COUNTS_TABLE_NAME,
@@ -2257,6 +2258,7 @@ def release_retractions(
     name: str,
     *,
     price_tolerance: float = 1e-6,
+    price_decimals: int | None = None,
     backup_alias: str | None = None,
 ) -> list[RetractedSpan]:
     """The unrestored `retracted_rows` of release `name`, by table and security id.
@@ -2266,7 +2268,8 @@ def release_retractions(
     `backup_alias` (the release backup, attached), a retracted bar is also received
     when another id gained a bar for that session (none in the backup) with the same
     open and close: the vendor now serves a revised bar (#3432), listed as `revised`.
-    Empty on a
+    Prices compare by `price_match_sql`: with `price_decimals`, a retracted price held
+    at that precision matches a newer one cut to it (#3465). Empty on a
     store without the table. Reads only."""
     if not _has_table(conn, "retracted_rows"):
         return []
@@ -2294,13 +2297,13 @@ def release_retractions(
         revised: list[date] = []
         receivers: set[str] = set()
         for day in days:  # one bar per session: its newest retracted revision
-            heard = _bar_receivers(conn, sid, day, latest[day], price_tolerance)
+            heard = _bar_receivers(conn, sid, day, latest[day], price_tolerance, price_decimals)
             receivers |= set(heard)
             if heard:
                 continue
             if backup_alias is not None:
                 again = _revision_receivers(
-                    conn, backup_alias, sid, day, latest[day], price_tolerance
+                    conn, backup_alias, sid, day, latest[day], price_tolerance, price_decimals
                 )
                 if again:
                     receivers |= set(again)
@@ -2331,6 +2334,7 @@ def _bar_receivers(
     day: date,
     values: Mapping[str, str],
     tolerance: float,
+    decimals: int | None = None,
 ) -> list[str]:
     try:
         o, h, lo, cl = (float(values[k]) for k in ("open", "high", "low", "close"))
@@ -2340,20 +2344,20 @@ def _bar_receivers(
             f"retracted bar {sid} {day} has a missing or unreadable price or volume field: "
             f"{ {k: values.get(k) for k in ('open', 'high', 'low', 'close', 'volume')} }"
         ) from None
+    same = {
+        c: price_match_sql(f"g.{c}", f"r.{c}", tolerance, decimals) for c in ("o", "h", "lo", "cl")
+    }
     found = conn.execute(
-        """
-        SELECT DISTINCT security_id FROM (
+        f"""
+        WITH r AS (SELECT ?::DOUBLE AS o, ?::DOUBLE AS h, ?::DOUBLE AS lo, ?::DOUBLE AS cl)
+        SELECT DISTINCT g.security_id FROM (
             SELECT security_id, arg_max(open, known_at) AS o, arg_max(high, known_at) AS h,
                    arg_max(low, known_at) AS lo, arg_max(close, known_at) AS cl,
                    arg_max(volume, known_at) AS v
-            FROM prices_daily WHERE session = ? AND security_id <> ? GROUP BY security_id)
-        WHERE v = ?
-          AND abs(o - ?) <= ? * greatest(1, abs(?))
-          AND abs(h - ?) <= ? * greatest(1, abs(?))
-          AND abs(lo - ?) <= ? * greatest(1, abs(?))
-          AND abs(cl - ?) <= ? * greatest(1, abs(?))
+            FROM prices_daily WHERE session = ? AND security_id <> ? GROUP BY security_id) g, r
+        WHERE g.v = ? AND {same["o"]} AND {same["h"]} AND {same["lo"]} AND {same["cl"]}
         """,
-        [day, sid, volume, o, tolerance, o, h, tolerance, h, lo, tolerance, lo, cl, tolerance, cl],
+        [o, h, lo, cl, day, sid, volume],
     ).fetchall()
     return [str(r[0]) for r in found]
 
@@ -2365,27 +2369,31 @@ def _revision_receivers(
     day: date,
     values: Mapping[str, str],
     tolerance: float,
+    decimals: int | None = None,
 ) -> list[str]:
     """Ids other than `sid` that gained a bar for `day` since the backup (no bar of
     that session in it) whose open and close equal the retracted bar's within
     `tolerance`: the vendor's revised bar of the same session (#3432). Volume, high
-    and low may differ. `_bar_receivers` has already parsed `values`."""
+    and low may differ; prices compare by `price_match_sql` (#3465). `_bar_receivers`
+    has already parsed `values`."""
     if re.fullmatch(r"[a-z_][a-z0-9_]*", backup_alias) is None:
         raise ValueError(f"bad backup alias {backup_alias!r}")
     o, cl = float(values["open"]), float(values["close"])
     root = sid.split(":")[0].split("@")[0]
+    same_o = price_match_sql("g.o", "r.o", tolerance, decimals)
+    same_cl = price_match_sql("g.cl", "r.cl", tolerance, decimals)
     found = conn.execute(
         f"""
-        SELECT DISTINCT security_id FROM (
+        WITH r AS (SELECT ?::DOUBLE AS o, ?::DOUBLE AS cl)
+        SELECT DISTINCT g.security_id FROM (
             SELECT security_id, arg_max(open, known_at) AS o, arg_max(close, known_at) AS cl
-            FROM prices_daily WHERE session = ? AND security_id <> ? GROUP BY security_id) g
+            FROM prices_daily WHERE session = ? AND security_id <> ? GROUP BY security_id) g, r
         WHERE split_part(split_part(g.security_id, ':', 1), '@', 1) = ?
           AND NOT EXISTS (SELECT 1 FROM {backup_alias}.prices_daily b
                           WHERE b.security_id = g.security_id AND b.session = ?)
-          AND abs(o - ?) <= ? * greatest(1, abs(?))
-          AND abs(cl - ?) <= ? * greatest(1, abs(?))
+          AND {same_o} AND {same_cl}
         """,
-        [day, sid, root, day, o, tolerance, o, cl, tolerance, cl],
+        [o, cl, day, sid, root, day],
     ).fetchall()
     return [str(r[0]) for r in found]
 

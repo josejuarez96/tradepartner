@@ -3501,6 +3501,21 @@ def test_a_different_bar_gained_with_another_open_is_not_a_revision(tmp_path: Pa
     assert "1 of 1 sessions NOT RECEIVED" in checked.output
 
 
+def test_a_revision_at_higher_precision_is_received_under_the_configured_decimals(
+    tmp_path: Path,
+) -> None:
+    """#3465: the retracted open 1.0 (4 decimals) is the receiver's 1.00005 cut to
+    `store.release_move_price_decimals`; one whole unit (1.0001) is another price."""
+    settings, _ = _cov_open(tmp_path)
+    _cov_revised_receiver(settings, open_=1.00005, volume=7)
+    checked = _cov_run(settings)
+    assert checked.exit_code == 0, checked.output
+    assert "1 sessions refetched as a vendor revision" in checked.output
+    other, _ = _cov_open(tmp_path / "unit")
+    _cov_revised_receiver(other, open_=1.0001, volume=7)
+    assert "1 of 1 sessions NOT RECEIVED" in _cov_run(other).output
+
+
 def test_a_revised_bar_the_receiver_already_held_is_not_a_vendor_revision(tmp_path: Path) -> None:
     """B held a bar for the session in the backup (a collision, not a gain): unmoved."""
     settings, _ = _cov_open(tmp_path)
