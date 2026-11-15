@@ -217,13 +217,6 @@ def test_a_missing_store_is_exit_2(tmp_path: Path) -> None:
     assert "no store" in out
 
 
-def test_store_option_points_at_another_file(store: Settings, tmp_path: Path) -> None:
-    other = Settings(_env_file=None, store={"path": str(tmp_path / "nowhere.duckdb")})
-    code, out = invoke(other, "--store", store.store.path, "--history", "mar-nyse-chicago-2020")
-    assert code == 0, out
-    assert store.store.path in out
-
-
 def test_a_run_writes_nothing(store: Settings) -> None:
     before = digest(store.store.path)
     invoke(store)
@@ -245,7 +238,7 @@ def test_the_store_is_opened_read_only(store: Settings, monkeypatch: pytest.Monk
 
 def test_the_option_set_is_pinned() -> None:
     command = typer.main.get_command(cli.make_app()).commands["identity-check"]  # type: ignore[attr-defined]
-    assert {opt for p in command.params for opt in p.opts} >= {"--store", "--history"}
+    assert {opt for p in command.params for opt in p.opts} == {"--history"}
 
 
 def test_rows_known_after_the_check_leave_the_result_unchanged(store: Settings) -> None:
