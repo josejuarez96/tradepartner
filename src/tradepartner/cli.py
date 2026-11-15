@@ -4222,6 +4222,8 @@ def make_app(
             with open_read_only(s) as conn:
                 found = stale_keys_module.stale_keys(
                     conn,
+                    settings=s,
+                    reading=datetime.now(UTC),
                     accepted_relistings=s.alpaca.accepted_relistings,
                     keep_successors=s.master.keep_successors,
                 )
@@ -4232,7 +4234,11 @@ def make_app(
             return
         for item in found:
             typer.echo(item.line)
-        raise _fail(f"{len(found)} stale keys: re-key each entry to the rebuilt id", 1)
+        raise _fail(
+            f"{len(found)} stale keys: re-key missing ids; read superseded hits; "
+            "never drop a keep entry without the owner",
+            1,
+        )
 
     @app.command()
     def export(
