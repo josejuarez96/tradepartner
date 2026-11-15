@@ -13,6 +13,7 @@ with no jump at the compare level. The literal check on `reconcile.py` is T50's.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -25,6 +26,7 @@ from tradepartner.config import RiskConfig
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.reconcile import (
     Explanations,
+    FilledOrder,
     JournalOpenOrder,
     Reconciliation,
     SymbolChangeRecord,
@@ -127,6 +129,7 @@ def _run(
     explanations: Explanations | None = None,
     account_id: str = "acct-1",
     frozen: RiskConfig = FROZEN,
+    filled_orders: Sequence[FilledOrder] = (),
 ) -> Reconciliation:
     return compare(
         ledger,
@@ -138,6 +141,7 @@ def _run(
         WINDOW,
         frozen,
         order_id_prefix=PREFIX,
+        filled_orders=filled_orders,
     )
 
 
@@ -2552,3 +2556,59 @@ def test_an_own_open_order_of_another_size_differs_from_its_row(
 def test_an_own_open_order_of_the_same_size_within_tolerance_passes() -> None:
     assert _kinds(_size_run({"quantity": 100.0}, {})) == []
     assert _kinds(_size_run({"notional": 100.0}, {"notional": 100.004})) == []
+
+
+# --- T400: an order whose live fills exceed its size ----------------------------
+
+
+def test_a_terminal_overfilled_order_reconciles_as_overfilled_not_ok() -> None:
+    """The broker agrees with the journal (both hold 20), the order is terminal, so
+    `_order_mismatches` never sees it: the new pass names it."""
+    row = _order_row("tp-a", "SEC_A", "buy", quantity=10.0)
+    result = _run(
+        _ledger(1_000.0, SEC_A=20.0),
+        _positions(AAA=20.0),
+        1_000.0,
+        filled_orders=[FilledOrder(row, 20.0, 2_000.0)],
+    )
+
+    assert result.status == "mismatch"
+    assert [(m.kind, m.client_order_id) for m in result.mismatches] == [("overfilled", "tp-a")]
+
+
+def test_an_order_filled_at_its_size_or_within_tolerance_is_not_overfilled() -> None:
+    row = _order_row("tp-a", "SEC_A", "buy", quantity=10.0)
+    tol = FROZEN.reconcile_quantity_tolerance
+    for filled in (4.0, 10.0, 10.0 + tol / 2):
+        result = _run(
+            _ledger(1_000.0, SEC_A=filled),
+            _positions(AAA=filled),
+            1_000.0,
+            filled_orders=[FilledOrder(row, filled, filled * 100.0)],
+        )
+        assert "overfilled" not in _kinds(result)
+
+
+def test_a_notional_order_is_overfilled_past_its_buffer_only() -> None:
+    row = _order_row("tp-a", "SEC_A", "buy", notional=500.0)
+    inside = 500.0 * (1 + FROZEN.whole_share_price_buffer)
+    for notional, expected in ((inside, []), (inside + 1.0, ["overfilled"])):
+        result = _run(
+            _ledger(1_000.0, SEC_A=5.0),
+            _positions(AAA=5.0),
+            1_000.0,
+            filled_orders=[FilledOrder(row, 5.0, notional)],
+        )
+        assert [k for k in _kinds(result) if k == "overfilled"] == expected
+
+
+def test_a_size_that_cannot_be_read_is_overfilled_never_a_pass() -> None:
+    row = _order_row("tp-a", "SEC_A", "buy", quantity=10.0)
+    for quantity, notional in ((math.nan, 100.0), (5.0, math.inf)):
+        result = _run(
+            _ledger(1_000.0, SEC_A=5.0),
+            _positions(AAA=5.0),
+            1_000.0,
+            filled_orders=[FilledOrder(row, quantity, notional)],
+        )
+        assert "overfilled" in _kinds(result)

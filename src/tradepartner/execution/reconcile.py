@@ -17,6 +17,11 @@ caller (T61's `reconcile_now`) gathers every input, writes the
   A broker symbol the map does not know is `unknown_symbol` (never journaled); a
   held `security_id` with no symbol is `unknown_security`.
 - Ledger cash against `account.cash` within `risk.reconcile_cash_tolerance`.
+- Every order of the window, terminal or not (`filled_orders`, T400), against its
+  size: live journaled fills above a quantity order's quantity plus the quantity
+  tolerance, or above a notional order's notional x (1 + `risk.whole_share_price_buffer`)
+  plus the cash tolerance, are an `overfilled` mismatch naming the order. Fills the
+  owner accepted with `paper resume --accept-fill-mismatch` are left out of the sums.
 - The journal's non-terminal orders (`lagging`) against `open_orders()`, both
   ways. A broker order without this system's `order_id_prefix` and its `-`
   separator is `foreign_order`. An own order the journal holds `pending` is a
@@ -232,6 +237,19 @@ class JournalOpenOrder:
     journaled_quantity: float
     journaled_notional: float
     reading: Order | None
+
+
+@dataclass(frozen=True)
+class FilledOrder:
+    """One order of the window, terminal or not, with the sums of its live
+    journaled fills' quantity and notional (quantity x price), less any fill the
+    owner accepted with `--accept-fill-mismatch` (T400). The input of the
+    `overfilled` pass, which `JournalOpenOrder` cannot feed: it holds only the
+    non-terminal orders."""
+
+    order: OrderRow
+    journaled_quantity: float
+    journaled_notional: float
 
 
 @dataclass(frozen=True)
@@ -776,13 +794,16 @@ def compare(
     frozen: RiskConfig,
     *,
     order_id_prefix: str,
+    filled_orders: Sequence[FilledOrder] = (),
 ) -> Reconciliation:
     """Compare the ledger stated through S with the broker (module docstring).
 
     `positions` is `Broker.positions()` (keyed by symbol), `open_orders` is
     `Broker.open_orders()`, `lagging` is every non-terminal journal order of the
     window with its reading, `frozen` is the window's frozen `risk` section and
-    `order_id_prefix` is `paper.order_id_prefix`."""
+    `order_id_prefix` is `paper.order_id_prefix`. `filled_orders` is every order
+    of the window with its live journaled fills, for the `overfilled` pass (T400).
+    """
     q_tol = frozen.reconcile_quantity_tolerance
     cash_tol = frozen.reconcile_cash_tolerance
     cash_in_lieu_tolerance = frozen.cash_in_lieu_tolerance
@@ -852,6 +873,7 @@ def compare(
             cash_band.widen(-sign * notional)
 
     mismatches += _order_mismatches(open_orders, lagging, order_id_prefix, q_tol, cash_tol)
+    mismatches += _overfilled(filled_orders, q_tol, buffer, cash_tol)
     # A lagging order's fills are the broker's, each booked to the cent like a
     # journaled one, so each lagging order counts as (at least) one fill in the
     # bound (#2996): a bare `paper reconcile` after a stop run's sells fill, before
@@ -1754,6 +1776,69 @@ def _size_differs(broker: float | None, journal: float | None, tolerance: float)
     if not (math.isfinite(broker) and math.isfinite(journal)):
         return True
     return abs(broker - journal) > tolerance
+
+
+def overfill_detail(
+    order: OrderRow,
+    quantity: float,
+    notional: float,
+    quantity_tolerance: float,
+    buffer: float,
+    cash_tolerance: float,
+) -> str | None:
+    """Why live fills of `quantity` shares and `notional` dollars exceed what
+    `order` asked for (T400), else None. A quantity order allows its quantity
+    plus `risk.reconcile_quantity_tolerance`; a notional order allows `abs(notional)
+    x (1 + risk.whole_share_price_buffer) + risk.reconcile_cash_tolerance` at the
+    fill prices. Fails closed: a sum or a size that is not a finite number, or an
+    order with no size at all, is a reason, never a pass. Pure: `collect` judges
+    a collection's fills with it and `compare` the journal."""
+    if not (math.isfinite(quantity) and math.isfinite(notional)):
+        return f"the fills' quantity {quantity} or notional {notional} is not a finite number"
+    if order.quantity is not None:
+        if not math.isfinite(order.quantity):
+            return f"the order's quantity {order.quantity} is not a finite number"
+        if quantity > order.quantity + quantity_tolerance:
+            return f"filled {quantity} of a quantity order for {order.quantity}"
+        return None
+    if order.notional is None:
+        return "the order has neither a quantity nor a notional"
+    if not math.isfinite(order.notional):
+        return f"the order's notional {order.notional} is not a finite number"
+    limit = abs(order.notional) * (1 + buffer) + cash_tolerance
+    if notional > limit:
+        return f"filled {notional:.2f} of a notional order for {order.notional} (limit {limit:.2f})"
+    return None
+
+
+def _overfilled(
+    filled: Sequence[FilledOrder], quantity_tolerance: float, buffer: float, cash_tolerance: float
+) -> list[Mismatch]:
+    """An `overfilled` mismatch for every order of the window, terminal or not,
+    whose live fills exceed its size (T400): `_order_mismatches` sees only
+    broker-open and journal-open orders, so it cannot name an order that went
+    terminal on an overfill the broker agrees with."""
+    found: list[Mismatch] = []
+    for item in filled:
+        detail = overfill_detail(
+            item.order,
+            item.journaled_quantity,
+            item.journaled_notional,
+            quantity_tolerance,
+            buffer,
+            cash_tolerance,
+        )
+        if detail is not None:
+            found.append(
+                Mismatch(
+                    "overfilled",
+                    detail,
+                    security_id=item.order.security_id,
+                    symbol=item.order.symbol,
+                    client_order_id=item.order.client_order_id,
+                )
+            )
+    return found
 
 
 def _order_mismatches(

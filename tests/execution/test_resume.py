@@ -264,6 +264,7 @@ def _resume(
     accept: bool = False,
     accept_rejections: bool = False,
     accept_fill_band: bool = False,
+    accept_fill_mismatch: bool = False,
     book_id: str | None = None,
 ) -> Any:
     # A real clock moves between reads; the release must be stamped after the
@@ -278,6 +279,7 @@ def _resume(
         accept,
         accept_rejections=accept_rejections,
         accept_fill_band=accept_fill_band,
+        accept_fill_mismatch=accept_fill_mismatch,
         book_id=book_id,
     )
 
@@ -2796,3 +2798,232 @@ def test_a_resume_stated_before_a_true_up_refuses_with_the_reason(
     )
     assert outcome.reconciliation_id is None and outcome.released_event_id is None
     assert _engaged(journal_settings, window)
+
+
+# --- T400: a fill checked against its order; `--accept-fill-mismatch` ---------
+
+
+def _overfilled_order(
+    settings: Settings,
+    fake: SkewedFake,
+    run_id: int,
+    coid: str,
+    clock: FixedClock,
+    *,
+    broker_quantity: float = 4.0,
+    journal_quantity: float = 2.0,
+) -> OrderRow:
+    """An order the journal holds for `journal_quantity` that the broker holds, and
+    fills, for `broker_quantity`: the broker's books and the fill agree, the order does
+    not."""
+    at = DAY1 - timedelta(hours=1)
+    order = _order(settings, fake, run_id, coid, broker_quantity, at)
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "UPDATE orders SET quantity = ? WHERE client_order_id = ?", [journal_quantity, coid]
+        )
+    fake.apply(coid, FillAt(PRICE))
+    return replace(order, quantity=journal_quantity)
+
+
+def _halts(settings: Settings, window: PaperWindowRow) -> list[KillSwitchRow]:
+    with open_read_only(settings) as conn:
+        return kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+
+
+def test_a_mismatched_fill_halts_a_plain_resume_and_the_halt_names_the_fill_ids(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _overfilled_order(journal_settings, fake, crashed, "tp-a", fixed_clock)
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("fill_mismatch" in r for r in outcome.reasons)
+    assert _all_fills(journal_settings, "tp-a") == []
+    assert _engaged(journal_settings, window)
+    named = [
+        resume_module.fill_mismatch_ids(e.reason)
+        for e in _halts(journal_settings, window)
+        if resume_module.is_fill_mismatch_fault(e.reason)
+    ]
+    assert named == [("fake-fill-1",)]
+
+
+def test_accept_fill_mismatch_journals_the_named_fill_with_its_acceptance_and_releases(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _overfilled_order(journal_settings, fake, crashed, "tp-a", fixed_clock)
+    _engage(journal_settings, window, fixed_clock)
+    assert _resume(journal_settings, fake, fixed_clock).status == REFUSED
+
+    unaccepted = _resume(journal_settings, fake, fixed_clock, accept=True)
+    assert unaccepted.status == REFUSED and _all_fills(journal_settings, "tp-a") == []
+
+    accepted = _resume(journal_settings, fake, fixed_clock, accept_fill_mismatch=True)
+
+    assert accepted.status == RELEASED, accepted.reasons
+    assert accepted.accepted_fill_mismatch == ("fake-fill-1",)
+    assert [row[4] for row in _all_fills(journal_settings, "tp-a")] == ["fake-fill-1"]
+    with open_read_only(journal_settings) as conn:
+        (row,) = [r for r in resume_acceptances(conn) if r.resume_id == accepted.resume_id]
+    (entry,) = json.loads(row.accepted_json)
+    assert (entry["kind"], entry["fill_ids"]) == ("fill_mismatch", ["fake-fill-1"])
+    assert not _engaged(journal_settings, window)
+
+
+def test_accept_fill_mismatch_leaves_the_accepted_fill_out_of_later_reconciliations(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _overfilled_order(journal_settings, fake, crashed, "tp-a", fixed_clock)
+    _engage(journal_settings, window, fixed_clock)
+    _resume(journal_settings, fake, fixed_clock)
+    assert (
+        _resume(journal_settings, fake, fixed_clock, accept_fill_mismatch=True).status == RELEASED
+    )
+
+    again = reconcile_now(
+        journal_settings,
+        lambda: open_for_write(journal_settings),
+        fake,
+        window,
+        DAY1.date(),
+        fixed_clock,
+        lambda: open_for_write(journal_settings),
+        frozen=FROZEN,
+        as_of=fixed_clock.advance(minutes=1),
+    )
+
+    assert again.status == "ok", again.mismatches
+
+
+def test_a_journal_that_already_holds_an_overfill_does_not_release(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An overfill on a terminal order, the broker agreeing with the journal, once
+    reconciled `ok`; it is `overfilled` now."""
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
+    run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=True)
+    order = _overfilled_order(journal_settings, fake, run_id, "tp-a", fixed_clock)
+    _collect_unchecked(journal_settings, fake, fixed_clock, order, run_id)
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("overfilled" in r for r in outcome.reasons), outcome.reasons
+    assert _engaged(journal_settings, window)
+
+
+def _collect_unchecked(
+    settings: Settings, fake: SkewedFake, clock: FixedClock, order: OrderRow, run_id: int
+) -> None:
+    """Journal the order's fill and terminal event as an older build did, with no
+    fill check: the order row is widened for the collect and narrowed back."""
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "UPDATE orders SET quantity = 4 WHERE client_order_id = ?", [order.client_order_id]
+        )
+    _collect(settings, fake, clock, [replace(order, quantity=4.0)], run_id)
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "UPDATE orders SET quantity = 2 WHERE client_order_id = ?", [order.client_order_id]
+        )
+
+
+def test_a_fill_that_arrived_after_the_halt_is_not_accepted_by_it(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _overfilled_order(journal_settings, fake, crashed, "tp-a", fixed_clock)
+    _engage(journal_settings, window, fixed_clock)
+    assert _resume(journal_settings, fake, fixed_clock).status == REFUSED  # halt names fill 1
+    _overfilled_order(journal_settings, fake, crashed, "tp-b", fixed_clock)  # fill 2, unnamed
+
+    outcome = _resume(journal_settings, fake, fixed_clock, accept_fill_mismatch=True)
+
+    assert outcome.status == REFUSED
+    assert any("fake-fill-2" in r for r in outcome.reasons)
+    assert _all_fills(journal_settings, "tp-a") == [] == _all_fills(journal_settings, "tp-b")
+    assert _count(journal_settings, "resume_acceptances") == 0
+    assert _engaged(journal_settings, window)
+    # The new halt names the fill, so the next flagged resume covers both.
+    named = set(resume_module._named_fill_mismatches(_halts(journal_settings, window)))
+    assert named == {"fake-fill-1", "fake-fill-2"}
+    both = _resume(journal_settings, fake, fixed_clock, accept_fill_mismatch=True)
+    assert both.status == RELEASED, both.reasons
+    assert both.accepted_fill_mismatch == ("fake-fill-1", "fake-fill-2")
+
+
+def test_accept_fill_mismatch_with_no_halt_naming_a_fill_refuses(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock, accept_fill_mismatch=True)
+
+    assert outcome.status == REFUSED
+    assert any("nothing to accept" in r for r in outcome.reasons)
+    assert _engaged(journal_settings, window)
+
+
+def test_accept_fill_mismatch_does_not_share_a_resume_with_other_acceptances(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _overfilled_order(journal_settings, fake, crashed, "tp-a", fixed_clock)
+    _engage(journal_settings, window, fixed_clock)
+    _resume(journal_settings, fake, fixed_clock)
+
+    both = _resume(
+        journal_settings, fake, fixed_clock, accept_fill_mismatch=True, accept_rejections=True
+    )
+
+    assert both.status == REFUSED
+    assert any("resume again" in r for r in both.reasons)
+    assert [row[4] for row in _all_fills(journal_settings, "tp-a")] == ["fake-fill-1"]
+    assert _count(journal_settings, "resume_acceptances") == 1
+    assert _resume(journal_settings, fake, fixed_clock, accept_rejections=True).status == RELEASED
+
+
+def test_accept_fill_mismatch_must_be_a_bool(
+    journal_settings: Settings, fake: SkewedFake, fixed_clock: FixedClock
+) -> None:
+    with pytest.raises(TypeError, match="accept_fill_mismatch"):
+        _resume(journal_settings, fake, fixed_clock, accept_fill_mismatch=1)  # type: ignore[arg-type]
