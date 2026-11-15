@@ -169,6 +169,10 @@ def stale_keys(
             )
             if others:
                 found.append(
-                    StaleKey(KEEP_SUCCESSORS, entry, f"superseded: same listing span on {others}")
+                    StaleKey(
+                        KEEP_SUCCESSORS,
+                        entry,
+                        f"superseded: same listing span on {others} (owner review)",
+                    )
                 )
     return tuple(found)
