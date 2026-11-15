@@ -160,3 +160,58 @@ def test_a_refetched_bar_is_stamped_no_earlier_than_its_session_close(settings: 
         "AND session >= DATE '2019-06-17' AND known_at < CAST(session AS TIMESTAMPTZ)",
     )
     assert late == [(0,)]
+
+
+def test_a_retracted_session_whose_receiver_holds_a_different_bar_is_a_hole(
+    settings: Settings,
+) -> None:
+    """ALTI: the receiver trades a foreign line every session, so no month has a gap."""
+    assert _backfill(settings, _History()).ok
+    days = _sessions(*JUNE_WINDOW)
+    keys = [(ACME, d) for d in days]
+    with open_for_write(settings) as conn:
+        retract(conn, "prices_daily", keys, "foreign", RELEASE, "r", at=THEN)
+    _open_release(settings)
+    # Refill ACME with the foreign line: restore the rows, then change them.
+    with open_for_write(settings) as conn:
+        for d in days:
+            conn.execute(
+                "INSERT INTO prices_daily (security_id, session, open, high, low, close, volume, "
+                "known_at, ingested_at, source, provenance) "
+                "SELECT ?, ?, 3.0, 3.0, 3.0, 3.0, 5, known_at, ?, source, provenance "
+                "FROM prices_daily WHERE security_id = ? LIMIT 1",
+                [ACME, d, THEN - timedelta(days=30), SPY],
+            )
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(found) == [(ACME, JUNE_WINDOW)]
+    assert fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER).exit_code == 0
+    # Answered: the refetched bar is newer than the retraction, so no hole is left.
+    again = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert again.holes == ()
+
+
+def test_a_retracted_session_after_the_receivers_last_bar_is_a_hole(settings: Settings) -> None:
+    """APPH: not a delisting tail, the bar was real."""
+    assert _backfill(settings, _History()).ok
+    last = _sessions(*JUNE_WINDOW)[-1]
+    _retract(settings, [last])
+    _open_release(settings)
+    assert _acme_sessions(settings, JUNE_WINDOW)[-1] < last
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(found) == [(ACME, JUNE_WINDOW)]
+
+
+def test_a_retracted_session_inside_a_month_the_receiver_lacks_is_a_hole(
+    settings: Settings,
+) -> None:
+    """NHWK: an interior gap of whole months, only a few sessions retracted."""
+    assert _backfill(settings, _History()).ok
+    with duckdb.connect(settings.store.path) as conn:
+        conn.execute(
+            "DELETE FROM prices_daily WHERE security_id = ? AND session BETWEEN ? AND ?",
+            [ACME, date(2019, 5, 1), date(2019, 5, 20)],
+        )
+    _retract(settings, _sessions(date(2019, 5, 21), date(2019, 5, 24)))
+    _open_release(settings)
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert (ACME, (date(2019, 5, 1), date(2019, 5, 31))) in _holes(found)

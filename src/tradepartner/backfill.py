@@ -840,13 +840,15 @@ def _retracted_holes(
     for row in listings_as_of(conn, t).iter_rows(named=True):
         tickers[row["security_id"]].append((row["valid_from"], row["ticker"]))
     held = {
-        (str(sid), day)
-        for sid, day in conn.execute(
-            "SELECT DISTINCT security_id, session FROM prices_daily "
-            "WHERE session BETWEEN ? AND ? AND known_at <= ?",
+        (str(sid), day): (o, c, ingested)
+        for sid, day, o, c, ingested in conn.execute(
+            "SELECT security_id, session, arg_max(open, known_at), arg_max(close, known_at), "
+            "max(ingested_at) FROM prices_daily "
+            "WHERE session BETWEEN ? AND ? AND known_at <= ? GROUP BY security_id, session",
             [first, last, t],
         ).fetchall()
     }
+    was = _retracted_prices(conn, t, window)
     fetched = set(ids)
     out: set[str] = set()
     for sid, day in days:
@@ -856,12 +858,51 @@ def _retracted_holes(
         if ticker is None or alpaca_symbol(ticker) is None:
             continue
         receiver = resolver.resolve(ticker, day) or resolver.lead(ticker, day)
-        if receiver is None or receiver not in fetched or (receiver, day) in held:
+        if receiver is None or receiver not in fetched:
+            continue
+        have = held.get((receiver, day))
+        if have is not None and not _foreign(have, was.get((sid, day))):
             continue
         if only is not None and receiver not in only:
             continue
         out.add(receiver)
     return out
+
+
+def _retracted_prices(
+    conn: duckdb.DuckDBPyConnection, t: datetime, window: tuple[date, date]
+) -> dict[tuple[str, date], tuple[float, float, datetime]]:
+    """The (open, close, retracted_at) of each bar the open release retracted by
+    `t` in `window` (the newest revision of a key)."""
+    release = open_release(conn)
+    if release is None:
+        return {}
+    rows = conn.execute(
+        "SELECT row_key[1], CAST(row_key[2] AS DATE), "
+        "arg_max(CAST(row_values['open'] AS DOUBLE), retracted_at), "
+        "arg_max(CAST(row_values['close'] AS DOUBLE), retracted_at), max(retracted_at) "
+        "FROM retracted_rows WHERE table_name = 'prices_daily' AND release = ? "
+        "AND restored_at IS NULL AND retracted_at <= ? "
+        "AND CAST(row_key[2] AS DATE) BETWEEN ? AND ? GROUP BY ALL",
+        [release.name, t, *window],
+    ).fetchall()
+    return {(str(sid), day): (o, c, at) for sid, day, o, c, at in rows}
+
+
+def _foreign(
+    have: tuple[float, float, datetime], was: tuple[float, float, datetime] | None
+) -> bool:
+    """True when the bar a receiver holds on a retracted session is not the
+    retracted line's: a different open or close (a vendor revision keeps both,
+    #3432) that was fetched before the retraction, so no fill has answered it yet
+    (#3431: a foreign line under the id that trades every session)."""
+    if was is None:
+        return False
+    close = 1e-6
+    same = abs(have[0] - was[0]) <= close * max(1.0, abs(was[0])) and abs(have[1] - was[1]) <= (
+        close * max(1.0, abs(was[1]))
+    )
+    return not same and have[2] < was[2]
 
 
 def _tail_windows(
