@@ -164,7 +164,12 @@ the process date (#3471, `ResolverReport.symbol_changes_ended`): Alpaca
 serves the old symbol no bar of it after the change, so the bars a later
 reuser of the symbol trades under it (AlTi's `GLBL -> ALTI` of 2023-01-04
 while its Class A id lists `ALTI`, then another issuer's `GLBL` from
-2024-09-17) never resolve to it; the new ticker stays the sibling's.
+2024-09-17) never resolve to it. From the process date up to the sibling's
+first row under the new ticker (and the old span's own end) the security holds
+the new ticker, as a followed change would give it (Fortress Value's
+`FVAC -> MP` of 2020-11-18, MP's class id listed from 2021-03-22), unless
+another issuer's equity row under it starts before that row; from the
+sibling's row on, the new ticker stays the sibling's.
 A change stored on an id with no listing row known at the run (a lost id
 whose rows master-retract withdrew) is carried to the one id of its issuer
 (`_same_issuer`) whose last equity row before `process_date` is under `old`
@@ -1020,12 +1025,14 @@ class ListingResolver:
         # change only ever adds sessions to its own security.
         refused = 0
         # #3471: a change refused because another id of its issuer lists the
-        # new ticker (a sibling class, `_sibling_lists`) still ends its old
+        # new ticker (a sibling class, `_sibling_start`) still ends its old
         # ticker on its security at the process date: Alpaca serves the old
         # symbol no bar of it after the change, and a later reuser of the
         # symbol must not price it (GLBL -> ALTI while AlTi's Class A id lists
-        # ALTI, then another issuer's GLBL from 2024-09-17).
-        ends: set[tuple[str, date, str]] = set()
+        # ALTI, then another issuer's GLBL from 2024-09-17). Up to the
+        # sibling's first row under the new ticker the security trades under
+        # it (FVAC -> MP of 2020-11-18, MP's class id listed from 2021-03-22).
+        ends: set[tuple[str, date, str, str, date | None]] = set()
         base: ListingResolver | None = None
         while True:
             late, followed = self._build(listings, evidence, changes, ends=ends, **options)
@@ -1037,11 +1044,18 @@ class ListingResolver:
                 break
             changes = [change for change in changes if change not in late]
             refused += len(late)
-            ends |= {
-                (security_id, day, old)
-                for security_id, day, old, new in late
-                if _sibling_lists(listings, security_id, new, class_symbols)
-            }
+            for security_id, day, old, new in late:
+                sibling = _sibling_start(listings, security_id, new, class_symbols)
+                if sibling is not None:
+                    window = (
+                        sibling
+                        if sibling > day
+                        and not _other_issuer_lists(
+                            listings, security_id, new, sibling, class_symbols
+                        )
+                        else None
+                    )
+                    ends.add((security_id, day, old, new, window))
         self._ends = frozenset(ends)  # #3471, for an audit of which changes ended
         if refused:
             self.report = replace(
@@ -1080,7 +1094,7 @@ class ListingResolver:
         evidence: RegistrantEvidence | None,
         changes: list[tuple[str, date, str, str]],
         *,
-        ends: Collection[tuple[str, date, str]] = (),
+        ends: Collection[tuple[str, date, str, str, date | None]] = (),
         rename_lead_days: int,
         accepted_relistings: Collection[str],
         first_sessions: Mapping[str, date] | None,
@@ -1089,16 +1103,19 @@ class ListingResolver:
         handover_sessions: int | None,
     ) -> tuple[set[tuple[str, date, str, str]], list[tuple[str, date, str, str]]]:
         """Build every mapping from `listings` with `changes` followed and
-        each of `ends` `(security_id, process_date, old)` (#3471: a change
-        refused for a sibling class) ending that security's equity span under
-        `old` on the process date; the followed changes the built mapping does
-        not honour (to refuse), and every change followed."""
+        each of `ends` `(security_id, process_date, old, new, until)` (#3471:
+        a change refused for a sibling class) ending that security's equity
+        span under `old` on the process date, and, with `until`, giving it a
+        span under `new` from that day to the earlier of `until` (the
+        sibling's first row under `new`) and the old span's end; the followed
+        changes the built mapping does not honour (to refuse), and every
+        change followed."""
         changes_of: dict[str, list[tuple[date, str, str]]] = defaultdict(list)
         for security_id, day, before, after in changes:
             changes_of[security_id].append((day, before, after))
-        ends_of: dict[str, list[tuple[date, str]]] = defaultdict(list)
-        for security_id, day, symbol in ends:
-            ends_of[security_id].append((day, symbol))
+        ends_of: dict[str, list[tuple[date, str, str, date | None]]] = defaultdict(list)
+        for security_id, day, symbol, renamed, until in ends:
+            ends_of[security_id].append((day, symbol, renamed, until))
         self._ends_applied = 0
         followed: list[tuple[str, date, str, str]] = []
         unmatched = 0
@@ -1177,19 +1194,26 @@ class ListingResolver:
                     end if left is None else left,
                     filing_name=all(row.filing_name for row in rows[first:index]),
                 )
+                window: TickerSpan | None = None
                 if kinds == {EQUITY}:
-                    stop = min(
+                    end_at = min(
                         (
-                            day
-                            for day, ended in ends_of.get(security_id, ())
+                            (day, renamed, until)
+                            for day, ended, renamed, until in ends_of.get(security_id, ())
                             if same_alpaca_symbol(ended, ticker)
                             and span.covers(day)
                             and start < day
                         ),
                         default=None,
                     )
-                    if stop is not None:
-                        span = replace(span, end=stop)
+                    if end_at is not None:
+                        day, renamed, until = end_at
+                        if until is not None:
+                            last = until if span.end is None else min(until, span.end)
+                            window = TickerSpan(
+                                security_id, alpaca_symbol(renamed) or renamed, day, last
+                            )
+                        span = replace(span, end=day)
                         self._ends_applied += 1
                 if left is not None:
                     cut.add(span)
@@ -1213,6 +1237,10 @@ class ListingResolver:
                     same_day_listings += index - first
                 else:
                     self._by_ticker[ticker].append(span)
+                if window is not None:  # #3471: the new ticker up to the sibling's row
+                    self._by_security[security_id].append(window)
+                    self._history[security_id].append(window)
+                    self._by_ticker[window.ticker].append(window)
         # A repair successor's row duplicating its predecessor's (#874) holds
         # the ticker alone: the predecessor's span is dropped before any other
         # rule, so it is never a tie (rule 4) nor a rival claim (rule 6). The
@@ -2441,24 +2469,55 @@ def _carry_orphan_changes(
     return out
 
 
-def _sibling_lists(
+def _equity_rows_under(
+    listings: Sequence[Mapping[str, Any]],
+    symbol: str,
+    class_symbols: Mapping[str, str] | None,
+) -> Iterator[tuple[str, date]]:
+    """`(security_id, valid_from)` of each equity row in `listings` under
+    `symbol` (Alpaca's form)."""
+    for row in listings:
+        ticker = str(row["ticker"])
+        if is_placeholder_ticker(ticker) or listing_kind(ticker, row.get("class_title")) != EQUITY:
+            continue
+        if same_alpaca_symbol(master_symbol(row, class_symbols) or ticker, symbol):
+            yield str(row["security_id"]), row["valid_from"]
+
+
+def _sibling_start(
     listings: Sequence[Mapping[str, Any]],
     security_id: str,
     symbol: str,
     class_symbols: Mapping[str, str] | None,
+) -> date | None:
+    """The first `valid_from` of an equity row under `symbol` in `listings`
+    of another id of `security_id`'s issuer (`_same_issuer`), else `None`
+    (#3471: AlTi's Class A id listing `ALTI` from 2023-04-17 when the bare
+    id's `GLBL -> ALTI` is refused). Pure."""
+    return min(
+        (
+            day
+            for sid, day in _equity_rows_under(listings, symbol, class_symbols)
+            if sid != security_id and _same_issuer(sid, security_id)
+        ),
+        default=None,
+    )
+
+
+def _other_issuer_lists(
+    listings: Sequence[Mapping[str, Any]],
+    security_id: str,
+    symbol: str,
+    before: date,
+    class_symbols: Mapping[str, str] | None,
 ) -> bool:
-    """True when another id of `security_id`'s issuer (`_same_issuer`) has an
-    equity row in `listings` under `symbol` (#3471: AlTi's Class A id listing
-    `ALTI` when the bare id's `GLBL -> ALTI` is refused). Pure."""
-    for row in listings:
-        sid, ticker = str(row["security_id"]), str(row["ticker"])
-        if sid == security_id or not _same_issuer(sid, security_id):
-            continue
-        if is_placeholder_ticker(ticker) or listing_kind(ticker, row.get("class_title")) != EQUITY:
-            continue
-        if same_alpaca_symbol(master_symbol(row, class_symbols) or ticker, symbol):
-            return True
-    return False
+    """True when an id of another issuer has an equity row under `symbol`
+    starting before `before` (#3471: the window under the new ticker would
+    take its sessions, so none is given). Pure."""
+    return any(
+        day < before and not _same_issuer(sid, security_id)
+        for sid, day in _equity_rows_under(listings, symbol, class_symbols)
+    )
 
 
 def _last_under(rows: Sequence[tuple[date, str]], day: date, symbol: str) -> bool:

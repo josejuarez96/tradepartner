@@ -134,6 +134,8 @@ def store(tmp_path: Path) -> Settings:
             _bar(conn, SPY, day, 500.0)
         for day in _sessions(date(2022, 11, 1), date(2023, 1, 3)):
             _bar(conn, BASE, day, 9.86)  # the SPAC
+        for day in _sessions(CHANGED, date(2023, 4, 14)):
+            _bar(conn, BASE, day, 10.5)  # AlTi as ALTI before its class id's row
         for day in _sessions(*FOREIGN):
             _bar(conn, BASE, day, 24.96)  # a later reuser of GLBL
         for day in _sessions(date(2023, 4, 17), FOREIGN[1]):
@@ -146,5 +148,78 @@ def test_the_reusers_bars_on_the_bare_id_are_found_and_no_alti_bar_is(store: Set
     assert set(result.found.bars) == {(BASE, day) for day in _sessions(*FOREIGN)}
     assert not [key for key in (*result.found.bars, *result.orphans) if key[0] == CLASS]
     assert not result.duplicates
-    # The SPAC's own GLBL bars before the change stay.
-    assert all(day >= CHANGED for _, day in result.found.bars)
+    # The SPAC's own GLBL bars before the change, and its ALTI bars up to the
+    # class id's row, stay.
+    assert all(day >= FOREIGN[0] for _, day in result.found.bars)
+
+
+MP_BASE = "0001801368"
+MP_CLASS = "0001801368:common-stock"
+MP_CHANGED = date(2020, 11, 18)
+MP_LISTED = date(2021, 3, 22)
+
+
+@pytest.fixture
+def mp_store(tmp_path: Path) -> Settings:
+    """Fortress Value -> MP Materials (#3471 cross-check): FVAC -> MP on
+    2020-11-18 on the bare id, MP's class id listed from 2021-03-22; MP's
+    bars of the window sit on the bare id."""
+    settings = Settings(
+        _env_file=None,
+        store={"path": str(tmp_path / "mp.duckdb"), "lock_retry_seconds": 1},
+        ingest={"max_missing_share": 1.0},
+    )
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        for sid, known in [
+            (MP_BASE, date(2020, 3, 6)),
+            (MP_CLASS, MP_LISTED),
+            (SPY, date(2020, 1, 2)),
+        ]:
+            insert_row(
+                conn,
+                "securities",
+                {
+                    "security_id": sid,
+                    "cik": sid[:10],
+                    "name": sid,
+                    "benchmark": sid == SPY,
+                    "known_at": _at(known, 21),
+                    "ingested_at": _at(known, 21),
+                    "source": "edgar",
+                    "provenance": "filing",
+                },
+            )
+        _listing(conn, SPY, "SPY", date(1993, 1, 29), "Common Stock")
+        _listing(conn, MP_BASE, "FVAC", date(2020, 6, 9), "Class A common stock")
+        _listing(conn, MP_CLASS, "MP", MP_LISTED, "Common Stock")
+        insert_row(
+            conn,
+            "symbol_changes",
+            {
+                "security_id": MP_BASE,
+                "old_symbol": "FVAC",
+                "new_symbol": "MP",
+                "old_cusip": "x",
+                "new_cusip": "y",
+                "process_date": MP_CHANGED,
+                "source_action_id": "mp1",
+                "known_at": _at(MP_CHANGED, 23),
+                "ingested_at": datetime(2026, 10, 16, 9, tzinfo=UTC),
+                "source": "alpaca",
+                "provenance": "action",
+            },
+        )
+        for day in _sessions(date(2020, 10, 1), date(2021, 5, 28)):
+            _bar(conn, SPY, day, 350.0)
+        for day in _sessions(date(2020, 10, 1), date(2021, 3, 19)):
+            _bar(conn, MP_BASE, day, 10.0 if day < MP_CHANGED else 20.0)
+        for day in _sessions(MP_LISTED, date(2021, 5, 28)):
+            _bar(conn, MP_CLASS, day, 30.0)
+    return settings
+
+
+def test_the_window_before_the_siblings_row_orphans_nothing(mp_store: Settings) -> None:
+    result = repair_resolution(mp_store, clock=lambda: RUN, dry_run=True)
+    assert not result.found.bars
+    assert not result.orphans
