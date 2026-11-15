@@ -38,6 +38,9 @@ names its predecessor or successor.
   data release (`--release`) and refuses, writing nothing, when no release
   of that name is open (`repair.release_refusal`); the run row's message
   names it.
+- **Refused inside an open paper window** (#3365, #3330). A window's runs read
+  the store, so `--apply` refuses, writing nothing, while any paper window is
+  open and the set is not empty (`repair.refuse_inside_open_window`).
 - **Owner-kept successors (#922).** A row of a security on
   `master.keep_successors` (an owner-accepted successor the rules no longer
   derive, MTCH's `0000891103@2020-08-10` on #828) is never proposed: it is
@@ -86,7 +89,12 @@ from tradepartner.ingest import (
     _unjudged_ciks,
     _write_run,
 )
-from tradepartner.repair import release_refusal
+from tradepartner.repair import (
+    RepairRefused,
+    known_dates,
+    refuse_inside_open_window,
+    release_refusal,
+)
 from tradepartner.store.classify import build_classifications
 from tradepartner.store.db import open_for_write, utc_now
 from tradepartner.store.master import build_chains, build_master
@@ -236,8 +244,8 @@ def master_retract(
     real run requires `expect`, the dry run's `(rows, digest)`, and raises
     `RetractRefused` before writing on any other, or on a traded row without
     `allow_traded`, or outside the open data release `release`
-    (`repair.release_refusal`). Raises `StoreLockedError` like ingest when
-    the store stays locked."""
+    (`repair.release_refusal`), or inside an open paper window (#3365).
+    Raises `StoreLockedError` like ingest when the store stays locked."""
     if not dry_run and expect is None:
         raise ValueError("an apply retracts only the set of a dry run: pass expect")
     if not dry_run and release is None:
@@ -328,6 +336,12 @@ def master_retract(
                     "window may hold them; nothing retracted (pass --allow-traded once "
                     "you have checked)"
                 )
+            try:
+                # An open paper window reads the store: a retraction moves what its
+                # runs read (#3365, #3330). Before any write.
+                refuse_inside_open_window(conn, known_dates(u.row["known_at"] for u in found))
+            except RepairRefused as exc:
+                raise RetractRefused(f"{exc}") from exc
             write_retractions(conn, found, at)
             run_id = uuid.uuid4().hex
             record_underived(conn, run_id, at, [u for u in found if u.table != "successor_chains"])

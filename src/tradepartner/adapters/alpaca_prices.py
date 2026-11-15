@@ -386,6 +386,7 @@ from tradepartner.store import spinoff_splits as spinoff_split_list
 from tradepartner.store.classify import EQUITY, listing_kind
 from tradepartner.store.delistings import DELISTED
 from tradepartner.store.dividend_reviews import DUPLICATE, ReviewedGroup, reviewed_groups
+from tradepartner.store.reviewed_spinoffs import ReviewedSpinoff, reviewed_spinoffs
 from tradepartner.store.spinoff_splits import SpinoffSplit
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import SHARES_FACT
@@ -404,6 +405,10 @@ ACTIONS_SOURCE = _ACTIONS_SOURCE
 #: it at the broker) before it trades regular-way as `MSGR`, the ticker the
 #: master lists. `execution.reconcile_run` reads the same suffix.
 WHEN_ISSUED_SUFFIX = ".WI"
+
+
+def _packaged_reviewed_spinoffs() -> tuple[ReviewedSpinoff, ...]:
+    return reviewed_spinoffs()
 
 
 def regular_way_symbol(symbol: str) -> str:
@@ -2596,6 +2601,9 @@ class ActionsParse:
     #: the identity `repair.retract_spinoff_splits` deleted), refused so a
     #: backfill never re-inserts them.
     reviewed_spinoff_splits_refused: int = 0
+    #: #3392: reviewed spin-offs (`store.reviewed_spinoffs`) returned because
+    #: the feed had no action for their (child, parent) identity.
+    reviewed_spinoffs_added: int = 0
 
 
 #: Alpaca's merger categories and the `Merger.kind` of each (spec "Mergers").
@@ -2974,6 +2982,11 @@ def parse_corporate_actions(
                         row, "source_rate", positive=True
                     )
                     parent = holder(row["source_symbol"], previous_session(ex_date))
+                    if parent is None:
+                        # #3392: a parent renamed by the distribution itself
+                        # (MSGS -> MSGK) is named by its new ticker, which the
+                        # master lists only from the ex-date.
+                        parent = holder(row["source_symbol"], ex_date)
                     # A when-issued child (`MSGR.WI`) is resolved under its
                     # regular-way root on its own first session (#2112).
                     child = holder(regular_way_symbol(row["new_symbol"]), ex_date)
@@ -3305,8 +3318,13 @@ class AlpacaPriceSource(PriceSource):
         fill_handovers: bool = False,
         reviewed: Sequence[ReviewedGroup] | None = None,
         spinoff_splits: Sequence[SpinoffSplit] | None = None,
+        reviewed_spinoffs: Sequence[ReviewedSpinoff] | None = None,
     ) -> None:
         self._resolver = resolver
+        # #3392: spin-offs read from filings that the feed may not carry.
+        self._reviewed_spinoffs: tuple[ReviewedSpinoff, ...] = (
+            _packaged_reviewed_spinoffs() if reviewed_spinoffs is None else tuple(reviewed_spinoffs)
+        )
         # #3058: a split row reviewed as a spin-off (the repair deleted it) is
         # never stored again; the packaged list unless a test hands its own.
         listed = spinoff_split_list.spinoff_splits() if spinoff_splits is None else spinoff_splits
@@ -3736,7 +3754,25 @@ class AlpacaPriceSource(PriceSource):
         # #3058: a spin-off is not a split. A split row of a security on the
         # ex-date of its own spin-off in this answer is that spin-off's echo;
         # a reviewed identity with its reviewed values is one judged so.
-        spin_parents = set(parsed.spinoff_parents)
+        # #3392: a reviewed spin-off of a requested child or parent whose
+        # ex-date is in the window; the feed's row of the same identity wins.
+        fed = {
+            (a.security_id, a.source_action_id)
+            for a in parsed.actions
+            if a.action_type is ActionType.SPINOFF
+        }
+        added = [
+            r.action
+            for r in self._reviewed_spinoffs
+            if start <= r.ex_date <= end
+            and (r.child_security_id in ids or r.parent_security_id in ids)
+            and r.identity not in fed
+        ]
+        # A parent split on a reviewed spin-off's ex-date is its echo too.
+        spin_parents = {
+            *parsed.spinoff_parents,
+            *((r.source_action_id or "", r.ex_date) for r in added),
+        }
         echo_refused: list[str] = []
         reviewed_spin_refused = 0
         # The reviewed key uses exact stored DOUBLE amounts, as in
@@ -3776,6 +3812,7 @@ class AlpacaPriceSource(PriceSource):
                     reviewed_spin_refused += 1
                 else:
                     kept.append(a)
+        kept.extend(added)
         aliased = tuple(
             f"{a.security_id} {a.action_type.value} {a.ex_date.isoformat()} under "
             f"{self._alias_hits[(a.security_id, previous_session(a.ex_date))]}"
@@ -3790,6 +3827,7 @@ class AlpacaPriceSource(PriceSource):
             aliased=aliased,
             spinoff_echo_splits_refused=tuple(echo_refused),
             reviewed_spinoff_splits_refused=reviewed_spin_refused,
+            reviewed_spinoffs_added=len(added),
         )
         return kept
 

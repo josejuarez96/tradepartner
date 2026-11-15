@@ -3079,3 +3079,73 @@ def test_chain_candidates_ignore_a_predecessor_row_after_the_handover() -> None:
     assert [(c.successor_id, c.predecessor_id, c.sessions) for c in candidates] == [
         ("0001000011", "0001000010", 18)
     ]
+
+
+class TestNotesOnlyIssuer:
+    """#3390: a company with no common stock (Caterpillar Financial, Ford
+    Credit) lists only notes. A note class never takes the main id, so a
+    master-retract of the main id's old rows is not re-derived by the next
+    write."""
+
+    CIK = "0000900390"
+
+    def _build(self, *pages: CoverPage, delistings: Sequence[DelistingFiling] = ()) -> MasterBuild:
+        source = FixtureFilingSource(
+            index=[_filing(self.CIK, "Finance Co", "10-K", _at(2015, 3, 1))],
+            cover_pages=list(pages),
+            delistings=list(delistings),
+        )
+        return build_master(source, _settings(), ingested_at=INGESTED_AT)
+
+    def test_first_note_takes_a_suffixed_id_and_the_main_id_holds_no_listing(self) -> None:
+        build = self._build(
+            _cover(self.CIK, _at(2020, 3, 1), ("2.5% Senior Notes due 2030", "FC30", "NYSE"))
+        )
+        ids = {r["security_id"] for r in build.listings}
+        assert self.CIK not in ids
+        assert all(i.startswith(f"{self.CIK}{INSTRUMENT_ID_SEPARATOR}") for i in ids)
+        # The main id's securities row stays: the issuer still exists.
+        assert any(r["security_id"] == self.CIK for r in build.securities)
+
+    def test_a_delisting_of_the_note_attaches_to_the_note_id_not_the_main_id(self) -> None:
+        filing = DelistingFiling(
+            self.CIK,
+            "25-NSE",
+            "2.5% Senior Notes due 2030",
+            "NYSE",
+            f"{self.CIK}-25-1",
+            _at(2025, 2, 20),
+        )
+        build = self._build(
+            _cover(self.CIK, _at(2020, 3, 1), ("2.5% Senior Notes due 2030", "FC30", "NYSE")),
+            delistings=[filing],
+        )
+        rows = build_delistings([filing], build, ingested_at=INGESTED_AT).delistings
+        assert [r["security_id"] for r in rows] != []
+        assert all(r["security_id"] != self.CIK for r in rows)
+
+    def test_common_stock_still_takes_the_main_id(self) -> None:
+        build = self._build(
+            _cover(
+                self.CIK,
+                _at(2020, 3, 1),
+                ("2.5% Senior Notes due 2030", "FC30", "NYSE"),
+                ("Common Stock", "FC", "NYSE"),
+            )
+        )
+        by_ticker = {r["ticker"]: r["security_id"] for r in build.listings}
+        assert by_ticker["FC"] == self.CIK
+        assert by_ticker["FC30"] != self.CIK
+
+    def test_a_snapshot_before_the_notes_first_page_is_not_given_the_later_note_id(self) -> None:
+        source = FixtureFilingSource(
+            index=[_filing(self.CIK, "Finance Co", "10-K", _at(2015, 3, 1))],
+            cover_pages=[
+                _cover(self.CIK, _at(2020, 3, 1), ("2.5% Senior Notes due 2030", "FC30", "NYSE"))
+            ],
+            snapshot=[_snap(self.CIK, "Finance Co", "FC30", "NYSE", _at(2019, 6, 1))],
+        )
+        build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+        known = {r["security_id"]: r["known_at"] for r in build.securities}
+        for row in build.listings:
+            assert row["known_at"] >= known[row["security_id"]]

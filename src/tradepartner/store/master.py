@@ -548,6 +548,16 @@ def _is_common(title: str, *, whole_words: bool = False) -> bool:
     return whole_words and _FALLBACK_COMMON.search(norm) is not None
 
 
+_NOTE_CLASS = re.compile(r"\b(?:notes?|debentures?)\b")
+
+
+def _is_note_class(title: str) -> bool:
+    """True when the title names a debt class (notes, debentures) and no
+    common equity. Such a class never takes the main id (#3390)."""
+    norm = _norm_title(title)
+    return _NOTE_CLASS.search(norm) is not None and not _is_common(title, whole_words=True)
+
+
 def _session_on_or_after(day: date) -> date:
     return day if is_session(day) else next_session(day)
 
@@ -1114,7 +1124,10 @@ class _Builder:
     def _new_class(
         self, first: FilingIndexEntry, item: CoverListing, classes: list[_Class], known_at: datetime
     ) -> _Class:
-        if not classes:
+        # A notes-only issuer's first note takes a suffixed id, not the main
+        # id, so a master-retract of the main id's rows is not re-derived by
+        # the next write (#3390). The main id keeps its `securities` row.
+        if not classes and not _is_note_class(item.title):
             cls = _Class(primary_security_id(first.cik), first.accepted_at)
         else:
             slug = re.sub(r"[^a-z0-9]+", "-", _norm_title(item.title).replace("%", "pct"))
@@ -1138,7 +1151,14 @@ class _Builder:
             cls = next((c for c in listed if entry.ticker in {k for k, _ in c.pairs_at(t)}), None)
             same_fetch = sum(1 for e in entries if e.fetched_at == t)
             if cls is None and not listed and same_fetch == 1:
-                cls = classes[0]  # a CIK with no cover page yet and one ticker
+                # A CIK with no cover page yet and one ticker. A note class
+                # (a suffixed id, #3390) not yet known at `t` is no home for it.
+                first_cls = classes[0]
+                if (
+                    first_cls.security_id == primary_security_id(entry.cik)
+                    or first_cls.known_at <= t
+                ):
+                    cls = first_cls
             if cls is None:
                 self.unmatched.append(entry)
                 continue

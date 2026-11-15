@@ -78,7 +78,7 @@ def _build(conn: duckdb.DuckDBPyConnection, cases: dict[str, Any]) -> None:
                 "listings",
                 {
                     "security_id": sid,
-                    "ticker": sid,
+                    "ticker": f"T{sid}",  # "NONE" itself is a placeholder ticker (#3383)
                     "exchange": exchange,
                     "class_title": "Common Stock",
                     "valid_from": valid_from,
