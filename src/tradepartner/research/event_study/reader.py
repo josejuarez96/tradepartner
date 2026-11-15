@@ -105,6 +105,6 @@ class EventStudyReader:
             frame = facts_as_of(conn, t, [security_id])
         return (
             frame.filter((pl.col("fact_name") == fact_name) & (pl.col("class_member") == ""))
-            .sort("known_at")
+            .sort(["as_of_date", "known_at"])
             .to_dicts()
         )
