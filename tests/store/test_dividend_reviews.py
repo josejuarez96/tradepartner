@@ -90,13 +90,14 @@ def test_the_amount_is_the_stored_double_exactly() -> None:
 
 
 def test_the_committed_list_pins_its_counts() -> None:
-    """195 groups (183 at the amendment, 10 by #1666, 2 by #1720): a later edit is
-    deliberate. #3054 settled STX 2021-05-11 as a duplicate (was unresolved)."""
+    """196 groups (184 at the amendment, 10 by #1666, 2 by #1720): a later edit is
+    deliberate. #3054 settled STX 2021-05-11 as a duplicate (was unresolved). #3460
+    added PNNT 2026-11-13 as distinct."""
     groups = reviewed_groups()
-    assert Counter(g.verdict for g in groups) == {"duplicate": 181, "distinct": 12, "unresolved": 2}
+    assert Counter(g.verdict for g in groups) == {"duplicate": 181, "distinct": 13, "unresolved": 2}
     assert all(g.evidence for g in groups)
     assert min(g.ex_date for g in groups) == date(2019, 6, 27)
-    assert max(g.ex_date for g in groups) == date(2026, 10, 15)
+    assert max(g.ex_date for g in groups) == date(2026, 11, 13)
 
 
 @pytest.mark.parametrize(
@@ -106,6 +107,7 @@ def test_the_committed_list_pins_its_counts() -> None:
         ("TDG", date(2025, 9, 2), 90.0, "duplicate"),
         ("MKTW", date(2026, 3, 18), 0.2, "duplicate"),
         ("PNNT", date(2026, 10, 15), 0.04, "distinct"),
+        ("PNNT", date(2026, 11, 13), 0.04, "distinct"),
         ("PFLT", date(2026, 10, 15), 0.0033, "duplicate"),
         ("F", date(2025, 2, 18), 0.15, "distinct"),
         ("CHRD", date(2023, 11, 13), 1.25, "distinct"),
