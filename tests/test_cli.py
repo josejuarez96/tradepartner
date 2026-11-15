@@ -1105,6 +1105,94 @@ def test_health_prints_the_figi_types_block_and_fails_only_with_the_threshold(
     assert "figi_types_disagreements" in failed.output
 
 
+def test_health_prints_the_figi_identity_block(tmp_path: Path, fixture_store_path: Path) -> None:
+    """#3440: the `figi_identity` block (T399) reaches `health`'s output: the
+    counts by kind, the first rows of each kind and the cannot-check lines,
+    beside 'figi types'."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    with open_for_write(settings) as conn:
+        for sid, share_class, figi, composite in (
+            ("SEC_DUAL_A", "SC1", "BBG-A", "BBGSAME"),
+            ("SEC_DUAL_B", "SC1", "BBG-B", "BBG-BB"),
+            ("SEC_MTUM", "SC2", "BBG-M", "BBGSAME"),
+        ):
+            insert_row(
+                conn,
+                "openfigi_types",
+                {
+                    "security_id": sid,
+                    "ticker": sid,
+                    "figi": figi,
+                    "composite_figi": composite,
+                    "share_class_figi": share_class,
+                    "security_type": "Common Stock",
+                    "security_type2": "Common Stock",
+                    "market_sector": "Equity",
+                    "name": sid,
+                    "exch_code": "US",
+                    "mapped": True,
+                    "known_at": T_END - timedelta(days=1),
+                    "ingested_at": T_END - timedelta(days=1),
+                    "provenance": "openfigi",
+                    "source": "openfigi",
+                },
+            )
+        insert_row(
+            conn,
+            "openfigi_types",
+            {
+                "security_id": "SEC_FACTS_RESTATED",
+                "ticker": "FRST",
+                "figi": "",
+                "composite_figi": "",
+                "share_class_figi": "",
+                "security_type": "",
+                "security_type2": "",
+                "market_sector": "",
+                "name": "",
+                "exch_code": "US",
+                "mapped": False,
+                "known_at": T_END - timedelta(days=1),
+                "ingested_at": T_END - timedelta(days=1),
+                "provenance": "openfigi",
+                "source": "openfigi",
+            },
+        )
+        insert_row(
+            conn,
+            "successor_chains",
+            {
+                "predecessor_id": "SEC_DUAL_A",
+                "successor_id": "SEC_MTUM",
+                "evidence_accession": "SEC_MTUM-1",
+                "evidence_form": "8-K12B",
+                "known_at": T_END - timedelta(days=1),
+                "ingested_at": T_END - timedelta(days=1),
+                "source": "edgar",
+                "provenance": "filing",
+                "retracted": False,
+            },
+        )
+    plain = _invoke(settings, ["health"], clock=lambda: T_END)
+    assert plain.exit_code == 0, plain.output
+    assert "figi identity: 4 disagreements (report-only)" in plain.output
+    assert (
+        "share_class_same_cik 1, successor_share_class_differs 1, "
+        "unmapped_while_listed 1, figi_shared_across_ciks 1" in plain.output
+    )
+    assert "share_class_same_cik SEC_DUAL_A <-> SEC_DUAL_B: share_class_figi SC1" in plain.output
+    assert (
+        "successor_share_class_differs SEC_MTUM <-> SEC_DUAL_A: "
+        "share_class_figi SC2 vs SC1" in plain.output
+    )
+    assert (
+        "unmapped_while_listed SEC_FACTS_RESTATED: mapped FALSE "
+        "(cik CIK0001000016) (FRST NYSE)" in plain.output
+    )
+    assert "figi_shared_across_ciks SEC_DUAL_A <-> SEC_MTUM: composite_figi BBGSAME" in plain.output
+    assert "cannot check: ticker: OpenFIGI's stored ticker is our own query echo" in plain.output
+
+
 def test_health_check_enforces_rate_stamp_and_passes_fixture(
     tmp_path: Path, fixture_store_path: Path
 ) -> None:

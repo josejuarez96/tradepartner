@@ -927,6 +927,36 @@ def _print_figi_types(report: HealthReport) -> None:
         )
 
 
+#: How many `figi_identity` rows each kind shows in `health` (T399, #3437).
+_FIGI_ROWS_SHOWN = 3
+
+
+def _print_figi_identity(report: HealthReport) -> None:
+    """The `figi_identity` block (plan T399, #3437): the counts by kind, the
+    first rows of each kind, then the cannot-check lines."""
+    block = report.figi_identity
+    typer.echo(f"figi identity: {block.verdict}")
+    counts = ", ".join(f"{kind} {n}" for kind, n in block.counts.items())
+    typer.echo(f"  {counts}")
+    for kind in block.counts:
+        rows = block.rows.filter(pl.col("kind") == kind).head(_FIGI_ROWS_SHOWN)
+        for row in rows.iter_rows(named=True):
+            other = f" <-> {row['other_id']}" if row["other_id"] else ""
+            detail = f"{row['field']} {row['value']}"
+            if row["other_value"] and row["other_value"] != row["value"]:
+                detail += f" vs {row['other_value']}"
+            if row["cik"]:
+                ciks = row["cik"]
+                if row["other_cik"] and row["other_cik"] != row["cik"]:
+                    ciks += f"/{row['other_cik']}"
+                detail += f" (cik {ciks})"
+            if row["ticker"]:
+                detail += f" ({row['ticker']} {row['exchange']})"
+            typer.echo(f"  {kind} {row['security_id']}{other}: {detail}")
+    for line in block.cannot_check:
+        typer.echo(f"  cannot check: {line}")
+
+
 def _print_mergers(report: HealthReport) -> None:
     """The report-only mergers block (#1762, T248e; printed since #3215)."""
     echo = typer.echo
@@ -1048,6 +1078,7 @@ def _print_report(report: HealthReport) -> None:
         for line in report.delisting_reasons.lines():
             echo(line)
     _print_figi_types(report)
+    _print_figi_identity(report)
     echo(f"settings: {report.settings}")
     _print_coverage_reference(report.coverage_reference)
     echo("integrity:")
