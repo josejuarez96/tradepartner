@@ -3636,6 +3636,114 @@ def test_an_unreceived_retraction_outside_the_approved_set_still_fails(tmp_path:
     assert _cov_close(settings).exit_code == 1
 
 
+def _cov_accept(settings: Settings, *extra: str) -> Any:
+    return _invoke(
+        settings, ["decision", "data-release", "accept-unreceived", "--name", "rel", *extra]
+    )
+
+
+def _orphan_rows(settings: Settings) -> list[registry.DataRelease]:
+    return [r for r in _releases(settings) if r.stage == "orphans"]
+
+
+def _cov_retract_b_unreceived(settings: Settings, day: date) -> None:
+    """B's bar on `day` retracted while A's bar there differs: nobody receives it."""
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "UPDATE prices_daily SET close = 7.0, high = 7.0 "
+            f"WHERE security_id = 'A' AND session = '{day.isoformat()}'"
+        )
+        retract(conn, "prices_daily", [("B", day)], "orphan", "rel", "line 8")
+
+
+def test_accept_unreceived_without_a_count_lists_the_keys_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_retract_unreceived(settings, _COV_DAYS[:2])
+    listed = _cov_accept(settings)
+    assert listed.exit_code == 1, listed.output
+    assert f"UNRECEIVED A {_COV_DAYS[0].isoformat()}" in listed.output
+    assert f"UNRECEIVED A {_COV_DAYS[1].isoformat()}" in listed.output
+    assert "release rel: 2 residual unreceived key(s)" in listed.output
+    assert "nothing written" in listed.output
+    assert _orphan_rows(settings) == []
+
+
+def test_accept_unreceived_refuses_a_count_that_is_not_the_key_count(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_retract_unreceived(settings, _COV_DAYS[:2])
+    for wrong in ("1", "3", "0"):
+        refused = _cov_accept(settings, "--count", wrong)
+        assert refused.exit_code == 1, refused.output
+        assert f"2 residual unreceived keys and --count is {wrong}" in refused.output
+    assert _orphan_rows(settings) == []
+    assert _cov_run(settings, "--record").exit_code == 1
+
+
+def test_accept_unreceived_with_the_exact_count_lets_coverage_pass(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_retract_unreceived(settings, _COV_DAYS[:2])
+    assert _cov_run(settings, "--record").exit_code == 1
+    accepted = _cov_accept(settings, "--count", "2")
+    assert accepted.exit_code == 0, accepted.output
+    assert "data_release rel orphans (accept-unreceived, count 2)" in accepted.output
+    (row,) = _orphan_rows(settings)
+    assert row.values["source"] == "accept-unreceived"
+    assert row.values["keys"] == [f"A|{d.isoformat()}" for d in _COV_DAYS[:2]]
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 0, checked.output
+    assert "2 sessions accepted by the owner's count 2 on rel" in checked.output
+    assert "NOT RECEIVED" not in checked.output
+    assert _cov_close(settings).exit_code == 0
+    again = _cov_accept(settings)  # nothing residual is left to accept
+    assert "release rel: 0 residual unreceived key(s)" in again.output
+
+
+def test_accept_unreceived_keeps_the_repair_orphans_and_adds_to_them(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_retract_unreceived(settings, _COV_DAYS[:3])
+    _cov_approve(settings, _COV_DAYS[:2])  # repair-resolution's count, before the fill
+    listed = _cov_accept(settings)
+    assert "release rel: 1 residual unreceived key(s)" in listed.output
+    assert _cov_accept(settings, "--count", "1").exit_code == 0
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 0, checked.output
+    assert "3 sessions accepted by the owner's count 3 on rel" in checked.output
+
+
+def test_accept_unreceived_by_security_id_leaves_the_other_ids_failing(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_retract_unreceived(settings, _COV_DAYS[:2])
+    _cov_retract_b_unreceived(settings, _COV_DAYS[15])
+    listed = _cov_accept(settings, "--security-id", "B")
+    assert "UNRECEIVED A" not in listed.output
+    assert "release rel: 1 residual unreceived key(s)" in listed.output
+    assert _cov_accept(settings, "--security-id", "B", "--count", "3").exit_code == 1
+    assert _cov_accept(settings, "--security-id", "B", "--count", "1").exit_code == 0
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 1, checked.output
+    assert "2 of 2 sessions NOT RECEIVED" in checked.output
+    assert _orphan_rows(settings)[0].values["keys"] == [f"B|{_COV_DAYS[15].isoformat()}"]
+
+
+def test_accept_unreceived_refuses_an_id_with_no_unreceived_bars(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_retract_unreceived(settings, _COV_DAYS[:2])
+    refused = _cov_accept(settings, "--security-id", "A", "--security-id", "Z", "--count", "2")
+    assert refused.exit_code == 1, refused.output
+    assert "no unreceived retracted bars for Z" in refused.output
+    assert _orphan_rows(settings) == []
+
+
+def test_accept_unreceived_refuses_a_closed_release(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    assert _cov_close(settings).exit_code == 0
+    refused = _cov_accept(settings, "--count", "0")
+    assert refused.exit_code == 1, refused.output
+    assert _orphan_rows(settings) == []
+
+
 def test_a_retracted_bar_with_an_empty_price_is_a_named_error(tmp_path: Path) -> None:
     settings, _ = _cov_open(tmp_path)
     with open_for_write(settings) as conn:
