@@ -4428,6 +4428,47 @@ def make_app(
                 f"{t.status}  {','.join(flags) or '-'}  {message}"
             )
 
+    @app.command("trial-reproduce")
+    def trial_reproduce(
+        trial_id: Annotated[int, typer.Argument(help="the trial to reproduce")],
+        holdout_repeat: Annotated[
+            bool, typer.Option(help="replay a holdout trial (it spends no holdout)")
+        ] = False,
+    ) -> None:
+        """Run a registered trial again on a temporary copy of the store, rebuilt as the
+        trial saw it (retracted rows put back, later backfills dropped), and compare every
+        stored base-level strategy metric. Writes nothing to the store; exits 1 when the
+        trial is not reproducible or a metric differs."""
+        from tradepartner.store import reproduce
+
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            result = reproduce.reproduce_trial(trial_id, settings=s, holdout_repeat=holdout_repeat)
+        except StoreLockedError as exc:
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
+        except (reproduce.UnknownTrial, reproduce.HoldoutReplayRefused) as exc:
+            raise _fail(_scrubbed(str(exc), s), USAGE_ERROR) from None
+        if result.holdout_replay:
+            typer.echo("holdout replay: the replay spent no holdout and wrote nothing")
+        if result.verdict == "not_reproducible":
+            for reason in result.reasons:
+                typer.echo(_scrubbed(f"not reproducible: {reason}", s))
+            raise typer.Exit(1)
+        r = result.restored
+        typer.echo(
+            f"trial {result.trial_id} ({result.kind}): restored {r.reinserted} retracted "
+            f"row(s), removed {r.deleted_unseen} the trial never saw and {r.deleted_after_ingest} "
+            f"ingested after it, left out {r.releases_left_out} later release(s)"
+        )
+        if result.verdict == "differs":
+            typer.echo(f"differs: {len(result.differences)} of {result.compared} metrics")
+            for line in result.differences:
+                typer.echo(f"  {line}")
+            raise typer.Exit(1)
+        typer.echo(f"reproduced: all {result.compared} base-level strategy metrics are equal")
+
     decision_app = typer.Typer(no_args_is_help=True, help="Record an owner decision.")
     app.add_typer(decision_app, name="decision")
 
