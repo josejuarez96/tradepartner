@@ -1878,6 +1878,23 @@ def test_moved_keys_are_not_orphans(store: Settings) -> None:
     assert " 0 orphan bar keys" in result.summary()
 
 
+def test_an_owner_holding_its_own_bar_is_no_receiver(store: Settings) -> None:
+    """#3455: HEIR already holds a bar of its own on 06-01, so no refetch lands
+    DEAD's bar there: an orphan. 06-02 (HEIR has none) stays moved."""
+    with open_for_write(store) as conn:
+        insert_row(conn, "prices_daily", _bar(HEIR, date(2021, 6, 1)))
+    result = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert dict(result.orphans) == {(DEAD, date(2021, 6, 1)): 1}
+
+
+def test_an_owner_without_a_bar_stays_a_receiver(store: Settings) -> None:
+    """#3455: HEIR holds a bar on another session only."""
+    with open_for_write(store) as conn:
+        insert_row(conn, "prices_daily", _bar(HEIR, date(2021, 6, 4)))
+    result = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert result.orphan_keys == 0
+
+
 def test_a_dry_run_lists_the_orphans_per_security(orphan_store: Settings) -> None:
     before = _bars(orphan_store)
     result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
