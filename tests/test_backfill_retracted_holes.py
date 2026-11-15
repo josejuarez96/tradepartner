@@ -219,3 +219,71 @@ def test_a_retracted_session_inside_a_month_the_receiver_lacks_is_a_hole(
     _open_release(settings)
     found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
     assert (ACME, (date(2019, 5, 1), date(2019, 5, 31))) in _holes(found)
+
+
+# --- #3454: the receiver of a hole whose lost id's listings were master-retracted ---
+
+LOST = "0000000099"
+
+
+def _lost_id_store(settings: Settings, *, listing_known: datetime = THEN) -> None:
+    """ACME is the receiver: it holds no June bar (the backfill cursor stops at
+    May). LOST held ACME's ticker, its June bars are retracted and its listing is
+    a retraction tombstone, as after step 9's master-retract (CRC, PG, DBD)."""
+    assert _backfill(settings, _History()).ok
+    days = _sessions(*JUNE_WINDOW)
+    with duckdb.connect(settings.store.path) as conn:
+        conn.execute("DELETE FROM ingestion_runs WHERE chunk_cursor LIKE '%through=2019-06-%'")
+        conn.execute(
+            "INSERT INTO prices_daily (security_id, session, open, high, low, close, volume, "
+            "known_at, ingested_at, source, provenance) "
+            "SELECT ?, session, open, high, low, close, volume, known_at, ingested_at, "
+            "source, provenance FROM prices_daily WHERE security_id = ? "
+            "AND session BETWEEN ? AND ?",
+            [LOST, ACME, *JUNE_WINDOW],
+        )
+        conn.execute(
+            "DELETE FROM prices_daily WHERE security_id = ? AND session BETWEEN ? AND ?",
+            [ACME, *JUNE_WINDOW],
+        )
+        for retracted in (False, True):
+            conn.execute(
+                "INSERT INTO listings (security_id, ticker, exchange, class_title, valid_from, "
+                "retracted, known_at, ingested_at, source, provenance) "
+                "SELECT ?, ticker, exchange, class_title, valid_from, ?, ?, ?, source, provenance "
+                "FROM listings WHERE security_id = ? ORDER BY known_at LIMIT 1",
+                [
+                    LOST,
+                    retracted,
+                    listing_known - timedelta(days=1) * (0 if retracted else 400),
+                    listing_known,
+                    ACME,
+                ],
+            )
+    with open_for_write(settings) as conn:
+        retract(
+            conn, "prices_daily", [(LOST, d) for d in days], "misattributed", RELEASE, "r", at=THEN
+        )
+    _open_release(settings)
+
+
+def test_a_hole_whose_lost_ids_listings_were_retracted_is_refetched_for_its_receiver(
+    settings: Settings,
+) -> None:
+    _lost_id_store(settings)
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(found) == [(ACME, JUNE_WINDOW)]
+    prices = _History()
+    result = fill_holes(settings, prices=prices, since=SINCE, clock=lambda: LATER)
+    assert [r.status for r in result.runs] == [FILLED]
+    assert prices.fetched == {date(2019, 6, 1): {ACME, SPY}}
+    assert _acme_sessions(settings, JUNE_WINDOW) == _sessions(*JUNE_WINDOW)
+
+
+def test_a_lost_ids_retracted_listing_made_after_the_clock_names_no_receiver(
+    settings: Settings,
+) -> None:
+    """No look-ahead: the tickers the lost id held are those known at `t`."""
+    _lost_id_store(settings, listing_known=LATER + timedelta(days=1))
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert found.holes == ()

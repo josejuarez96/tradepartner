@@ -346,11 +346,17 @@ def orphan_bars(
     *moved* key has such an owner. Returns `{key: 1}` per orphan key. Pure."""
     out: dict[Key, int] = {}
     for sid, day in bar_keys:
-        owners = {resolver.fill_resolve(t, day) for t in tickers(sid, day)}
-        owners |= {resolver.lead(t, day) for t in tickers(sid, day)}
-        if not (owners - {None, sid}):
+        if not (bar_owners(resolver, tickers(sid, day), day) - {sid}):
             out[(sid, day)] = 1
     return out
+
+
+def bar_owners(resolver: ListingResolver, tickers: Iterable[str], day: date) -> set[str]:
+    """The securities that receive a bar of `day` under any of `tickers`, for a
+    fill or a bar (`fill_resolve`, then a rename or first-span `lead`). Pure."""
+    owners = {resolver.fill_resolve(t, day) for t in tickers}
+    owners |= {resolver.lead(t, day) for t in tickers}
+    return {o for o in owners if o is not None}
 
 
 def _norm(ticker: str) -> str:
