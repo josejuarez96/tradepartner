@@ -23,6 +23,7 @@ from test_backfill import (
 )
 from test_ingest import ACME, SPY
 
+from tradepartner.adapters.prices import bar_known_at
 from tradepartner.backfill import FILLED, fill_holes
 from tradepartner.config import Settings
 from tradepartner.store import registry
@@ -178,15 +179,18 @@ def test_a_retracted_session_whose_receiver_holds_a_different_bar_is_a_hole(
             conn.execute(
                 "INSERT INTO prices_daily (security_id, session, open, high, low, close, volume, "
                 "known_at, ingested_at, source, provenance) "
-                "SELECT ?, ?, 3.0, 3.0, 3.0, 3.0, 5, known_at, ?, source, provenance "
+                "SELECT ?, ?, 3.0, 4.0, 2.0, 3.0, 1000000, ?, ?, source, provenance "
                 "FROM prices_daily WHERE security_id = ? LIMIT 1",
-                [ACME, d, THEN - timedelta(days=30), SPY],
+                [ACME, d, bar_known_at(d), bar_known_at(d) + timedelta(hours=1), SPY],
             )
-    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    # The vendor serves exactly the planted bar again: the refetch writes nothing, yet
+    # the month is answered and the next dry run lists no hole.
+    same = _History(close=3.0)
+    found = fill_holes(settings, prices=same, since=SINCE, clock=lambda: LATER, dry_run=True)
     assert _holes(found) == [(ACME, JUNE_WINDOW)]
-    assert fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER).exit_code == 0
-    # Answered: the refetched bar is newer than the retraction, so no hole is left.
-    again = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert fill_holes(settings, prices=same, since=SINCE, clock=lambda: LATER).exit_code == 0
+    # Answered: a fill finished after the retraction, so no hole is left.
+    again = fill_holes(settings, prices=same, since=SINCE, clock=lambda: LATER, dry_run=True)
     assert again.holes == ()
 
 

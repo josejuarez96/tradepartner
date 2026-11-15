@@ -381,8 +381,11 @@ class HoleFill:
 HALTED = "not filled: the fill halted first"
 
 
+_RETRACTED_MARK = "with a retracted session no id holds"
+
+
 def _retracted_note(retr: Collection[str]) -> str:
-    return f"; {len(retr)} with a retracted session no id holds" if retr else ""
+    return f"; {len(retr)} {_RETRACTED_MARK}" if retr else ""
 
 
 def _dropped_note(dropped: dict[str, int]) -> str:
@@ -849,6 +852,12 @@ def _retracted_holes(
         ).fetchall()
     }
     was = _retracted_prices(conn, t, window)
+    answered = conn.execute(
+        "SELECT max(finished_at) FROM ingestion_runs WHERE source = 'alpaca' AND mode = ? "
+        "AND status = ? AND finished_at <= ? AND chunk_cursor LIKE ? AND message LIKE ?",
+        [HOLES, FILLED, t, f"%;through={last.isoformat()}", f"%{_RETRACTED_MARK}%"],
+    ).fetchone()
+    fetched_at = None if answered is None else answered[0]
     fetched = set(ids)
     out: set[str] = set()
     for sid, day in days:
@@ -861,7 +870,7 @@ def _retracted_holes(
         if receiver is None or receiver not in fetched:
             continue
         have = held.get((receiver, day))
-        if have is not None and not _foreign(have, was.get((sid, day))):
+        if have is not None and not _foreign(have, was.get((sid, day)), fetched_at):
             continue
         if only is not None and receiver not in only:
             continue
@@ -890,13 +899,17 @@ def _retracted_prices(
 
 
 def _foreign(
-    have: tuple[float, float, datetime], was: tuple[float, float, datetime] | None
+    have: tuple[float, float, datetime],
+    was: tuple[float, float, datetime] | None,
+    answered: datetime | None,
 ) -> bool:
     """True when the bar a receiver holds on a retracted session is not the
     retracted line's: a different open or close (a vendor revision keeps both,
     #3432) that was fetched before the retraction, so no fill has answered it yet
-    (#3431: a foreign line under the id that trades every session)."""
-    if was is None:
+    (#3431: a foreign line under the id that trades every session). A month a
+    retracted-session fill finished after the retraction has answered it: the vendor
+    may serve the same bar again, which writes nothing."""
+    if was is None or (answered is not None and answered > was[2]):
         return False
     close = 1e-6
     same = abs(have[0] - was[0]) <= close * max(1.0, abs(was[0])) and abs(have[1] - was[1]) <= (
