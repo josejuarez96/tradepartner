@@ -1907,6 +1907,63 @@ def test_an_owner_without_a_bar_stays_a_receiver(store: Settings) -> None:
     assert result.orphan_keys == 0
 
 
+def test_an_owner_holding_the_same_bar_covers_the_key(store: Settings) -> None:
+    """#3463: HEIR holds DEAD's 06-01 bar itself (the latest revision, close
+    26.0, same volume): retracting DEAD's copy loses nothing, so it is no
+    orphan; the dry run lists it as a duplicate of HEIR."""
+    with open_for_write(store) as conn:
+        insert_row(conn, "prices_daily", _bar(HEIR, date(2021, 6, 1), close=26.0))
+    result = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert result.orphan_keys == 0
+    assert dict(result.duplicates) == {(DEAD, date(2021, 6, 1)): HEIR}
+    [line] = [x for x in result.lines() if "DUPLICATE" in x]
+    assert line == (
+        f"  DUPLICATE {DEAD} (?): 1 bar keys 2021-06-01..2021-06-01 duplicate of {HEIR}"
+    )
+    assert "1 duplicate bar keys an owner already holds" in result.summary()
+
+
+def test_a_duplicate_needs_no_orphan_count_to_apply(store: Settings) -> None:
+    with open_for_write(store) as conn:
+        insert_row(conn, "prices_daily", _bar(HEIR, date(2021, 6, 1), close=26.0))
+    result = repair_resolution(store, clock=lambda: RUN, expect=(3, 1), release=REL)
+    assert (result.bar_rows, result.orphan_keys, len(result.duplicates)) == (3, 0, 1)
+    with open_for_write(store) as conn:
+        assert registry.approved_orphans(conn, REL)[0] == 0
+
+
+def test_a_duplicate_within_the_tolerance_covers_the_key(store: Settings) -> None:
+    with open_for_write(store) as conn:
+        insert_row(conn, "prices_daily", _bar(HEIR, date(2021, 6, 1), close=26.0 + 1e-6))
+    assert repair_resolution(store, clock=lambda: RUN, dry_run=True).orphan_keys == 0
+    strict = store.model_copy(
+        update={"store": store.store.model_copy(update={"release_move_price_tolerance": 0.0})}
+    )
+    result = repair_resolution(strict, clock=lambda: RUN, dry_run=True)
+    assert dict(result.orphans) == {(DEAD, date(2021, 6, 1)): 1}
+    assert not result.duplicates
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"close": 25.0},  # DEAD's earlier revision, not its latest
+        {"volume": 999},
+        {"open": 27.0},
+        {"high": 27.0},
+        {"low": 25.0},
+    ],
+)
+def test_a_different_bar_stays_an_orphan(store: Settings, change: dict[str, float]) -> None:
+    """#3457's rule holds for any other bar: the owner's refetch lands its own."""
+    row = {**_bar(HEIR, date(2021, 6, 1), close=26.0), **change}
+    with open_for_write(store) as conn:
+        insert_row(conn, "prices_daily", row)
+    result = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert dict(result.orphans) == {(DEAD, date(2021, 6, 1)): 1}
+    assert not result.duplicates
+
+
 def test_a_dry_run_lists_the_orphans_per_security(orphan_store: Settings) -> None:
     before = _bars(orphan_store)
     result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
