@@ -5270,6 +5270,8 @@ def make_app(
         """Record one desk-read launch and print its id. A repeat of a record prints
         the first id and writes nothing. Exit 2 on a refusal, with nothing written."""
         s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
         if probe_unavailable != (reason is not None):
             raise _fail("--probe-unavailable and --reason go together", USAGE_ERROR)
         start = _parse_day("--window-start", window_start, settings)
