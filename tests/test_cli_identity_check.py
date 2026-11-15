@@ -246,3 +246,67 @@ def test_the_store_is_opened_read_only(store: Settings, monkeypatch: pytest.Monk
 def test_the_option_set_is_pinned() -> None:
     command = typer.main.get_command(cli.make_app()).commands["identity-check"]  # type: ignore[attr-defined]
     assert {opt for p in command.params for opt in p.opts} >= {"--store", "--history"}
+
+
+def test_rows_known_after_the_check_leave_the_result_unchanged(store: Settings) -> None:
+    before = run(store, key())
+    later = datetime(2027, 1, 1, tzinfo=UTC)
+    with open_for_write(store) as conn:
+        conn.execute(
+            "DELETE FROM prices_daily WHERE security_id = ? AND session = ?",
+            [MAR, date(2020, 10, 1)],
+        )
+        insert_row(
+            conn,
+            "prices_daily",
+            {
+                "security_id": MAR,
+                "session": date(2020, 10, 1),
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 0,
+                "known_at": later,
+                "ingested_at": later,
+                "source": "alpaca_sip",
+                "provenance": "bar",
+            },
+        )
+        insert_row(
+            conn,
+            "securities",
+            {
+                "security_id": MAR,
+                "cik": "0000000001",
+                "name": "x",
+                "known_at": later,
+                "ingested_at": later,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+    # the bar gap is a miss; but the late zero-volume revision and the late CIK change do not matter
+    after = run(store, key())
+    assert [m.expected.kind for m in after.misses] == ["bars"]
+    assert before.misses == ()
+
+
+def test_a_retracted_security_is_not_read(store: Settings) -> None:
+    t = datetime(2026, 11, 1, tzinfo=UTC)
+    with open_for_write(store) as conn:
+        insert_row(
+            conn,
+            "securities",
+            {
+                "security_id": MAR,
+                "cik": MAR,
+                "name": "x",
+                "retracted": True,
+                "known_at": t,
+                "ingested_at": t,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+    assert run(store, key()).misses

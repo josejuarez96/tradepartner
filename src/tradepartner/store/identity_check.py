@@ -50,7 +50,7 @@ from tradepartner.store.identity_answer_key import (
     load_answer_key,
     match,
 )
-from tradepartner.store.master import _is_common
+from tradepartner.store.master import _is_common, securities_as_of
 
 
 @dataclass(frozen=True)
@@ -78,11 +78,8 @@ def exchange_key(name: str) -> str:
 
 def _ciks(conn: duckdb.DuckDBPyConnection, at: datetime) -> dict[str, str]:
     """`security_id -> cik` from the latest `securities` row known at `at`."""
-    rows = conn.execute(
-        "SELECT security_id, cik FROM securities WHERE known_at <= ? AND NOT retracted"
-        " QUALIFY row_number() OVER (PARTITION BY security_id ORDER BY known_at DESC) = 1",
-        [at],
-    ).fetchall()
+    frame = securities_as_of(conn, at)
+    rows = frame.select("security_id", "cik").iter_rows()
     return {str(sid): str(cik) for sid, cik in rows}
 
 
@@ -138,12 +135,12 @@ def _bar_sessions(
         return []
     rows = conn.execute(
         "SELECT DISTINCT session FROM ("
-        "  SELECT security_id, session, volume FROM prices_daily"
-        "  WHERE known_at <= ? AND list_contains(?, source) AND list_contains(?, security_id)"
+        "  SELECT security_id, session, volume, source FROM prices_daily"
+        "  WHERE known_at <= ? AND list_contains(?, security_id)"
         "  QUALIFY row_number() OVER"
         "    (PARTITION BY security_id, session ORDER BY known_at DESC) = 1"
-        ") WHERE volume > 0 ORDER BY session",
-        [at, sorted(BAR_SOURCES), list(security_ids)],
+        ") WHERE volume > 0 AND list_contains(?, source) ORDER BY session",
+        [at, list(security_ids), sorted(BAR_SOURCES)],
     ).fetchall()
     return [r[0] for r in rows]
 
