@@ -937,7 +937,8 @@ kind = "holds"
 cik = "0001077428"
 ticker = "TCBI"
 first = 2026-09-14
-cite = { kind = "accession", ref = "0001077428-26-000061", date = 2026-09-14 }
+last = 2026-10-22
+cite = { kind = "accession", ref = "0001077428-26-000080", date = 2026-10-22 }
 
 [[history.expected]]
 kind = "line_end"
@@ -1354,14 +1355,15 @@ cite = { kind = "accession", ref = "0000887921-22-000021", date = 2022-11-08 }
 
 [[history]]
 id = "rad-nyse-suspension-2023"
-title = "Rite Aid RAD: NYSE suspended trading on 2023-10-16 after the Chapter 11 filing, Form 25-NSE removal 2023-11-13"
+title = "Rite Aid RAD: NYSE suspended trading on 2023-10-16 (last session 2023-10-13) after the Chapter 11 filing, Form 25-NSE removal 2023-11-13"
 # Rite Aid (CIK 0000084129) filed Chapter 11 on Sunday 2023-10-15. The NYSE "on October 16, 2023 ...
 # determined that the Common Stock ... should be suspended from trading" and will remove it at the opening
-# of 2023-11-13 (Form 25-NSE notice, EX-99.25); the company's 8-K says the stock "began trading exclusively
-# on the over-the-counter market on October 17, 2023 under the symbol RADCQ". The last NYSE session is
-# Monday 2023-10-16. DERIVED: neither cited filing says the stock traded on 10-16; the
-# 8-K only fixes exclusive OTC trading from 10-17, so 10-16 is the latest the last NYSE session
-# can be (if halted before that open it was 2023-10-13).
+# of 2023-11-13 (Form 25-NSE notice, EX-99.25); the 10-Q (filed 2023-10-18) says that on October 16 the
+# NYSE announced delisting proceedings and "Trading ... was immediately suspended"; the company's 8-K says
+# the stock "began trading exclusively on the over-the-counter market on October 17, 2023". DERIVED, and
+# conservative: no cited filing gives the hour of the 10-16 suspension, so the last NYSE session is taken
+# as Friday 2023-10-13 (the NYSE suspended Chesapeake pre-open on the day of its determination, the same
+# pattern); if the stock traded on 10-16 the last session was 2023-10-16.
 [[history.input]]
 kind = "25-nse"
 cik = "0000084129"
@@ -1374,21 +1376,21 @@ cite = { kind = "accession", ref = "0001143313-23-000135", date = 2023-10-31 }
 [[history.bars]]
 cik = "0000084129"
 ticker = "RAD"
-first = 2023-10-16
-last = 2023-10-16
-cite = { kind = "accession", ref = "0001104659-23-113408", date = 2023-11-01 }
+first = 2023-10-13
+last = 2023-10-13
+cite = { kind = "accession", ref = "0001558370-23-016503", date = 2023-10-18 }
 
 [[history.expected]]
 kind = "bars"
 cik = "0000084129"
 ticker = "RAD"
-first = 2023-10-16
-last = 2023-10-16
-cite = { kind = "accession", ref = "0001104659-23-113408", date = 2023-11-01 }
+first = 2023-10-13
+last = 2023-10-13
+cite = { kind = "accession", ref = "0001558370-23-016503", date = 2023-10-18 }
 
 [[history.expected]]
 kind = "line_end"
 cik = "0000084129"
 exchange = "NYSE"
-last = 2023-10-16
-cite = { kind = "accession", ref = "0001104659-23-113408", date = 2023-11-01 }
+last = 2023-10-13
+cite = { kind = "accession", ref = "0001558370-23-016503", date = 2023-10-18 }
