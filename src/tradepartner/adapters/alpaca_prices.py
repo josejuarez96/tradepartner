@@ -158,6 +158,13 @@ Alight's `WPF -> ALIT` and ContextLogic's `WISH -> LOGC` did). A refused
 change leaves the listings' mapping, so it can forgo sessions only the change
 would have given (its own cover page trailing it by more than
 `alpaca.rename_lead_days`, a rival's span in between); it never takes one.
+A change refused because another id of its issuer lists the new ticker (a
+sibling class) still ends its security's equity span under the old ticker on
+the process date (#3471, `ResolverReport.symbol_changes_ended`): Alpaca
+serves the old symbol no bar of it after the change, so the bars a later
+reuser of the symbol trades under it (AlTi's `GLBL -> ALTI` of 2023-01-04
+while its Class A id lists `ALTI`, then another issuer's `GLBL` from
+2024-09-17) never resolve to it; the new ticker stays the sibling's.
 A change stored on an id with no listing row known at the run (a lost id
 whose rows master-retract withdrew) is carried to the one id of its issuer
 (`_same_issuer`) whose last equity row before `process_date` is under `old`
@@ -568,7 +575,8 @@ class ResolverReport:
     leads clipped to such a hand-over; (#1597) the sessions another
     security lost to a `filing_name` span; and (#1696) the stored symbol
     changes followed, those refused and those matching no listing
-    (`_follow_changes`)."""
+    (`_follow_changes`), and (#3471) the refused ones that still end their
+    old ticker because a sibling class lists the new one."""
 
     placeholder: int = 0
     non_equity: Mapping[str, int] = field(default_factory=dict)
@@ -594,6 +602,7 @@ class ResolverReport:
     symbol_changes_followed: int = 0
     symbol_changes_unmatched: int = 0
     symbol_changes_refused: int = 0
+    symbol_changes_ended: int = 0
     chain_early_starts: int = 0
 
     def summary(self) -> str:
@@ -622,6 +631,8 @@ class ResolverReport:
             f"{self.filename_disputes} sessions another security lost to a filing_name span; "
             f"{self.symbol_changes_followed} symbol changes followed, "
             f"{self.symbol_changes_refused} refused (the new ticker not theirs on the day), "
+            f"{self.symbol_changes_ended} of them ending the old ticker (a sibling class "
+            "lists the new one), "
             f"{self.symbol_changes_unmatched} matching no listing; "
             f"{self.chain_early_starts} chained spans started early (rule 9)"
         )
@@ -1008,9 +1019,16 @@ class ListingResolver:
         # (a sibling class already listing the new ticker, #1696 review): a
         # change only ever adds sessions to its own security.
         refused = 0
+        # #3471: a change refused because another id of its issuer lists the
+        # new ticker (a sibling class, `_sibling_lists`) still ends its old
+        # ticker on its security at the process date: Alpaca serves the old
+        # symbol no bar of it after the change, and a later reuser of the
+        # symbol must not price it (GLBL -> ALTI while AlTi's Class A id lists
+        # ALTI, then another issuer's GLBL from 2024-09-17).
+        ends: set[tuple[str, date, str]] = set()
         base: ListingResolver | None = None
         while True:
-            late, followed = self._build(listings, evidence, changes, **options)
+            late, followed = self._build(listings, evidence, changes, ends=ends, **options)
             if not late and followed:
                 if base is None:
                     base = ListingResolver(listings, evidence, **options)
@@ -1019,8 +1037,18 @@ class ListingResolver:
                 break
             changes = [change for change in changes if change not in late]
             refused += len(late)
+            ends |= {
+                (security_id, day, old)
+                for security_id, day, old, new in late
+                if _sibling_lists(listings, security_id, new, class_symbols)
+            }
+        self._ends = frozenset(ends)  # #3471, for an audit of which changes ended
         if refused:
-            self.report = replace(self.report, symbol_changes_refused=refused)
+            self.report = replace(
+                self.report,
+                symbol_changes_refused=refused,
+                symbol_changes_ended=self._ends_applied,
+            )
         # #3054: each security's listing rows (day, ticker, provenance), for
         # `backdated`, and its first session, the alias's lower bound.
         self._listing_rows: dict[str, list[tuple[date, str, str | None]]] = defaultdict(list)
@@ -1052,6 +1080,7 @@ class ListingResolver:
         evidence: RegistrantEvidence | None,
         changes: list[tuple[str, date, str, str]],
         *,
+        ends: Collection[tuple[str, date, str]] = (),
         rename_lead_days: int,
         accepted_relistings: Collection[str],
         first_sessions: Mapping[str, date] | None,
@@ -1059,12 +1088,18 @@ class ListingResolver:
         last_bar: LastBar | None,
         handover_sessions: int | None,
     ) -> tuple[set[tuple[str, date, str, str]], list[tuple[str, date, str, str]]]:
-        """Build every mapping from `listings` with `changes` followed; the
-        followed changes the built mapping does not honour (to refuse), and
-        every change followed."""
+        """Build every mapping from `listings` with `changes` followed and
+        each of `ends` `(security_id, process_date, old)` (#3471: a change
+        refused for a sibling class) ending that security's equity span under
+        `old` on the process date; the followed changes the built mapping does
+        not honour (to refuse), and every change followed."""
         changes_of: dict[str, list[tuple[date, str, str]]] = defaultdict(list)
         for security_id, day, before, after in changes:
             changes_of[security_id].append((day, before, after))
+        ends_of: dict[str, list[tuple[date, str]]] = defaultdict(list)
+        for security_id, day, symbol in ends:
+            ends_of[security_id].append((day, symbol))
+        self._ends_applied = 0
         followed: list[tuple[str, date, str, str]] = []
         unmatched = 0
         self._evidence = evidence
@@ -1142,6 +1177,20 @@ class ListingResolver:
                     end if left is None else left,
                     filing_name=all(row.filing_name for row in rows[first:index]),
                 )
+                if kinds == {EQUITY}:
+                    stop = min(
+                        (
+                            day
+                            for day, ended in ends_of.get(security_id, ())
+                            if same_alpaca_symbol(ended, ticker)
+                            and span.covers(day)
+                            and start < day
+                        ),
+                        default=None,
+                    )
+                    if stop is not None:
+                        span = replace(span, end=stop)
+                        self._ends_applied += 1
                 if left is not None:
                     cut.add(span)
                 kept_spans += kept
@@ -2390,6 +2439,26 @@ def _carry_orphan_changes(
                 security_id = heirs[0]
         out.append((security_id, day, old, new))
     return out
+
+
+def _sibling_lists(
+    listings: Sequence[Mapping[str, Any]],
+    security_id: str,
+    symbol: str,
+    class_symbols: Mapping[str, str] | None,
+) -> bool:
+    """True when another id of `security_id`'s issuer (`_same_issuer`) has an
+    equity row in `listings` under `symbol` (#3471: AlTi's Class A id listing
+    `ALTI` when the bare id's `GLBL -> ALTI` is refused). Pure."""
+    for row in listings:
+        sid, ticker = str(row["security_id"]), str(row["ticker"])
+        if sid == security_id or not _same_issuer(sid, security_id):
+            continue
+        if is_placeholder_ticker(ticker) or listing_kind(ticker, row.get("class_title")) != EQUITY:
+            continue
+        if same_alpaca_symbol(master_symbol(row, class_symbols) or ticker, symbol):
+            return True
+    return False
 
 
 def _last_under(rows: Sequence[tuple[date, str]], day: date, symbol: str) -> bool:
