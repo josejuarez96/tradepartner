@@ -3087,6 +3087,38 @@ def test_a_later_cover_title_never_names_an_earlier_facts_class(settings: Settin
     assert with_later == without
 
 
+def test_a_later_listing_title_never_names_an_earlier_facts_class(settings: Settings) -> None:
+    source = _filings()
+    master = build_master(source, settings, ingested_at=NOW)
+    classes = build_classifications(source, master, settings, ingested_at=NOW)
+    later = _at(2019, 5, 1)
+    listing = next(row for row in master.listings if row["security_id"] == ACME)
+    retitled = listing | {"class_title": "Class A Common Stock", "known_at": later}
+    with_later = replace(master, listings=(*master.listings, retitled))
+    early = _fact(ACME, "us-gaap:CommonClassAMember", 7, f"{ACME}-19-2", later - timedelta(days=1))
+    after = _fact(ACME, "us-gaap:CommonClassAMember", 8, f"{ACME}-19-3", later + timedelta(days=1))
+
+    early_rows, early_unmatched = fact_rows([early], with_later, classes, ingested_at=NOW)
+    baseline = fact_rows([early], master, classes, ingested_at=NOW)
+    after_rows, after_unmatched = fact_rows([after], with_later, classes, ingested_at=NOW)
+
+    assert (early_rows, early_unmatched) == baseline == ((), (early,))
+    assert [(row["security_id"], row["value"]) for row in after_rows] == [(ACME, 8)]
+    assert after_unmatched == ()
+
+
+def test_a_retracted_listing_title_never_names_a_facts_class(settings: Settings) -> None:
+    source = _filings()
+    master = build_master(source, settings, ingested_at=NOW)
+    classes = build_classifications(source, master, settings, ingested_at=NOW)
+    listing = next(row for row in master.listings if row["security_id"] == ACME)
+    retracted = listing | {"class_title": "Class A Common Stock", "retracted": True}
+    master = replace(master, listings=(*master.listings, retracted))
+    fact = _fact(ACME, "us-gaap:CommonClassAMember", 7, f"{ACME}-19-2", _at(2019, 5, 1))
+
+    assert fact_rows([fact], master, classes, ingested_at=NOW) == ((), (fact,))
+
+
 def test_an_owner_override_sends_the_named_member_to_the_sole_common_class(
     settings: Settings,
 ) -> None:

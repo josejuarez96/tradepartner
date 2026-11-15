@@ -61,7 +61,8 @@ def test_every_listed_setting_changes_hash(key: str) -> None:
 # T389's `CURRENT_SCHEMA_VERSION` 49 (`retracted_rows`; at 48 the hash is 5c00edf7...e07e1b),
 # then #3363's `BUILD_RULES_VERSION` 9 (at 8 the hash is 9e881b83...f56932).
 # then #3362's `BUILD_RULES_VERSION` 10 (at 9 the hash is 0512a8aa...996a855).
-MAIN_DEFAULT_HASH = "c5591bf753663f2285c7376571a8ac217f4a31448357037e2dd8c916ab812cfe"
+# then #3325's `BUILD_RULES_VERSION` 11 (at 10 the hash is c5591bf7...812cfe).
+MAIN_DEFAULT_HASH = "0b36a3c68dcc6f1f83ca0f53369de85f54edb75310ae459e00c9c26921b69452"
 
 
 def test_hash_at_defaults_equals_the_hex_pinned_from_main() -> None:
