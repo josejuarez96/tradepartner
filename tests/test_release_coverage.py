@@ -244,6 +244,7 @@ def test_sub_dollar_move_uses_absolute_price_floor(tmp_path: Path) -> None:
     _backup_and_open(s, tmp_path)
     with open_for_write(s) as conn:
         conn.execute("DELETE FROM prices_daily WHERE security_id = 'A'")
+        _master(conn, "A2", "AAA2")  # an id with bars needs a master row (T393)
         for d in _days(20):
             _bar(conn, "A2", d, close=0.50000075)
     code, out = _coverage(s)

@@ -4477,7 +4477,12 @@ def make_app(
             raise missing
         decision_id = _release_write(
             lambda conn: registry.close_data_release(
-                conn, name=name, sessions_from=first, sessions_to=last, reason=reason
+                conn,
+                name=name,
+                sessions_from=first,
+                sessions_to=last,
+                reason=reason,
+                enforce_coverage=True,
             ),
             s,
         )
@@ -4486,11 +4491,23 @@ def make_app(
     @release_app.command("coverage")
     def release_coverage_cmd(
         name: Annotated[str, typer.Option(help="the release whose backup to compare")],
+        record: Annotated[
+            bool,
+            typer.Option(
+                "--record",
+                help="write the verdict against the open release; `close` needs a passing one",
+            ),
+        ] = False,
     ) -> None:
-        """Read-only: list securities that lost trading days since the release's backup.
+        """List securities that lost trading days since the release's backup.
 
         Exits 1 when unmoved loss exceeds either the per-security or store-wide
-        configured threshold (#3274, #3280). Writes nothing.
+        configured threshold (#3274, #3280), when a row the release retracted
+        has no other id holding an equal bar, or when a bar or dividend has no
+        owner (ADR 0029, T393). The check reads only; with `--record` the verdict
+        is then written as a coverage record of the open release, which
+        `data-release close` requires of a release that changed bars, actions or
+        master rows.
         """
         s = settings()
         if (missing := _store_missing(s)) is not None:
@@ -4514,7 +4531,12 @@ def make_app(
                     conn,
                     backup_alias="bk",
                     price_tolerance=s.store.release_move_price_tolerance,
+                    retraction_release=name,
                 )
+                spans = registry.release_retractions(
+                    conn, name, price_tolerance=s.store.release_move_price_tolerance
+                )
+                ownerless = registry.ownerless_rows(conn)
         except StoreLockedError as exc:
             raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except ReleaseCoverageError as exc:
@@ -4531,7 +4553,37 @@ def make_app(
             f"{len(bad)} not moved; {total} total unmoved sessions "
             f"(limit {total_limit})"
         )
-        if bad or total > total_limit:
+        unreceived = [x for x in spans if x.unreceived]
+        for span in spans:
+            typer.echo(span.describe())
+        for table, ids in ownerless.items():
+            shown = ",".join(ids[:5]) + (" ..." if len(ids) > 5 else "")
+            typer.echo(f"OWNERLESS {table}: {len(ids)} security id(s) with no master row: {shown}")
+        typer.echo(
+            f"retracted by {name}: {sum(x.count for x in spans)} row(s) in {len(spans)} span(s), "
+            f"{len(unreceived)} with sessions no other id holds an equal bar for; "
+            f"{sum(len(v) for v in ownerless.values())} ownerless id(s)"
+        )
+        failed = bool(bad or total > total_limit or unreceived or ownerless)
+        if record:
+            summary = {
+                "lost_unmoved_sessions": total,
+                "failing_securities": len(bad),
+                "retracted_rows": sum(x.count for x in spans),
+                "unreceived_spans": len(unreceived),
+                "ownerless_ids": sum(len(v) for v in ownerless.values()),
+            }
+            decision_id = _release_write(
+                lambda conn: registry.record_release_coverage(
+                    conn, name=name, passed=not failed, summary=summary
+                ),
+                s,
+            )
+            typer.echo(
+                f"decision {decision_id}: data_release {name} coverage "
+                f"({'failed' if failed else 'passed'})"
+            )
+        if failed:
             raise typer.Exit(1)
 
     @release_app.command("record")
