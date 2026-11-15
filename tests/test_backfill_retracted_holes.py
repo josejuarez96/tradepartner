@@ -289,3 +289,22 @@ def test_a_lost_ids_retracted_listing_made_after_the_clock_names_no_receiver(
     _lost_id_store(settings, listing_known=LATER + timedelta(days=1))
     found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
     assert found.holes == ()
+
+
+def test_an_owner_holding_its_own_bar_is_no_receiver_of_the_lost_ids_hole(
+    settings: Settings,
+) -> None:
+    """#3455: the receiver already holds its own, non-foreign bars there, so a
+    refetch could not land the retracted bar and none is asked for."""
+    _lost_id_store(settings)
+    with duckdb.connect(settings.store.path) as conn:
+        for d in _sessions(*JUNE_WINDOW):  # the same line the retracted bar carried
+            conn.execute(
+                "INSERT INTO prices_daily (security_id, session, open, high, low, close, volume, "
+                "known_at, ingested_at, source, provenance) "
+                "SELECT ?, ?, 20.0, 21.0, 19.0, 20.0, 1000000, ?, ?, source, provenance "
+                "FROM prices_daily WHERE security_id = ? LIMIT 1",
+                [ACME, d, bar_known_at(d), bar_known_at(d) + timedelta(hours=1), SPY],
+            )
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert found.holes == ()

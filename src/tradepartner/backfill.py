@@ -860,14 +860,18 @@ def _retracted_holes(
     out: set[str] = set()
     for sid, day in days:
         tickers = [tk for tk in tickers_of(sid, day) if alpaca_symbol(tk) is not None]
-        owners = bar_owners(resolver, tickers, day)
+
+        def holds(owner: str, session: date, sid: str = sid) -> bool:
+            # An owner with its own bar there takes no refetch (#3455); a foreign
+            # bar (the retracted line under the receiver) is still a hole.
+            have = held.get((owner, session))
+            return have is not None and not _foreign(have, was.get((sid, session)), fetched_at)
+
+        owners = bar_owners(resolver, tickers, day, holds)
         # The id's own bar goes back to it only where no other id receives it (a
         # mixed-ticker id whose other ticker is owned elsewhere drops itself).
         for receiver in sorted((owners - {sid}) or owners):
-            if receiver not in fetched or (only is not None and receiver not in only):
-                continue
-            have = held.get((receiver, day))
-            if have is None or _foreign(have, was.get((sid, day)), fetched_at):
+            if receiver in fetched and (only is None or receiver in only):
                 out.add(receiver)
     return out
 
