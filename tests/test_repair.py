@@ -1915,6 +1915,17 @@ def test_the_exact_orphan_count_lets_the_apply_through(orphan_store: Settings) -
     assert (DEAD, date(2021, 6, 1)) not in {(r[0], r[1]) for r in _bars(orphan_store)}
 
 
+def test_the_apply_records_the_approved_orphan_keys_against_the_release(
+    orphan_store: Settings,
+) -> None:
+    from tradepartner.store import registry
+
+    repair_resolution(orphan_store, clock=lambda: RUN, expect=(3, 1), release=REL, allow_orphans=2)
+    with open_for_write(orphan_store) as conn:
+        count, keys = registry.approved_orphans(conn, REL)
+    assert count == 2 and {sid for sid, _ in keys} == {DEAD} and len(keys) == 2
+
+
 def test_an_orphan_count_with_no_orphans_refuses(store: Settings) -> None:
     before = _bars(store)
     with pytest.raises(RepairRefused, match="--allow-orphans"):

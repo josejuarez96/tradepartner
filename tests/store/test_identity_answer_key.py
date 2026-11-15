@@ -69,7 +69,7 @@ def test_the_loader_refuses_a_bad_cik_and_an_empty_history() -> None:
 
 def test_the_seeds_load_with_sources_outside_this_repo() -> None:
     key = load_answer_key(date(2026, 11, 11))
-    assert [h.id for h in key] == ["apa-apache-holdco-2021", "mar-nyse-chicago-2020"]
+    assert [h.id for h in key][:2] == ["apa-apache-holdco-2021", "mar-nyse-chicago-2020"]
     facts = [
         c
         for h in key
@@ -82,11 +82,12 @@ def test_the_seeds_load_with_sources_outside_this_repo() -> None:
         assert c.kind == "accession" or c.ref.startswith("https://")
         assert "tradepartner" not in c.ref
     apa = key[0]
-    assert {i.citation.ref for i in apa.inputs} == {
+    assert {
         "0001193125-20-163490",
         "0001193125-20-163501",
         "0001193125-21-063695",
-    }
+        "0001354457-21-000304",
+    } <= {i.citation.ref for i in apa.inputs}
 
 
 def _true_apa() -> Observed:
@@ -199,3 +200,44 @@ def test_overlong_bars_running_into_the_holdco_window_are_a_miss() -> None:
     )
     (miss,) = match(apa, overlong)
     assert miss.why.startswith("bars: 0000006769 also has APA")
+
+
+_NSE = (
+    '[[history]]\nid = "h"\n'
+    '[[history.input]]\nkind = "25-nse"\ncik = "0000006769"\ndate = 2021-03-04\n'
+    'exchange = "Nasdaq"\nticker = "APA"\n'
+    'cite = { kind = "accession", ref = "0001354457-21-000304", date = 2021-03-04 }\n'
+    "{extra}"
+    '[[history.expected]]\nkind = "line_end"\ncik = "0000006769"\nexchange = "Nasdaq"\n'
+    'cite = { kind = "accession", ref = "0001354457-21-000304", date = 2021-03-04 }\n'
+)
+
+
+def test_a_25_nse_input_carries_the_removal_date_the_notice_states() -> None:
+    (h,) = parse_key(_NSE.replace("{extra}", "effective = 2021-03-14\n"), date(2026, 1, 1))
+    assert h.inputs[0].kind == "25-nse"
+    assert h.inputs[0].effective == date(2021, 3, 14)
+
+
+def test_a_25_nse_input_without_a_stated_removal_date_loads_with_none() -> None:
+    (h,) = parse_key(_NSE.replace("{extra}", ""), date(2026, 1, 1))
+    assert h.inputs[0].effective is None
+
+
+def test_a_removal_date_before_the_filing_or_on_a_listing_is_refused() -> None:
+    with pytest.raises(AnswerKeyError, match="effective is before the event date"):
+        parse_key(_NSE.replace("{extra}", "effective = 2021-03-03\n"), date(2026, 1, 1))
+    listing = _NSE.replace("25-nse", "listing").replace("{extra}", "effective = 2021-03-14\n")
+    with pytest.raises(AnswerKeyError, match="only a form25 or 25-nse"):
+        parse_key(listing, date(2026, 1, 1))
+
+
+def test_every_history_in_the_key_is_well_formed_and_cited_from_outside() -> None:
+    key = load_answer_key(date(2026, 11, 10))
+    assert len(key) >= 19
+    for h in key:
+        assert h.inputs, h.id
+        assert {b.cik for b in h.bars} <= {i.cik for i in h.inputs} | {e.cik for e in h.expected}
+        for c in [i.citation for i in h.inputs] + [e.citation for e in h.expected]:
+            assert "tradepartner" not in c.ref
+            assert c.kind != "accession" or re.fullmatch(r"\d{10}-\d{2}-\d{6}", c.ref)

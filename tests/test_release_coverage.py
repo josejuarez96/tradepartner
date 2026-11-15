@@ -244,6 +244,7 @@ def test_sub_dollar_move_uses_absolute_price_floor(tmp_path: Path) -> None:
     _backup_and_open(s, tmp_path)
     with open_for_write(s) as conn:
         conn.execute("DELETE FROM prices_daily WHERE security_id = 'A'")
+        _master(conn, "A2", "AAA2")  # an id with bars needs a master row (T393)
         for d in _days(20):
             _bar(conn, "A2", d, close=0.50000075)
     code, out = _coverage(s)
@@ -264,3 +265,40 @@ def test_unknown_release_name_is_scrubbed(tmp_path: Path) -> None:
     assert res.exit_code == 2
     assert "no release named '<scrubbed>'" in res.output
     assert secret not in res.output
+
+
+def test_a_retracted_session_regained_with_another_volume_is_a_vendor_revision(
+    tmp_path: Path,
+) -> None:
+    """#3432: the receiving id gained a bar with the same open and close but another
+    volume and high; the retracted session is moved and counted as revised. Without the
+    retraction release, or when the receiver held the bar already, it stays lost."""
+    from tradepartner.store.release_coverage import format_loss
+    from tradepartner.store.retracted_rows import retract
+
+    s = _settings(tmp_path)
+    _seed(s)
+    backup = _backup_and_open(s, tmp_path)
+    with open_for_write(s) as conn:
+        retract(conn, "prices_daily", [("A", d) for d in _days(20)], "dup", "rel", "line 1")
+        _master(conn, "A:new", "AAA2")
+        for d in _days(20):
+            _bar(conn, "A:new", d)
+        conn.execute("UPDATE prices_daily SET volume = 9, high = 1.5 WHERE security_id = 'A:new'")
+        # B and C hold A's seeded bar in the backup too; make theirs differ now.
+        conn.execute("UPDATE prices_daily SET open = 5 WHERE security_id IN ('B', 'C')")
+    with duckdb.connect(s.store.path, read_only=True) as conn:
+        conn.execute(f"ATTACH '{backup}' AS bk (READ_ONLY)")
+        plain = release_coverage(conn, backup_alias="bk")
+        (loss,) = release_coverage(conn, backup_alias="bk", retraction_release="rel")
+    assert plain[0].unmoved == 20 and plain[0].revised == 0
+    assert (loss.lost, loss.moved, loss.revised, loss.unmoved) == (20, 20, 20, 0)
+    assert "moved to A:new (20 as a vendor revision" in format_loss(loss)
+    # The same bars on an id of another issuer are no revision.
+    with open_for_write(s) as conn:
+        conn.execute("UPDATE prices_daily SET security_id = 'Z' WHERE security_id = 'A:new'")
+        _master(conn, "Z", "ZZZ")
+    with duckdb.connect(s.store.path, read_only=True) as conn:
+        conn.execute(f"ATTACH '{backup}' AS bk (READ_ONLY)")
+        (other,) = release_coverage(conn, backup_alias="bk", retraction_release="rel")
+    assert (other.moved, other.unmoved) == (0, 20)

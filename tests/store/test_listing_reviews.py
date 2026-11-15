@@ -104,6 +104,7 @@ def test_packaged_file_cites_each_row_to_its_filing() -> None:
         "LINK",
         "MSGK",
         "MSGR",
+        "B",
     }
     assert {row.ticker: row.exchange for row in rows} == {
         "DDS": "TXSE",
@@ -114,12 +115,16 @@ def test_packaged_file_cites_each_row_to_its_filing() -> None:
         "LINK": "NASDAQ",
         "MSGK": "NYSE",
         "MSGR": "NYSE",
+        "B": "NYSE",
     }
     for row in rows:
-        assert row.issue == {"MSGK": "#3391", "MSGR": "#3392"}.get(row.ticker, "#3293")
+        assert row.issue == {"MSGK": "#3391", "MSGR": "#3392", "B": "#3432"}.get(
+            row.ticker, "#3293"
+        )
         assert normalize_exchange(row.exchange) == row.exchange
-        # A listing starts on the session of the filing that states it.
-        assert row.valid_from == session_of(row.known_at)
+        # A listing never starts before the session of the filing that states it
+        # (#3432: Barrick's 6-K of 05-06 states a symbol change effective 05-09).
+        assert row.valid_from >= session_of(row.known_at)
 
 
 def test_txse_is_a_code_only_the_reviewed_rows_use() -> None:
@@ -440,3 +445,17 @@ def test_msgr_regular_way_span_starts_oct_27_not_at_the_cover_page() -> None:
     assert msgr["valid_from"].to_list() == [date(2026, 10, 27)]
     early = listings_as_of(conn, MSGR_8K_ACCEPTED - timedelta(seconds=1))
     assert "MSGR" not in early["ticker"].to_list()
+
+
+# --- Barrick (#3432) ----------------------------------------------------
+
+
+def test_barrick_b_row_resolves_b_to_barrick_from_the_effective_day() -> None:
+    """The 6-K of 2025-05-06 states GOLD -> B effective 2025-05-09; without the row
+    the store starts B at 2026-02-27 and Barrick's bars of 2025-12-02..2026-02-05
+    (sent as B) are assigned to no one."""
+    (row,) = [r for r in reviewed_listings() if r.ticker == "B"]
+    assert row.security_id == "0000756894"
+    assert row.valid_from == date(2025, 5, 9)
+    assert row.known_at == _utc(2025, 5, 6, 21, 20, 5)
+    assert row.accession == "0001193125-25-113917"
