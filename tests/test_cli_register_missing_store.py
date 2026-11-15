@@ -7,6 +7,9 @@ the path and creates no file.
 
 from __future__ import annotations
 
+import hashlib
+import os
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -63,4 +66,50 @@ def test_dataset_register_refuses_a_missing_store(missing: Path, tmp_path: Path)
     f.write_text("event_date\n2023-01-03\n", encoding="utf-8")
     args = ["dataset", "register", "--name", "n", "--version", "v1", "--path", str(f)]
     args += ["--event-start", "2023-01-01", "--event-end", "2023-12-31"]
+    _refused(*_run(*args), missing)
+
+
+def test_exposure_record_refuses_a_missing_store(missing: Path, tmp_path: Path) -> None:
+    probe = tmp_path / "probe-2689.py"
+    probe.write_text("print('probe')\n", encoding="utf-8")
+    probe_mtime = (
+        datetime.fromisoformat("2026-10-31T20:00:00+00:00") - timedelta(hours=1)
+    ).timestamp()
+    os.utime(probe, (probe_mtime, probe_mtime))
+    kill = tmp_path / "kill.md"
+    kill.write_text("kill line: fail if t < 2\n", encoding="utf-8")
+    args = [
+        "exposure",
+        "record",
+        "--candidate",
+        "#2689",
+        "--source",
+        "store",
+        "--family",
+        "momentum",
+        "--kill-line-url",
+        "https://github.com/josejuarez96/tradepartner/issues/2689#issuecomment-6548103186",
+        "--kill-line-file",
+        str(kill),
+        "--kill-line-posted-at",
+        "2026-10-31T19:29:02+00:00",
+        "--probe",
+        str(probe),
+        "--probe-sha256",
+        hashlib.sha256(probe.read_bytes()).hexdigest(),
+        "--read-at",
+        "2026-10-31T20:00:00+00:00",
+        "--pin",
+        "store_max_ingested_at=2026-10-31T04:41:00+00:00",
+        "--window-start",
+        "2020-08-31",
+        "--window-end",
+        "2023-12-29",
+        "--configurations",
+        "1",
+        "--verdict",
+        "fail",
+        "--desk-read",
+        "docs/research/2026-10-31-desk-read.md",
+    ]
     _refused(*_run(*args), missing)
