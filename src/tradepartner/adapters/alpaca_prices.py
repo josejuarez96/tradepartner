@@ -158,6 +158,12 @@ Alight's `WPF -> ALIT` and ContextLogic's `WISH -> LOGC` did). A refused
 change leaves the listings' mapping, so it can forgo sessions only the change
 would have given (its own cover page trailing it by more than
 `alpaca.rename_lead_days`, a rival's span in between); it never takes one.
+A change stored on an id with no listing row known at the run (a lost id
+whose rows master-retract withdrew) is carried to the one id of its issuer
+(`_same_issuer`) whose last equity row before `process_date` is under `old`
+(#3466: Atlantic International's `ATLN -> CIRC` sat on the retracted
+`@2025-03-27` id, so the receiver `@2024-12-09` was asked for `ATLN` after
+Alpaca had stopped serving it); with no such id, or two, it stays put.
 Both refusal tests judge the resolver with every change applied, so another
 security's change can refuse this one (#1728 follow-up). A
 change known after the run is not read, so it bounds nothing at that run
@@ -984,6 +990,7 @@ class ListingResolver:
             )
             for change in symbol_changes
         ]
+        changes = _carry_orphan_changes(listings, changes, class_symbols)
         alias_changes = list(changes)
         options: dict[str, Any] = {
             "rename_lead_days": rename_lead_days,
@@ -2351,6 +2358,48 @@ def _drop_same_day_typos(rows: Sequence[_Row]) -> tuple[list[_Row], date | None]
             continue
         kept = [r for r in kept if not (r.day == day and r.kind == EQUITY and r.ticker != held)]
     return kept, None
+
+
+def _carry_orphan_changes(
+    listings: Sequence[Mapping[str, Any]],
+    changes: Sequence[tuple[str, date, str, str]],
+    class_symbols: Mapping[str, str] | None,
+) -> list[tuple[str, date, str, str]]:
+    """`changes` `(security_id, process_date, old, new)` with each one whose
+    security has no row in `listings` re-keyed to the one id of the same
+    issuer (`_same_issuer`) whose last equity row before `process_date` is
+    under `old` (#3466); a change with no such id, or several, is kept as it
+    is. Pure: the listings are those known at the run."""
+    by_security: dict[str, list[tuple[date, str]]] = defaultdict(list)
+    for row in listings:
+        ticker = str(row["ticker"])
+        if is_placeholder_ticker(ticker) or listing_kind(ticker, row.get("class_title")) != EQUITY:
+            continue
+        symbol = master_symbol(row, class_symbols) or ticker
+        by_security[str(row["security_id"])].append((row["valid_from"], symbol))
+    known = {str(row["security_id"]) for row in listings}
+    out: list[tuple[str, date, str, str]] = []
+    for security_id, day, old, new in changes:
+        if security_id not in known:
+            heirs = [
+                sid
+                for sid, rows in by_security.items()
+                if _same_issuer(sid, security_id) and _last_under(rows, day, old)
+            ]
+            if len(heirs) == 1:
+                security_id = heirs[0]
+        out.append((security_id, day, old, new))
+    return out
+
+
+def _last_under(rows: Sequence[tuple[date, str]], day: date, symbol: str) -> bool:
+    """True when the latest of `rows` `(valid_from, ticker)` before `day`
+    names `symbol` (one of them, on a day with two)."""
+    before = [d for d, _ in rows if d < day]
+    if not before:
+        return False
+    last = max(before)
+    return any(d == last and same_alpaca_symbol(t, symbol) for d, t in rows)
 
 
 def _follow_changes(
