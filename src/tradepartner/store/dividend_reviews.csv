@@ -194,3 +194,4 @@ security_id,ex_date,amount,verdict,retract_source_action_id,ticker,evidence
 0001514281,2019-06-27,0.5,duplicate,88cc3d07-5c7d-4cc7-9938-01e731b705b2,MITT,raw records differ by cusip only
 0001383414,2026-10-15,0.04,distinct,,PNNT,base plus supplemental: https://pnnt.pennantpark.com/dividends-splits
 0001504619,2026-10-15,0.0033,duplicate,764fdbfa-b7dd-47af-b79d-dd57095cc021,PFLT,one $0.0033 supplemental beside the $0.08 base: https://pflt.pennantpark.com/stock-information/dividends-splits
+0001383414,2026-11-13,0.04,distinct,,PNNT,base plus supplemental: https://www.sec.gov/Archives/edgar/data/0001383414/000117184326007074/exh_991.htm
