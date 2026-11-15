@@ -12,7 +12,10 @@ as a merge into a successor id does. With `retraction_release`, a session the re
 retracted from `retracted_rows` (T393, ADR 0029) is also moved when another id
 holds an equal bar for it in the current store, gained or not: the retracted bar
 was a duplicate of the owner's. The caller checks per-security and total
-unmoved losses against configured thresholds. It writes nothing.
+unmoved losses against configured thresholds. A retracted session whose receiving
+id gained a bar for it (none in the backup) with the same open and close and the same issuer
+(the id's CIK), but another volume, high or low, is moved too, counted as a vendor
+revision (#3432): the vendor now serves a different bar for that day. It writes nothing.
 """
 
 from __future__ import annotations
@@ -44,6 +47,7 @@ class SessionLoss:
     lost: int
     moved: int
     moved_to: tuple[str, ...]
+    revised: int = 0
 
     @property
     def unmoved(self) -> int:
@@ -120,29 +124,42 @@ def release_coverage(
         retr AS ({retr}),
         moved AS (
             SELECT l.security_id, l.session, min(cb.security_id) AS successor,
-                   list(DISTINCT cb.security_id) AS successors
+                   list(DISTINCT cb.security_id) AS successors,
+                   bool_or(cb.v = bb.v
+                           AND abs(cb.h - bb.h) <= ? * greatest(1, abs(bb.h))
+                           AND abs(cb.lo - bb.lo) <= ? * greatest(1, abs(bb.lo))) AS exact
             FROM lost l
             JOIN bb ON bb.security_id = l.security_id AND bb.session = l.session
             JOIN cb ON cb.session = l.session AND cb.security_id <> l.security_id
-             AND (EXISTS (SELECT 1 FROM gained g
-                          WHERE g.security_id = cb.security_id AND g.session = cb.session)
-                  OR EXISTS (SELECT 1 FROM retr r
-                             WHERE r.security_id = l.security_id AND r.session = l.session))
-             AND cb.v = bb.v
              AND abs(cb.o - bb.o) <= ? * greatest(1, abs(bb.o))
-             AND abs(cb.h - bb.h) <= ? * greatest(1, abs(bb.h))
-             AND abs(cb.lo - bb.lo) <= ? * greatest(1, abs(bb.lo))
              AND abs(cb.cl - bb.cl) <= ? * greatest(1, abs(bb.cl))
+             AND (
+                 (cb.v = bb.v
+                  AND abs(cb.h - bb.h) <= ? * greatest(1, abs(bb.h))
+                  AND abs(cb.lo - bb.lo) <= ? * greatest(1, abs(bb.lo))
+                  AND (EXISTS (SELECT 1 FROM gained g
+                               WHERE g.security_id = cb.security_id AND g.session = cb.session)
+                       OR EXISTS (SELECT 1 FROM retr r
+                                  WHERE r.security_id = l.security_id
+                                    AND r.session = l.session)))
+                 OR (split_part(split_part(cb.security_id, ':', 1), '@', 1)
+                         = split_part(split_part(l.security_id, ':', 1), '@', 1)
+                     AND EXISTS (SELECT 1 FROM gained g
+                             WHERE g.security_id = cb.security_id AND g.session = cb.session)
+                     AND EXISTS (SELECT 1 FROM retr r
+                                 WHERE r.security_id = l.security_id AND r.session = l.session))
+             )
             GROUP BY ALL
         ),
         agg AS (
             SELECT l.security_id, min(l.session) AS first, max(l.session) AS last,
                    count(*) AS lost, count(m.session) AS moved,
+                   count(m.session) FILTER (WHERE NOT m.exact) AS revised,
                    flatten(list(m.successors) FILTER (WHERE m.session IS NOT NULL)) AS succ
             FROM lost l LEFT JOIN moved m USING (security_id, session)
             GROUP BY l.security_id
         )
-        SELECT a.security_id, a.first, a.last, a.lost, a.moved, a.succ,
+        SELECT a.security_id, a.first, a.last, a.lost, a.moved, a.succ, a.revised,
                coalesce(
                    (SELECT arg_max(name, known_at) FROM main.securities s
                     WHERE s.security_id = a.security_id),
@@ -155,12 +172,12 @@ def release_coverage(
                     WHERE s.security_id = a.security_id))
         FROM agg a ORDER BY a.lost DESC, a.security_id
         """,
-        [[k[0] for k in keys], [k[1] for k in keys], *retr_params, *([price_tolerance] * 4)],
+        [[k[0] for k in keys], [k[1] for k in keys], *retr_params, *([price_tolerance] * 6)],
     ).fetchall()
     out: list[SessionLoss] = []
-    for sid, first, last, lost, moved, succ, name, ticker in rows:
+    for sid, first, last, lost, moved, succ, revised, name, ticker in rows:
         ids = sorted({str(x) for x in (succ or [])})[:_MAX_SUCCESSORS]
-        out.append(SessionLoss(sid, name, ticker, first, last, lost, moved, tuple(ids)))
+        out.append(SessionLoss(sid, name, ticker, first, last, lost, moved, tuple(ids), revised))
     return out
 
 
@@ -177,6 +194,8 @@ def format_loss(x: SessionLoss) -> str:
         where = f"moved to {','.join(x.moved_to)}"
     else:
         where = f"PARTLY MOVED ({x.moved} of {x.lost}) to {','.join(x.moved_to)}"
+    if x.revised:
+        where += f" ({x.revised} as a vendor revision: another volume, high or low)"
     return (
         f"{x.security_id} {x.name or '-'} {x.ticker or '-'}: lost {x.first}..{x.last}, "
         f"{x.lost} sessions, {where}"
