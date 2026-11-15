@@ -16,6 +16,11 @@ unmoved losses against configured thresholds. A retracted session whose receivin
 id gained a bar for it (none in the backup) with the same open and close and the same issuer
 (the id's CIK), but another volume, high or low, is moved too, counted as a vendor
 revision (#3432): the vendor now serves a different bar for that day. It writes nothing.
+
+A price also matches when the older (lost or retracted) row holds it at the configured
+`price_decimals` and is the newer price truncated or rounded to it (#3465):
+the vendor first served the bar at 4 decimals (SNTI open 0.1732) and now at 5 (0.17325).
+A price a whole unit or more away at that precision is still another price.
 """
 
 from __future__ import annotations
@@ -29,6 +34,29 @@ import duckdb
 
 _ALIAS = re.compile(r"[a-z_][a-z0-9_]*")
 _MAX_SUCCESSORS = 3
+# Float noise when a price is scaled to its decimal grid; not a matching tolerance.
+_GRID_EPS = 1e-6
+
+
+def price_match_sql(new: str, old: str, tolerance: float, decimals: int | None) -> str:
+    """A SQL predicate: price `new` equals the older row's price `old` (SQL
+    expressions). Equal within `tolerance` relative to `old` with an absolute floor at
+    price 1; or, with `decimals`, `old` lies on the `decimals` grid and `new` is in
+    [old - u/2, old + u) for u one unit of that last decimal, i.e. `old` is `new`
+    truncated or rounded to the older row's stored precision (#3465). Two prices that both hold
+    `decimals` places match only when equal, so a real different price still fails."""
+    tol = float(tolerance)
+    base = f"abs({new} - {old}) <= {tol!r} * greatest(1, abs({old}))"
+    if decimals is None:
+        return f"({base})"
+    if not 0 <= int(decimals) <= 8:
+        raise ValueError(f"price decimals out of range: {decimals!r}")
+    unit = 10 ** int(decimals)
+    return (
+        f"({base} OR (abs({old} * {unit} - round({old} * {unit})) <= {_GRID_EPS!r} "
+        f"AND {new} * {unit} - {old} * {unit} >= {-0.5 - _GRID_EPS!r} "
+        f"AND {new} * {unit} - {old} * {unit} < {1 - _GRID_EPS!r}))"
+    )
 
 
 class ReleaseCoverageError(RuntimeError):
@@ -60,6 +88,7 @@ def release_coverage(
     *,
     backup_alias: str,
     price_tolerance: float = 1e-6,
+    price_decimals: int | None = None,
     retraction_release: str | None = None,
     accepted: Collection[tuple[str, date]] = (),
 ) -> list[SessionLoss]:
@@ -68,8 +97,9 @@ def release_coverage(
     `conn` is read-only on the current store with the backup attached read-only
     as `backup_alias`; `retraction_release` names a release whose unrestored
     `retracted_rows` bars count as moved when another id holds an equal bar.
-    `accepted` bar keys (`security_id`, session) are left out of the losses: the
-    owner-approved orphans of the release (`registry.approved_orphans`).
+    `price_decimals` is the precision an older row may hold a price at
+    (`price_match_sql`). `accepted` bar keys (`security_id`, session) are left out
+    of the losses: the owner-approved orphans of the release (`registry.approved_orphans`).
     Only distinct sessions count, so a revised bar (a second
     `known_at`) is no loss. A security new since the backup has no loss.
     """
@@ -103,6 +133,10 @@ def release_coverage(
     )
     retr_params = [retraction_release] if "?" in retr else []
     keys = sorted(accepted)
+
+    def same(col: str) -> str:
+        return price_match_sql(f"cb.{col}", f"bb.{col}", price_tolerance, price_decimals)
+
     rows = conn.execute(
         f"""
         WITH bb AS (
@@ -125,18 +159,16 @@ def release_coverage(
         moved AS (
             SELECT l.security_id, l.session, min(cb.security_id) AS successor,
                    list(DISTINCT cb.security_id) AS successors,
-                   bool_or(cb.v = bb.v
-                           AND abs(cb.h - bb.h) <= ? * greatest(1, abs(bb.h))
-                           AND abs(cb.lo - bb.lo) <= ? * greatest(1, abs(bb.lo))) AS exact
+                   bool_or(cb.v = bb.v AND {same("h")} AND {same("lo")}) AS exact
             FROM lost l
             JOIN bb ON bb.security_id = l.security_id AND bb.session = l.session
             JOIN cb ON cb.session = l.session AND cb.security_id <> l.security_id
-             AND abs(cb.o - bb.o) <= ? * greatest(1, abs(bb.o))
-             AND abs(cb.cl - bb.cl) <= ? * greatest(1, abs(bb.cl))
+             AND {same("o")}
+             AND {same("cl")}
              AND (
                  (cb.v = bb.v
-                  AND abs(cb.h - bb.h) <= ? * greatest(1, abs(bb.h))
-                  AND abs(cb.lo - bb.lo) <= ? * greatest(1, abs(bb.lo))
+                  AND {same("h")}
+                  AND {same("lo")}
                   AND (EXISTS (SELECT 1 FROM gained g
                                WHERE g.security_id = cb.security_id AND g.session = cb.session)
                        OR EXISTS (SELECT 1 FROM retr r
@@ -172,7 +204,7 @@ def release_coverage(
                     WHERE s.security_id = a.security_id))
         FROM agg a ORDER BY a.lost DESC, a.security_id
         """,
-        [[k[0] for k in keys], [k[1] for k in keys], *retr_params, *([price_tolerance] * 6)],
+        [[k[0] for k in keys], [k[1] for k in keys], *retr_params],
     ).fetchall()
     out: list[SessionLoss] = []
     for sid, first, last, lost, moved, succ, revised, name, ticker in rows:
