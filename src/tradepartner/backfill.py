@@ -192,6 +192,7 @@ from tradepartner.store.db import StoreLockedError, insert_row, open_for_write, 
 from tradepartner.store.delistings import DELISTED, LISTED, TRANSFERRED, listing_ends_as_of
 from tradepartner.store.dividend_reviews import REVIEWED_IDENTITIES
 from tradepartner.store.master import first_session, securities_as_of
+from tradepartner.store.registry import open_release
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import on_list_ids
@@ -380,6 +381,10 @@ class HoleFill:
 HALTED = "not filled: the fill halted first"
 
 
+def _retracted_note(retr: Collection[str]) -> str:
+    return f"; {len(retr)} with a retracted session no id holds" if retr else ""
+
+
 def _dropped_note(dropped: dict[str, int]) -> str:
     if not dropped:
         return ""
@@ -539,11 +544,17 @@ def fill_holes(
         run = SourceRun("alpaca", LOCKED, 0, cursor, _clean(str(exc), settings))
         return HoleFill((), (run,), dry_run)
     windows = month_windows(since, end - timedelta(days=1)) if end > since else []
+    try:
+        tail = _tail_windows(_retracted_at(settings, clock), since, end)
+    except StoreLockedError as exc:
+        run = SourceRun("alpaca", LOCKED, 0, cursor, _clean(str(exc), settings))
+        return HoleFill((), (run,), dry_run)
+    windows += tail
     tally = _Tally()
     if dry_run:
         try:
             t = ensure_tz_aware_utc(clock(), field_name="clock()")
-            holes, known = _holes(settings, windows, t, only, tally)
+            holes, known = _holes(settings, windows, t, only, tally, frozenset(tail))
         except StoreLockedError as exc:
             run = SourceRun("alpaca", LOCKED, 0, cursor, _clean(str(exc), settings))
             return HoleFill((), (run,), dry_run)
@@ -574,6 +585,7 @@ def fill_holes(
             only=only,
             tally=tally,
             resolvers=resolvers,
+            tail=window in tail,
         )
         if progress is not None:
             progress(_progress_line(window, n, len(windows), chunk, time.monotonic() - began))
@@ -586,6 +598,15 @@ def fill_holes(
             break
     named = _named(only, known, tally, halted=halted)
     return HoleFill((), tuple(runs), dry_run, tally.totals(), named)
+
+
+def _retracted_at(settings: Settings, clock: Callable[[], datetime]) -> list[tuple[str, date]]:
+    """`_retracted_sessions` as of the clock; none when the store is absent."""
+    if not Path(settings.store.path).exists():
+        return []
+    t = ensure_tz_aware_utc(clock(), field_name="clock()")
+    with _read(settings) as conn:
+        return _retracted_sessions(conn, t)
 
 
 def _progress_line(
@@ -775,16 +796,101 @@ def _month_holes(
     return sorted({*empty, *gaps, *handed}), gaps, stored, dropped, handed
 
 
+def _retracted_sessions(conn: duckdb.DuckDBPyConnection, t: datetime) -> list[tuple[str, date]]:
+    """The (security_id, session) bars the open release retracted by `t`
+    (`retracted_rows`, ADR 0029) and has not restored, sorted; none without an
+    open release or a `retracted_rows` table (#3431). `retracted_at <= t`: a fill
+    as of `t` knows no later retraction."""
+    tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
+    if "retracted_rows" not in tables:
+        return []
+    release = open_release(conn)
+    if release is None:
+        return []
+    rows = conn.execute(
+        "SELECT DISTINCT row_key[1], CAST(row_key[2] AS DATE) FROM retracted_rows "
+        "WHERE table_name = 'prices_daily' AND release = ? AND restored_at IS NULL "
+        "AND retracted_at <= ? ORDER BY 1, 2",
+        [release.name, t],
+    ).fetchall()
+    return [(str(sid), day) for sid, day in rows]
+
+
+def _retracted_holes(
+    conn: duckdb.DuckDBPyConnection,
+    resolver: ListingResolver,
+    t: datetime,
+    window: tuple[date, date],
+    ids: Collection[str],
+    only: frozenset[str] | None,
+    retracted: Collection[tuple[str, date]],
+) -> set[str]:
+    """Those of `ids` (of `only`, when given) that a bar retracted in `window`
+    (`_retracted_sessions`) now belongs to by the resolver at `t` and that hold no
+    bar known at `t` on that session: a hole whatever the id stores in the rest of
+    the month or the backfill cursor says (#3431). The retracted bar's ticker is
+    its security's listing live on the session; a session whose ticker is not an
+    Alpaca symbol, or that the resolver (rename lead included) gives to no id, is
+    none: a fetched bar could not land on it."""
+    first, last = window
+    days = [(sid, day) for sid, day in retracted if first <= day <= last]
+    if not days:
+        return set()
+    tickers: dict[str, list[tuple[date, str]]] = defaultdict(list)
+    for row in listings_as_of(conn, t).iter_rows(named=True):
+        tickers[row["security_id"]].append((row["valid_from"], row["ticker"]))
+    held = {
+        (str(sid), day)
+        for sid, day in conn.execute(
+            "SELECT DISTINCT security_id, session FROM prices_daily "
+            "WHERE session BETWEEN ? AND ? AND known_at <= ?",
+            [first, last, t],
+        ).fetchall()
+    }
+    fetched = set(ids)
+    out: set[str] = set()
+    for sid, day in days:
+        rows = sorted(tickers.get(sid, []))
+        live = [tk for start, tk in rows if start <= day]
+        ticker = live[-1] if live else (rows[0][1] if rows else None)
+        if ticker is None or alpaca_symbol(ticker) is None:
+            continue
+        receiver = resolver.resolve(ticker, day) or resolver.lead(ticker, day)
+        if receiver is None or receiver not in fetched or (receiver, day) in held:
+            continue
+        if only is not None and receiver not in only:
+            continue
+        out.add(receiver)
+    return out
+
+
+def _tail_windows(
+    retracted: Collection[tuple[str, date]], since: date, end: date
+) -> list[tuple[date, date]]:
+    """The months from `end` (the day after the last committed backfill month)
+    holding a retracted session on or after `since`: each from the month's first
+    day (or `end`) to its last retracted session, so a fetch stops at a session
+    that has a bar (#3431)."""
+    last: dict[date, date] = {}
+    for _, day in retracted:
+        if day >= max(since, end):
+            month = day.replace(day=1)
+            last[month] = max(day, last.get(month, day))
+    return [(max(month, end), last[month]) for month in sorted(last)]
+
+
 def _holes(
     settings: Settings,
     windows: list[tuple[date, date]],
     t: datetime,
     only: frozenset[str] | None = None,
     tally: _Tally | None = None,
+    tail: frozenset[tuple[date, date]] = frozenset(),
 ) -> tuple[list[Hole], set[str]]:
     """Every hole in `windows` as of `t` that a fetched bar could land on
     (of the `only` ids, when given), a short read per month; the dropped
-    ones are added to `tally`. Also the ids with a listing known at `t`."""
+    ones are added to `tally`. A `tail` window (past the backfill cursor) lists
+    only the holes of retracted sessions (#3431). Also the ids with a listing known at `t`."""
     if not windows and only is None:
         return [], set()
     with _read(settings) as conn:
@@ -807,9 +913,16 @@ def _holes(
         first, last = window
         with _read(settings) as conn:
             ids, *_ = _window_names(conn, t, window, settings, resolver)
-            kept, gaps, _, dropped, handed = _month_holes(
-                conn, resolver, t, window, ids, only, settings.alpaca.rename_lead_days
+            retr = _retracted_holes(
+                conn, resolver, t, window, ids, only, _retracted_sessions(conn, t)
             )
+            if window in tail:
+                kept, gaps, dropped, handed = sorted(retr), set(), {}, set()
+            else:
+                kept, gaps, _, dropped, handed = _month_holes(
+                    conn, resolver, t, window, ids, only, settings.alpaca.rename_lead_days
+                )
+                kept = sorted({*kept, *retr})
         if tally is not None:
             tally.add((), dropped)
         for sid in kept:
@@ -868,6 +981,7 @@ def _price_chunk(
     only: frozenset[str] | None = None,
     tally: _Tally | None = None,
     resolvers: _Resolvers | None = None,
+    tail: bool = False,
 ) -> SourceRun | None:
     """One month. The store is read as of the clock when the month starts
     (after the EDGAR chunk committed) and rows are stamped with the clock
@@ -878,7 +992,10 @@ def _price_chunk(
     stored bars count toward the staleness share; and a month with no hole
     to fetch is skipped (`None`). `resolvers` (a fill's, #3234) serves the
     store's resolver at the month's start, reusing the last one read when
-    the store cannot have changed since (`_Resolvers`)."""
+    the store cannot have changed since (`_Resolvers`). A hole fill also fetches
+    the ids a retracted session of the open release now belongs to and that hold
+    no bar on it (#3431); with `tail` (a month past the backfill cursor) only
+    those."""
     first, last = window
     mode, done = (HOLES, FILLED) if fill else (BACKFILL, OK)
     cursor = f"{HOLES};{_cursor(since, last)}" if fill else _cursor(since, last)
@@ -904,10 +1021,18 @@ def _price_chunk(
             dropped: dict[str, str] = {}
             handed: set[str] = set()
             windows8: dict[str, list[tuple[date, date]]] = {}
+            retr: set[str] = set()
             if fill:
-                holes, renames, stored, dropped, handed = _month_holes(
-                    conn, resolver, started, window, ids, only, settings.alpaca.rename_lead_days
+                retr = _retracted_holes(
+                    conn, resolver, started, window, ids, only, _retracted_sessions(conn, started)
                 )
+                if tail:
+                    stored = _with_bars(conn, started, window)
+                else:
+                    holes, renames, stored, dropped, handed = _month_holes(
+                        conn, resolver, started, window, ids, only, settings.alpaca.rename_lead_days
+                    )
+                holes = sorted({*holes, *retr})
                 windows8 = {
                     sid: [(h.start, h.end) for h in resolver.handovers(sid)] for sid in handed
                 }
@@ -970,8 +1095,8 @@ def _price_chunk(
             empty8 = len(handed - landed)
             renamed += f"; {empty8} rule8_window holes with nothing stored" if empty8 else ""
             filled = (
-                f"holes of {len(set(holes) - renames - (handed & stored))} names with no "
-                f"stored bar{renamed}"
+                f"holes of {len(set(holes) - renames - retr - (handed & stored))} names with no "
+                f"stored bar{renamed}{_retracted_note(retr)}"
                 f"{_dropped_note(dict(Counter(dropped.values())))}: "
                 if fill
                 else ""
