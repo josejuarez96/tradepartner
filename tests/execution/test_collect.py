@@ -38,6 +38,7 @@ from tradepartner.store.journal import (
     PaperWindowRow,
     RebalanceEventRow,
     ReconciliationRow,
+    ResumeAcceptanceRow,
     ResumeInvocationRow,
     append,
     decisions_for,
@@ -2018,3 +2019,37 @@ def test_the_halts_fill_ids_are_read_from_its_structure_not_its_prose() -> None:
     assert collect_module.is_fill_mismatch_fault(reason)
     for bad in (None, "", "fill_mismatch: nope", 'fill_mismatch: {"fill_ids": "x"}'):
         assert collect_module.fill_mismatch_ids(bad) == ()
+
+
+def test_a_crash_while_writing_the_acceptance_leaves_neither_it_nor_the_fills(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, a, b = _two_overfills(journal_settings, open_window, scripted_fake, fixed_clock)
+    resume_id = _resume(journal_settings, fixed_clock(), None)
+    real_append = collect_module.append
+
+    def crashing(conn: Any, row: object) -> Any:
+        if isinstance(row, ResumeAcceptanceRow):
+            raise OSError("disk went away")
+        return real_append(conn, row)
+
+    monkeypatch.setattr(collect_module, "append", crashing)
+    with pytest.raises(OSError, match="disk went away"):
+        collect(
+            scripted_fake,
+            lambda: open_for_write(journal_settings),
+            [a, b],
+            fixed_clock,
+            "resume",
+            resume_id,
+            FROZEN,
+            journal_settings,
+            accept_fill_mismatch=_accepting({"fake-fill-1", "fake-fill-2"}, resume_id),
+        )
+
+    assert _all_fill_rows(journal_settings) == []
+    assert _acceptances(journal_settings) == []

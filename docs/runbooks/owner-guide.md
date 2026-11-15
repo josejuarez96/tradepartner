@@ -184,6 +184,7 @@ Alerts reach the store and a macOS notification only. Email is built but not con
 ### Kill and resume
 - Stop one book: `paper kill --book <token> --reason "<why>"`. Stop all: `paper kill --all --reason "<why>"`. Mac only.
 - Resume: `paper resume --book <token> --reason "<root cause and what you checked>"`. It settles orders, reconciles, then releases the switch. It refuses if reconciliation fails. Add `--accept-broker-fills` or `--accept-rejections` only in the cases [scheduling](scheduling.md) "Kill switch" describes.
+- A halt that names `fill_mismatch` means a broker fill did not match its order (symbol, side or size): check the fill ids it names with the broker, then `paper resume --reason "<what you checked>" --accept-fill-mismatch`. It accepts only the ids that halt names; a newer bad fill halts again and names itself.
 
 ### Where trades and performance live today
 | Question | Where | Limits today |
