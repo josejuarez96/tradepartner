@@ -285,6 +285,8 @@ def test_a_retracted_session_regained_with_another_volume_is_a_vendor_revision(
         for d in _days(20):
             _bar(conn, "A2", d)
         conn.execute("UPDATE prices_daily SET volume = 9, high = 1.5 WHERE security_id = 'A2'")
+        # B and C hold A's seeded bar in the backup too; make theirs differ now.
+        conn.execute("UPDATE prices_daily SET open = 5 WHERE security_id IN ('B', 'C')")
     with duckdb.connect(s.store.path, read_only=True) as conn:
         conn.execute(f"ATTACH '{backup}' AS bk (READ_ONLY)")
         plain = release_coverage(conn, backup_alias="bk")
