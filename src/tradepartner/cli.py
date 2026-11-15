@@ -59,8 +59,10 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   names a store path (`tests/test_cli_sweep.py`), so a copy is chosen through settings.
 - `tradepartner stale-keys` (#3387) lists every reviewed or config entry whose security id
   is no longer in the store (`dividend_reviews.csv`, `listing_reviews.csv`,
-  `spinoff_splits.csv`, `alpaca.accepted_relistings`, `master.keep_successors`); read-only,
-  exits 1 on any hit.
+  `spinoff_splits.csv`, `alpaca.accepted_relistings`, `master.keep_successors`), and every
+  kept successor superseded by another id on the same listing span; read-only, exits 1 on
+  any hit. Superseded hits are read, never acted on: never drop a keep entry without the
+  owner.
 - `tradepartner index-check [--start YYYY-MM] [--end YYYY-MM] [--out PATH]` runs
   `backtest.index_check_store.run_index_check` (backtest spec
   amendment #1598, plan T245): the whole universe, equal and cap weight, against RSP
@@ -927,6 +929,37 @@ def _print_figi_types(report: HealthReport) -> None:
         )
 
 
+#: How many `figi_identity` rows each kind shows in `health` (T399, #3437).
+_FIGI_ROWS_SHOWN = 3
+
+
+def _print_figi_identity(report: HealthReport) -> None:
+    """The `figi_identity` block (plan T399, #3437): the counts by kind, the
+    first rows of each kind, then the cannot-check lines."""
+    block = report.figi_identity
+    typer.echo(f"figi identity: {block.verdict}")
+    counts = ", ".join(f"{kind} {n}" for kind, n in block.counts.items())
+    typer.echo(f"  {counts}")
+    for kind in block.counts:
+        rows = block.rows.filter(pl.col("kind") == kind).head(_FIGI_ROWS_SHOWN)
+        for row in rows.iter_rows(named=True):
+            arrow = "successor of" if kind == "successor_share_class_differs" else "<->"
+            other = f" {arrow} {row['other_id']}" if row["other_id"] else ""
+            detail = f"{row['field']} {row['value']}"
+            if row["other_value"] and row["other_value"] != row["value"]:
+                detail += f" vs {row['other_value']}"
+            if row["cik"]:
+                ciks = row["cik"]
+                if row["other_cik"] and row["other_cik"] != row["cik"]:
+                    ciks += f"/{row['other_cik']}"
+                detail += f" (cik {ciks})"
+            if row["ticker"]:
+                detail += f" ({row['ticker']} {row['exchange']})"
+            typer.echo(f"  {kind} {row['security_id']}{other}: {detail}")
+    for line in block.cannot_check:
+        typer.echo(f"  cannot check: {line}")
+
+
 def _print_mergers(report: HealthReport) -> None:
     """The report-only mergers block (#1762, T248e; printed since #3215)."""
     echo = typer.echo
@@ -1048,6 +1081,7 @@ def _print_report(report: HealthReport) -> None:
         for line in report.delisting_reasons.lines():
             echo(line)
     _print_figi_types(report)
+    _print_figi_identity(report)
     echo(f"settings: {report.settings}")
     _print_coverage_reference(report.coverage_reference)
     echo("integrity:")
@@ -4213,7 +4247,9 @@ def make_app(
         """List reviewed and config entries whose security id left the store (#3387).
 
         Read-only. Checks dividend_reviews.csv, listing_reviews.csv, spinoff_splits.csv,
-        alpaca.accepted_relistings and master.keep_successors; exits 1 on any hit.
+        alpaca.accepted_relistings and master.keep_successors; exits 1 on any hit. A kept
+        successor superseded by another id on the same listing span is listed too: read
+        such hits, and never drop a keep entry without the owner.
         """
         s = settings()
         if (missing := _store_missing(s)) is not None:
@@ -5276,6 +5312,8 @@ def make_app(
         """Record one desk-read launch and print its id. A repeat of a record prints
         the first id and writes nothing. Exit 2 on a refusal, with nothing written."""
         s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
         if probe_unavailable != (reason is not None):
             raise _fail("--probe-unavailable and --reason go together", USAGE_ERROR)
         start = _parse_day("--window-start", window_start, settings)
