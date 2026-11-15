@@ -709,7 +709,7 @@ def _rename_gaps(
     stored: dict[str, list[date]] = defaultdict(list)
     for sid, session in conn.execute(
         "SELECT DISTINCT security_id, session FROM prices_daily "
-        "WHERE session BETWEEN ? AND ? AND known_at <= ? AND list_contains(?, security_id) "
+        "WHERE session BETWEEN ? AND ? AND known_at <= ? AND security_id IN (SELECT unnest(?)) "
         "ORDER BY session",
         [window[0], window[1] + timedelta(days=horizon), t, sorted(led)],
     ).fetchall():
@@ -749,7 +749,7 @@ def _interior_gaps(
         sid: (lo, hi)
         for sid, lo, hi in conn.execute(
             "SELECT security_id, min(session), max(session) FROM prices_daily "
-            "WHERE known_at <= ? AND volume > 0 AND list_contains(?, security_id) GROUP BY ALL",
+            "WHERE known_at <= ? AND volume > 0 AND security_id IN (SELECT unnest(?)) GROUP BY ALL",
             [t, ordered],
         ).fetchall()
     }
@@ -757,7 +757,7 @@ def _interior_gaps(
     for sid, session in conn.execute(
         "SELECT DISTINCT security_id, session FROM prices_daily "
         "WHERE session BETWEEN ? AND ? AND known_at <= ? AND volume > 0 "
-        "AND list_contains(?, security_id)",
+        "AND security_id IN (SELECT unnest(?))",
         [window[0], window[1], t, ordered],
     ).fetchall():
         traded[sid].add(session)

@@ -818,7 +818,7 @@ def _runs_for_switch(
         "LEFT JOIN paper_run_results s ON s.run_id = r.run_id "
         "WHERE r.window_id = ? AND ("
         "s.run_id IS NULL "
-        "OR (list_contains(?, s.status) "
+        "OR (s.status IN (SELECT unnest(?)) "
         "AND (? IS NULL OR ? <= r.started_at OR ? <= s.finished_at)) "
         "OR r.run_id = (SELECT max(run_id) FROM paper_runs WHERE window_id = ?)"
         ") ORDER BY r.run_id",
@@ -912,7 +912,7 @@ def _open_orders_count(conn: duckdb.DuckDBPyConnection, window_id: int) -> int:
     row = conn.execute(
         "SELECT COUNT(*) FROM orders o JOIN paper_runs r ON r.run_id = o.run_id "
         "WHERE r.window_id = ? AND o.client_order_id NOT IN "
-        "(SELECT client_order_id FROM order_events WHERE list_contains(?, status))",
+        "(SELECT client_order_id FROM order_events WHERE status IN (SELECT unnest(?)))",
         [window_id, list(TERMINAL_ORDER_STATUSES)],
     ).fetchone()
     assert row is not None
@@ -1743,7 +1743,7 @@ def _waiting_span(conn: duckdb.DuckDBPyConnection, now: datetime) -> waiting.Spa
     book_column = "book_id" if _alerts_have_book(conn) else f"'{DEFAULT_BOOK_ID}'"
     rows = conn.execute(
         f'SELECT alert_id, {book_column}, kind, session, "at" FROM alerts '
-        'WHERE list_contains(?, kind) AND "at" >= ? AND "at" <= ? '
+        'WHERE kind IN (SELECT unnest(?)) AND "at" >= ? AND "at" <= ? '
         "AND known_at <= ? ORDER BY alert_id",
         [list(waiting.NOTED_ALERT_KINDS), span.start_at, now, now],
     ).fetchall()

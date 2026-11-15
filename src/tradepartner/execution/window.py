@@ -962,7 +962,7 @@ def _gap_signoff_refusal(
             int(i): (c, v)
             for i, c, v in conn.execute(
                 "SELECT trial_id, data_cutoff, data_vintage FROM trials "
-                "WHERE list_contains(?, trial_id)",
+                "WHERE trial_id IN (SELECT unnest(?))",
                 [trial_ids],
             ).fetchall()
         }

@@ -2472,7 +2472,7 @@ def _read_ledger_set(conn: duckdb.DuckDBPyConnection, tax_year: int, book_id: st
     ended = {
         int(w): _local(at)
         for w, at in conn.execute(
-            'SELECT window_id, min("at") FROM paper_window_stops WHERE list_contains(?, state) '
+            'SELECT window_id, min("at") FROM paper_window_stops WHERE state IN (SELECT unnest(?)) '
             "GROUP BY window_id",
             [list(journal.CLOSING_STOP_STATES)],
         ).fetchall()

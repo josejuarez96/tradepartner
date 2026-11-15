@@ -136,10 +136,10 @@ def _bar_sessions(
     rows = conn.execute(
         "SELECT DISTINCT session FROM ("
         "  SELECT security_id, session, volume, source FROM prices_daily"
-        "  WHERE known_at <= ? AND list_contains(?, security_id)"
+        "  WHERE known_at <= ? AND security_id IN (SELECT unnest(?))"
         "  QUALIFY row_number() OVER"
         "    (PARTITION BY security_id, session ORDER BY known_at DESC) = 1"
-        ") WHERE volume > 0 AND list_contains(?, source) ORDER BY session",
+        ") WHERE volume > 0 AND source IN (SELECT unnest(?)) ORDER BY session",
         [at, list(security_ids), sorted(BAR_SOURCES)],
     ).fetchall()
     return [r[0] for r in rows]
