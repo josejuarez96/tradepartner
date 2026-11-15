@@ -51,6 +51,12 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
 - `tradepartner close-gap --reference FILE [--symbol SPY]` (#3077) compares a benchmark's
   stored daily closes with owner-supplied official closes (`session,close` CSV) and exits 1
   on any session off by more than `index_check.max_close_gap`; read-only.
+- `tradepartner identity-check [--history ID]` (#3275, ADR 0029, plan T396) runs the
+  identity answer key (`store.identity_answer_key`) against `store.path` through the
+  resolver and the listing ends (`store.identity_check`): one line per miss with the
+  fact's citation. Exit 0 when every expectation is met, 1 on any miss, 2 when it cannot
+  run (no store, unknown history, store busy). Read-only and check only; no option
+  names a store path (`tests/test_cli_sweep.py`), so a copy is chosen through settings.
 - `tradepartner stale-keys` (#3387) lists every reviewed or config entry whose security id
   is no longer in the store (`dividend_reviews.csv`, `listing_reviews.csv`,
   `spinoff_splits.csv`, `alpaca.accepted_relistings`, `master.keep_successors`); read-only,
@@ -6961,6 +6967,49 @@ def make_app(
             payload["header"]["code_version"] = version
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    @app.command("identity-check")
+    def identity_check_(
+        history: Annotated[
+            list[str] | None, typer.Option(help="check only this history id (repeatable)")
+        ] = None,
+    ) -> None:
+        """The identity answer key against a store, read-only (#3275, ADR 0029).
+
+        Runs each hard security history of the key through the resolver and the
+        listing ends, prints a miss per fact with its citation, and exits 1 on any
+        miss (2 when it cannot run). Check only: it writes nothing, and no universe,
+        signal, backtest or research path reads the key."""
+        from tradepartner.store import identity_check as ic_
+
+        s = settings()
+        if not Path(s.store.path).exists():
+            raise _fail(_scrubbed(f"no store at {s.store.path}", s), USAGE_ERROR)
+        at = ensure_tz_aware_utc(clock(), field_name="clock()")
+        try:
+            histories = ic_.load_answer_key(at.date())
+        except ic_.AnswerKeyError as exc:
+            raise _fail(_scrubbed(f"identity-check: the key is refused: {exc}", s), 1) from None
+        if history:
+            known = {h.id for h in histories}
+            if unknown := sorted(set(history) - known):
+                raise _input_fail(
+                    f"unknown history id(s): {unknown}; known: {sorted(known)}", settings
+                )
+            histories = tuple(h for h in histories if h.id in set(history))
+        try:
+            with open_read_only(s) as conn:
+                report = ic_.check(conn, s, histories, at)
+        except StoreLockedError as exc:
+            raise _fail(_scrubbed(f"store busy: {exc}", s), USAGE_ERROR) from None
+        except duckdb.Error as exc:
+            raise _fail(
+                _scrubbed(f"identity-check failed: {type(exc).__name__}: {exc}", s), USAGE_ERROR
+            ) from None
+        for line in ic_.report_lines(report, s.store.path):
+            typer.echo(_scrubbed(line, s))
+        if report.misses:
+            raise typer.Exit(1)
 
     @app.command("close-gap")
     def close_gap_(
