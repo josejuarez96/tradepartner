@@ -60,7 +60,9 @@ _ALLOWED = frozenset({"health.py", "store/index_members.py"})
 #: backtest, paper or research path. `store/registry.py` names it only in its
 #: trial data-vintage classification comment (the table is excluded there by
 #: construction), so it is allowed by name, not as a reader.
-_FIGI_ALLOWED = frozenset({"health.py", "ingest.py", "store/schema.py", "store/registry.py"})
+_FIGI_ALLOWED = frozenset(
+    {"health.py", "ingest.py", "store/schema.py", "store/registry.py", "store/figi_identity.py"}
+)
 #: A text naming the key's module or file: an import path, a file name or a
 #: `from tradepartner.store import ..., index_members` list.
 _NAMING = (
@@ -157,6 +159,53 @@ def test_the_figi_source_scan_finds_no_reader_outside_the_check_and_its_writer()
     assert offences == []
     # The allowed reader really reads it: the scan is not vacuous.
     assert "openfigi_types" in (_SRC / "health.py").read_text("utf-8")
+
+
+#: Only `health.py` may import the OpenFIGI identity cross-check (plan T399,
+#: #3437): not `backtest/`, `research/`, `universe.py`, the signals, `repair.py`
+#: or `ingest.py`, nor any other module.
+_IDENTITY_NAMING = re.compile(r"figi_identity\b")
+_IDENTITY_ALLOWED = frozenset({"health.py", "store/figi_identity.py"})
+
+
+def _identity_offences(relative: str, text: str) -> list[str]:
+    if relative in _IDENTITY_ALLOWED:
+        return []
+    found = []
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.ImportFrom) and node.module is not None:
+            names = {alias.name for alias in node.names}
+            if "figi_identity" in node.module or (
+                node.module == "tradepartner.store" and "figi_identity" in names
+            ):
+                found.append(f"{relative}: imports the identity check (line {node.lineno})")
+        elif isinstance(node, ast.Import) and any(
+            "figi_identity" in alias.name for alias in node.names
+        ):
+            found.append(f"{relative}: imports the identity check (line {node.lineno})")
+    return found
+
+
+def test_no_module_but_health_imports_the_figi_identity_check() -> None:
+    offences = [
+        offence
+        for path in sorted(_SRC.rglob("*.py"))
+        for offence in _identity_offences(
+            path.relative_to(_SRC).as_posix(), path.read_text("utf-8")
+        )
+    ]
+    assert offences == []
+    assert _IDENTITY_NAMING.search((_SRC / "health.py").read_text("utf-8"))
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ["backtest/run.py", "research/exposures.py", "universe.py", "repair.py", "ingest.py"],
+)
+def test_the_figi_identity_scan_has_teeth(relative: str) -> None:
+    assert _identity_offences(relative, "from tradepartner.store.figi_identity import KINDS\n")
+    assert _identity_offences(relative, "from tradepartner.store import figi_identity\n")
+    assert _identity_offences("health.py", "from tradepartner.store import figi_identity\n") == []
 
 
 def test_the_figi_source_scan_has_teeth() -> None:
