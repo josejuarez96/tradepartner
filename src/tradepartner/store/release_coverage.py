@@ -18,7 +18,7 @@ id gained a bar for it (none in the backup) with the same open and close and the
 revision (#3432): the vendor now serves a different bar for that day. It writes nothing.
 
 A price also matches when the older (lost or retracted) row holds it at the configured
-`price_decimals` and the newer price lies within one unit of that last decimal (#3465):
+`price_decimals` and is the newer price truncated or rounded to it (#3465):
 the vendor first served the bar at 4 decimals (SNTI open 0.1732) and now at 5 (0.17325).
 A price a whole unit or more away at that precision is still another price.
 """
@@ -41,20 +41,21 @@ _GRID_EPS = 1e-6
 def price_match_sql(new: str, old: str, tolerance: float, decimals: int | None) -> str:
     """A SQL predicate: price `new` equals the older row's price `old` (SQL
     expressions). Equal within `tolerance` relative to `old` with an absolute floor at
-    price 1; or, with `decimals`, `old` lies on the `decimals` grid and `new` is less
-    than one unit of its last decimal away, i.e. `old` is `new` cut (truncated or
-    rounded) to the older row's stored precision (#3465). Two prices that both hold
+    price 1; or, with `decimals`, `old` lies on the `decimals` grid and `new` is in
+    [old - u/2, old + u) for u one unit of that last decimal, i.e. `old` is `new`
+    truncated or rounded to the older row's stored precision (#3465). Two prices that both hold
     `decimals` places match only when equal, so a real different price still fails."""
     tol = float(tolerance)
     base = f"abs({new} - {old}) <= {tol!r} * greatest(1, abs({old}))"
     if decimals is None:
         return f"({base})"
-    if not 0 <= int(decimals) <= 12:
+    if not 0 <= int(decimals) <= 8:
         raise ValueError(f"price decimals out of range: {decimals!r}")
     unit = 10 ** int(decimals)
     return (
         f"({base} OR (abs({old} * {unit} - round({old} * {unit})) <= {_GRID_EPS!r} "
-        f"AND abs({new} * {unit} - {old} * {unit}) < {1 - _GRID_EPS!r}))"
+        f"AND {new} * {unit} - {old} * {unit} >= {-0.5 - _GRID_EPS!r} "
+        f"AND {new} * {unit} - {old} * {unit} < {1 - _GRID_EPS!r}))"
     )
 
 

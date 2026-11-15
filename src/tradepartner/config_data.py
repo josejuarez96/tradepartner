@@ -95,8 +95,8 @@ class StoreConfig(_ClosedConfig):
     release_move_price_tolerance: float = Field(default=1e-6, ge=0)
     # #3465: the precision an older stored bar may hold its prices at (Alpaca first
     # served SNTI/JTAI 2026-11-05 at 4 decimals, now at 5). A lost price on this grid
-    # matches a newer one less than one unit of its last decimal away; None turns it off.
-    release_move_price_decimals: int | None = Field(default=4, ge=0, le=12)
+    # matches a newer one that truncates or rounds to it; None turns it off.
+    release_move_price_decimals: int | None = Field(default=4, ge=0, le=8)
 
     @field_validator("path")
     @classmethod

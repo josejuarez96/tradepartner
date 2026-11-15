@@ -372,3 +372,14 @@ def test_an_older_price_held_at_more_decimals_needs_the_tolerance(tmp_path: Path
     4-decimal grid, so the receiver's 0.17325 is another price."""
     s, backup = _precision_store(tmp_path, (0.17321, 0.9, 0.8651, 0.8948), _SNTI_JTAI_NEW)
     assert _both(s, backup, 4) == (20, 20)
+
+
+def test_a_newer_price_below_the_older_one_matches_only_by_rounding(tmp_path: Path) -> None:
+    """Below the older price only rounding can produce it: 0.17311 cuts to 0.1731 either
+    way, so against 0.1732 it is another price; 0.17315 rounds up to 0.1732."""
+    s, backup = _precision_store(tmp_path, _SNTI_JTAI_OLD, (0.17311, 0.9, 0.86515, 0.89485))
+    assert _both(s, backup, 4) == (20, 20)
+    s, backup = _precision_store(
+        tmp_path / "half", _SNTI_JTAI_OLD, (0.17315, 0.9, 0.86515, 0.89485)
+    )
+    assert _both(s, backup, 4) == (0, 0)
