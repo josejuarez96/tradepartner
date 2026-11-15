@@ -861,7 +861,8 @@ def _retracted_holes(
     for sid, day in days:
         tickers = [tk for tk in tickers_of(sid, day) if alpaca_symbol(tk) is not None]
         owners = bar_owners(resolver, tickers, day)
-        # The id's own bar goes back to it only where no other id receives it.
+        # The id's own bar goes back to it only where no other id receives it (a
+        # mixed-ticker id whose other ticker is owned elsewhere drops itself).
         for receiver in sorted((owners - {sid}) or owners):
             if receiver not in fetched or (only is not None and receiver not in only):
                 continue

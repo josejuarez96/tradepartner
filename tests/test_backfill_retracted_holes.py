@@ -232,6 +232,8 @@ def _lost_id_store(settings: Settings, *, listing_known: datetime = THEN) -> Non
     a retraction tombstone, as after step 9's master-retract (CRC, PG, DBD)."""
     assert _backfill(settings, _History()).ok
     days = _sessions(*JUNE_WINDOW)
+    # Both listing rows are known after the clock when the tombstone is (no look-ahead).
+    live_gap = timedelta(days=400) if listing_known <= THEN else timedelta(hours=1)
     with duckdb.connect(settings.store.path) as conn:
         conn.execute("DELETE FROM ingestion_runs WHERE chunk_cursor LIKE '%through=2019-06-%'")
         conn.execute(
@@ -255,7 +257,7 @@ def _lost_id_store(settings: Settings, *, listing_known: datetime = THEN) -> Non
                 [
                     LOST,
                     retracted,
-                    listing_known - timedelta(days=1) * (0 if retracted else 400),
+                    listing_known - (timedelta(0) if retracted else live_gap),
                     listing_known,
                     ACME,
                 ],
