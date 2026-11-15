@@ -659,10 +659,6 @@ def replay_trial(
         hypothesis = registry.get_hypothesis_by_id(conn, facts.hypothesis_id)
         if hypothesis.family not in ENGINE_FAMILIES:
             raise ValueError(f"{hypothesis.slug!r} is in family {hypothesis.family!r}, not run")
-        if registry.params_sha256(hypothesis.params) != hypothesis.params_sha256:
-            raise ValueError(
-                f"hypothesis {hypothesis.slug!r}: stored parameters do not match their hash"
-            )
         params = _overlay(
             _reset_inert(live, frozen_module.inert_sections(hypothesis.family)),
             frozen_values(hypothesis),

@@ -13,8 +13,8 @@ the trial there.
 1. Reads the trial and, under one read-only connection to the real store (which is
    never written; the file hash is the same after), copies the store file and its WAL
    into a temporary directory.
-2. On the copy: migrates it, `restore_for_trial`, and writes the `reproduction` marker
-   (`store_markers`, widened on the copy only). The marker is what lets
+2. On the copy: `restore_for_trial` and the `reproduction` marker (a
+   `reproduction_markers` table of its own). The marker is what lets
    `backtest.run.replay_trial` run on a copy of the real store; `run._marked_copy` is
    unchanged, so an unmarked copy is still refused for every other caller.
 3. Compares the copy's `registered_data_vintage` at the trial's cutoff with the stored
@@ -72,12 +72,11 @@ from typing import Any, Literal
 import duckdb
 
 from tradepartner.config import Settings, get_settings
-from tradepartner.store import lab_schema, registry, retracted_rows, schema
+from tradepartner.store import registry, retracted_rows, schema
 from tradepartner.store.db import open_for_write, open_read_only, utc_now
 
-#: `store_markers.kind` of a store made only to reproduce a trial. The kind is not in
-#: `lab_schema.STORE_MARKER_KINDS` (a fixture store has no use for it): the copy's
-#: table is widened to hold it, on the copy alone.
+#: The `reproduction_markers.kind` of a store made only to reproduce a trial. It has a
+#: table of its own: `store_markers` is written only by the fixture loader.
 REPRODUCTION_MARKER_KIND = "reproduction"
 
 Verdict = Literal["reproduced", "differs", "not_reproducible"]
@@ -146,12 +145,16 @@ class Reproduction:
 
 
 def write_reproduction_marker(conn: duckdb.DuckDBPyConnection, written_by: str) -> None:
-    """Mark `conn`'s store as a reproduction copy. Widens `store_markers.kind` to take
-    the marker (the table is created if absent), so call it on a throwaway copy only."""
-    lab_schema.create_store_markers(conn)
-    lab_schema.widen_enum(conn, "store_markers", "kind", (REPRODUCTION_MARKER_KIND,))
+    """Mark `conn`'s store as a reproduction copy: a row in `reproduction_markers`, a
+    table of its own (not `store_markers`, which only the fixture loader writes), created
+    here. Call it on a throwaway copy only."""
     conn.execute(
-        "INSERT INTO store_markers (kind, written_at, written_by) VALUES (?, ?, ?) "
+        "CREATE TABLE IF NOT EXISTS reproduction_markers "
+        "(kind VARCHAR NOT NULL PRIMARY KEY, written_at TIMESTAMPTZ NOT NULL, "
+        "written_by VARCHAR NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO reproduction_markers (kind, written_at, written_by) VALUES (?, ?, ?) "
         "ON CONFLICT (kind) DO NOTHING",
         [REPRODUCTION_MARKER_KIND, utc_now(), written_by],
     )
@@ -159,15 +162,15 @@ def write_reproduction_marker(conn: duckdb.DuckDBPyConnection, written_by: str) 
 
 def has_reproduction_marker(conn: duckdb.DuckDBPyConnection) -> bool:
     """Whether the store carries the `reproduction` marker row (false when
-    `store_markers` is absent)."""
+    `reproduction_markers` is absent)."""
     present = conn.execute(
         "SELECT 1 FROM duckdb_tables() WHERE database_name = current_database() "
-        "AND schema_name = current_schema() AND table_name = 'store_markers'"
+        "AND schema_name = current_schema() AND table_name = 'reproduction_markers'"
     ).fetchone()
     if present is None:
         return False
     (count,) = conn.execute(  # type: ignore[misc]
-        "SELECT COUNT(*) FROM store_markers WHERE kind = ?", [REPRODUCTION_MARKER_KIND]
+        "SELECT COUNT(*) FROM reproduction_markers WHERE kind = ?", [REPRODUCTION_MARKER_KIND]
     ).fetchone()
     return bool(count)
 
@@ -242,12 +245,24 @@ def compare_metrics(
 
 
 def _ids(conn: duckdb.DuckDBPyConnection, where: str, params: list[Any]) -> list[tuple[int, str]]:
+    if not _has_retracted_rows(conn):  # a store older than version 49 retracted nothing
+        return []
     rows = conn.execute(
         f"SELECT retraction_id, table_name FROM retracted_rows r WHERE {where} "
         "ORDER BY retraction_id",
         params,
     ).fetchall()
     return [(int(i), str(t)) for i, t in rows]
+
+
+def _has_retracted_rows(conn: duckdb.DuckDBPyConnection) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM duckdb_tables() WHERE database_name = current_database() "
+            "AND schema_name = current_schema() AND table_name = 'retracted_rows'"
+        ).fetchone()
+        is not None
+    )
 
 
 def _match_ids(conn: duckdb.DuckDBPyConnection, ids: Sequence[int]) -> None:
@@ -420,7 +435,6 @@ def reproduce_trial(
             update={"store": settings.store.model_copy(update={"path": str(copy)})}
         )
         with open_for_write(on_copy) as conn:
-            schema.init_schema(conn)
             restored = restore_for_trial(conn, facts)
             write_reproduction_marker(conn, "trial-reproduce")
         reasons = _not_reproducible(on_copy, facts)
