@@ -1887,6 +1887,18 @@ def test_an_owner_holding_its_own_bar_is_no_receiver(store: Settings) -> None:
     assert dict(result.orphans) == {(DEAD, date(2021, 6, 1)): 1}
 
 
+def test_a_stale_owner_bar_does_not_count_as_held(store: Settings) -> None:
+    """#3455: an owner's bar that this run retracts is not one that stays."""
+    from tradepartner.repair import _holds_bar
+
+    with open_for_write(store) as conn:
+        insert_row(conn, "prices_daily", _bar(HEIR, date(2021, 6, 1)))
+        day = date(2021, 6, 1)
+        assert _holds_bar(conn, ["alpaca"], {})(HEIR, day)
+        assert not _holds_bar(conn, ["alpaca"], {(HEIR, day): 1})(HEIR, day)
+        assert not _holds_bar(conn, ["alpaca"], {})(HEIR, date(2021, 6, 2))
+
+
 def test_an_owner_without_a_bar_stays_a_receiver(store: Settings) -> None:
     """#3455: HEIR holds a bar on another session only."""
     with open_for_write(store) as conn:

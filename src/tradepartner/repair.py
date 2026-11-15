@@ -361,7 +361,8 @@ def _holds_bar(
     conn: duckdb.DuckDBPyConnection, sources: list[str], stale: Mapping[Key, int]
 ) -> Callable[[str, date], bool]:
     """`(security_id, session)` to whether the store holds a bar of that
-    security there that stays: not one of the `stale` keys this run retracts."""
+    security there that stays: not one of the `stale` keys this run retracts.
+    Reads every stored bar, like `_Counted` (the same view as `found_bars`)."""
     cache: dict[Key, bool] = {}
 
     def holds(sid: str, day: date) -> bool:
