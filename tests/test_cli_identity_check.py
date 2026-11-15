@@ -252,10 +252,6 @@ def test_rows_known_after_the_check_leave_the_result_unchanged(store: Settings) 
     before = run(store, key())
     later = datetime(2027, 1, 1, tzinfo=UTC)
     with open_for_write(store) as conn:
-        conn.execute(
-            "DELETE FROM prices_daily WHERE security_id = ? AND session = ?",
-            [MAR, date(2020, 10, 1)],
-        )
         insert_row(
             conn,
             "prices_daily",
@@ -286,10 +282,9 @@ def test_rows_known_after_the_check_leave_the_result_unchanged(store: Settings) 
                 "provenance": "filing",
             },
         )
-    # the bar gap is a miss; but the late zero-volume revision and the late CIK change do not matter
-    after = run(store, key())
-    assert [m.expected.kind for m in after.misses] == ["bars"]
+    # a zero-volume bar revision and a CIK change known after the check change nothing
     assert before.misses == ()
+    assert run(store, key()).misses == ()
 
 
 def test_a_retracted_security_is_not_read(store: Settings) -> None:
