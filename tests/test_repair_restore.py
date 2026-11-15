@@ -270,3 +270,44 @@ def test_the_command_exits_one_on_a_refusal(store: Settings) -> None:
     code, out = _invoke(store, "--release", NEW, "--from-release", OLD, "--dry-run")
     assert code == 1
     assert "repair refused" in out
+
+
+def test_a_key_restore_in_the_releasing_release_refuses(store: Settings) -> None:
+    with open_for_write(store) as conn:
+        registry.close_data_release(conn, name=NEW, sessions_from=D1, sessions_to=D3)
+        registry.open_data_release(conn, conn, name=OLD, backup_path="b.duckdb", reason="again")
+    with pytest.raises(RepairRefused, match="its own release"):
+        repair_restore(
+            store, release=OLD, table="prices_daily", key=(SID, D2), expect=1, clock=lambda: RUN
+        )
+    assert _bars(store) == [(OTHER, D1)]
+    assert _restored(store) == 0
+
+
+def test_the_close_range_starts_at_the_known_date_and_snaps_to_sessions(store: Settings) -> None:
+    # A listing dated on a Saturday, known on the Wednesday before.
+    sat, wed = date(2021, 6, 5), datetime(2021, 6, 2, 21, tzinfo=UTC)
+    with open_for_write(store) as conn:
+        insert_row(
+            conn,
+            "listings",
+            {
+                "security_id": SID,
+                "ticker": "AAA",
+                "exchange": "NYSE",
+                "class_title": None,
+                "valid_from": sat,
+                "known_at": wed,
+                "ingested_at": wed,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+    with open_for_write(store) as conn:
+        retract(conn, "listings", [(SID, "AAA", "NYSE", sat)], "bad", "other-old", "r", at=THEN)
+    result = repair_restore(
+        store, release=NEW, table="listings", key=(SID, "AAA", "NYSE", sat), expect=1,
+        clock=lambda: RUN,
+    )  # fmt: skip
+    assert result.sessions_from == date(2021, 6, 2)
+    assert result.sessions_to == date(2021, 6, 7)

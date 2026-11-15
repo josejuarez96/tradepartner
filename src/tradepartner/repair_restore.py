@@ -37,9 +37,11 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import duckdb
 
+from tradepartner.calendar import is_session, next_session, previous_session
 from tradepartner.config import Settings
 from tradepartner.ingest import SourceRun, _write_run
 from tradepartner.repair import (
@@ -52,6 +54,8 @@ from tradepartner.repair import (
 from tradepartner.store.db import open_for_write, utc_now
 from tradepartner.store.retracted_rows import RestoreRefused, restore
 from tradepartner.timeutil import ensure_tz_aware_utc
+
+_NEW_YORK = ZoneInfo("America/New_York")
 
 #: The `row_values` field that dates each source table's row for the close.
 _SESSION_FIELD = {
@@ -76,6 +80,9 @@ class RestoredRow:
     #: The session the row is dated on: a bar's session, an action's ex-date, a
     #: listing's `valid_from`, a delisting's `effective_on`.
     session: date
+    #: The New York date of `known_at`: a row can be known before its session
+    #: (a delisting filed days before `effective_on`), and trials read it from then.
+    known_date: date
 
 
 class _DryRunDone(Exception):
@@ -92,13 +99,16 @@ class RestoreRepaired:
 
     @property
     def sessions_from(self) -> date:
-        """The earliest session restored."""
-        return min(r.session for r in self.rows)
+        """The first trading session a restored row can be read from: the earlier
+        of its session and the date it was known, snapped back to a session."""
+        day = min(min(r.session, r.known_date) for r in self.rows)
+        return day if is_session(day) else previous_session(day)
 
     @property
     def sessions_to(self) -> date:
-        """The latest session restored."""
-        return max(r.session for r in self.rows)
+        """The last restored session, snapped forward to a trading session."""
+        day = max(r.session for r in self.rows)
+        return day if is_session(day) else next_session(day)
 
     def summary(self) -> str:
         """One line for the terminal and the run row."""
@@ -149,6 +159,11 @@ def _restored_rows(conn: duckdb.DuckDBPyConnection, restored_at: datetime) -> li
                 retracted_in=str(retracted_in),
                 known_at=str(values["known_at"]),
                 session=date.fromisoformat(str(values[_SESSION_FIELD[str(table)]])),
+                known_date=ensure_tz_aware_utc(
+                    datetime.fromisoformat(str(values["known_at"])), field_name="known_at"
+                )
+                .astimezone(_NEW_YORK)
+                .date(),
             )
         )
     return out
@@ -194,6 +209,11 @@ def repair_restore(
             except RestoreRefused as exc:
                 raise RepairRefused(str(exc)) from None
             rows = _restored_rows(conn, started)
+            if own := sorted({r.retracted_in for r in rows if r.retracted_in == release}):
+                raise RepairRefused(
+                    f"release {own[0]!r} retracted these rows: a restore runs in its own "
+                    "release, not the one that retracted them; nothing restored"
+                )
             refuse_inside_open_window(conn, [r.session for r in rows])
             result = RestoreRepaired(release=release, rows=tuple(rows), dry_run=dry_run)
             if dry_run:
