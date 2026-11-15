@@ -6552,11 +6552,13 @@ def fact_rows(
             alive = [sid for sid in alive if sid not in gone]
         return alive
 
-    letters: dict[str, set[str]] = defaultdict(set)
+    letters: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
     for row in master.listings:
+        if row.get("retracted", False):
+            continue
         letter = _title_letter(row["class_title"] or "")
         if letter:
-            letters[row["security_id"]].add(letter)
+            letters[row["security_id"]].append((row["known_at"], letter))
     titled: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
     for title in master.class_titles:
         letter = _title_letter(title.title)
@@ -6564,9 +6566,8 @@ def fact_rows(
             titled[title.security_id].append((title.known_at, letter))
 
     def letters_at(sid: str, t: datetime) -> set[str]:
-        """The letters `sid`'s listing titles name, plus those its cover-page
-        titles known at `t` name (no later page names an earlier fact's class)."""
-        return letters[sid] | {letter for at, letter in titled[sid] if at <= t}
+        """Letters named by live listing and cover-page titles known at `t`."""
+        return {letter for at, letter in (*letters[sid], *titled[sid]) if at <= t}
 
     linker = _ClassLinker(master) if class_member_link else None
     largest = (
@@ -6700,6 +6701,8 @@ class _ClassLinker:
         self._titles: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
         self._listed: dict[str, datetime] = {}
         for row in master.listings:
+            if row.get("retracted", False):
+                continue
             sid, at = row["security_id"], row["known_at"]
             if row["class_title"]:
                 self._titles[sid].append((at, row["class_title"]))
