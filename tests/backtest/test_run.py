@@ -26,6 +26,7 @@ import duckdb
 import polars as pl
 import pytest
 from conftest import load_universe_fixtures, mark_pre_lab
+from pydantic import ValidationError
 
 from tradepartner.backtest import engine
 from tradepartner.backtest import run as run_module
@@ -75,6 +76,21 @@ _METHODS = (
 
 #: The reads whose read time is their second argument (`t_prev`, `t`).
 _WINDOW_READS = ("late_dividends", "late_splits")
+
+
+@pytest.mark.parametrize("store_path", ["", "   "])
+def test_on_store_refuses_blank_path(tmp_path: Path, store_path: str) -> None:
+    live = Settings(_env_file=None, store={"path": str(tmp_path / "live.duckdb")})
+    with pytest.raises(ValidationError, match="path must be a file path"):
+        run_module._on_store(live, store_path)
+
+
+def test_on_store_accepts_file_path(tmp_path: Path) -> None:
+    live = Settings(_env_file=None, store={"path": str(tmp_path / "live.duckdb")})
+    path = tmp_path / "fixture.duckdb"
+    updated = run_module._on_store(live, path)
+    assert updated.store.path == str(path)
+    assert run_module._on_store(live, None) is live
 
 
 def _frozen() -> Settings:

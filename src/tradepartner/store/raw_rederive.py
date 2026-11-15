@@ -228,8 +228,8 @@ def _selected(
     if accessions:
         rows = _rows(
             conn,
-            f"SELECT * FROM {FORM4_TABLE} WHERE list_contains(?, accession) "
-            "AND list_contains(?, source) ORDER BY accession, filer_cik, line_no",
+            f"SELECT * FROM {FORM4_TABLE} WHERE accession IN (SELECT unnest(?)) "
+            "AND source IN (SELECT unnest(?)) ORDER BY accession, filer_cik, line_no",
             [sorted(set(accessions)), sorted(ROW_SOURCES)],
         )
         if missing := sorted(set(accessions) - {r["accession"] for r in rows}):
@@ -240,7 +240,7 @@ def _selected(
         return out
     rows = _rows(
         conn,
-        f"SELECT * FROM {di.INDEX_TABLE} WHERE list_contains(?, listed_on) "
+        f"SELECT * FROM {di.INDEX_TABLE} WHERE listed_on IN (SELECT unnest(?)) "
         "ORDER BY listed_on, cik, accession, known_at",
         [sorted(set(file_dates))],
     )
@@ -261,7 +261,7 @@ def _manifests(
     parse = di.parse_index_manifest if index else parse_manifest
     runs = conn.execute(
         "SELECT run_id, source, mode, finished_at, message FROM ingestion_runs "
-        "WHERE list_contains(?, source) AND list_contains(?, mode) AND status <> 'failed' "
+        "WHERE source IN (SELECT unnest(?)) AND mode IN (SELECT unnest(?)) AND status <> 'failed' "
         "ORDER BY started_at, run_id",
         [writers, sorted({mode, REPAIR})],
     ).fetchall()

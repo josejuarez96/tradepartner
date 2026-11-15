@@ -59,8 +59,10 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   names a store path (`tests/test_cli_sweep.py`), so a copy is chosen through settings.
 - `tradepartner stale-keys` (#3387) lists every reviewed or config entry whose security id
   is no longer in the store (`dividend_reviews.csv`, `listing_reviews.csv`,
-  `spinoff_splits.csv`, `alpaca.accepted_relistings`, `master.keep_successors`); read-only,
-  exits 1 on any hit.
+  `spinoff_splits.csv`, `alpaca.accepted_relistings`, `master.keep_successors`), and every
+  kept successor superseded by another id on the same listing span; read-only, exits 1 on
+  any hit. Superseded hits are read, never acted on: never drop a keep entry without the
+  owner.
 - `tradepartner index-check [--start YYYY-MM] [--end YYYY-MM] [--out PATH]` runs
   `backtest.index_check_store.run_index_check` (backtest spec
   amendment #1598, plan T245): the whole universe, equal and cap weight, against RSP
@@ -941,7 +943,8 @@ def _print_figi_identity(report: HealthReport) -> None:
     for kind in block.counts:
         rows = block.rows.filter(pl.col("kind") == kind).head(_FIGI_ROWS_SHOWN)
         for row in rows.iter_rows(named=True):
-            other = f" <-> {row['other_id']}" if row["other_id"] else ""
+            arrow = "successor of" if kind == "successor_share_class_differs" else "<->"
+            other = f" {arrow} {row['other_id']}" if row["other_id"] else ""
             detail = f"{row['field']} {row['value']}"
             if row["other_value"] and row["other_value"] != row["value"]:
                 detail += f" vs {row['other_value']}"
@@ -2469,7 +2472,7 @@ def _read_ledger_set(conn: duckdb.DuckDBPyConnection, tax_year: int, book_id: st
     ended = {
         int(w): _local(at)
         for w, at in conn.execute(
-            'SELECT window_id, min("at") FROM paper_window_stops WHERE list_contains(?, state) '
+            'SELECT window_id, min("at") FROM paper_window_stops WHERE state IN (SELECT unnest(?)) '
             "GROUP BY window_id",
             [list(journal.CLOSING_STOP_STATES)],
         ).fetchall()
@@ -4244,7 +4247,9 @@ def make_app(
         """List reviewed and config entries whose security id left the store (#3387).
 
         Read-only. Checks dividend_reviews.csv, listing_reviews.csv, spinoff_splits.csv,
-        alpaca.accepted_relistings and master.keep_successors; exits 1 on any hit.
+        alpaca.accepted_relistings and master.keep_successors; exits 1 on any hit. A kept
+        successor superseded by another id on the same listing span is listed too: read
+        such hits, and never drop a keep entry without the owner.
         """
         s = settings()
         if (missing := _store_missing(s)) is not None:

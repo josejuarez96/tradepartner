@@ -373,6 +373,7 @@ def test_a_kept_successor_replaced_for_the_same_span_is_superseded(tmp_path: Pat
         (sk.KEEP_SUCCESSORS, "0000000002@2021-08-09")
     ]
     assert "superseded" in found[0].detail
+    assert found[0].detail.endswith(" (owner review)")
 
 
 def test_a_replacement_without_bars_has_no_overlap_evidence(tmp_path: Path) -> None:

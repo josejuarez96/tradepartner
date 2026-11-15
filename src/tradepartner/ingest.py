@@ -1359,7 +1359,7 @@ def _split_spinoff_collisions(
         "  SELECT *, row_number() OVER (PARTITION BY security_id, source_action_id, "
         "    CASE WHEN source_action_id = '' THEN ex_date END ORDER BY known_at DESC) AS rn "
         "  FROM corporate_actions WHERE action_type = 'split' "
-        "    AND list_contains(?, security_id)) "
+        "    AND security_id IN (SELECT unnest(?))) "
         "WHERE rn = 1 AND NOT cancelled ORDER BY security_id, ex_date",
         [sorted({parent for parent, _ in keys})],
     ).fetchall()
@@ -5069,7 +5069,7 @@ def _delete_classifications(
     if not ids:
         return 0
     deleted = conn.execute(
-        "DELETE FROM classifications WHERE list_contains(?, security_id)", [ids]
+        "DELETE FROM classifications WHERE security_id IN (SELECT unnest(?))", [ids]
     ).fetchone()
     return int(deleted[0]) if deleted else 0
 
@@ -5674,7 +5674,8 @@ def restamp_from_manifest(
     refused_ids = frozenset(
         r[0]
         for r in conn.execute(
-            "SELECT security_id FROM _restamp_sids WHERE list_contains(?, cik)", [sorted(refused)]
+            "SELECT security_id FROM _restamp_sids WHERE cik IN (SELECT unnest(?))",
+            [sorted(refused)],
         ).fetchall()
     )
 
@@ -7566,8 +7567,8 @@ def _stored_actions(
     ids = sorted({row["security_id"] for row in rows})
     source_ids = sorted({row["source_action_id"] for row in rows if row["source_action_id"]})
     cursor = conn.execute(
-        "SELECT * FROM corporate_actions WHERE list_contains(?, security_id) "
-        "AND (ex_date BETWEEN ? AND ? OR list_contains(?, source_action_id))",
+        "SELECT * FROM corporate_actions WHERE security_id IN (SELECT unnest(?)) "
+        "AND (ex_date BETWEEN ? AND ? OR source_action_id IN (SELECT unnest(?)))",
         [ids, *window, source_ids],
     )
     names = [d[0] for d in cursor.description]
@@ -7856,7 +7857,9 @@ def _add_symbol_changes(
     ids = sorted({change.security_id for change in changes})
     if not ids:
         return 0
-    cursor = conn.execute("SELECT * FROM symbol_changes WHERE list_contains(?, security_id)", [ids])
+    cursor = conn.execute(
+        "SELECT * FROM symbol_changes WHERE security_id IN (SELECT unnest(?))", [ids]
+    )
     names = [column[0] for column in cursor.description]
     history: dict[_Identity, list[Row]] = defaultdict(list)
     for values in cursor.fetchall():
@@ -7951,7 +7954,7 @@ def _add_mergers(
     ids = sorted({merger.security_id for merger in mergers})
     if not ids:
         return 0
-    cursor = conn.execute("SELECT * FROM mergers WHERE list_contains(?, security_id)", [ids])
+    cursor = conn.execute("SELECT * FROM mergers WHERE security_id IN (SELECT unnest(?))", [ids])
     names = [column[0] for column in cursor.description]
     history: dict[_Identity, list[Row]] = defaultdict(list)
     for values in cursor.fetchall():
@@ -7986,7 +7989,7 @@ def _add_mergers(
             SELECT count(*) FROM (
                 SELECT security_id, effective_date FROM (
                     SELECT security_id, source_action_id, effective_date FROM mergers
-                    WHERE list_contains(?, security_id)
+                    WHERE security_id IN (SELECT unnest(?))
                     QUALIFY row_number() OVER (
                         PARTITION BY security_id, source_action_id ORDER BY known_at DESC
                     ) = 1
@@ -8046,7 +8049,7 @@ def _add_rows(
 
     ids = sorted({row["security_id"] for row in rows})
     cursor = conn.execute(
-        f"SELECT * FROM {table} WHERE list_contains(?, security_id) {where}", [ids, *params]
+        f"SELECT * FROM {table} WHERE security_id IN (SELECT unnest(?)) {where}", [ids, *params]
     )
     names = [d[0] for d in cursor.description]
     history: dict[tuple[Any, ...], list[Row]] = defaultdict(list)

@@ -43,6 +43,7 @@ from typing import Any
 import duckdb
 import pytest
 from conftest import load_universe_fixtures, mark_pre_lab
+from pydantic import ValidationError
 
 from tradepartner.backtest import engine, frozen, hypothesis, lab, sweep, sweep_report
 from tradepartner.backtest.holdout import Flags
@@ -56,6 +57,23 @@ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 SWEEP_SOURCE = FIXTURES / "sweeps" / "fixture-sweep.md"
 TWIN_SOURCE = FIXTURES / "hypotheses" / "fixture-momentum.md"
 SLUG = "fixture-sweep"
+
+
+@pytest.mark.parametrize("store_path", ["", "   "])
+def test_on_store_refuses_blank_path(tmp_path: Path, store_path: str) -> None:
+    live = Settings(_env_file=None, store={"path": str(tmp_path / "live.duckdb")})
+    with pytest.raises(ValidationError, match="path must be a file path"):
+        lab._on_store(live, store_path)
+
+
+def test_on_store_accepts_file_path(tmp_path: Path) -> None:
+    live = Settings(_env_file=None, store={"path": str(tmp_path / "live.duckdb")})
+    path = tmp_path / "fixture.duckdb"
+    updated = lab._on_store(live, path)
+    assert updated.store.path == str(path)
+    assert lab._on_store(live, None) is live
+
+
 #: The window the full-size smoke test's fixture files are copied with, today's inputs:
 #: a ~15-month in-sample window (2018-01-31..2019-04-30) and the four extra per-side
 #: cost levels.

@@ -1182,7 +1182,7 @@ def test_health_prints_the_figi_identity_block(tmp_path: Path, fixture_store_pat
     )
     assert "share_class_same_cik SEC_DUAL_A <-> SEC_DUAL_B: share_class_figi SC1" in plain.output
     assert (
-        "successor_share_class_differs SEC_MTUM <-> SEC_DUAL_A: "
+        "successor_share_class_differs SEC_MTUM successor of SEC_DUAL_A: "
         "share_class_figi SC2 vs SC1" in plain.output
     )
     assert (

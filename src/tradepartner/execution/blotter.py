@@ -200,7 +200,7 @@ def session_blotter(
     decisions = {
         d.decision_id: d
         for d in journal._select(
-            conn, DecisionRow, "list_contains(?, t.decision_id)", [decision_ids]
+            conn, DecisionRow, "t.decision_id IN (SELECT unnest(?))", [decision_ids]
         )
     }
     for order in shown:
@@ -217,7 +217,7 @@ def session_blotter(
         "JOIN signals s ON s.run_id = p.run_id "
         "AND s.rebalance_session = p.rebalance_session "
         "AND s.security_id = d.security_id "
-        "WHERE list_contains(?, d.decision_id) "
+        "WHERE d.decision_id IN (SELECT unnest(?)) "
         "AND p.run_id IN (SELECT run_id FROM paper_runs WHERE window_id = ?)",
         [decision_ids, window_id],
     ).fetchall()

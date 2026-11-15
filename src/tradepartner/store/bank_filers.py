@@ -256,11 +256,12 @@ def census(conn: duckdb.DuckDBPyConnection, filers: Sequence[BankFiler]) -> tupl
         if ids:
             bars, last_bar = conn.execute(
                 "SELECT count(*), max(session) FROM prices_daily "
-                "WHERE list_contains(?, security_id)",
+                "WHERE security_id IN (SELECT unnest(?))",
                 [list(ids)],
             ).fetchone() or (0, None)
             (delistings,) = conn.execute(
-                "SELECT count(*) FROM delistings WHERE list_contains(?, security_id)", [list(ids)]
+                "SELECT count(*) FROM delistings WHERE security_id IN (SELECT unnest(?))",
+                [list(ids)],
             ).fetchone() or (0,)
         holders = tuple(
             TickerHolder(*r)
@@ -268,7 +269,7 @@ def census(conn: duckdb.DuckDBPyConnection, filers: Sequence[BankFiler]) -> tupl
                 "SELECT DISTINCT l.security_id, s.cik, s.name, l.exchange, l.valid_from "
                 "FROM listings l JOIN securities s USING (security_id) "
                 f"WHERE l.ticker = ? AND {lst_live} AND {sec_live} "
-                "AND NOT list_contains(?, l.security_id) "
+                "AND NOT l.security_id IN (SELECT unnest(?)) "
                 "ORDER BY l.valid_from, l.security_id",
                 [filer.ticker, list(ids)],
             ).fetchall()

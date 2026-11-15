@@ -1422,7 +1422,7 @@ def stored_rename_changes(
     if news:
         for sid, ticker in conn.execute(
             "SELECT DISTINCT security_id, ticker FROM listings "
-            "WHERE known_at <= ? AND list_contains(?, ticker)",
+            "WHERE known_at <= ? AND ticker IN (SELECT unnest(?))",
             [at, news],
         ).fetchall():
             holders[ticker].add(sid)
@@ -1455,7 +1455,7 @@ def _latest_listing_rows(
         return out
     for sid, valid_from, known_at, ticker, exchange in conn.execute(
         "SELECT security_id, valid_from, known_at, ticker, exchange FROM listings "
-        "WHERE known_at <= ? AND list_contains(?, security_id) "
+        "WHERE known_at <= ? AND security_id IN (SELECT unnest(?)) "
         "QUALIFY NOT retracted AND row_number() OVER (PARTITION BY security_id, ticker, "
         "exchange, valid_from ORDER BY known_at DESC) = 1",
         [at, sorted(security_ids)],
@@ -2194,23 +2194,23 @@ def _filename_rows(
 #: "A held position" paragraph): an order in flight counts as held.
 _HELD_SQL = """
     SELECT security_id FROM orders
-        WHERE list_contains(?, security_id) AND run_id IN (
+        WHERE security_id IN (SELECT unnest(?)) AND run_id IN (
             SELECT run_id FROM paper_runs WHERE window_id IN (
                 SELECT window_id FROM paper_windows WHERE window_id NOT IN (
-                    SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))))
+                    SELECT window_id FROM paper_window_stops WHERE state IN (SELECT unnest(?)))))
     UNION SELECT security_id FROM positions_daily
-        WHERE list_contains(?, security_id) AND run_id IN (
+        WHERE security_id IN (SELECT unnest(?)) AND run_id IN (
             SELECT run_id FROM paper_runs WHERE window_id IN (
                 SELECT window_id FROM paper_windows WHERE window_id NOT IN (
-                    SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))))
+                    SELECT window_id FROM paper_window_stops WHERE state IN (SELECT unnest(?)))))
     UNION SELECT security_id FROM adjustments
-        WHERE list_contains(?, security_id) AND window_id IN (
+        WHERE security_id IN (SELECT unnest(?)) AND window_id IN (
             SELECT window_id FROM paper_windows WHERE window_id NOT IN (
-                SELECT window_id FROM paper_window_stops WHERE list_contains(?, state)))
+                SELECT window_id FROM paper_window_stops WHERE state IN (SELECT unnest(?))))
     UNION SELECT security_id FROM lots
-        WHERE list_contains(?, security_id) AND book_id IN (
+        WHERE security_id IN (SELECT unnest(?)) AND book_id IN (
             SELECT book_id FROM paper_windows WHERE window_id NOT IN (
-                SELECT window_id FROM paper_window_stops WHERE list_contains(?, state)))
+                SELECT window_id FROM paper_window_stops WHERE state IN (SELECT unnest(?))))
 """
 
 

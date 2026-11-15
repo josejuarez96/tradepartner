@@ -2987,7 +2987,7 @@ class EdgarFilingSource(FilingSource):
                 _fsn_rows(
                     members["dim.tsv"],
                     ("dimhash", "segments"),
-                    where="list_contains(?, dimhash)",
+                    where="dimhash IN (SELECT unnest(?))",
                     params=[dimhashes],
                     free_text="segments",
                 )
