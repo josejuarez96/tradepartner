@@ -46,8 +46,12 @@ What the repair is and is not:
   one of the symbols the security held that session, so a fill-holes refetch
   puts the bar there) or an *orphan* (no id receives the symbol on that
   session: the deleted bar is lost, as when a one-exchange Form 25 cut Apache
-  or Marriott while another line stayed listed). The dry run lists every
-  orphan security with its first and last session and its key count. A real
+  or Marriott while another line stayed listed). A key whose would-be owner
+  already holds the same bar as its own (equal volume, OHLC within
+  `store.release_move_price_tolerance`, as release coverage judges a move) is
+  a *duplicate*, not an orphan (#3463): retracting it loses nothing, and the
+  dry run lists it per security as `duplicate of <owner>`. The dry run lists
+  every orphan security with its first and last session and its key count. A real
   run refuses, deleting nothing, on any orphan unless `allow_orphans` equals
   the dry run's orphan key count exactly. Classified as the resolver at the
   run (listings, delistings and chains known then); no look-ahead is added.
@@ -340,6 +344,7 @@ def orphan_bars(
     bar_keys: Iterable[Key],
     tickers: Callable[[str, date], Sequence[str]],
     holds_bar: Callable[[str, date], bool] = lambda _sid, _day: False,
+    same_bar: Callable[[str, str, date], bool] = lambda _sid, _owner, _day: False,
 ) -> dict[Key, int]:
     """The bar keys among `bar_keys` (each one the resolver does not assign
     to its security) that no id receives (#3265): no ticker the security held
@@ -347,12 +352,56 @@ def orphan_bars(
     *moved* key has such an owner. An owner that already holds a stored bar
     of its own on the session (`holds_bar`) is no receiver (#3455): a refetch
     lands that owner's bar, never this one (Barrick under Gold.com's AMRK
-    bars). Returns `{key: 1}` per orphan key. Pure."""
+    bars). A key whose holding owner's bar is this very bar (`same_bar`) is
+    no orphan either (#3463, `duplicate_bars`): retracting it loses nothing.
+    Returns `{key: 1}` per orphan key. Pure."""
     out: dict[Key, int] = {}
     for sid, day in bar_keys:
-        if not (bar_owners(resolver, tickers(sid, day), day, holds_bar) - {sid}):
+        held = tickers(sid, day)
+        if not (bar_owners(resolver, held, day, holds_bar) - {sid}) and (
+            _duplicate_owner(resolver, sid, day, held, holds_bar, same_bar) is None
+        ):
             out[(sid, day)] = 1
     return out
+
+
+def duplicate_bars(
+    resolver: ListingResolver,
+    bar_keys: Iterable[Key],
+    tickers: Callable[[str, date], Sequence[str]],
+    holds_bar: Callable[[str, date], bool],
+    same_bar: Callable[[str, str, date], bool],
+) -> dict[Key, str]:
+    """The bar keys among `bar_keys` that no id receives but that an owner
+    already holds as its own bar (#3463): one of the security's tickers on the
+    session resolves to that owner (as in `bar_owners`), the owner keeps a
+    stored bar there (`holds_bar`), and that bar is this one (`same_bar`: the
+    rule release coverage uses to call a bar moved). Retracting such a key
+    loses nothing, so it is no orphan. Returns `{key: owner}` (the smallest
+    such owner id). Pure."""
+    out: dict[Key, str] = {}
+    for sid, day in bar_keys:
+        held = tickers(sid, day)
+        if bar_owners(resolver, held, day, holds_bar) - {sid}:
+            continue  # moved: a receiver exists
+        owner = _duplicate_owner(resolver, sid, day, held, holds_bar, same_bar)
+        if owner is not None:
+            out[(sid, day)] = owner
+    return out
+
+
+def _duplicate_owner(
+    resolver: ListingResolver,
+    sid: str,
+    day: date,
+    tickers: Sequence[str],
+    holds_bar: Callable[[str, date], bool],
+    same_bar: Callable[[str, str, date], bool],
+) -> str | None:
+    """The smallest owner of `day` under `tickers`, other than `sid`, that
+    holds a bar of its own there equal to `sid`'s (#3463), else `None`."""
+    owners = bar_owners(resolver, tickers, day) - {sid}
+    return min((o for o in owners if holds_bar(o, day) and same_bar(sid, o, day)), default=None)
 
 
 def bar_owners(
@@ -390,6 +439,38 @@ def _holds_bar(
         return cache[key]
 
     return holds
+
+
+def _same_bar(
+    conn: duckdb.DuckDBPyConnection, sources: list[str], tolerance: float
+) -> Callable[[str, str, date], bool]:
+    """`(stale_id, owner, session)` to whether the two ids' stored bars there
+    are the same bar (#3463): each id's latest revision (by `known_at`, over
+    `sources`), equal volume and every one of open, high, low and close within
+    `tolerance` relative to the stale bar's, with an absolute floor at price 1:
+    the rule `release_coverage` uses to call a lost bar moved
+    (`store.release_move_price_tolerance`)."""
+
+    def latest(sid: str, day: date) -> tuple[float, float, float, float, int] | None:
+        row = conn.execute(
+            "SELECT arg_max(open, known_at), arg_max(high, known_at), arg_max(low, known_at), "
+            "arg_max(close, known_at), arg_max(volume, known_at) FROM prices_daily "
+            "WHERE security_id = ? AND session = ? AND source IN (SELECT unnest(?))",
+            [sid, day, sources],
+        ).fetchone()
+        if row is None or any(v is None for v in row):
+            return None
+        return float(row[0]), float(row[1]), float(row[2]), float(row[3]), int(row[4])
+
+    def same(stale: str, owner: str, day: date) -> bool:
+        a, b = latest(stale, day), latest(owner, day)
+        if a is None or b is None or a[4] != b[4]:
+            return False
+        return all(
+            abs(y - x) <= tolerance * max(1.0, abs(x)) for x, y in zip(a[:4], b[:4], strict=True)
+        )
+
+    return same
 
 
 def _norm(ticker: str) -> str:
@@ -484,7 +565,10 @@ class RepairResult:
     chains: tuple[ChainLine, ...] = ()
     #: The bar keys no id receives (#3265): `(security_id, session)` to rows.
     orphans: Mapping[Key, int] = field(default_factory=dict)
-    #: Display names by base id, for the orphan lines only.
+    #: The bar keys an owner already holds as its own bar (#3463): no orphans,
+    #: `(security_id, session)` to that owner.
+    duplicates: Mapping[Key, str] = field(default_factory=dict)
+    #: Display names by base id, for the orphan and duplicate lines only.
     names: Mapping[str, str] = field(default_factory=dict)
     #: Rows beyond the counted ones that retracting these keys would also move
     #: (`_wider`); a real run refuses on any.
@@ -521,6 +605,11 @@ class RepairResult:
             f"{self.unjudged_mergers} mergers rows unjudged; "
             f"{self.orphan_keys} orphan bar keys no id receives on "
             f"{len({sid for sid, _ in self.orphans})} securities"
+            + (
+                f"; {len(self.duplicates)} duplicate bar keys an owner already holds"
+                if self.duplicates
+                else ""
+            )
             + (f"; {len(self.wider)} extra rows held by the same keys" if self.wider else "")
         )
 
@@ -550,6 +639,16 @@ class RepairResult:
             out.append(
                 f"  ORPHAN {sid} ({name}): {len(days)} bar keys {min(days)}..{max(days)} "
                 "that no id receives"
+            )
+        dups: dict[tuple[str, str], list[date]] = defaultdict(list)
+        for (sid, day), owner in self.duplicates.items():
+            dups[(sid, owner)].append(day)
+        for sid, owner in sorted(dups):
+            days = dups[(sid, owner)]
+            name = self.names.get(_base_id(sid), "?")
+            out.append(
+                f"  DUPLICATE {sid} ({name}): {len(days)} bar keys {min(days)}..{max(days)} "
+                f"duplicate of {owner}"
             )
         out += [f"  WIDER {line}" for line in self.wider]
         for chain in self.chains:
@@ -998,11 +1097,12 @@ def repair_resolution(
             )
             + _wider_spinoffs(conn, bad_spins)
         )
-        orphans = orphan_bars(
-            resolver,
-            found_bars,
-            _held_tickers(conn, started),
-            _holds_bar(conn, bar_sources, found_bars),
+        held_tickers = _held_tickers(conn, started)
+        holds_bar = _holds_bar(conn, bar_sources, found_bars)
+        same_bar = _same_bar(conn, bar_sources, settings.store.release_move_price_tolerance)
+        orphans = orphan_bars(resolver, found_bars, held_tickers, holds_bar, same_bar)
+        duplicates = duplicate_bars(
+            resolver, [k for k in found_bars if k not in orphans], held_tickers, holds_bar, same_bar
         )
         names = {
             _base_id(str(sid)): str(name)
@@ -1026,6 +1126,7 @@ def repair_resolution(
             unjudged_mergers=int(mergers_row[0]),
             chains=_chain_lines(conn, started),
             orphans=orphans,
+            duplicates=duplicates,
             names=names,
             wider=wider,
         )
