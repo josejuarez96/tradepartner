@@ -2221,6 +2221,7 @@ class RetractedSpan:
     received_by: tuple[str, ...] = ()
     accepted: tuple[date, ...] = ()
     accepted_note: str = ""
+    revised: tuple[date, ...] = ()
 
     def describe(self) -> str:
         """One report line: table, id, count, the reason and rule, and for bars where
@@ -2236,6 +2237,11 @@ class RetractedSpan:
             parts.append(
                 f"{self.days[0]}..{self.days[-1]} received by {','.join(self.received_by)}"
             )
+        if self.revised:
+            parts.append(
+                f"{len(self.revised)} sessions refetched as a vendor revision "
+                f"({self.revised[0]}..{self.revised[-1]})"
+            )
         if self.accepted:
             parts.append(f"{len(self.accepted)} sessions {self.accepted_note}")
         if self.unreceived:
@@ -2247,12 +2253,20 @@ class RetractedSpan:
 
 
 def release_retractions(
-    conn: duckdb.DuckDBPyConnection, name: str, *, price_tolerance: float = 1e-6
+    conn: duckdb.DuckDBPyConnection,
+    name: str,
+    *,
+    price_tolerance: float = 1e-6,
+    backup_alias: str | None = None,
 ) -> list[RetractedSpan]:
     """The unrestored `retracted_rows` of release `name`, by table and security id.
     A retracted bar is received when another security id holds a bar for that session
     with the same volume and OHLC within `price_tolerance` (as `release_coverage`
-    decides a move), compared as sets of days; the rest are `unreceived`. Empty on a
+    decides a move), compared as sets of days; the rest are `unreceived`. With
+    `backup_alias` (the release backup, attached), a retracted bar is also received
+    when another id gained a bar for that session (none in the backup) with the same
+    open and close: the vendor now serves a revised bar (#3432), listed as `revised`.
+    Empty on a
     store without the table. Reads only."""
     if not _has_table(conn, "retracted_rows"):
         return []
@@ -2277,12 +2291,21 @@ def release_retractions(
         days = sorted(latest)
         unreceived: list[date] = []
         accepted: list[date] = []
+        revised: list[date] = []
         receivers: set[str] = set()
         for day in days:  # one bar per session: its newest retracted revision
             heard = _bar_receivers(conn, sid, day, latest[day], price_tolerance)
             receivers |= set(heard)
             if heard:
                 continue
+            if backup_alias is not None:
+                again = _revision_receivers(
+                    conn, backup_alias, sid, day, latest[day], price_tolerance
+                )
+                if again:
+                    receivers |= set(again)
+                    revised.append(day)
+                    continue
             (accepted if (sid, day) in approved_keys else unreceived).append(day)
         out.append(
             RetractedSpan(
@@ -2296,6 +2319,7 @@ def release_retractions(
                 tuple(sorted(receivers)[:3]),
                 tuple(accepted),
                 note,
+                tuple(revised),
             )
         )
     return out
@@ -2330,6 +2354,36 @@ def _bar_receivers(
           AND abs(cl - ?) <= ? * greatest(1, abs(?))
         """,
         [day, sid, volume, o, tolerance, o, h, tolerance, h, lo, tolerance, lo, cl, tolerance, cl],
+    ).fetchall()
+    return [str(r[0]) for r in found]
+
+
+def _revision_receivers(
+    conn: duckdb.DuckDBPyConnection,
+    backup_alias: str,
+    sid: str,
+    day: date,
+    values: Mapping[str, str],
+    tolerance: float,
+) -> list[str]:
+    """Ids other than `sid` that gained a bar for `day` since the backup (no bar of
+    that session in it) whose open and close equal the retracted bar's within
+    `tolerance`: the vendor's revised bar of the same session (#3432). Volume, high
+    and low may differ. `_bar_receivers` has already parsed `values`."""
+    if re.fullmatch(r"[a-z_][a-z0-9_]*", backup_alias) is None:
+        raise ValueError(f"bad backup alias {backup_alias!r}")
+    o, cl = float(values["open"]), float(values["close"])
+    found = conn.execute(
+        f"""
+        SELECT DISTINCT security_id FROM (
+            SELECT security_id, arg_max(open, known_at) AS o, arg_max(close, known_at) AS cl
+            FROM prices_daily WHERE session = ? AND security_id <> ? GROUP BY security_id) g
+        WHERE NOT EXISTS (SELECT 1 FROM {backup_alias}.prices_daily b
+                          WHERE b.security_id = g.security_id AND b.session = ?)
+          AND abs(o - ?) <= ? * greatest(1, abs(?))
+          AND abs(cl - ?) <= ? * greatest(1, abs(?))
+        """,
+        [day, sid, day, o, tolerance, o, cl, tolerance, cl],
     ).fetchall()
     return [str(r[0]) for r in found]
 

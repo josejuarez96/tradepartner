@@ -265,3 +265,30 @@ def test_unknown_release_name_is_scrubbed(tmp_path: Path) -> None:
     assert res.exit_code == 2
     assert "no release named '<scrubbed>'" in res.output
     assert secret not in res.output
+
+
+def test_a_retracted_session_regained_with_another_volume_is_a_vendor_revision(
+    tmp_path: Path,
+) -> None:
+    """#3432: the receiving id gained a bar with the same open and close but another
+    volume and high; the retracted session is moved and counted as revised. Without the
+    retraction release, or when the receiver held the bar already, it stays lost."""
+    from tradepartner.store.release_coverage import format_loss
+    from tradepartner.store.retracted_rows import retract
+
+    s = _settings(tmp_path)
+    _seed(s)
+    backup = _backup_and_open(s, tmp_path)
+    with open_for_write(s) as conn:
+        retract(conn, "prices_daily", [("A", d) for d in _days(20)], "dup", "rel", "line 1")
+        _master(conn, "A2", "AAA2")
+        for d in _days(20):
+            _bar(conn, "A2", d)
+        conn.execute("UPDATE prices_daily SET volume = 9, high = 1.5 WHERE security_id = 'A2'")
+    with duckdb.connect(s.store.path, read_only=True) as conn:
+        conn.execute(f"ATTACH '{backup}' AS bk (READ_ONLY)")
+        plain = release_coverage(conn, backup_alias="bk")
+        (loss,) = release_coverage(conn, backup_alias="bk", retraction_release="rel")
+    assert plain[0].unmoved == 20 and plain[0].revised == 0
+    assert (loss.lost, loss.moved, loss.revised, loss.unmoved) == (20, 20, 20, 0)
+    assert "moved to A2 (20 as a vendor revision" in format_loss(loss)
