@@ -367,6 +367,7 @@ def test_write_sweep_variant_refuses_an_index_outside_the_sweep(
 def test_open_and_close_sweep_run(
     lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
+    (tmp_path / ".git").write_text("gitdir: /nonexistent\n")
     sweep = _sweep(lab_store, settings)
     run_id = _run(lab_store, sweep.sweep_id, tmp_path, None)
     opened = lab_store.execute(
