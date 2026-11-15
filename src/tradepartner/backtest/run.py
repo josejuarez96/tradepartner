@@ -102,7 +102,8 @@ from __future__ import annotations
 
 import math
 import traceback
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from functools import partial
@@ -113,6 +114,7 @@ import duckdb
 import polars as pl
 
 from tradepartner.backtest import engine, placebo
+from tradepartner.backtest import frozen as frozen_module
 from tradepartner.backtest.engine import BacktestResult, DelistingExit
 from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.holdout import (
@@ -126,9 +128,9 @@ from tradepartner.backtest.holdout import (
     default_in_sample_window,
     gap_sessions,
 )
-from tradepartner.backtest.hypothesis import load_frozen
+from tradepartner.backtest.hypothesis import _overlay, _reset_inert, load_frozen
 from tradepartner.backtest.provider import DataProvider
-from tradepartner.backtest.results import write_results
+from tradepartner.backtest.results import hypothesis_cadence, metric_rows, write_results
 from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import session_close
@@ -601,3 +603,106 @@ def run_hypothesis(
     if status == "ok":
         return RunOutcome(handle.trial_id, "ok", results)
     return RunOutcome(handle.trial_id, "failed")
+
+
+@contextmanager
+def _replay_registry(handle: registry.TrialHandle) -> Iterator[duckdb.DuckDBPyConnection]:
+    """An in-memory stand-in for the registry connection `StoreProvider` checks its handle
+    against: it holds the replayed trial's `trials` row (its `started_at`) and no result row,
+    so the check "an open trial" passes without the replayed store being written."""
+    conn = duckdb.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE trials (trial_id BIGINT, started_at TIMESTAMPTZ)")
+        conn.execute("CREATE TABLE trial_results (trial_id BIGINT)")
+        conn.execute("INSERT INTO trials VALUES (?, ?)", [handle.trial_id, handle.started_at])
+        yield conn
+    finally:
+        conn.close()
+
+
+def replay_trial(
+    trial_id: int, store_path: Path | str, *, holdout_replay: bool = False
+) -> list[registry.MetricRow]:
+    """Run trial `trial_id` again over `store_path` and return the metric rows the run
+    produces (T398; ADR 0029, `store.reproduce`). Writes nothing: no `trials`,
+    `trial_results`, `trial_metrics` or lab row, no decision; the store is opened read-only.
+
+    The trial runs as it ran: its own registration (the `hypotheses` row it names, not
+    the slug's latest), its stored window and kind, its frozen parameters over the live
+    settings for every other key, and the cost levels it was evaluated at (the base, the
+    sensitivity ladder and any `measured` level its metrics hold). The metrics are
+    `results.metric_rows`, the function `write_results` writes them with.
+
+    `store_path` must carry the `reproduction` marker (`store.reproduce`): a copy of the
+    real store made by `reproduce_trial`. `_marked_copy` is unchanged, so an unmarked copy
+    of the real store is still refused for every other caller
+    (`registry.UnmarkedStoreRefused` here too). A holdout trial raises `ValueError`
+    unless `holdout_replay`: the replay spends no holdout, but a caller must say it is
+    replaying one."""
+    from tradepartner.store import reproduce
+
+    live = get_settings()
+    store = _on_store(live, store_path)
+    with open_read_only(store) as conn:
+        if not reproduce.has_reproduction_marker(conn):
+            raise registry.UnmarkedStoreRefused(
+                "replay_trial runs only on a store carrying the reproduction marker "
+                "(store.reproduce.reproduce_trial makes one)"
+            )
+        facts = reproduce.read_trial(conn, trial_id)
+        if facts.kind == "holdout" and not holdout_replay:
+            raise ValueError(f"trial {trial_id} is a holdout trial; a holdout replay is explicit")
+        hypothesis = registry.get_hypothesis_by_id(conn, facts.hypothesis_id)
+        if hypothesis.family not in ENGINE_FAMILIES:
+            raise ValueError(f"{hypothesis.slug!r} is in family {hypothesis.family!r}, not run")
+        if registry.params_sha256(hypothesis.params) != hypothesis.params_sha256:
+            raise ValueError(
+                f"hypothesis {hypothesis.slug!r}: stored parameters do not match their hash"
+            )
+        params = _overlay(
+            _reset_inert(live, frozen_module.inert_sections(hypothesis.family)),
+            frozen_values(hypothesis),
+        )
+        measured = reproduce.stored_measured_levels(conn, trial_id)
+        handle = registry._issue_handle(
+            trial_id=trial_id,
+            hypothesis_id=hypothesis.hypothesis_id,
+            family=hypothesis.family,
+            params_sha256=hypothesis.params_sha256,
+            kind=facts.kind,
+            synthetic=facts.synthetic,
+            started_at=facts.started_at,
+            store_max_ingested_at=facts.store_max_ingested_at,
+            detail_level=registry.DETAIL_LEVEL_FULL,
+            data_vintage=facts.data_vintage,
+            database=None,
+        )
+        cadence = hypothesis_cadence(conn, handle)
+    levels = {params.costs.per_side_bps, *params.costs.sensitivity_per_side_bps, *measured}
+    with (
+        _replay_registry(handle) as stub,
+        StoreProvider(
+            partial(open_read_only, store),
+            handle,
+            params,
+            registry_connect=lambda: _borrowed(stub),
+            refuse_forked_chains=True,
+        ) as provider,
+    ):
+        results = engine.run(
+            params,
+            provider,
+            facts.start_session,
+            facts.end_session,
+            handle,
+            sorted(levels),
+            family=hypothesis.family,
+            keep_marking_frames=False,
+        )
+    return metric_rows(results, params, cadence=cadence, family=hypothesis.family)
+
+
+@contextmanager
+def _borrowed(conn: duckdb.DuckDBPyConnection) -> Iterator[duckdb.DuckDBPyConnection]:
+    """`conn` for one `with`, left open (it belongs to the caller)."""
+    yield conn

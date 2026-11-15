@@ -385,6 +385,53 @@ def test_the_retracted_rows_source_scan_has_teeth() -> None:
     assert _retracted_offences("repair.py", sql) == []
 
 
+# `store.reproduce` (ADR 0029, #3428, T398) reads `retracted_rows` to rebuild a trial's
+# store on a copy. No universe, signal, backtest or research module may import it, except
+# `backtest/run.py`'s `replay_trial`, the one seam that runs a trial on such a copy.
+_REPRODUCE_BARRED = ("backtest/", "research/", "universe.py", "signals/", "signal.py")
+_REPRODUCE_SEAM = "backtest/run.py"
+_REPRODUCE_NAMING = re.compile(
+    r"store\.reproduce\b|from tradepartner\.store import [^\n(]*\breproduce\b"
+    r"|from tradepartner\.store import \([^)]*\breproduce\b"
+)
+
+
+def _reproduce_offences(relative: str, text: str) -> list[str]:
+    """Why the module at `relative` imports `store.reproduce` on a path that must not."""
+    if not relative.startswith(_REPRODUCE_BARRED) or relative == _REPRODUCE_SEAM:
+        return []
+    if _REPRODUCE_NAMING.search(text):
+        return [f"{relative}: imports store.reproduce"]
+    return []
+
+
+def test_the_reproduce_source_scan_finds_no_importer_on_a_barred_path() -> None:
+    offences = [
+        offence
+        for path in sorted(_SRC.rglob("*.py"))
+        for offence in _reproduce_offences(
+            path.relative_to(_SRC).as_posix(), path.read_text("utf-8")
+        )
+    ]
+    assert offences == []
+    # The seam exists and is the one importer in `backtest/`.
+    assert _REPRODUCE_NAMING.search((_SRC / _REPRODUCE_SEAM).read_text("utf-8"))
+    assert (_SRC / "store" / "reproduce.py").is_file()
+
+
+def test_the_reproduce_source_scan_has_teeth() -> None:
+    plain = "from tradepartner.store import reproduce"
+    assert _reproduce_offences("backtest/engine.py", plain)
+    assert _reproduce_offences("backtest/results.py", "import tradepartner.store.reproduce")
+    assert _reproduce_offences("research/experiment.py", plain)
+    assert _reproduce_offences("universe.py", "from tradepartner.store import registry, reproduce")
+    assert _reproduce_offences(
+        "backtest/signals.py", "from tradepartner.store import (\n    reproduce,\n)"
+    )
+    assert _reproduce_offences("backtest/run.py", plain) == []
+    assert _reproduce_offences("cli.py", plain) == []
+
+
 # The identity answer key (#3275, ADR 0029, T394): judges the resolver, is never
 # read by a universe, signal, backtest or research module.
 _ID_KEY_SOURCES = ("backtest/", "research/", "universe.py", "signals/", "signal.py")
