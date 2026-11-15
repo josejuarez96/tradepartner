@@ -6445,10 +6445,11 @@ def fact_rows(
     a listed preferred, warrant or note never takes shares. A fact whose
     member names a class letter (`us-gaap:CommonClassBMember`) goes to the
     one common class whose listing title names that letter ("Class B Common
-    Stock", "Series B common stock"), or whose cover-page title known at the
-    fact's acceptance does (`MasterBuild.class_titles`: a class first listed
-    as "Common Stock" and retitled "Class A Common Stock" later, #1166), and
-    is unmatched if none does (an unlisted class). Any other
+    Stock", "Series B common stock") and was known by the fact's acceptance
+    (a retracted listing row is skipped, #3405), or whose cover-page title
+    known at the fact's acceptance does (`MasterBuild.class_titles`: a class
+    first listed as "Common Stock" and retitled "Class A Common Stock" later,
+    #1166), and is unmatched if none does (an unlisted class). Any other
     fact (undimensioned, or a member with no letter) goes to the sole common
     class, and is unmatched when there are several: a total is no one
     class's shares. `class_member_overrides` (`edgar.class_member_overrides`,

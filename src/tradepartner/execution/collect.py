@@ -94,6 +94,23 @@ path's read, `paper resume`'s settlement). In order:
    reconciliation can see it. Resume and the halt path's read use the same band;
    a newly journaled bad fill refuses release or is named in the halt notes.
 
+6. **The fill check** (T400, #3333; inside the step-3 write chunk, before the cursor).
+   Each new own fill is compared with its journaled order: its `symbol` and
+   `side` with the `OrderRow`'s own (the submitted order's, so a ticker rename is
+   no false halt), and, per order with a new fill, the sum of its **live** journaled
+   fills (a feed fill that follows a `broker_status` synthetic one is not counted
+   twice) plus this collection's against its size (`reconcile.overfill_detail`).
+   A difference, an overfill, or a symbol, side, quantity or price that is empty or
+   not finite raises `SystemFaultError` as `fill_mismatch: {json}`, the JSON object
+   carrying the `fill_ids` (`fill_mismatch_ids` reads them back, never the prose)
+   and the `details`. The raise rolls the chunk back: none of the collection's fills
+   is written, no cursor advances, and the fault returns on every collection. Only
+   `paper resume --accept-fill-mismatch` passes fills: its ids (named in a halt
+   since the last release, `resume.py`) arrive as `accept_fill_mismatch`, and the
+   `resume_acceptances` row (`"kind": "fill_mismatch"`) is written with the accepted
+   fills in the same chunk, so a crash leaves neither. A fill not in the accepted
+   ids still raises, and rolls the acceptance back with it.
+
 Every clock reading is checked (ADR 0007 point 4): an exception, a
 non-`datetime` or a naive value becomes `ClockError`, and so does a write
 stamp earlier than the reading taken for the skew check.
@@ -141,11 +158,12 @@ from zoneinfo import ZoneInfo
 import duckdb
 import polars as pl
 
-from tradepartner.adapters.broker import TERMINAL_STATUSES, Broker, Fill, Order
+from tradepartner.adapters.broker import TERMINAL_STATUSES, Broker, Fill, Order, canonical_symbol
 from tradepartner.calendar import all_sessions, is_session
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, RejectionCapError, SystemFaultError
 from tradepartner.execution.plan import decision_state
+from tradepartner.execution.reconcile import overfill_detail
 from tradepartner.execution.risk import order_shape_violation
 from tradepartner.store.journal import (
     DecisionEventRow,
@@ -155,6 +173,7 @@ from tradepartner.store.journal import (
     OrderEventRow,
     OrderRow,
     ReconciliationRow,
+    ResumeAcceptanceRow,
     all_fill_ids,
     all_fill_terms,
     append,
@@ -187,6 +206,9 @@ _UNFUNDED = "unfunded"
 _SPLIT = "split"
 _SPINOFF = "spinoff"
 _FILL_BAND_FAULT = "fill_price_outside_band"
+_FILL_MISMATCH = "fill_mismatch"
+#: The `kind` of a `resume_acceptances` entry written by `--accept-fill-mismatch`.
+FILL_MISMATCH_KIND = "fill_mismatch"
 _BROKER_FEED = "broker_feed"
 _BROKER_STATUS = "broker_status"
 #: The `mismatches_json` key under which a reconciliation lists its lagging
@@ -277,6 +299,9 @@ class Collected:
     one_sided: tuple[str, ...] = ()
     #: Warnings that our clock runs ahead of the broker's (#2186); they never halt.
     clock_notes: tuple[str, ...] = ()
+    #: The `broker_fill_id`s that were a fill mismatch and that
+    #: `--accept-fill-mismatch` let through, journaled with their acceptance row (T400).
+    fill_mismatch_accepted: tuple[str, ...] = ()
 
     @property
     def lagging(self) -> tuple[OrderReading, ...]:
@@ -301,6 +326,15 @@ def note_unjudged(collected: Collected, notes: list[str]) -> None:
 
 
 @dataclass(frozen=True)
+class FillMismatchAcceptance:
+    """The owner's `--accept-fill-mismatch` (T400), as `paper resume` hands it to
+    `collect`: the resume that carries it and the `broker_fill_id`s a halt named."""
+
+    resume_id: int
+    fill_ids: frozenset[str]
+
+
+@dataclass(frozen=True)
 class LagVerdict:
     """An order's lag bound: its anchor (None when no reconciliation listed it),
     the sessions past it, and whether the bound is breached."""
@@ -322,6 +356,7 @@ def collect(
     *,
     write_offs: WriteOffContext | None = None,
     price_band: PriceBand | None = None,
+    accept_fill_mismatch: FillMismatchAcceptance | None = None,
 ) -> Collected:
     """Collect fills and the terminal events of `orders` (module docstring).
 
@@ -334,11 +369,18 @@ def collect(
     `SystemFaultError` naming `refused_order_shape` for a reading that is not
     the default order shape, all before any write, and `RejectionCapError`
     when the write-off back-fill fails after this collection found a
-    rejection verdict."""
+    rejection verdict. A fill that does not match its order (module docstring,
+    step 6) raises `SystemFaultError` naming `fill_mismatch` in the write chunk,
+    which writes nothing. `accept_fill_mismatch` (a resume's only) passes the
+    fills it names and journals their acceptance with them."""
     if writer_kind not in WRITER_KINDS:
         raise ValueError(f"writer_kind must be one of {WRITER_KINDS}, got {writer_kind!r}")
     if write_offs is not None and writer_kind != _RUN:
         raise ValueError("only a run writes decision_events (the write-off back-fill)")
+    if accept_fill_mismatch is not None and (
+        writer_kind != _RESUME or accept_fill_mismatch.resume_id != writer_id
+    ):
+        raise ValueError("only the resume that carries --accept-fill-mismatch passes its fills")
     ids = [o.client_order_id for o in orders]
     repeated = sorted({i for i in ids if ids.count(i) > 1})
     if repeated:
@@ -404,7 +446,9 @@ def collect(
         stamp = _read_clock(clock)
         if stamp < now:
             raise ClockError(f"clock went back from {now.isoformat()} to {stamp.isoformat()}")
-        journaled, superseded, foreign = _journal_fills(conn, seen, stamp)
+        journaled, superseded, foreign, waived = _journal_fills(
+            conn, seen, stamp, frozen, accept_fill_mismatch
+        )
         collected = _journal_terminals(conn, to_read, readings, frozen, stamp)
         # The same book(s) as the cursors above: `last_run` is this book's, so
         # judging another book's rejections against it would re-judge them (#2475).
@@ -465,6 +509,7 @@ def collect(
         unjudged=unjudged,
         one_sided=one_sided,
         clock_notes=tuple(clock_notes),
+        fill_mismatch_accepted=waived,
     )
 
 
@@ -644,11 +689,27 @@ def _check_skew(fills: Iterable[Fill], now: datetime, skew_seconds: float) -> No
 
 
 def _journal_fills(
-    conn: duckdb.DuckDBPyConnection, seen: Sequence[Fill], stamp: datetime
-) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    """Insert-or-ignore each own fill; (journaled, superseded, foreign) ids."""
+    conn: duckdb.DuckDBPyConnection,
+    seen: Sequence[Fill],
+    stamp: datetime,
+    frozen: RiskConfig,
+    acceptance: FillMismatchAcceptance | None = None,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Insert-or-ignore each own fill; (journaled, superseded, foreign, waived) ids.
+
+    Every new own fill is checked against its order first (T400), and the
+    cumulative size after the inserts; a fault raises, and the caller's chunk
+    rolls back every row. `waived` are the accepted fills that were a fault,
+    written with their `resume_acceptances` row."""
     known = set(all_fill_ids(conn))
-    own = {o.client_order_id for o in orders_for(conn, window_id=None)}
+    orders = {o.client_order_id: o for o in orders_for(conn, window_id=None)}
+    accepted = acceptance.fill_ids if acceptance is not None else frozenset()
+    new = [f for f in seen if f.broker_fill_id not in known and f.client_order_id in orders]
+    faults = _fill_faults(new, orders)
+    early = {fid: why for fid, why in faults if fid not in accepted}
+    if early:
+        # Before anything is appended: a wrong or unreadable fill is never written.
+        raise SystemFaultError(_fill_mismatch_message(early))
     journaled: list[str] = []
     superseded: list[str] = []
     foreign: list[str] = []
@@ -657,7 +718,7 @@ def _journal_fills(
         if fill.broker_fill_id in known:
             _check_unchanged(fill, journaled_as.get(fill.broker_fill_id))
             continue
-        if fill.client_order_id not in own:
+        if fill.client_order_id not in orders:
             foreign.append(fill.broker_fill_id)
             continue
         synthetic = [
@@ -684,7 +745,152 @@ def _journal_fills(
         journaled.append(fill.broker_fill_id)
         if synthetic:
             superseded.append(fill.broker_fill_id)
-    return tuple(journaled), tuple(superseded), tuple(foreign)
+    faults += _overfill_faults(conn, new, orders, frozen, accepted)
+    unaccepted = {fid: why for fid, why in faults if fid not in accepted}
+    if unaccepted:
+        raise SystemFaultError(_fill_mismatch_message(unaccepted))
+    waived = tuple(sorted({fid for fid, _ in faults if fid in accepted}))
+    if acceptance is not None and waived:
+        entry = {
+            "kind": FILL_MISMATCH_KIND,
+            "fill_ids": list(waived),
+            "message": "; ".join(sorted({why for fid, why in faults if fid in accepted})),
+        }
+        append(
+            conn,
+            ResumeAcceptanceRow(
+                resume_id=acceptance.resume_id,
+                accepted_json=json.dumps([entry], sort_keys=True),
+                known_at=stamp,
+                ingested_at=stamp,
+            ),
+        )
+    return tuple(journaled), tuple(superseded), tuple(foreign), waived
+
+
+def _fill_faults(new: Sequence[Fill], orders: dict[str, OrderRow]) -> list[tuple[str, str]]:
+    """(fill id, why) for every new own fill whose symbol or side is not its
+    order's, or that is unreadable: an empty or non-finite field is a fault, never
+    a pass (T400). The order's own `symbol` and `side` are compared, so a ticker
+    renamed after submission is no mismatch."""
+    found: list[tuple[str, str]] = []
+    for fill in new:
+        order = orders[fill.client_order_id]
+        ident = f"fill {fill.broker_fill_id} of order {fill.client_order_id}"
+        try:
+            symbol = canonical_symbol(fill.symbol)
+            expected = canonical_symbol(order.symbol)
+            side = getattr(fill.side, "value", fill.side)
+            readable = (
+                isinstance(side, str)
+                and bool(side)
+                and math.isfinite(fill.quantity)
+                and fill.quantity > 0
+                and math.isfinite(fill.price)
+                and fill.price > 0
+            )
+        except (ValueError, TypeError, AttributeError):
+            found.append(
+                (fill.broker_fill_id, f"{ident} is unreadable (symbol, side, size or price)")
+            )
+            continue
+        if not readable:
+            found.append(
+                (fill.broker_fill_id, f"{ident} is unreadable (symbol, side, size or price)")
+            )
+        elif symbol != expected:
+            found.append(
+                (fill.broker_fill_id, f"{ident} is for {symbol}, the order is for {expected}")
+            )
+        elif side != order.side:
+            found.append((fill.broker_fill_id, f"{ident} is a {side}, the order is a {order.side}"))
+    return found
+
+
+def _overfill_faults(
+    conn: duckdb.DuckDBPyConnection,
+    new: Sequence[Fill],
+    orders: dict[str, OrderRow],
+    frozen: RiskConfig,
+    accepted: frozenset[str],
+) -> list[tuple[str, str]]:
+    """(fill id, why) for the new fills of every order whose live fills, now
+    including this collection's, exceed its size (T400). The sums are `fills_for`'s
+    live rows, as `_journal_terminals` sums them, so a feed fill superseded by a
+    `broker_status` synthetic one is not counted twice. An order all of whose new
+    fills are accepted is skipped here and recorded by the caller."""
+    by_order: dict[str, list[str]] = {}
+    for fill in new:
+        by_order.setdefault(fill.client_order_id, []).append(fill.broker_fill_id)
+    if not by_order:
+        return []
+    live = fills_for(conn, client_order_ids=sorted(by_order))
+    found: list[tuple[str, str]] = []
+    for coid, fill_ids in sorted(by_order.items()):
+        mine = [f.fill for f in live if f.fill.client_order_id == coid]
+        why = overfill_detail(
+            orders[coid],
+            math.fsum(f.quantity for f in mine),
+            math.fsum(f.quantity * f.price for f in mine),
+            frozen.reconcile_quantity_tolerance,
+            frozen.whole_share_price_buffer,
+            frozen.reconcile_cash_tolerance,
+        )
+        if why is not None:
+            found += [(fid, f"order {coid} overfilled by fill {fid}: {why}") for fid in fill_ids]
+    return found
+
+
+def _fill_mismatch_message(faults: dict[str, str]) -> str:
+    """The fault text: the token and one JSON object whose `fill_ids` the halt
+    carries structurally (T400)."""
+    return f"{_FILL_MISMATCH}: " + json.dumps(
+        {"fill_ids": sorted(faults), "details": sorted(set(faults.values()))}, sort_keys=True
+    )
+
+
+def is_fill_mismatch_fault(reason: str | None) -> bool:
+    """Whether a kill-switch `reason` carries a `fill_mismatch` fault (a run's halt
+    headline puts its fault type first)."""
+    return reason is not None and f"{_FILL_MISMATCH}: {{" in reason
+
+
+def fill_mismatch_ids(reason: str | None) -> tuple[str, ...]:
+    """The `broker_fill_id`s a `fill_mismatch` halt names, read from its JSON
+    object and never from the prose; empty for any other reason or one that does
+    not parse (fail closed: nothing can then be accepted)."""
+    if reason is None:
+        return ()
+    start = reason.find(f"{_FILL_MISMATCH}: {{")
+    if start < 0:
+        return ()
+    try:
+        body, _ = json.JSONDecoder().raw_decode(reason, start + len(_FILL_MISMATCH) + 2)
+        ids = body["fill_ids"]
+    except (ValueError, KeyError, TypeError):
+        return ()
+    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+        return ()
+    return tuple(ids)
+
+
+def accepted_fill_mismatch_ids(rows: Iterable[ResumeAcceptanceRow]) -> frozenset[str]:
+    """Every `broker_fill_id` any `resume_acceptances` row accepted as a fill
+    mismatch (T400). A row that does not parse accepts nothing."""
+    ids: set[str] = set()
+    for row in rows:
+        try:
+            entries = json.loads(row.accepted_json)
+        except ValueError:
+            continue
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("kind") == FILL_MISMATCH_KIND:
+                listed = entry.get("fill_ids")
+                if isinstance(listed, list):
+                    ids.update(i for i in listed if isinstance(i, str))
+    return frozenset(ids)
 
 
 def _check_unchanged(fill: Fill, journaled: tuple[float, float] | None) -> None:

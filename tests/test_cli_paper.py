@@ -530,6 +530,7 @@ PAPER_OPTIONS = {
         "--accept-broker-fills",
         "--accept-rejections",
         "--accept-fill-band",
+        "--accept-fill-mismatch",
         "--book",
     },
     "report": {"--book"},
@@ -1281,11 +1282,12 @@ def test_commands_under_a_held_run_lock_exit_locked(clock: _Clock, factory: _Fac
 
 
 @pytest.mark.parametrize(
-    ("flags", "accepted", "band"),
+    ("flags", "accepted", "band", "mismatch"),
     [
-        ((), False, False),
-        (("--accept-rejections",), True, False),
-        (("--accept-fill-band",), False, True),
+        ((), False, False, False),
+        (("--accept-rejections",), True, False, False),
+        (("--accept-fill-band",), False, True, False),
+        (("--accept-fill-mismatch",), False, False, True),
     ],
 )
 def test_resume_passes_the_owners_flags_on_unchanged(
@@ -1295,6 +1297,7 @@ def test_resume_passes_the_owners_flags_on_unchanged(
     flags: tuple[str, ...],
     accepted: bool,
     band: bool,
+    mismatch: bool,
 ) -> None:
     seen: list[tuple[Any, ...]] = []
 
@@ -1306,11 +1309,21 @@ def test_resume_passes_the_owners_flags_on_unchanged(
     out = _paper(clock, factory, "resume", "--reason", LONG_REASON, *flags)
     assert out.exit_code == 0, out.output
     assert seen == [
-        (False, {"accept_rejections": accepted, "accept_fill_band": band, "book_id": "main"})
+        (
+            False,
+            {
+                "accept_rejections": accepted,
+                "accept_fill_band": band,
+                "accept_fill_mismatch": mismatch,
+                "book_id": "main",
+            },
+        )
     ]
 
 
-@pytest.mark.parametrize("flag", ["--accept-rejections", "--accept-fill-band"])
+@pytest.mark.parametrize(
+    "flag", ["--accept-rejections", "--accept-fill-band", "--accept-fill-mismatch"]
+)
 def test_accept_rejections_is_a_plain_off_by_default_flag(flag: str) -> None:
     group: Any = typer.main.get_command(cli.make_app())
     resume_command = group.commands["paper"].commands["resume"]
@@ -1335,12 +1348,20 @@ def test_accept_rejections_ignores_an_auto_envvar_prefix(
     monkeypatch.setattr(paper_resume, "resume", recording)
     monkeypatch.setenv("TP_PAPER_RESUME_ACCEPT_REJECTIONS_FLAG", "1")
     monkeypatch.setenv("TP_PAPER_RESUME_ACCEPT_FILL_BAND_FLAG", "1")
+    monkeypatch.setenv("TP_PAPER_RESUME_ACCEPT_FILL_MISMATCH_FLAG", "1")
     app = cli.make_app(clock=clock, broker=factory)
     result = CliRunner().invoke(
         app, ["paper", "resume", "--reason", LONG_REASON], auto_envvar_prefix="TP"
     )
     assert result.exit_code == 0, result.output
-    assert seen == [{"accept_rejections": False, "accept_fill_band": False, "book_id": "main"}]
+    assert seen == [
+        {
+            "accept_rejections": False,
+            "accept_fill_band": False,
+            "accept_fill_mismatch": False,
+            "book_id": "main",
+        }
+    ]
 
 
 # --- `--book` and the multi-book `paper run` (ADR 0017 B.2 to B.5; plan T155b) -----------

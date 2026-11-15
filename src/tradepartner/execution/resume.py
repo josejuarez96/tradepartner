@@ -36,6 +36,22 @@ The only way the kill switch is released. In the req 5 order:
      before anything that could release. A bad fill this invocation itself first
      journals still refuses, so the owner always sees a print before accepting it.
      Every other check below still applies. Only the CLI flag sets it.
+   - **`accept_fill_mismatch`** (`--accept-fill-mismatch`, T400, #3333) is the owner's
+     word that he has checked with the broker a fill `collect` refused: a symbol or
+     side that is not its order's, or a size beyond it (`collect` module docstring,
+     step 6). The collection halts the book with `fill_mismatch: {json}`, the JSON
+     object carrying the `fill_ids`; this flag accepts only the fill ids named in a
+     halt journaled since the window's last release (`collect.fill_mismatch_ids`
+     reads the structure, never the prose). They go into `collect`, which writes the
+     `resume_acceptances` row (`"kind": "fill_mismatch"`) and the accepted fills in
+     one write chunk, so a crash leaves neither. A fill that arrived since the halt
+     and is not named still halts the resume, engages a new halt naming it and rolls
+     the acceptance back with it; the owner sees it before accepting it. The resume
+     then reconciles as usual, and the `overfilled` pass leaves the accepted ids out.
+     A flag with no such halt refuses. The acceptance row is the resume's one, so
+     this flag does not combine with a collection that also writes `--accept-rejections`
+     or `--accept-fill-band` acceptances: the resume refuses after journaling the
+     fills, and the owner resumes again with those flags.
    - A rejection-cap verdict refuses the release: one from the collection
      (an all-rejected or over-cap submitting run whose rejection this resume
      journaled; #374, T58's handoff), or one on a run the release would clear
@@ -158,12 +174,15 @@ from tradepartner.execution import drawdown, marks, switch
 from tradepartner.execution.collect import (
     WRITER_KINDS,
     Connect,
+    FillMismatchAcceptance,
     OrderReading,
     PriceBand,
     RejectionBreach,
     collect,
     fill_band_violations,
+    fill_mismatch_ids,
     is_fill_band_fault,
+    is_fill_mismatch_fault,
     lag_verdict,
     note_unjudged,
     rejection_breaches,
@@ -203,6 +222,7 @@ from tradepartner.store.journal import (
     pending_orders,
     positions_daily_for,
     reconciliations_for,
+    resume_acceptances,
     resume_invocations,
     runs_for,
 )
@@ -243,6 +263,8 @@ class ResumeOutcome:
     accepted_rejections: tuple[str, ...] = ()
     #: The band faults `--accept-fill-band` accepted (#3130), as journaled.
     accepted_fill_band: tuple[str, ...] = ()
+    #: The `broker_fill_id`s `--accept-fill-mismatch` let through (T400), as journaled.
+    accepted_fill_mismatch: tuple[str, ...] = ()
     fill_prices: tuple[tuple[str, float], ...] = ()
     fill_warnings: tuple[str, ...] = ()
 
@@ -627,7 +649,7 @@ def _accept(
     clock: Callable[[], datetime],
     stamps: _MonotonicStamps,
     band_accepted: Sequence[str] = (),
-) -> None:
+) -> bool:
     """Journal the verdicts `--accept-rejections` accepted (`[]` for none) and the
     fill-band faults `--accept-fill-band` accepted (#3130, entries with `"kind":
     "fill_band"`), one row per resume, before anything that could lead to a release."""
@@ -644,6 +666,8 @@ def _accept(
     ]
     verdicts += [{"kind": "fill_band", "message": message} for message in band_accepted]
     with connect() as conn:
+        if any(row.resume_id == resume_id for row in resume_acceptances(conn)):
+            return False  # `collect` wrote this resume's row (`--accept-fill-mismatch`)
         append(
             conn,
             ResumeAcceptanceRow(
@@ -653,6 +677,21 @@ def _accept(
                 ingested_at=stamp,
             ),
         )
+    return True
+
+
+def _named_fill_mismatches(events: Sequence[KillSwitchRow]) -> frozenset[str]:
+    """The `broker_fill_id`s any `fill_mismatch` halt since the window's last release
+    names (T400), read from each halt's JSON object (`collect.fill_mismatch_ids`)."""
+    last_release = max((e.event_id or 0 for e in events if e.state == switch.RELEASED), default=0)
+    return frozenset(
+        fill_id
+        for event in events
+        if (event.event_id or 0) > last_release
+        and event.source == "fault"
+        and is_fill_mismatch_fault(event.reason)
+        for fill_id in fill_mismatch_ids(event.reason)
+    )
 
 
 def _switch(connect: Connect, window: PaperWindowRow) -> switch.SwitchState:
@@ -681,6 +720,7 @@ def resume(
     *,
     accept_rejections: bool,
     accept_fill_band: bool = False,
+    accept_fill_mismatch: bool = False,
     book_id: str | None = None,
 ) -> ResumeOutcome:
     """`paper resume --reason` (module docstring). `accept_rejections` is the
@@ -700,6 +740,10 @@ def resume(
         raise TypeError(f"accept_rejections must be a bool, got {type(accept_rejections).__name__}")
     if not isinstance(accept_fill_band, bool):
         raise TypeError(f"accept_fill_band must be a bool, got {type(accept_fill_band).__name__}")
+    if not isinstance(accept_fill_mismatch, bool):
+        raise TypeError(
+            f"accept_fill_mismatch must be a bool, got {type(accept_fill_mismatch).__name__}"
+        )
     book = resolve_book(settings, book_id)
     with run_lock(settings, book):
         with connect() as conn:
@@ -737,6 +781,21 @@ def resume(
             accept_broker_fills,
             accept_rejections=accept_rejections,
         )
+        acceptance: FillMismatchAcceptance | None = None
+        if accept_fill_mismatch:
+            with connect() as conn:
+                named = _named_fill_mismatches(kill_switch_events_for(conn, window_id))
+            if not named:
+                return ResumeOutcome(
+                    REFUSED,
+                    resume_id,
+                    (
+                        "--accept-fill-mismatch: no fill_mismatch halt since the window's last "
+                        "release names a fill, so there is nothing to accept",
+                    ),
+                    crashed_runs=crashed,
+                )
+            acceptance = FillMismatchAcceptance(resume_id, named)
         settled = _settle(broker, connect, pending, clock, stamps)
         session = command_session(now)
         cut = session_close(previous_session(session))
@@ -760,6 +819,7 @@ def resume(
             bar_sessions.__getitem__,
         )
         band_error: SystemFaultError | None = None
+        mismatch_error: SystemFaultError | None = None
         try:
             collected = collect(
                 broker,
@@ -771,11 +831,15 @@ def resume(
                 frozen,
                 settings,
                 price_band=band,
+                accept_fill_mismatch=acceptance,
             )
         except SystemFaultError as exc:
-            if "fill_price_outside_band" not in str(exc):
+            if is_fill_mismatch_fault(str(exc)):
+                mismatch_error = exc
+            elif "fill_price_outside_band" in str(exc):
+                band_error = exc
+            else:
                 raise
-            band_error = exc
             collected = None
         with connect() as conn:
             fill_prices = tuple(
@@ -805,6 +869,9 @@ def resume(
                 released_event_id=released_event_id,
                 accepted_rejections=tuple(b.message for b in accepted),
                 accepted_fill_band=accepted_band,
+                accepted_fill_mismatch=(
+                    collected.fill_mismatch_accepted if collected is not None else ()
+                ),
                 fill_prices=fill_prices,
                 fill_warnings=tuple(fill_warnings),
             )
@@ -832,6 +899,10 @@ def resume(
                 )
             return outcome(REFUSED, message)
 
+        if mismatch_error is not None:
+            # The collection wrote nothing (fills, cursor and acceptance roll back
+            # together); the new halt names the fills, so the owner sees them first.
+            return refuse_bad_fill(str(mismatch_error))
         if band_error is not None:
             return refuse_bad_fill(str(band_error))
         assert collected is not None
@@ -869,13 +940,22 @@ def resume(
             *("fill_price_outside_band: " + v for v in prior_violations),
         ]
         faulted = _faulted_run_breaches(connect, window, frozen)
+        # The collection already wrote this resume's one acceptance row when it
+        # waived a fill mismatch: another acceptance waits for the next resume.
+        second = outcome(
+            REFUSED,
+            "fill mismatch accepted and journaled for "
+            + ", ".join(collected.fill_mismatch_accepted)
+            + "; resume again with --accept-rejections or --accept-fill-band",
+        )
         if accept_rejections:
             # Only the verdicts on runs the release would clear (#451's refusal).
             # A collection verdict on such a run is the same run's verdict.
             accepted = faulted
-            _accept(connect, resume_id, accepted, clock, stamps, band_accepted)
-        elif band_accepted:
-            _accept(connect, resume_id, (), clock, stamps, band_accepted)
+            if not _accept(connect, resume_id, accepted, clock, stamps, band_accepted):
+                return second
+        elif band_accepted and not _accept(connect, resume_id, (), clock, stamps, band_accepted):
+            return second
         accepted_band = tuple(band_accepted)
         cleared = {b.run_id for b in accepted}
         reasons = [b.message for b in collected.rejections if b.run_id not in cleared]
