@@ -19,6 +19,7 @@ from conftest import open_paper_window
 from typer.testing import CliRunner
 
 from tradepartner import cli
+from tradepartner import repair_restore as restore_module
 from tradepartner.config import Settings
 from tradepartner.repair import RepairRefused
 from tradepartner.repair_restore import repair_restore
@@ -122,6 +123,18 @@ def test_a_dry_run_lists_the_rows_and_writes_nothing(store: Settings) -> None:
     assert _rows(store, "SELECT count(*) FROM ingestion_runs") == [(0,)]
 
 
+def test_a_dry_run_never_opens_the_write_lock(
+    store: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def reject_write(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("dry run acquired the write lock")
+
+    monkeypatch.setattr(restore_module, "open_for_write", reject_write)
+    result = repair_restore(store, release=NEW, from_release=OLD, dry_run=True, clock=lambda: RUN)
+    assert len(result.rows) == 4
+    assert _restored(store) == 0
+
+
 def test_a_restore_of_one_row_puts_back_that_key_only(store: Settings) -> None:
     result = repair_restore(
         store, release=NEW, table="prices_daily", key=(SID, D2), expect=1, clock=lambda: RUN
@@ -133,6 +146,17 @@ def test_a_restore_of_one_row_puts_back_that_key_only(store: Settings) -> None:
         store, "SELECT restored_at FROM retracted_rows WHERE restored_at IS NOT NULL"
     )
     assert stamp == RUN
+
+
+def test_equal_restore_instants_do_not_select_an_earlier_restore(store: Settings) -> None:
+    repair_restore(
+        store, release=NEW, table="prices_daily", key=(SID, D1), expect=1, clock=lambda: RUN
+    )
+    result = repair_restore(
+        store, release=NEW, table="prices_daily", key=(SID, D2), expect=1, clock=lambda: RUN
+    )
+    assert [(r.table, r.session) for r in result.rows] == [("prices_daily", D2)]
+    assert _restored(store) == 2
 
 
 def test_a_restore_of_one_release_puts_back_every_row_with_its_known_at(store: Settings) -> None:
@@ -169,6 +193,63 @@ def test_the_dry_run_names_a_held_key_too(store: Settings) -> None:
         insert_row(conn, "prices_daily", _bar(SID, D1))
     with pytest.raises(RepairRefused, match="is held"):
         repair_restore(store, release=NEW, from_release=OLD, dry_run=True, clock=lambda: RUN)
+
+
+def test_dry_and_real_bar_restore_refuse_the_same_held_ticker(store: Settings) -> None:
+    with open_for_write(store) as conn:
+        for sid in (SID, OTHER):
+            insert_row(
+                conn,
+                "listings",
+                {
+                    "security_id": sid,
+                    "ticker": "AAA",
+                    "exchange": "NYSE",
+                    "class_title": None,
+                    "valid_from": D1,
+                    "known_at": KNOWN,
+                    "ingested_at": KNOWN,
+                    "source": "edgar",
+                    "provenance": "filing",
+                },
+            )
+        insert_row(conn, "prices_daily", _bar(OTHER, D2))
+    for dry in (True, False):
+        with pytest.raises(RepairRefused, match=r"bar .* ticker AAA .* held by"):
+            repair_restore(
+                store, release=NEW, table="prices_daily", key=(SID, D2),
+                dry_run=dry, expect=None if dry else 1, clock=lambda: RUN,
+            )  # fmt: skip
+    assert _restored(store) == 0
+
+
+def test_dry_and_real_listing_restore_refuse_the_same_held_ticker(store: Settings) -> None:
+    with open_for_write(store) as conn:
+        for sid in (SID, OTHER):
+            insert_row(
+                conn,
+                "listings",
+                {
+                    "security_id": sid,
+                    "ticker": "AAA",
+                    "exchange": "NYSE",
+                    "class_title": None,
+                    "valid_from": D2,
+                    "known_at": KNOWN,
+                    "ingested_at": KNOWN,
+                    "source": "edgar",
+                    "provenance": "filing",
+                },
+            )
+    with open_for_write(store) as conn:
+        retract(conn, "listings", [(SID, "AAA", "NYSE", D2)], "bad", OLD, "r", at=THEN)
+    for dry in (True, False):
+        with pytest.raises(RepairRefused, match=r"listing .* ticker and session is held by"):
+            repair_restore(
+                store, release=NEW, table="listings", key=(SID, "AAA", "NYSE", D2),
+                dry_run=dry, expect=None if dry else 1, clock=lambda: RUN,
+            )  # fmt: skip
+    assert _restored(store) == 0
 
 
 def test_a_real_run_writes_only_the_dry_runs_count(store: Settings) -> None:
@@ -212,6 +293,35 @@ def test_an_open_paper_window_refuses_a_real_run_and_a_dry_run(store: Settings) 
                 clock=lambda: RUN,
             )
     assert _bars(store) == [(OTHER, D1)]
+    assert _restored(store) == 0
+
+
+def test_open_window_guard_uses_the_known_date_before_the_row_session(store: Settings) -> None:
+    # The listing is dated after the window opens but was already known on D2.
+    with open_for_write(store) as conn:
+        insert_row(
+            conn,
+            "listings",
+            {
+                "security_id": SID,
+                "ticker": "AAA",
+                "exchange": "NYSE",
+                "class_title": None,
+                "valid_from": D3,
+                "known_at": datetime(2021, 6, 2, 21, tzinfo=UTC),
+                "ingested_at": datetime(2021, 6, 2, 21, tzinfo=UTC),
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+    with open_for_write(store) as conn:
+        retract(conn, "listings", [(SID, "AAA", "NYSE", D3)], "bad", "other-old", "r", at=THEN)
+    open_paper_window(store, datetime(2021, 6, 2, 14, tzinfo=UTC))
+    with pytest.raises(RepairRefused, match="changes 1 dates from 2021-06-02"):
+        repair_restore(
+            store, release=NEW, table="listings", key=(SID, "AAA", "NYSE", D3), expect=1,
+            clock=lambda: RUN,
+        )  # fmt: skip
     assert _restored(store) == 0
 
 
