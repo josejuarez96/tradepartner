@@ -168,8 +168,9 @@ while its Class A id lists `ALTI`, then another issuer's `GLBL` from
 first row under the new ticker (and the old span's own end) the security holds
 the new ticker, as a followed change would give it (Fortress Value's
 `FVAC -> MP` of 2020-11-18, MP's class id listed from 2021-03-22), unless
-another issuer's equity row under it starts before that row; from the
-sibling's row on, the new ticker stays the sibling's.
+the listings alone give a session of it in that window to another security
+(`_window_takes`, as `_takes` refuses a followed change); from the sibling's
+row on, the new ticker stays the sibling's.
 A change stored on an id with no listing row known at the run (a lost id
 whose rows master-retract withdrew) is carried to the one id of its issuer
 (`_same_issuer`) whose last equity row before `process_date` is under `old`
@@ -1041,21 +1042,23 @@ class ListingResolver:
                     base = ListingResolver(listings, evidence, **options)
                 late = {change for change in followed if self._takes(base, change)}
             if not late:
-                break
+                # A window that takes a session of its new ticker from another
+                # security the listings alone give it to is dropped, as a
+                # followed change taking one is refused (#1696); the end stays.
+                windowed = [end for end in ends if end[4] is not None]
+                if windowed and base is None:
+                    base = ListingResolver(listings, evidence, **options)
+                taking = {end for end in windowed if base is not None and _window_takes(base, end)}
+                if not taking:
+                    break
+                ends = (ends - taking) | {(*end[:4], None) for end in taking}
+                continue
             changes = [change for change in changes if change not in late]
             refused += len(late)
             for security_id, day, old, new in late:
                 sibling = _sibling_start(listings, security_id, new, class_symbols)
                 if sibling is not None:
-                    window = (
-                        sibling
-                        if sibling > day
-                        and not _other_issuer_lists(
-                            listings, security_id, new, sibling, class_symbols
-                        )
-                        else None
-                    )
-                    ends.add((security_id, day, old, new, window))
+                    ends.add((security_id, day, old, new, sibling if sibling > day else None))
         self._ends = frozenset(ends)  # #3471, for an audit of which changes ended
         if refused:
             self.report = replace(
@@ -2504,20 +2507,20 @@ def _sibling_start(
     )
 
 
-def _other_issuer_lists(
-    listings: Sequence[Mapping[str, Any]],
-    security_id: str,
-    symbol: str,
-    before: date,
-    class_symbols: Mapping[str, str] | None,
-) -> bool:
-    """True when an id of another issuer has an equity row under `symbol`
-    starting before `before` (#3471: the window under the new ticker would
-    take its sessions, so none is given). Pure."""
-    return any(
-        day < before and not _same_issuer(sid, security_id)
-        for sid, day in _equity_rows_under(listings, symbol, class_symbols)
-    )
+def _window_takes(base: ListingResolver, end: tuple[str, date, str, str, date | None]) -> bool:
+    """True when the #3471 window of `end` (`security_id`, day, old, new,
+    until) covers a session, before the run's day, that `base` (the listings
+    alone) gives the new ticker to another security."""
+    security_id, day, _, new, until = end
+    if until is None:
+        return False
+    symbol = alpaca_symbol(new) or new
+    last = min(until - timedelta(days=1), base.run_day)
+    for session in _sessions_through(day, last):
+        owner = base.resolve(symbol, session) or base.lead(symbol, session)
+        if owner not in (None, security_id):
+            return True
+    return False
 
 
 def _last_under(rows: Sequence[tuple[date, str]], day: date, symbol: str) -> bool:

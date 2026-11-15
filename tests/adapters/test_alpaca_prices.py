@@ -5138,6 +5138,11 @@ class TestSymbolChangesBoundSpans:
         resolver = ListingResolver(listings, symbol_changes=[change])
         assert resolver.resolve("MP", date(2020, 12, 1)) == other
         assert resolver.resolve("FVAC", date(2020, 12, 1)) is None
+        # An older holder that had left the ticker (VivoPower's VIVO window,
+        # Meridian's VIVO long gone) blocks nothing.
+        moved = [*listings, _listing(other, "MPX", date(2019, 1, 2), "Common Stock")]
+        resolver = ListingResolver(moved, symbol_changes=[change])
+        assert resolver.resolve("MP", date(2020, 12, 1)) == bare
 
     def test_a_refusal_with_no_sibling_listing_the_new_ticker_keeps_the_old_span(self) -> None:
         # Only the sibling-class refusal ends the old ticker: a change refused
