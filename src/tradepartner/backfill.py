@@ -180,7 +180,7 @@ from tradepartner.ingest import (
     _write_run,
     expected_session,
 )
-from tradepartner.repair import store_resolver
+from tradepartner.repair import _held_tickers, bar_owners, store_resolver
 from tradepartner.store.asof import listings_as_of
 from tradepartner.store.benchmarks import (
     BenchmarkIdentityError,
@@ -839,9 +839,7 @@ def _retracted_holes(
     days = [(sid, day) for sid, day in retracted if first <= day <= last]
     if not days:
         return set()
-    tickers: dict[str, list[tuple[date, str]]] = defaultdict(list)
-    for row in listings_as_of(conn, t).iter_rows(named=True):
-        tickers[row["security_id"]].append((row["valid_from"], row["ticker"]))
+    tickers_of = _held_tickers(conn, t)
     held = {
         (str(sid), day): (o, c, ingested)
         for sid, day, o, c, ingested in conn.execute(
@@ -861,20 +859,20 @@ def _retracted_holes(
     fetched = set(ids)
     out: set[str] = set()
     for sid, day in days:
-        rows = sorted(tickers.get(sid, []))
-        live = [tk for start, tk in rows if start <= day]
-        ticker = live[-1] if live else (rows[0][1] if rows else None)
-        if ticker is None or alpaca_symbol(ticker) is None:
-            continue
-        receiver = resolver.resolve(ticker, day) or resolver.lead(ticker, day)
-        if receiver is None or receiver not in fetched:
-            continue
-        have = held.get((receiver, day))
-        if have is not None and not _foreign(have, was.get((sid, day)), fetched_at):
-            continue
-        if only is not None and receiver not in only:
-            continue
-        out.add(receiver)
+        tickers = [tk for tk in tickers_of(sid, day) if alpaca_symbol(tk) is not None]
+
+        def holds(owner: str, session: date, sid: str = sid) -> bool:
+            # An owner with its own bar there takes no refetch (#3455); a foreign
+            # bar (the retracted line under the receiver) is still a hole.
+            have = held.get((owner, session))
+            return have is not None and not _foreign(have, was.get((sid, session)), fetched_at)
+
+        owners = bar_owners(resolver, tickers, day, holds)
+        # The id's own bar goes back to it only where no other id receives it (a
+        # mixed-ticker id whose other ticker is owned elsewhere drops itself).
+        for receiver in sorted((owners - {sid}) or owners):
+            if receiver in fetched and (only is None or receiver in only):
+                out.add(receiver)
     return out
 
 

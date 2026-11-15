@@ -350,11 +350,23 @@ def orphan_bars(
     bars). Returns `{key: 1}` per orphan key. Pure."""
     out: dict[Key, int] = {}
     for sid, day in bar_keys:
-        owners = {resolver.fill_resolve(t, day) for t in tickers(sid, day)}
-        owners |= {resolver.lead(t, day) for t in tickers(sid, day)}
-        if not any(o is not None and o != sid and not holds_bar(o, day) for o in owners):
+        if not (bar_owners(resolver, tickers(sid, day), day, holds_bar) - {sid}):
             out[(sid, day)] = 1
     return out
+
+
+def bar_owners(
+    resolver: ListingResolver,
+    tickers: Iterable[str],
+    day: date,
+    holds_bar: Callable[[str, date], bool] = lambda _sid, _day: False,
+) -> set[str]:
+    """The securities that receive a bar of `day` under any of `tickers`, for a
+    fill or a bar (`fill_resolve`, then a rename or first-span `lead`), less
+    any that already hold a bar of their own there (`holds_bar`, #3455). Pure."""
+    owners = {resolver.fill_resolve(t, day) for t in tickers}
+    owners |= {resolver.lead(t, day) for t in tickers}
+    return {o for o in owners if o is not None and not holds_bar(o, day)}
 
 
 def _holds_bar(
