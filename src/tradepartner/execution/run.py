@@ -1194,7 +1194,7 @@ def open_books(
 def _open_book_ids(conn: duckdb.DuckDBPyConnection) -> tuple[str, ...]:
     rows = conn.execute(
         "SELECT DISTINCT book_id FROM paper_windows WHERE window_id NOT IN "
-        "(SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))",
+        "(SELECT window_id FROM paper_window_stops WHERE state IN (SELECT unnest(?)))",
         [list(CLOSING_STOP_STATES)],
     ).fetchall()
     return tuple(sorted(str(row[0]) for row in rows))

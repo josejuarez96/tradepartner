@@ -334,7 +334,7 @@ def _windows(conn: duckdb.DuckDBPyConnection, now: datetime) -> list[PaperWindow
 def _closed_at(conn: duckdb.DuckDBPyConnection, now: datetime) -> dict[int, datetime]:
     """Each window's first closing stop (`closed` or `abandoned`)."""
     rows = conn.execute(
-        'SELECT window_id, MIN("at") FROM paper_window_stops WHERE list_contains(?, state) '
+        'SELECT window_id, MIN("at") FROM paper_window_stops WHERE state IN (SELECT unnest(?)) '
         'AND known_at <= ? AND "at" <= ? '
         "GROUP BY window_id",
         [list(store_journal.CLOSING_STOP_STATES), now, now],
@@ -1083,7 +1083,7 @@ def _orders_line(
         for d, run, pq, pn, side, pos, target in conn.execute(
             "SELECT decision_id, run_id, planned_quantity, planned_notional, side, "
             "position_side, target_notional FROM decisions "
-            "WHERE list_contains(?, decision_id) AND known_at <= ?",
+            "WHERE decision_id IN (SELECT unnest(?)) AND known_at <= ?",
             [decision_ids, now],
         ).fetchall()
     }

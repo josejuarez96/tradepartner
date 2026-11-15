@@ -1522,7 +1522,7 @@ def _merger_first_known(
     rows = conn.execute(
         """
         SELECT security_id, source_action_id, min(known_at) FROM mergers
-        WHERE known_at <= ? AND list_contains(?, security_id)
+        WHERE known_at <= ? AND security_id IN (SELECT unnest(?))
         GROUP BY security_id, source_action_id
         """,
         [cut, list(names)],

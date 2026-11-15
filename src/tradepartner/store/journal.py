@@ -1084,7 +1084,7 @@ def fills_for(
         "LEFT JOIN paper_runs r ON r.run_id = o.run_id "
         "WHERE f.superseded_by IS NULL "
         "AND (? IS NULL OR r.run_id IS NULL OR r.window_id = ?) "
-        "AND (? IS NULL OR list_contains(?, f.client_order_id)) "
+        "AND (? IS NULL OR f.client_order_id IN (SELECT unnest(?))) "
     )
     scope = [window_id, window_id, ids, ids]
     if limit is not None:
@@ -1166,7 +1166,7 @@ _ORDER_IN_WINDOW = (
     "(? IS NULL OR t.client_order_id IN (SELECT o.client_order_id FROM orders o "
     "JOIN paper_runs r ON r.run_id = o.run_id WHERE r.window_id = ?))"
 )
-_ORDER_IN_LIST = "(? IS NULL OR list_contains(?, t.client_order_id))"
+_ORDER_IN_LIST = "(? IS NULL OR t.client_order_id IN (SELECT unnest(?)))"
 #: `orders_for(limit=...)`'s order: newest first, ties by `client_order_id`.
 _NEWEST_ORDER_FIRST = "t.known_at DESC, t.client_order_id DESC"
 
@@ -1262,7 +1262,7 @@ def _open_windows(conn: duckdb.DuckDBPyConnection, book_id: str | None) -> list[
         conn,
         PaperWindowRow,
         f"{_BOOK_FILTER} AND t.window_id NOT IN (SELECT window_id FROM paper_window_stops "
-        "WHERE list_contains(?, state))",
+        "WHERE state IN (SELECT unnest(?)))",
         [*_book_params(book_id), list(CLOSING_STOP_STATES)],
         order="t.window_id",
     )
@@ -1399,7 +1399,7 @@ def _orders_where(
         conn,
         OrderRow,
         f"{_ORDER_IN_WINDOW} AND t.client_order_id NOT IN (SELECT client_order_id "
-        "FROM order_events WHERE list_contains(?, status))",
+        "FROM order_events WHERE status IN (SELECT unnest(?)))",
         [window_id, window_id, list(statuses)],
     )
 

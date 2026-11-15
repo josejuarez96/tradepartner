@@ -211,10 +211,10 @@ def _row_ids(item: Underived) -> tuple[str, ...]:
 #: orders, adjustments (a spin-off child arrives as a `spinoff_receipt` with
 #: no order), daily positions and lots (safety review of #872).
 _TRADED_SQL = """
-    SELECT security_id FROM orders WHERE list_contains(?, security_id)
-    UNION SELECT security_id FROM adjustments WHERE list_contains(?, security_id)
-    UNION SELECT security_id FROM positions_daily WHERE list_contains(?, security_id)
-    UNION SELECT security_id FROM lots WHERE list_contains(?, security_id)
+    SELECT security_id FROM orders WHERE security_id IN (SELECT unnest(?))
+    UNION SELECT security_id FROM adjustments WHERE security_id IN (SELECT unnest(?))
+    UNION SELECT security_id FROM positions_daily WHERE security_id IN (SELECT unnest(?))
+    UNION SELECT security_id FROM lots WHERE security_id IN (SELECT unnest(?))
 """
 
 

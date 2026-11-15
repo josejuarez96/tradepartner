@@ -231,7 +231,7 @@ def filed_bars(conn: duckdb.DuckDBPyConnection, at: datetime) -> dict[tuple[str,
             "SELECT d.security_id, d.filed_on, max(b.session) FROM _filed_days d"
             " JOIN ("
             "  SELECT security_id, session, volume FROM prices_daily"
-            "  WHERE known_at <= ? AND list_contains(?, source)"
+            "  WHERE known_at <= ? AND source IN (SELECT unnest(?))"
             "  AND security_id IN (SELECT security_id FROM _filed_days)"
             "  QUALIFY row_number() OVER"
             "    (PARTITION BY security_id, session ORDER BY known_at DESC) = 1"
@@ -264,7 +264,7 @@ def last_bar(
         "SELECT max(session) FROM ("
         "  SELECT session, volume FROM prices_daily"
         "  WHERE security_id = ? AND session >= ? AND session < ? AND known_at <= ?"
-        "  AND list_contains(?, source)"
+        "  AND source IN (SELECT unnest(?))"
         "  QUALIFY row_number() OVER (PARTITION BY session ORDER BY known_at DESC) = 1"
         ") WHERE volume > 0",
         [security_id, start, before, at, sorted(BAR_SOURCES)],
@@ -560,10 +560,10 @@ class _Counted:
         sources: list[str],
         action_types: Sequence[str] | None = None,
     ) -> None:
-        extra = " AND list_contains(?, action_type)" if action_types is not None else ""
+        extra = " AND action_type IN (SELECT unnest(?))" if action_types is not None else ""
         self._cursor = conn.execute(
             f"SELECT security_id, {day}, count(*) FROM {table} "
-            f"WHERE list_contains(?, source){extra} GROUP BY ALL",
+            f"WHERE source IN (SELECT unnest(?)){extra} GROUP BY ALL",
             [sources, *([list(action_types)] if action_types is not None else [])],
         )
         self.seen = 0
@@ -610,10 +610,10 @@ def _select_rows(
         return []
     conn.execute("CREATE OR REPLACE TEMP TABLE _repair_keys (security_id VARCHAR, day DATE)")
     conn.executemany("INSERT INTO _repair_keys VALUES (?, ?)", rows)
-    extra = " AND list_contains(?, action_type)" if action_types is not None else ""
+    extra = " AND action_type IN (SELECT unnest(?))" if action_types is not None else ""
     try:
         found = conn.execute(
-            f"SELECT {_cols(table)[0]} FROM {table} WHERE list_contains(?, source){extra} "
+            f"SELECT {_cols(table)[0]} FROM {table} WHERE source IN (SELECT unnest(?)){extra} "
             f"AND (security_id, {day}) IN (SELECT (security_id, day) FROM _repair_keys)",
             [sources, *([list(action_types)] if action_types is not None else [])],
         ).fetchall()
@@ -1099,7 +1099,7 @@ def _bars_in_range(
 ) -> tuple[int, tuple[date, ...], int, tuple[date, ...]]:
     bars = conn.execute(
         "SELECT session, count(*) FROM prices_daily WHERE security_id = ? "
-        "AND session BETWEEN ? AND ? AND list_contains(?, source) GROUP BY ALL ORDER BY 1",
+        "AND session BETWEEN ? AND ? AND source IN (SELECT unnest(?)) GROUP BY ALL ORDER BY 1",
         [security_id, first, last, sorted(BAR_SOURCES)],
     ).fetchall()
     actions = conn.execute(
