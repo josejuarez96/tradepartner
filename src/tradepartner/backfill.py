@@ -916,6 +916,9 @@ def _holes(
             retr = _retracted_holes(
                 conn, resolver, t, window, ids, only, _retracted_sessions(conn, t)
             )
+            gaps: set[str]
+            dropped: dict[str, str]
+            handed: set[str]
             if window in tail:
                 kept, gaps, dropped, handed = sorted(retr), set(), {}, set()
             else:
