@@ -604,6 +604,7 @@ def write_results(
     family_sharpes: FamilySharpesFn = registry.family_sharpes,
     *,
     detail_level: DetailLevel = "full",
+    store_changed: bool | None = None,
 ) -> str:
     """Write one run's rows for `handle` at `detail_level` and its result row; return
     the recorded status, `"ok"`, or `"failed"` when the store changed during the run
@@ -617,6 +618,8 @@ def write_results(
     by `metric_rows`, its equity and rebalance rows as a ladder level's. N, V,
     DSR and the red flag stay the base level's (module docstring, step 4), so a
     measured level is never in them.
+    `store_changed` may be passed only when the caller checked the store under
+    the same write lock; otherwise the registry checks it during `write_result`.
     Raises `ValueError` before any write when `params` are not those frozen settings,
     a level or benchmark is missing or the detail level is unknown, and
     `ResearchNotInitialised` when the store has no research tables (module docstring,
@@ -656,4 +659,5 @@ def write_results(
         conn,
         handle,
         _StatisticsWithResearch(**asdict(stats), n_research=n.research, n_exposure=n.exposures),
+        store_changed=store_changed,
     )

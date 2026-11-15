@@ -392,6 +392,95 @@ def _by_group(outcome: lab.SweepRunOutcome) -> dict[int, list[int]]:
 # --- sweep run and accounting ---------------------------------------------------
 
 
+def test_sweep_group_reuses_registry_snapshot_and_close_scan(
+    store: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    names = ("data_vintage", "store_max_ingested_at", "code_version", "code_tree_sha256")
+    calls = {name: 0 for name in names}
+    originals = {name: getattr(registry, name) for name in calls}
+
+    def counted(name: str) -> Callable[..., Any]:
+        def call(*args: Any, **kwargs: Any) -> Any:
+            calls[name] += 1
+            return originals[name](*args, **kwargs)
+
+        return call
+
+    for name in calls:
+        monkeypatch.setattr(registry, name, counted(name))
+    outcome = lab.run_sweep(SLUG, clock=clock)
+    assert outcome.n_ok == 4
+    assert len(_by_group(outcome)) == 2
+    assert calls == {
+        "data_vintage": 4,  # one open and one close read per group
+        "store_max_ingested_at": 2,
+        "code_version": 2,
+        "code_tree_sha256": 3,  # run preflight plus one per group
+    }
+
+    with _read(store) as conn:
+        rows = conn.execute(
+            "SELECT s.read_group_index, t.data_cutoff, t.data_vintage, "
+            "t.store_max_ingested_at, t.code_version, t.code_dirty, t.code_tree_sha256 "
+            "FROM sweep_trials s JOIN trials t USING (trial_id) "
+            "WHERE s.sweep_run_id = ? ORDER BY s.read_group_index, t.trial_id",
+            [outcome.sweep_run_id],
+        ).fetchall()
+        assert len(rows) == 4
+        for group_rows in (rows[:2], rows[2:]):
+            assert group_rows[0] == group_rows[1]
+            _, cutoff, vintage, maximum, version, dirty, tree = group_rows[0]
+            assert vintage == originals["data_vintage"](conn, cutoff)
+            assert maximum == originals["store_max_ingested_at"](conn)
+            assert (version, dirty) == originals["code_version"]()
+            assert tree == originals["code_tree_sha256"]()
+
+
+def test_sweep_group_write_failure_retries_each_trial(
+    store: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_write = lab.write_results
+    calls = 0
+
+    def fail_once(*args: Any, **kwargs: Any) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            real_write(*args, **kwargs)
+            raise RuntimeError("temporary write failure")
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(lab, "write_results", fail_once)
+    outcome = lab.run_sweep(SLUG, clock=clock)
+    assert outcome.n_ok == 4 and outcome.completed
+    with _read(store) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT trial_id) FROM sweep_trials WHERE sweep_run_id = ?",
+            [outcome.sweep_run_id],
+        ).fetchone()
+        assert row == (4, 4)
+
+
+def test_sweep_group_detects_vintage_appearing_after_empty_open(
+    store: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_vintage = registry.data_vintage
+    calls = 0
+
+    def empty_first_open(*args: Any, **kwargs: Any) -> datetime | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        return real_vintage(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "data_vintage", empty_first_open)
+    outcome = lab.run_sweep(SLUG, clock=clock)
+    first_group = next(iter(_by_group(outcome).values()))
+    statuses = {trial.variant_index: trial for trial in outcome.trials}
+    assert {statuses[index].message for index in first_group} == {registry.STORE_CHANGED_MESSAGE}
+
+
 def test_a_plain_run_runs_every_variant_then_nothing_then_rerun_runs_all(
     store: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:

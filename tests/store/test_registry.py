@@ -263,6 +263,7 @@ def test_register_refuses_experiment_only_family(
 def test_open_trial_records_every_field_and_ids_increase(
     conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
+    (tmp_path / ".git").write_text("gitdir: /nonexistent\n")
     hypothesis = _register(conn, settings)
     first = _open(conn, settings, tmp_path, note="n", holdout_reason=None)
     second = _open(conn, settings, tmp_path, kind="holdout", holdout_reason="spend")
@@ -1748,6 +1749,7 @@ def test_a_moved_chain_stales_every_cutoff_from_its_withdrawn_stamp(
 def test_open_trial_records_the_data_vintage_at_its_cutoff(
     conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
+    (tmp_path / ".git").write_text("gitdir: /nonexistent\n")
     _register(conn, settings)
     ingested = _T0.replace(hour=1)
     _price(conn, "A", _T0.replace(hour=0), ingested)
@@ -1846,6 +1848,7 @@ def test_code_tree_sha256_hashes_package_sources_and_the_lock_only(tmp_path: Pat
 
 
 def test_code_tree_sha256_is_none_outside_a_checkout(tmp_path: Path) -> None:
+    (tmp_path / ".git").write_text("gitdir: /nonexistent\n")
     assert registry.code_tree_sha256(tmp_path) is None
 
 
@@ -1935,6 +1938,7 @@ def test_code_version_reads_the_commit_and_dirty_flag(tmp_path: Path) -> None:
 
 
 def test_code_version_is_unknown_outside_a_checkout(tmp_path: Path) -> None:
+    (tmp_path / ".git").write_text("gitdir: /nonexistent\n")
     assert registry.code_version(tmp_path) == ("unknown", None)
 
 

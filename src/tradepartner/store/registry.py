@@ -969,6 +969,38 @@ def _hypothesis_where(
 # --- trials ----------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class TrialSnapshot:
+    """Fact and code values shared by trials opened in one sweep read group."""
+
+    code_version: str
+    code_dirty: bool | None
+    code_tree_sha256: str | None
+    store_max_ingested_at: datetime | None
+    data_vintage: datetime | None
+
+
+def trial_snapshot(
+    conn: duckdb.DuckDBPyConnection,
+    cutoff: datetime | None,
+    gates: VintageGates,
+    repo_dir: Path | None = None,
+) -> TrialSnapshot:
+    """Capture one group's code identity and fact-table state before opening trials."""
+    version, dirty = code_version(repo_dir)
+    return TrialSnapshot(
+        version,
+        dirty,
+        code_tree_sha256(repo_dir),
+        store_max_ingested_at(conn),
+        data_vintage(
+            conn, cutoff, spin_offs=gates.spin_offs, delisting_policy=gates.delisting_policy
+        )
+        if cutoff is not None
+        else None,
+    )
+
+
 def open_trial(
     conn: duckdb.DuckDBPyConnection,
     *,
@@ -986,6 +1018,7 @@ def open_trial(
     settings: Settings | None = None,
     repo_dir: Path | None = None,
     detail_level: DetailLevel = DETAIL_LEVEL_FULL,
+    snapshot: TrialSnapshot | None = None,
 ) -> TrialHandle:
     """Insert a `trials` row for hypothesis `hypothesis_id` and return its
     handle. This is the moment a run becomes a trial (spec "Definitions").
@@ -1006,7 +1039,8 @@ def open_trial(
     "Vintages"), and the development boundary in force (`development_boundary`,
     NULL when none; module docstring, "The development boundary"). Refuses an
     unknown detail level and `synthetic=True` on the real store. Commit it in its own write chunk
-    (module docstring, "Trial handle").
+    (module docstring, "Trial handle"). A sweep may pass a snapshot captured
+    for variants with the same cutoff and frozen vintage gates.
     """
     if detail_level not in DETAIL_LEVELS:
         raise ValueError(f"detail level must be one of {DETAIL_LEVELS}, got {detail_level!r}")
@@ -1014,19 +1048,13 @@ def open_trial(
     hypothesis = get_hypothesis_by_id(conn, hypothesis_id)
     if synthetic and _is_real_store(conn, settings):
         raise RealStoreRefused("a synthetic trial is refused on the real store")
-    version, dirty = code_version(repo_dir)
-    max_ingested = store_max_ingested_at(conn)
-    gates = vintage_gates(hypothesis)
-    vintage = (
-        data_vintage(
-            conn,
-            data_cutoff,
-            spin_offs=gates.spin_offs,
-            delisting_policy=gates.delisting_policy,
-        )
-        if data_cutoff is not None
-        else None
+    snapshot = (
+        snapshot
+        if snapshot is not None
+        else trial_snapshot(conn, data_cutoff, vintage_gates(hypothesis), repo_dir)
     )
+    version, dirty = snapshot.code_version, snapshot.code_dirty
+    max_ingested, vintage = snapshot.store_max_ingested_at, snapshot.data_vintage
     boundary = development_boundary(conn)
     trial_id = max(
         _next_id(conn, "trials", "trial_id"), _next_id(conn, "trial_results", "trial_id")
@@ -1057,7 +1085,7 @@ def open_trial(
                 "note": note,
                 "detail_level": detail_level,
                 "data_vintage": vintage,
-                "code_tree_sha256": code_tree_sha256(repo_dir),
+                "code_tree_sha256": snapshot.code_tree_sha256,
                 "development_boundary": boundary.boundary if boundary is not None else None,
             },
         ),
@@ -1097,11 +1125,15 @@ def write_result(
     handle: TrialHandle,
     stats: ResultStatistics,
     message: str | None = None,
+    *,
+    store_changed: bool | None = None,
 ) -> str:
     """Record an `ok` outcome with `stats` and return `"ok"`; or, when the
     store changed under the run (`_store_changed`), record `failed` with
     `STORE_CHANGED_MESSAGE` and no statistics and return `"failed"`.
-    Refuses a trial opened without a `data_cutoff`: only refusals lack one."""
+    Refuses a trial opened without a `data_cutoff`: only refusals lack one.
+    `store_changed` is for a caller that checked under the same write lock;
+    omitting it performs the registry's normal check."""
     _check_open(conn, handle)
     cutoff = conn.execute(
         "SELECT data_cutoff FROM trials WHERE trial_id = ?", [handle.trial_id]
@@ -1111,7 +1143,7 @@ def write_result(
             f"trial {handle.trial_id} has no data_cutoff; an ok run needs its resolved end "
             "(it keys the trial's V pair)"
         )
-    if _store_changed(conn, handle, cutoff[0]):
+    if store_changed if store_changed is not None else _store_changed(conn, handle, cutoff[0]):
         _insert_result(conn, handle, "failed", STORE_CHANGED_MESSAGE, ResultStatistics())
         return "failed"
     _insert_result(conn, handle, "ok", message, stats)
