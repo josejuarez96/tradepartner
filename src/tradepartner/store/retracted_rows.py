@@ -192,12 +192,13 @@ def _key_text(conn: duckdb.DuckDBPyConnection, table: str, key: Sequence[Any]) -
     return [str(v) for v in text]
 
 
-def _select_ids(
+def select_restore_ids(
     conn: duckdb.DuckDBPyConnection,
     release: str | None,
     table: str | None,
     key: Sequence[Any] | None,
 ) -> list[int]:
+    """Select unrestored retraction ids for a release, a logical key, or both."""
     if release is None and (table is None or key is None):
         raise RestoreRefused("name a release, or a table and a key, to restore")
     if (table is None) != (key is None):
@@ -239,7 +240,7 @@ def restore(
     and session (module docstring); the message names each offender."""
     restored_at = ensure_tz_aware(utc_now() if at is None else at, field="at")
     with atomic(conn):
-        ids = _select_ids(conn, release, table, key)
+        ids = select_restore_ids(conn, release, table, key)
         if not ids:
             raise RestoreRefused("no unrestored retracted row matches")
         conn.execute("CREATE OR REPLACE TEMP TABLE _restore_ids (retraction_id BIGINT)")
@@ -280,6 +281,68 @@ def restore(
     return len(ids)
 
 
+def preview_restore(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    release: str | None = None,
+    table: str | None = None,
+    key: Sequence[Any] | None = None,
+) -> list[int]:
+    """Validate a restore on a read-only connection and return its retraction ids.
+
+    Only temporary tables are written. The real restore repeats these checks and
+    also applies insert casts and table constraints under its write transaction.
+    """
+    ids = select_restore_ids(conn, release, table, key)
+    if not ids:
+        raise RestoreRefused("no unrestored retracted row matches")
+    conn.execute("CREATE OR REPLACE TEMP TABLE _restore_ids (retraction_id BIGINT)")
+    try:
+        conn.executemany("INSERT INTO _restore_ids VALUES (?)", [(i,) for i in ids])
+        tables = [
+            str(r[0])
+            for r in conn.execute(
+                "SELECT DISTINCT table_name FROM retracted_rows "
+                "WHERE retraction_id IN (SELECT retraction_id FROM _restore_ids) ORDER BY 1"
+            ).fetchall()
+        ]
+        problems: list[str] = []
+        for name in tables:
+            problems += _held_keys(conn, name)
+            problems += _duplicate_revisions(conn, name)
+            # This raises for unknown stored columns; the preview inserts no rows.
+            _check_restore_columns(conn, name)
+        if problems:
+            raise RestoreRefused("; ".join(problems) + "; nothing restored")
+        conn.execute(
+            "CREATE TEMP VIEW _preview_listings AS "
+            "SELECT security_id, ticker, valid_from, retracted FROM listings UNION ALL "
+            "SELECT row_values['security_id'], row_values['ticker'], "
+            "CAST(row_values['valid_from'] AS DATE), "
+            "coalesce(CAST(row_values['retracted'] AS BOOLEAN), FALSE) FROM retracted_rows "
+            "WHERE table_name = 'listings' AND retraction_id IN "
+            "(SELECT retraction_id FROM _restore_ids)"
+        )
+        conn.execute(
+            "CREATE TEMP VIEW _preview_bars AS "
+            "SELECT security_id, session FROM prices_daily UNION ALL "
+            "SELECT row_values['security_id'], CAST(row_values['session'] AS DATE) "
+            "FROM retracted_rows WHERE table_name = 'prices_daily' AND retraction_id IN "
+            "(SELECT retraction_id FROM _restore_ids)"
+        )
+        if "prices_daily" in tables:
+            problems += _held_bar_tickers(conn, listings="_preview_listings", bars="_preview_bars")
+        if "listings" in tables:
+            problems += _held_listing_tickers(conn, listings="_preview_listings")
+        if problems:
+            raise RestoreRefused("; ".join(problems) + "; nothing restored")
+    finally:
+        conn.execute("DROP VIEW IF EXISTS _preview_bars")
+        conn.execute("DROP VIEW IF EXISTS _preview_listings")
+        conn.execute("DROP TABLE IF EXISTS _restore_ids")
+    return ids
+
+
 _IDS = "retraction_id IN (SELECT retraction_id FROM _restore_ids)"
 
 
@@ -311,7 +374,13 @@ _ACTIVE = (
 )
 
 
-def _held_bar_tickers(conn: duckdb.DuckDBPyConnection) -> list[str]:
+def _active_listing(day: str, listings: str) -> str:
+    return _ACTIVE.format(day=day).replace("listings x", f"{listings} x")
+
+
+def _held_bar_tickers(
+    conn: duckdb.DuckDBPyConnection, *, listings: str = "listings", bars: str = "prices_daily"
+) -> list[str]:
     """Another id with a bar on the session whose listing active that day carries a
     ticker the bar's own id carries."""
     rows = conn.execute(
@@ -322,13 +391,13 @@ def _held_bar_tickers(conn: duckdb.DuckDBPyConnection) -> list[str]:
         ),
         mine AS (
             SELECT DISTINCT b.sid, b.day, l.ticker FROM batch b
-            JOIN listings l ON l.security_id = b.sid AND NOT l.retracted
-             AND {_ACTIVE.format(day="b.day")}
+            JOIN {listings} l ON l.security_id = b.sid AND NOT l.retracted
+             AND {_active_listing("b.day", listings)}
         )
         SELECT DISTINCT m.sid, m.day, m.ticker, l.security_id
-        FROM mine m JOIN listings l ON l.ticker = m.ticker AND l.security_id <> m.sid
-         AND NOT l.retracted AND {_ACTIVE.format(day="m.day")}
-        WHERE EXISTS (SELECT 1 FROM prices_daily p
+        FROM mine m JOIN {listings} l ON l.ticker = m.ticker AND l.security_id <> m.sid
+         AND NOT l.retracted AND {_active_listing("m.day", listings)}
+        WHERE EXISTS (SELECT 1 FROM {bars} p
                       WHERE p.security_id = l.security_id AND p.session = m.day)
         ORDER BY ALL
         """
@@ -339,7 +408,9 @@ def _held_bar_tickers(conn: duckdb.DuckDBPyConnection) -> list[str]:
     ]
 
 
-def _held_listing_tickers(conn: duckdb.DuckDBPyConnection) -> list[str]:
+def _held_listing_tickers(
+    conn: duckdb.DuckDBPyConnection, *, listings: str = "listings"
+) -> list[str]:
     rows = conn.execute(
         f"""
         WITH batch AS (
@@ -348,7 +419,7 @@ def _held_listing_tickers(conn: duckdb.DuckDBPyConnection) -> list[str]:
             FROM retracted_rows WHERE table_name = 'listings' AND {_IDS}
         )
         SELECT DISTINCT b.sid, b.day, b.ticker, l.security_id FROM batch b
-        JOIN listings l ON l.ticker = b.ticker AND l.valid_from = b.day
+        JOIN {listings} l ON l.ticker = b.ticker AND l.valid_from = b.day
          AND l.security_id <> b.sid AND NOT l.retracted
         ORDER BY ALL
         """
@@ -359,7 +430,7 @@ def _held_listing_tickers(conn: duckdb.DuckDBPyConnection) -> list[str]:
     ]
 
 
-def _insert_back(conn: duckdb.DuckDBPyConnection, table: str) -> None:
+def _check_restore_columns(conn: duckdb.DuckDBPyConnection, table: str) -> list[tuple[str, str]]:
     columns = _columns(conn, table)
     known = {c for c, _ in columns}
     [stored] = conn.execute(
@@ -370,7 +441,11 @@ def _insert_back(conn: duckdb.DuckDBPyConnection, table: str) -> None:
     extra = sorted(set(stored or []) - known)
     if extra:
         raise RestoreRefused(f"{table} has no column {extra} that the retracted rows carry")
-    present = [(c, t) for c, t in columns if c in set(stored or [])]
+    return [(c, t) for c, t in columns if c in set(stored or [])]
+
+
+def _insert_back(conn: duckdb.DuckDBPyConnection, table: str) -> None:
+    present = _check_restore_columns(conn, table)
     names = ", ".join(c for c, _ in present)
     casts = ", ".join(f"CAST(r.row_values['{c}'] AS {t})" for c, t in present)
     conn.execute(
