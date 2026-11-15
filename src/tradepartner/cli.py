@@ -4641,6 +4641,17 @@ def make_app(
         )
         typer.echo(f"decision {decision_id}: data_release {name} after ({first}..{last})")
 
+    def _attach_release_backup(conn: duckdb.DuckDBPyConnection, name: str, s: Settings) -> None:
+        """Attach release `name`'s pre-release backup read-only as `bk`."""
+        befores = [
+            r for r in registry.data_releases(conn) if r.name == name and r.stage == "before"
+        ]
+        if not befores or befores[0].backup_path is None:
+            raise _input_fail(f"no release named {name!r} with a backup", settings)
+        backup = Path(befores[0].backup_path)
+        _backup(backup, s).close()
+        conn.execute(f"ATTACH '{str(backup).replace(chr(39), chr(39) * 2)}' AS bk (READ_ONLY)")
+
     @release_app.command("coverage")
     def release_coverage_cmd(
         name: Annotated[str, typer.Option(help="the release whose backup to compare")],
@@ -4668,18 +4679,7 @@ def make_app(
         threshold = s.store.release_max_lost_sessions
         try:
             with open_read_only(s) as conn:
-                befores = [
-                    r
-                    for r in registry.data_releases(conn)
-                    if r.name == name and r.stage == "before"
-                ]
-                if not befores or befores[0].backup_path is None:
-                    raise _input_fail(f"no release named {name!r} with a backup", settings)
-                backup = Path(befores[0].backup_path)
-                _backup(backup, s).close()
-                conn.execute(
-                    f"ATTACH '{str(backup).replace(chr(39), chr(39) * 2)}' AS bk (READ_ONLY)"
-                )
+                _attach_release_backup(conn, name, s)
                 losses = release_coverage(
                     conn,
                     backup_alias="bk",
@@ -4744,6 +4744,81 @@ def make_app(
             )
         if failed:
             raise typer.Exit(1)
+
+    @release_app.command("accept-unreceived")
+    def release_accept_unreceived(
+        name: Annotated[str, typer.Option(help="the open release")],
+        count: Annotated[
+            int | None,
+            typer.Option(
+                help="the owner's exact count of the printed residual keys; without it the "
+                "keys are listed and nothing is written"
+            ),
+        ] = None,
+        security_id: Annotated[
+            list[str] | None,
+            typer.Option(
+                "--security-id",
+                help="accept only this retracted id's residual keys (repeatable; default all)",
+            ),
+        ] = None,
+    ) -> None:
+        """Accept the open release's residual unreceived retracted bars (#3464).
+
+        After the fill, a retracted bar no other id holds an equal bar for (a
+        coverage `NOT RECEIVED` session) may be one no fix can refill: the vendor
+        has no bar for the receiver that day. This lists those keys (security id,
+        session), or the named ids' only, and their count; with `--count` equal to
+        that count it records them on the open release as owner-approved orphans,
+        so `coverage` accepts exactly them. Any other count, or none, writes
+        nothing and exits 1. Thresholds are unchanged.
+        """
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        wanted = set(security_id or [])
+
+        def accept(conn: duckdb.DuckDBPyConnection) -> int | None:
+            _attach_release_backup(conn, name, s)
+            spans = registry.release_retractions(
+                conn,
+                name,
+                price_tolerance=s.store.release_move_price_tolerance,
+                backup_alias="bk",
+            )
+            keys = [
+                (x.security_id, day)
+                for x in spans
+                if not wanted or x.security_id in wanted
+                for day in x.unreceived
+            ]
+            for sid, day in keys:
+                typer.echo(f"UNRECEIVED {sid} {day.isoformat()}")
+            typer.echo(f"release {name}: {len(keys)} residual unreceived key(s)")
+            unknown = wanted - {x.security_id for x in spans if x.unreceived}
+            if unknown:
+                raise registry.ReleaseRefused(
+                    f"no unreceived retracted bars for {', '.join(sorted(unknown))}"
+                )
+            if count is None:
+                return None
+            if not keys or count != len(keys):
+                raise registry.ReleaseRefused(
+                    f"{len(keys)} residual unreceived keys and --count is {count}; "
+                    f"the owner's exact count is required"
+                )
+            return registry.record_approved_orphans(
+                conn, release=name, allow_orphans=count, keys=keys, source="accept-unreceived"
+            )
+
+        decision_id = _release_write(accept, s)
+        if decision_id is None:
+            typer.echo(f"nothing written: rerun with --count to accept these keys on {name}")
+            raise typer.Exit(1)
+        typer.echo(
+            f"decision {decision_id}: data_release {name} orphans "
+            f"(accept-unreceived, count {count})"
+        )
 
     @release_app.command("record")
     def release_record(

@@ -2093,11 +2093,14 @@ def record_approved_orphans(
     release: str,
     allow_orphans: int,
     keys: Iterable[tuple[str, date]],
+    source: str = "repair-resolution",
 ) -> int:
     """Write an `orphans` row against the open release `release`: the bar keys
     (`security_id`, session) that `repair-resolution` retracted under the owner's exact
-    `--allow-orphans` count, which no id receives (#3265). The coverage check accepts
-    exactly these retracted bars as unreceived (`approved_orphans`) and fails any other.
+    `--allow-orphans` count, which no id receives (#3265), or (`source`
+    `accept-unreceived`, #3464) the residual unreceived retracted keys the owner accepts
+    after the fill with his exact `--count`. The coverage check accepts exactly these
+    retracted bars as unreceived (`approved_orphans`) and fails any other.
     Refuses a name that is not the open release and a count that is not the key count."""
     current = open_release(conn)
     if current is None or current.name != release:
@@ -2106,7 +2109,7 @@ def record_approved_orphans(
     ordered = sorted({(str(sid), day) for sid, day in keys})
     if not ordered or len(ordered) != allow_orphans:
         raise ReleaseRefused(
-            f"{len(ordered)} orphan keys do not match --allow-orphans {allow_orphans}"
+            f"{len(ordered)} orphan keys do not match the owner's count {allow_orphans}"
         )
     now = utc_now()
     values = {
@@ -2114,10 +2117,14 @@ def record_approved_orphans(
         "stage": "orphans",
         "made_at": now,
         "allow_orphans": allow_orphans,
+        "source": source,
         "keys": [f"{sid}|{day.isoformat()}" for sid, day in ordered],
     }
     return _write_release(
-        conn, values, f"owner-approved orphan bars: count {allow_orphans}", made_at=now
+        conn,
+        values,
+        f"owner-approved orphan bars ({source}): count {allow_orphans}",
+        made_at=now,
     )
 
 
