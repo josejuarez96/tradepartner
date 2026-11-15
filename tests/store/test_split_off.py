@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 
+import pytest
+
 from tradepartner.adapters.alpaca_prices import ListingResolver, is_placeholder_ticker
 from tradepartner.adapters.filings import CoverListing, CoverPage, DelistingFiling, FilingIndexEntry
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
@@ -227,3 +229,40 @@ def test_a_form_25_of_another_class_does_not_block_the_end() -> None:
     build = build_master(source, _settings(), ingested_at=INGESTED_AT)
     ends = [r for r in build.listings if is_placeholder_ticker(str(r["ticker"]))]
     assert len(ends) == 2
+
+
+def test_a_placeholder_end_row_is_not_a_listing_for_the_universe() -> None:
+    """#3383: the row that ends a class's span is current, but names no
+    ticker, so rule 2 must not read it as a live listing."""
+    from tradepartner.universe import _listing_reason
+
+    build = build_master(_live(), _settings(), ingested_at=INGESTED_AT)
+    end = next(r for r in build.listings if is_placeholder_ticker(str(r["ticker"])))
+    listing = {**end, "status": "listed", "end_session": None, "on_listed_exchange": True}
+    assert _listing_reason(listing, date(2026, 3, 2), [str(end["exchange"])]) == "not_listed"
+    real = {**listing, "ticker": "LLYVA"}
+    assert _listing_reason(real, date(2026, 3, 2), [str(end["exchange"])]) == ""
+
+
+def test_a_real_listing_beats_a_placeholder_row_starting_the_same_day(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3383 review: `N/A` sorts before N-Z tickers, so a tie must not pick it."""
+    import polars as pl
+
+    from tradepartner import universe
+
+    build = build_master(_live(), _settings(), ingested_at=INGESTED_AT)
+    end = next(r for r in build.listings if is_placeholder_ticker(str(r["ticker"])))
+    base = {**end, "status": "listed", "end_session": None}
+    for order in ([{**base}, {**base, "ticker": "NWSA"}], [{**base, "ticker": "NWSA"}, {**base}]):
+        monkeypatch.setattr(
+            universe, "listing_ends_as_of", lambda *a, _o=order, **k: pl.DataFrame(_o)
+        )
+        got = universe._current_listings(
+            None,  # type: ignore[arg-type]
+            datetime(2026, 3, 3, tzinfo=UTC),
+            date(2026, 3, 2),
+            _settings(),
+        )
+        assert got[str(end["security_id"])]["ticker"] == "NWSA"

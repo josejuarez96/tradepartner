@@ -328,6 +328,14 @@ def _is_live(row: Mapping[str, Any], session: date) -> bool:
     )
 
 
+def _is_placeholder_row(row: Mapping[str, Any]) -> bool:
+    """Whether a listing row names no ticker (the span-end row, #3363).
+    Imported late because `adapters.alpaca_prices` imports this module."""
+    from tradepartner.adapters.alpaca_prices import is_placeholder_ticker
+
+    return is_placeholder_ticker(str(row.get("ticker") or ""))
+
+
 def _current_listings(
     conn: duckdb.DuckDBPyConnection, t: datetime, session: date, settings: Settings
 ) -> dict[str, dict[str, Any]]:
@@ -349,7 +357,15 @@ def _current_listings(
         if row["exchange"] in exchanges and _is_live(row, session):
             on_list.add(row["security_id"])
         held = current.get(row["security_id"])
-        if prefer_current_listing(row, held, session, exchanges):
+        if (
+            held is not None
+            and held["valid_from"] == row["valid_from"]
+            and _is_placeholder_row(row) != _is_placeholder_row(held)
+        ):
+            # On a same-day tie a real ticker beats the span-end row (#3383).
+            if _is_placeholder_row(held):
+                current[row["security_id"]] = row
+        elif prefer_current_listing(row, held, session, exchanges):
             current[row["security_id"]] = row
     return {sid: {**row, "on_listed_exchange": sid in on_list} for sid, row in current.items()}
 
@@ -390,6 +406,10 @@ def on_universe_exchange(row: Mapping[str, Any], exchanges: Collection[str]) -> 
 def _listing_reason(listing: dict[str, Any] | None, session: date, exchanges: list[str]) -> str:
     """Why a listing fails rule 2, or `""` if it passes."""
     if listing is None:
+        return "not_listed"
+    # A row naming no ticker "ends the previous span" (#3363): it holds
+    # nothing, so it never counts as a live listing (#3383).
+    if _is_placeholder_row(listing):
         return "not_listed"
     status, end = listing["status"], listing["end_session"]
     if status == DELISTED:
