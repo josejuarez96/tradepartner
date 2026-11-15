@@ -884,7 +884,8 @@ title = "Texas Capital TCBI: Nasdaq to the Texas Stock Exchange 2026-10-08"
 # Texas Capital Bancshares (CIK 0001077428): Nasdaq listing and trading end "at market close on October 7,
 # 2026" and TXSE trading begins at market open 2026-10-08 (8-K of 2026-09-14, confirmed in the past tense
 # by the Form 8-A12B of 2026-10-08). The common stock's ticker then changes to TXCP on 2026-11-09; the
-# filing that shows it is dated 2026-11-13, after this key's as-of day, so the change is not entered.
+# filing that shows it is dated 2026-11-13, after this key's as-of day, so the change is not entered. The TCBI spans on the TXSE therefore end at the last cover
+# page that shows TCBI there (10-Q 0001077428-26-000080, filed 2026-10-22), not open.
 [[history.input]]
 kind = "form25"
 cik = "0001077428"
@@ -920,14 +921,16 @@ cite = { kind = "accession", ref = "0001077428-26-000061", date = 2026-09-14 }
 cik = "0001077428"
 ticker = "TCBI"
 first = 2026-10-08
-cite = { kind = "accession", ref = "0001077428-26-000074", date = 2026-10-08 }
+last = 2026-10-22
+cite = { kind = "accession", ref = "0001077428-26-000080", date = 2026-10-22 }
 
 [[history.expected]]
 kind = "bars"
 cik = "0001077428"
 ticker = "TCBI"
 first = 2026-10-08
-cite = { kind = "accession", ref = "0001077428-26-000074", date = 2026-10-08 }
+last = 2026-10-22
+cite = { kind = "accession", ref = "0001077428-26-000080", date = 2026-10-22 }
 
 [[history.expected]]
 kind = "holds"
@@ -1193,6 +1196,7 @@ cik = "0000020520"
 date = 2020-04-29
 exchange = "Nasdaq"
 ticker = "FTR"
+effective = 2020-05-08
 cite = { kind = "accession", ref = "0001354457-20-000170", date = 2020-04-29 }
 
 [[history.input]]
@@ -1276,13 +1280,14 @@ title = "Bed Bath & Beyond BBBY: Nasdaq delisting determination 2023-04-24, susp
 # Bed Bath & Beyond (CIK 0000886158): Nasdaq notified the company on 2023-04-24 that the stock "will be
 # delisted" and "Trading ... will be suspended at the opening of business on May 3, 2023" (8-K), so the
 # last Nasdaq session is Tuesday 2023-05-02. It then traded over the counter (BBBYQ, 8-K cover of
-# 2023-06-28). The Nasdaq Form 25-NSE is signed 2023-07-10; its effective date is not stated.
+# 2023-06-28). The Nasdaq Form 25-NSE is signed 2023-07-10 and states effective 2023-07-20.
 [[history.input]]
 kind = "25-nse"
 cik = "0000886158"
 date = 2023-07-10
 exchange = "Nasdaq"
 ticker = "BBBY"
+effective = 2023-07-20
 cite = { kind = "accession", ref = "0001354457-23-000478", date = 2023-07-10 }
 
 [[history.bars]]
@@ -1354,7 +1359,9 @@ title = "Rite Aid RAD: NYSE suspended trading on 2023-10-16 after the Chapter 11
 # determined that the Common Stock ... should be suspended from trading" and will remove it at the opening
 # of 2023-11-13 (Form 25-NSE notice, EX-99.25); the company's 8-K says the stock "began trading exclusively
 # on the over-the-counter market on October 17, 2023 under the symbol RADCQ". The last NYSE session is
-# Monday 2023-10-16.
+# Monday 2023-10-16. DERIVED: neither cited filing says the stock traded on 10-16; the
+# 8-K only fixes exclusive OTC trading from 10-17, so 10-16 is the latest the last NYSE session
+# can be (if halted before that open it was 2023-10-13).
 [[history.input]]
 kind = "25-nse"
 cik = "0000084129"
