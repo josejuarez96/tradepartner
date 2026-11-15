@@ -14,6 +14,10 @@ stamped later on the same day is not seen. A comparison between two ids reads
 the store at the later of their two `known_at` values, the first instant both
 observations existed.
 
+**Chains are the exception.** A chain retracted later reads as retracted at
+every earlier instant too (the agreed design rule, #2110), and a chain first
+written after both observations is not compared.
+
 **Kinds** (one row per disagreement, none for an agreement):
 
 - `share_class_same_cik`: two ids under one CIK that OpenFIGI puts in one
@@ -67,6 +71,7 @@ KINDS: tuple[str, ...] = (
 CANNOT_CHECK: tuple[str, ...] = (
     "ticker: OpenFIGI's stored ticker is our own query echo",
     "exchange: OpenFIGI's exch_code is always US",
+    "chains: a chain retracted later reads as retracted earlier too (#2110)",
 )
 
 IDENTITY_SCHEMA: dict[str, Any] = {
