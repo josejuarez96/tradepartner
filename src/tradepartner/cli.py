@@ -152,6 +152,13 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   (PKI -> RVTY, CHK -> EXE), exactly the rows the EDGAR master derives. The
   dry run lists the rows and the refused changes with reasons; a real run
   writes only that count, inside the open data release named.
+- `tradepartner repair-restore --release <name> (--from-release <name> |
+  --table <t> --key <field> ...) [--dry-run | --expect-rows N]` runs
+  `repair_restore.repair_restore` (ADR 0029, T391): it puts retracted rows back
+  with their original `known_at`, in its own open release (not the one that
+  retracted them), refusing a held key, an open paper window or a count other
+  than the dry run's; it prints the `data-release close` command naming the
+  restored sessions.
 - `tradepartner dashboard` runs the Streamlit shell (`dashboard/app.py`) bound to
   localhost with usage telemetry off (ADR 0011), and exits with Streamlit's code.
 - `tradepartner export OUT_DIR` writes every table in the store to
@@ -609,6 +616,7 @@ from tradepartner.repair_form4_titles import (
 from tradepartner.repair_form4_titles import (
     repair_form4_titles as apply_form4_titles_repair,
 )
+from tradepartner.repair_restore import repair_restore
 from tradepartner.research import (
     EVERY_ROW_SPLITS,
     DatasetChanged,
@@ -3760,6 +3768,59 @@ def make_app(
         typer.echo(result.summary())
         for line in result.lines():
             typer.echo(line)
+
+    @app.command("repair-restore")
+    def repair_restore_cmd(
+        release: Annotated[str, typer.Option(help="the open data release (its own, a new one)")],
+        from_release: Annotated[
+            str | None, typer.Option(help="restore every unrestored row this release retracted")
+        ] = None,
+        table: Annotated[
+            str | None, typer.Option(help="with --key: restore one logical key of this table")
+        ] = None,
+        key: Annotated[
+            list[str] | None,
+            typer.Option(help="one logical-key field, repeated in the table's key order"),
+        ] = None,
+        dry_run: Annotated[
+            bool, typer.Option(help="list the rows, check every refusal and change nothing")
+        ] = False,
+        expect_rows: Annotated[
+            int | None, typer.Option(help="the dry run's row count (required to write)")
+        ] = None,
+    ) -> None:
+        """Put retracted rows back, row by row or by release (ADR 0029, T391)."""
+        if _blank_text(release):
+            raise _fail(
+                "a restore writes only inside a data release: pass --release <name>", USAGE_ERROR
+            )
+        if not dry_run and expect_rows is None:
+            raise _fail("run --dry-run first, then pass its count as --expect-rows", USAGE_ERROR)
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            result = repair_restore(
+                s,
+                release=release,
+                from_release=from_release,
+                table=table,
+                key=tuple(key) if key else None,
+                expect=expect_rows,
+                dry_run=dry_run,
+                clock=clock,
+            )
+        except StoreLockedError as exc:
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
+        except RepairRefused as exc:
+            raise _fail(_scrubbed(f"repair refused: {exc}", s), 1) from None
+        except ValueError as exc:
+            raise _fail(_scrubbed(f"refused: {exc}", s), USAGE_ERROR) from None
+        typer.echo(result.summary())
+        for line in result.lines():
+            typer.echo(line)
+        if not dry_run:
+            typer.echo(f"now close the release: {result.close_command()}")
 
     @app.command("spinoff-allocation")
     def spinoff_allocation(
