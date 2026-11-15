@@ -1894,9 +1894,9 @@ def test_a_stale_owner_bar_does_not_count_as_held(store: Settings) -> None:
     with open_for_write(store) as conn:
         insert_row(conn, "prices_daily", _bar(HEIR, date(2021, 6, 1)))
         day = date(2021, 6, 1)
-        assert _holds_bar(conn, ["alpaca"], {})(HEIR, day)
-        assert not _holds_bar(conn, ["alpaca"], {(HEIR, day): 1})(HEIR, day)
-        assert not _holds_bar(conn, ["alpaca"], {})(HEIR, date(2021, 6, 2))
+        assert _holds_bar(conn, ["alpaca_sip"], {})(HEIR, day)
+        assert not _holds_bar(conn, ["alpaca_sip"], {(HEIR, day): 1})(HEIR, day)
+        assert not _holds_bar(conn, ["alpaca_sip"], {})(HEIR, date(2021, 6, 2))
 
 
 def test_an_owner_without_a_bar_stays_a_receiver(store: Settings) -> None:
