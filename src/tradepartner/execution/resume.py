@@ -161,7 +161,7 @@ import logging
 import math
 from collections.abc import Callable, Sequence
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime
 
 import duckdb
@@ -199,6 +199,7 @@ from tradepartner.execution.reconcile_run import (
     reconcile_now,
     verify_frozen_sha256,
 )
+from tradepartner.execution.risk import order_shape_violation
 from tradepartner.execution.window import ACCOUNT_MISMATCH
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.journal import (
@@ -409,6 +410,11 @@ def _settle(
             broker_id = confirmed.get(coid)
             # The submit reply confirmed it (#3335): never closed `not_received`.
             readings[coid] = None if broker_id is None else read_confirmed(broker, coid, broker_id)
+        reading = readings[coid]
+        if reading is not None and (violation := order_shape_violation(reading)) is not None:
+            raise ReconciliationError(
+                f"pending order {coid}: {violation.rule}: the read-back returned {violation.detail}"
+            )
     stamp = stamps.next(clock, "settle order_events")
     for order in pending:
         reading = readings[order.client_order_id]
@@ -427,8 +433,10 @@ def _settle(
             events.append(
                 OrderEventRow(
                     client_order_id=order.client_order_id,
+                    event_at=reading.submitted_at,
                     status=_ACCEPTED,
                     broker_order_id=reading.broker_order_id,
+                    raw_json=json.dumps(asdict(reading), default=str, sort_keys=True),
                     known_at=stamp,
                     ingested_at=stamp,
                 )
