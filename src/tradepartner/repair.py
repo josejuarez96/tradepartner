@@ -484,7 +484,10 @@ def _held_tickers(
 ) -> Callable[[str, date], Sequence[str]]:
     """`(security_id, session)` to the tickers the security's listings known
     at `at` carry on that session: those of its latest listing starting on or
-    before it, else all of its listings (a bar before its first row)."""
+    before it, else all of its listings (a bar before its first row); plus the
+    new symbol of each of its own `symbol_changes` known at `at` on or before
+    that session from a ticker it then carried (#3466: a lost id's bars after
+    `ATLN -> CIRC` were Alpaca's `CIRC`)."""
     listed: dict[str, list[tuple[date, str]]] = defaultdict(list)
     live_classes: dict[str, list[tuple[date, str, Any]]] = defaultdict(list)
     for row in listings_as_of(conn, at).iter_rows(named=True):
@@ -520,19 +523,38 @@ def _held_tickers(
             continue
         withdrawn[str(sid)].append((valid_from, norm))
 
-    def held(security_id: str, day: date) -> Sequence[str]:
+    renames: dict[str, list[tuple[date, str, str]]] = defaultdict(list)
+    for change in _symbol_changes(conn, at):
+        renames[str(change["security_id"])].append(
+            (
+                change["process_date"],
+                _norm(str(change["old_symbol"])),
+                _norm(str(change["new_symbol"])),
+            )
+        )
+    for listed_changes in renames.values():
+        listed_changes.sort()
+
+    def listed_on(security_id: str, day: date) -> set[str]:
         rows = listed.get(security_id, [])
         if not rows:  # a retracted id: its own retracted listing rows (#3265 review)
-            return sorted(retracted.get(security_id, ()))
+            return set(retracted.get(security_id, ()))
         started = [r for r in rows if r[0] <= day]
         if not started:
-            return sorted({t for _, t in rows})
+            return {t for _, t in rows}
         latest = max(r[0] for r in started)
         out = {t for d, t in started if d == latest}
         own = [r for r in withdrawn.get(security_id, ()) if r[0] <= day]
         if own:
             last = max(r[0] for r in own)
             out |= {t for d, t in own if d == last}
+        return out
+
+    def held(security_id: str, day: date) -> Sequence[str]:
+        out = listed_on(security_id, day)
+        for process_date, old, new in renames.get(security_id, ()):
+            if process_date <= day and old in out:
+                out.add(new)
         return sorted(out)
 
     return held
