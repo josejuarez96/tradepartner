@@ -204,6 +204,7 @@ from tradepartner.config import RiskConfig, Settings, render_validation_errors
 from tradepartner.errors import ClockError, LimitBreachError, ReconciliationError
 from tradepartner.execution import breaks as break_rules
 from tradepartner.execution import switch
+from tradepartner.execution.collect import accepted_fill_mismatch_ids
 from tradepartner.execution.dividend_dues import net_dividend_dues
 from tradepartner.execution.ledger import (
     TRUE_UP_KINDS,
@@ -223,6 +224,7 @@ from tradepartner.execution.reconcile import (
     UNEXPLAINED_DIVIDEND_GROUP,
     DelistedCash,
     Explanations,
+    FilledOrder,
     JournalOpenOrder,
     Mismatch,
     OpenMerger,
@@ -270,6 +272,7 @@ from tradepartner.store.journal import (
     orders_for,
     pending_orders,
     reconciliations_for,
+    resume_acceptances,
 )
 from tradepartner.store.schema import AUTO_TRUE_UP_KIND
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -1778,6 +1781,26 @@ def _open_orders(
     return orders, pending, sums
 
 
+def _filled_orders(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[FilledOrder]:
+    """Every order of the window, terminal or not, with its live journaled fills'
+    (quantity, notional), for `compare`'s `overfilled` pass (T400). A fill the owner
+    accepted with `--accept-fill-mismatch` is left out of the sums."""
+    accepted = accepted_fill_mismatch_ids(resume_acceptances(conn))
+    sums: dict[str, tuple[float, float]] = {}
+    for item in fills_for(conn, window_id=window_id):
+        if item.fill.broker_fill_id in accepted:
+            continue
+        quantity, notional = sums.get(item.fill.client_order_id, (0.0, 0.0))
+        sums[item.fill.client_order_id] = (
+            quantity + item.fill.quantity,
+            notional + item.fill.quantity * item.fill.price,
+        )
+    return [
+        FilledOrder(order, *sums.get(order.client_order_id, (0.0, 0.0)))
+        for order in orders_for(conn, window_id=window_id)
+    ]
+
+
 def spinoff_receipt_terms(
     conn: duckdb.DuckDBPyConnection,
     cut: datetime,
@@ -2497,6 +2520,7 @@ def reconcile_now(
     with connect() as conn:
         _refuse_before_a_true_up(adjustments_for(conn, window_id), through)
         orders, pending, sums = _open_orders(conn, window_id)
+        filled_orders = _filled_orders(conn, window_id)
 
     positions: dict[str, Position] = broker.positions()
     open_orders: list[Order] = broker.open_orders()
@@ -2580,6 +2604,7 @@ def reconcile_now(
         window,
         frozen,
         order_id_prefix=settings.paper.order_id_prefix,
+        filled_orders=filled_orders,
     )
     unsupported_dividend_cash = [
         activity

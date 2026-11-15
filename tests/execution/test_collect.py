@@ -38,12 +38,14 @@ from tradepartner.store.journal import (
     PaperWindowRow,
     RebalanceEventRow,
     ReconciliationRow,
+    ResumeAcceptanceRow,
     ResumeInvocationRow,
     append,
     decisions_for,
     fill_cursors,
     fills_for,
     order_events_for,
+    resume_acceptances,
 )
 
 
@@ -1685,3 +1687,369 @@ def test_the_anchor_day_is_the_new_york_date() -> None:
     rows = [_reconciliation(datetime(2026, 10, 2, 1, 0, tzinfo=UTC), ["tp-a"], 1)]
     verdict = lag_verdict(order, rows, FRI, FROZEN)
     assert (verdict.sessions_past, verdict.breached) == (1, True)
+
+
+# --- the fill check (T400, #3333) -------------------------------------------
+
+
+def _corrupt(fake: FakeBroker, index: int, **changes: Any) -> None:
+    """Rewrite one fill the fake holds: the broker double's wrong print."""
+    fake._fills[index] = replace(fake._fills[index], **changes)
+
+
+def _acceptances(settings: Settings) -> list[tuple[int, str]]:
+    with open_read_only(settings) as conn:
+        return conn.execute("SELECT resume_id, accepted_json FROM resume_acceptances").fetchall()
+
+
+def _fault_setup(
+    settings: Settings,
+    window: PaperWindowRow,
+    fake: FakeBroker,
+    clock: FixedClock,
+    *,
+    quantity: float | None = 10.0,
+    notional: float | None = None,
+) -> tuple[int, OrderRow]:
+    run_id = _run(settings, window, clock())
+    order = _order(
+        settings, fake, clock, run_id, "tp-a", quantity=quantity, notional=notional, side="buy"
+    )
+    clock.advance(minutes=1)
+    return run_id, order
+
+
+@pytest.mark.parametrize(
+    ("changes", "named"),
+    [
+        ({"side": Side.SELL}, "is a sell, the order is a buy"),
+        ({"symbol": "ZZZ"}, "is for ZZZ, the order is for AAA"),
+        ({"quantity": 20.0}, "overfilled by fill fake-fill-1"),
+    ],
+)
+def test_a_wrong_fill_halts_the_collection_and_writes_no_fill(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+    changes: dict[str, Any],
+    named: str,
+) -> None:
+    run_id, order = _fault_setup(journal_settings, open_window, scripted_fake, fixed_clock)
+    scripted_fake.apply("tp-a", FillAt(50.0))
+    _corrupt(scripted_fake, 0, **changes)
+    fixed_clock.advance(minutes=1)
+
+    with pytest.raises(SystemFaultError, match="fill_mismatch") as raised:
+        _collect(journal_settings, scripted_fake, fixed_clock, [order], writer_id=run_id)
+
+    assert named in str(raised.value)
+    assert collect_module.fill_mismatch_ids(str(raised.value)) == ("fake-fill-1",)
+    assert _all_fill_rows(journal_settings) == []
+    assert _cursors(journal_settings) == []
+    # The cursor did not advance, so the fault returns on the next collection.
+    with pytest.raises(SystemFaultError, match="fill_mismatch"):
+        _collect(journal_settings, scripted_fake, fixed_clock, [order], writer_id=run_id)
+
+
+def test_an_overfill_split_across_two_collections_halts_on_the_second(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id, order = _fault_setup(journal_settings, open_window, scripted_fake, fixed_clock)
+    scripted_fake.apply("tp-a", PartialFill(5.0, 50.0))
+    fixed_clock.advance(minutes=1)
+    first = _collect(journal_settings, scripted_fake, fixed_clock, [order], writer_id=run_id)
+    assert first.fills_journaled == ("fake-fill-1",)
+
+    scripted_fake.apply("tp-a", PartialFill(4.0, 50.0))
+    _corrupt(scripted_fake, 1, quantity=9.0)  # 5 + 9 = 14 of 10
+    fixed_clock.advance(minutes=1)
+    with pytest.raises(SystemFaultError, match="fill_mismatch") as raised:
+        _collect(journal_settings, scripted_fake, fixed_clock, [order], writer_id=run_id)
+
+    assert collect_module.fill_mismatch_ids(str(raised.value)) == ("fake-fill-2",)
+    assert [f.fill.broker_fill_id for f in _fills(journal_settings)] == ["fake-fill-1"]
+    assert len(_cursors(journal_settings)) == 1
+
+
+def test_fills_at_the_size_partial_and_within_tolerance_still_journal(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id, order = _fault_setup(journal_settings, open_window, scripted_fake, fixed_clock)
+    scripted_fake.apply("tp-a", PartialFill(4.0, 50.0))
+    scripted_fake.apply("tp-a", PartialFill(6.0, 50.0))
+    # Exactly the size, plus rounding inside risk.reconcile_quantity_tolerance.
+    _corrupt(scripted_fake, 1, quantity=6.0 + TOL / 2)
+    fixed_clock.advance(minutes=1)
+
+    collected = _collect(journal_settings, scripted_fake, fixed_clock, [order], writer_id=run_id)
+
+    assert collected.fills_journaled == ("fake-fill-1", "fake-fill-2")
+
+
+def test_a_feed_fill_that_supersedes_a_synthetic_one_is_not_counted_twice(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _run(journal_settings, open_window, fixed_clock())
+    order = _order(journal_settings, scripted_fake, fixed_clock, run_id, "tp-a", quantity=10.0)
+    scripted_fake.lag_fills(1)
+    fixed_clock.advance(minutes=1)
+    scripted_fake.apply("tp-a", FillAt(50.0))
+    at = fixed_clock.advance(minutes=1)
+    _append(
+        journal_settings,
+        FillRow(
+            client_order_id="tp-a",
+            filled_at=at,
+            quantity=10.0,
+            price=50.0,
+            price_implied=True,
+            broker_fill_id="synthetic:tp-a",
+            source="broker_status",
+            known_at=at,
+            ingested_at=at,
+        ),
+        OrderEventRow(client_order_id="tp-a", status="filled", known_at=at, ingested_at=at),
+    )
+    scripted_fake.lag_fills(0)
+    _collect(journal_settings, scripted_fake, fixed_clock, [])  # the lag
+    fixed_clock.advance(minutes=1)
+
+    collected = _collect(journal_settings, scripted_fake, fixed_clock, [])
+
+    assert collected.superseded == ("fake-fill-1",)
+    assert order.client_order_id == "tp-a"
+
+
+def test_a_notional_orders_overfill_past_the_buffer_halts_and_inside_it_journals(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id, order = _fault_setup(
+        journal_settings, open_window, scripted_fake, fixed_clock, quantity=None, notional=1000.0
+    )
+    scripted_fake.apply("tp-a", PartialFill(20.0, 50.0))  # $1000
+    _corrupt(scripted_fake, 0, quantity=20.2)  # $1010, inside the 2% buffer
+    fixed_clock.advance(minutes=1)
+    ok = _collect(journal_settings, scripted_fake, fixed_clock, [order], writer_id=run_id)
+    assert ok.fills_journaled == ("fake-fill-1",)
+
+    scripted_fake.apply("tp-a", PartialFill(1.0, 50.0))
+    _corrupt(scripted_fake, 1, quantity=1.0)  # $1060 in all, past 1000 x 1.02 + 0.01
+    fixed_clock.advance(minutes=1)
+    with pytest.raises(SystemFaultError, match="fill_mismatch"):
+        _collect(journal_settings, scripted_fake, fixed_clock, [order], writer_id=run_id)
+    assert [f.fill.broker_fill_id for f in _fills(journal_settings)] == ["fake-fill-1"]
+
+
+def test_an_order_whose_security_was_renamed_since_submission_does_not_halt(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    """The fill is checked against the order's own journaled symbol, not a
+    present-day map: a ticker renamed after the submit is no false halt."""
+    run_id, order = _fault_setup(journal_settings, open_window, scripted_fake, fixed_clock)
+    scripted_fake.apply("tp-a", FillAt(50.0))
+    fixed_clock.advance(minutes=1)
+
+    collected = _collect(journal_settings, scripted_fake, fixed_clock, [order], writer_id=run_id)
+
+    assert collected.fills_journaled == ("fake-fill-1",)
+
+
+def test_an_unreadable_fill_is_a_fault_never_a_pass(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id, order = _fault_setup(journal_settings, open_window, scripted_fake, fixed_clock)
+    scripted_fake.apply("tp-a", FillAt(50.0))
+    # `Fill` refuses these at construction; a double that skips that is the case.
+    object.__setattr__(scripted_fake._fills[0], "quantity", float("nan"))
+    fixed_clock.advance(minutes=1)
+
+    with pytest.raises(SystemFaultError, match="unreadable"):
+        _collect(journal_settings, scripted_fake, fixed_clock, [order], writer_id=run_id)
+    assert _all_fill_rows(journal_settings) == []
+
+
+def test_a_foreign_fill_stays_foreign_not_a_mismatch(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id, order = _fault_setup(journal_settings, open_window, scripted_fake, fixed_clock)
+    scripted_fake.apply("tp-a", FillAt(50.0))
+    _corrupt(scripted_fake, 0, client_order_id="other-system-1", side=Side.SELL, quantity=99.0)
+    fixed_clock.advance(minutes=1)
+
+    collected = _collect(journal_settings, scripted_fake, fixed_clock, [order], writer_id=run_id)
+
+    assert collected.foreign_fill_ids == ("fake-fill-1",)
+    assert collected.fills_journaled == ()
+
+
+def _two_overfills(
+    settings: Settings,
+    window: PaperWindowRow,
+    fake: FakeBroker,
+    clock: FixedClock,
+) -> tuple[int, OrderRow, OrderRow]:
+    run_id = _run(settings, window, clock())
+    a = _order(settings, fake, clock, run_id, "tp-a", quantity=10.0)
+    b = _order(settings, fake, clock, run_id, "tp-b", quantity=10.0)
+    clock.advance(minutes=1)
+    fake.apply("tp-a", FillAt(50.0))
+    fake.apply("tp-b", FillAt(50.0))
+    _corrupt(fake, 0, quantity=20.0)
+    _corrupt(fake, 1, quantity=20.0)
+    clock.advance(minutes=1)
+    return run_id, a, b
+
+
+def _accepting(ids: set[str], resume_id: int) -> collect_module.FillMismatchAcceptance:
+    return collect_module.FillMismatchAcceptance(resume_id, frozenset(ids))
+
+
+def test_an_accepted_mismatch_is_journaled_with_its_acceptance_in_one_chunk(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    _, a, b = _two_overfills(journal_settings, open_window, scripted_fake, fixed_clock)
+    resume_id = _resume(journal_settings, fixed_clock(), None)
+
+    collected = collect(
+        scripted_fake,
+        lambda: open_for_write(journal_settings),
+        [a, b],
+        fixed_clock,
+        "resume",
+        resume_id,
+        FROZEN,
+        journal_settings,
+        accept_fill_mismatch=_accepting({"fake-fill-1", "fake-fill-2"}, resume_id),
+    )
+
+    assert collected.fills_journaled == ("fake-fill-1", "fake-fill-2")
+    assert collected.fill_mismatch_accepted == ("fake-fill-1", "fake-fill-2")
+    ((row_id, accepted),) = _acceptances(journal_settings)
+    assert row_id == resume_id
+    (entry,) = json.loads(accepted)
+    assert (entry["kind"], entry["fill_ids"]) == ("fill_mismatch", ["fake-fill-1", "fake-fill-2"])
+    with open_read_only(journal_settings) as conn:
+        assert collect_module.accepted_fill_mismatch_ids(resume_acceptances(conn)) == {
+            "fake-fill-1",
+            "fake-fill-2",
+        }
+
+
+def test_an_unaccepted_mismatch_still_halts_and_the_acceptance_covers_only_named_ids(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    """A is named, B arrived after the halt: B raises inside the same chunk, so
+    neither the acceptance row nor A's fill is written."""
+    _, a, b = _two_overfills(journal_settings, open_window, scripted_fake, fixed_clock)
+    resume_id = _resume(journal_settings, fixed_clock(), None)
+
+    with pytest.raises(SystemFaultError, match="fill_mismatch") as raised:
+        collect(
+            scripted_fake,
+            lambda: open_for_write(journal_settings),
+            [a, b],
+            fixed_clock,
+            "resume",
+            resume_id,
+            FROZEN,
+            journal_settings,
+            accept_fill_mismatch=_accepting({"fake-fill-1"}, resume_id),
+        )
+
+    assert collect_module.fill_mismatch_ids(str(raised.value)) == ("fake-fill-2",)
+    assert _all_fill_rows(journal_settings) == []
+    assert _acceptances(journal_settings) == []
+
+
+def test_an_acceptance_is_refused_outside_its_own_resume(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _run(journal_settings, open_window, fixed_clock())
+    with pytest.raises(ValueError, match="accept-fill-mismatch"):
+        collect(
+            scripted_fake,
+            lambda: open_for_write(journal_settings),
+            [],
+            fixed_clock,
+            "run",
+            run_id,
+            FROZEN,
+            journal_settings,
+            accept_fill_mismatch=_accepting({"x"}, run_id),
+        )
+
+
+def test_the_halts_fill_ids_are_read_from_its_structure_not_its_prose() -> None:
+    reason = (
+        'SystemFaultError: fill_mismatch: {"details": ["fill fake-fill-9 is a sell"], '
+        '"fill_ids": ["fake-fill-1", "fake-fill-2"]}; halt read of tp-a failed'
+    )
+    assert collect_module.fill_mismatch_ids(reason) == ("fake-fill-1", "fake-fill-2")
+    assert collect_module.is_fill_mismatch_fault(reason)
+    for bad in (None, "", "fill_mismatch: nope", 'fill_mismatch: {"fill_ids": "x"}'):
+        assert collect_module.fill_mismatch_ids(bad) == ()
+
+
+def test_a_crash_while_writing_the_acceptance_leaves_neither_it_nor_the_fills(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, a, b = _two_overfills(journal_settings, open_window, scripted_fake, fixed_clock)
+    resume_id = _resume(journal_settings, fixed_clock(), None)
+    real_append = collect_module.append
+
+    def crashing(conn: Any, row: object) -> Any:
+        if isinstance(row, ResumeAcceptanceRow):
+            raise OSError("disk went away")
+        return real_append(conn, row)
+
+    monkeypatch.setattr(collect_module, "append", crashing)
+    with pytest.raises(OSError, match="disk went away"):
+        collect(
+            scripted_fake,
+            lambda: open_for_write(journal_settings),
+            [a, b],
+            fixed_clock,
+            "resume",
+            resume_id,
+            FROZEN,
+            journal_settings,
+            accept_fill_mismatch=_accepting({"fake-fill-1", "fake-fill-2"}, resume_id),
+        )
+
+    assert _all_fill_rows(journal_settings) == []
+    assert _acceptances(journal_settings) == []
