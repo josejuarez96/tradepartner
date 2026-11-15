@@ -687,7 +687,9 @@ def _named_fill_mismatches(events: Sequence[KillSwitchRow]) -> frozenset[str]:
     return frozenset(
         fill_id
         for event in events
-        if (event.event_id or 0) > last_release and is_fill_mismatch_fault(event.reason)
+        if (event.event_id or 0) > last_release
+        and event.source == "fault"
+        and is_fill_mismatch_fault(event.reason)
         for fill_id in fill_mismatch_ids(event.reason)
     )
 
