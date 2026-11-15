@@ -128,7 +128,12 @@ from tradepartner.backtest.holdout import (
     default_in_sample_window,
     gap_sessions,
 )
-from tradepartner.backtest.hypothesis import _overlay, _reset_inert, load_frozen
+from tradepartner.backtest.hypothesis import (
+    _overlay,
+    _reset_inert,
+    frozen_hash_matches,
+    load_frozen,
+)
 from tradepartner.backtest.provider import DataProvider
 from tradepartner.backtest.results import hypothesis_cadence, metric_rows, write_results
 from tradepartner.backtest.schedule import read_time
@@ -605,6 +610,10 @@ def run_hypothesis(
     return RunOutcome(handle.trial_id, "failed")
 
 
+class ReplayRefused(ValueError):
+    """A replay that would not run the trial's registered parameters."""
+
+
 @contextmanager
 def _replay_registry(handle: registry.TrialHandle) -> Iterator[duckdb.DuckDBPyConnection]:
     """An in-memory stand-in for the registry connection `StoreProvider` checks its handle
@@ -663,6 +672,13 @@ def replay_trial(
             _reset_inert(live, frozen_module.inert_sections(hypothesis.family)),
             frozen_values(hypothesis),
         )
+        if not frozen_hash_matches(params, hypothesis.params_sha256, family=hypothesis.family):
+            # The values this replay would run hash to something other than what the
+            # registration recorded: the stored parameters were changed.
+            raise ReplayRefused(
+                f"hypothesis {hypothesis.slug!r}: the frozen parameters to run do not hash to "
+                f"the registered {hypothesis.params_sha256}; the replay is refused"
+            )
         measured = reproduce.stored_measured_levels(conn, trial_id)
         handle = registry._issue_handle(
             trial_id=trial_id,

@@ -401,7 +401,7 @@ def reproduce_trial(
     `StoreLockedError` (the store is being written). A reproduction that cannot be run or
     does not match is a returned `not_reproducible` / `differs`, never a pass.
     `work_dir` is where the temporary copy is made (default the system temp)."""
-    from tradepartner.backtest.run import replay_trial
+    from tradepartner.backtest.run import ReplayRefused, replay_trial
 
     settings = settings if settings is not None else get_settings()
     source = Path(settings.store.path)
@@ -447,7 +447,17 @@ def reproduce_trial(
                 reasons=tuple(reasons),
                 restored=restored,
             )
-        rows = replay_trial(trial_id, copy, holdout_replay=holdout_repeat, settings=settings)
+        try:
+            rows = replay_trial(trial_id, copy, holdout_replay=holdout_repeat, settings=settings)
+        except ReplayRefused as exc:
+            return Reproduction(
+                trial_id,
+                "not_reproducible",
+                facts.kind,
+                holdout,
+                reasons=(f"params_sha256: {exc}",),
+                restored=restored,
+            )
         replayed: dict[str, float | None] = {
             r.metric: r.value
             for r in rows

@@ -507,3 +507,21 @@ def test_a_trial_with_no_stored_metrics_is_not_a_pass(
     result = reproduce.reproduce_trial(trial)
     assert result.verdict == "not_reproducible"
     assert "no stored base-level" in result.reasons[0]
+
+
+def test_a_tampered_params_row_is_refused(store: Path) -> None:
+    trial = _run()
+    with open_for_write(_settings(store)) as conn:
+        conn.execute(
+            "UPDATE hypotheses SET params_json = replace(params_json, "
+            "'\"strategy.top_fraction\":0.5', '\"strategy.top_fraction\":0.3')"
+        )
+        [changed] = conn.execute(
+            "SELECT count(*) FROM hypotheses "
+            "WHERE params_json LIKE '%\"strategy.top_fraction\":0.3%'"
+        ).fetchone() or (0,)
+    assert changed == 1, "the fixture's params_json layout changed; adjust the tamper"
+    result = reproduce.reproduce_trial(trial)
+    assert result.verdict == "not_reproducible"
+    assert result.reasons[0].startswith("params_sha256")
+    assert result.compared == 0
