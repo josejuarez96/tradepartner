@@ -972,15 +972,26 @@ def test_a_cached_delisting_makes_no_request(tmp_path: Path) -> None:
     assert router.urls[before:] == []
 
 
+def _document_payload(
+    cik: int, accession: str, accepted: str, *, form: str, document: str
+) -> dict[str, object]:
+    """As `_xml_payload`, with the `primaryDocument` given (#3084)."""
+    payload = _xml_payload(cik, accession, accepted, form=form)
+    payload["filings"]["recent"]["primaryDocument"] = [document]  # type: ignore[index]
+    return payload
+
+
 def test_a_pre_xml_form_25_is_not_downloaded_and_is_counted(tmp_path: Path) -> None:
-    """`_index_payload`'s recorded documents are all `doc.htm`: not XML, so
-    `parse_delisting` (XML only) is never even called for it."""
+    """A text Form 25 (`.txt`, the pre-2001 shape) is neither XML nor an
+    issuer's HTML form, so it is never even fetched (#3084 kept this)."""
     form_25 = "0005555555-26-000001"
     line = index_line("25", "Old Corp", 5555555, "2026-09-01", form_25)
     router = _delisting_router(line)
     router.add(
         f"{SUBMISSIONS_URL}CIK0005555555.json",
-        _index_payload(5555555, (form_25, "25", "2026-09-01T20:00:00")),
+        _document_payload(
+            5555555, form_25, "2026-09-01T20:00:00", form="25", document="form25.txt"
+        ),
     )
     _add_klx_document(router)
     source = _delisting_source(router, tmp_path)
@@ -991,6 +1002,126 @@ def test_a_pre_xml_form_25_is_not_downloaded_and_is_counted(tmp_path: Path) -> N
     # submissions are fetched (to know the primary document is `doc.htm`),
     # but no `Archives/edgar/data/...` document request for it
     assert not any("Archives/edgar/data/5555555" in u for u in router.urls)
+
+
+#: An issuer's HTML Form 25 (#3084), in the shape `test_edgar_form25_html` reads.
+_HTML_FORM_25 = (
+    "<html><body><p>FORM 25</p><p>Commission File Number 001-11111</p>"
+    "<p>Html Corp</p><p>The Nasdaq Stock Market LLC</p>"
+    "<p>(Exact name of Issuer as specified in its charter, and name of Exchange where "
+    "security is listed and/or registered)</p><p>1 Main St</p>"
+    "<p>(Address, including zip code, and telephone number, including area code, of "
+    "Issuer&#8217;s principal executive offices)</p><p>Common Stock, $0.01 par value</p>"
+    "<p>(Description of class of securities)</p></body></html>"
+)
+
+
+def _html_form_25(
+    tmp_path: Path, body: str, *, form: str = "25", document: str = "form25.htm"
+) -> tuple[EdgarRouter, EdgarFilingSource, str]:
+    accession = "0005555580-26-000001"
+    router = _delisting_router(index_line(form, "Html Corp", 5555580, "2026-09-01", accession))
+    router.add(
+        f"{SUBMISSIONS_URL}CIK0005555580.json",
+        _document_payload(5555580, accession, "2026-09-01T20:00:00", form=form, document=document),
+    )
+    router.add(_download_url("0005555580", accession, document), body)
+    _add_klx_document(router)
+    return router, _delisting_source(router, tmp_path), accession
+
+
+def test_an_issuers_html_form_25_is_read_and_cached(tmp_path: Path) -> None:
+    """#3084: an issuer's own Form 25 is HTML; it is read under its one CIK,
+    stamped at its acceptance, and served from the cache afterwards."""
+    router, source, accession = _html_form_25(tmp_path, _HTML_FORM_25)
+    [html] = [d for d in source.delistings() if d.accession == accession]
+    assert (html.cik, html.form, html.class_title, html.exchange) == (
+        "0005555580",
+        "25",
+        "Common Stock, $0.01 par value",
+        "NASDAQ",
+    )
+    assert html.accepted_at == datetime(2026, 9, 1, 20, 0, tzinfo=UTC)
+    assert source.pre_xml_delistings == 0
+    assert source.unread_html_delistings == 0
+    document_url = _download_url("0005555580", accession, "form25.htm")
+    assert router.urls.count(document_url) == 1
+
+    before = len(router.urls)
+    assert accession in {d.accession for d in source.delistings()}
+    assert document_url not in router.urls[before:]
+
+
+def test_an_unreadable_html_form_25_is_counted_not_failed_and_not_refetched(
+    tmp_path: Path,
+) -> None:
+    """A layout naming no exchange (a third of sampled issuers) is no
+    malformed filing: no row, no failure (which would trip the run's
+    failure share), counted on `.unread_html_delistings` and never fetched
+    again under this `DELISTING_HTML_VERSION`."""
+    body = _HTML_FORM_25.replace("<p>The Nasdaq Stock Market LLC</p>", "")
+    router, source, accession = _html_form_25(tmp_path, body)
+    assert accession not in {d.accession for d in source.delistings()}
+    assert source.unread_html_delistings == 1
+    assert source.failed_filings == 0
+    source.check_failures()  # no failure to trip the run
+    document_url = _download_url("0005555580", accession, "form25.htm")
+    before = len(router.urls)
+    assert accession not in {d.accession for d in source.delistings()}
+    assert source.unread_html_delistings == 1
+    assert document_url not in router.urls[before:]
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_over_cap_html_form_25_is_unreadable_and_counted(tmp_path: Path, cached: bool) -> None:
+    router, source, accession = _html_form_25(tmp_path, _HTML_FORM_25 + " " * 100)
+    source._settings = edgar_settings(tmp_path, form25_html_max_bytes=len(_HTML_FORM_25.encode()))
+    document = "form25.htm"
+    path = edgar_raw.cached_filing_path(
+        "0005555580", accession, document, settings=source._settings
+    )
+    if cached:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes((_HTML_FORM_25 + " " * 100).encode())
+    assert accession not in {d.accession for d in source.delistings()}
+    assert source.unread_html_delistings == 1
+    assert source.failed_filings == 0
+    assert not path.exists()
+    source.check_failures()
+    document_url = _download_url("0005555580", accession, document)
+    before = router.urls.count(document_url)
+    assert accession not in {d.accession for d in source.delistings()}
+    assert router.urls.count(document_url) == before
+
+    source._settings = edgar_settings(tmp_path, form25_html_max_bytes=2_000_000)
+    assert accession in {d.accession for d in source.delistings()}
+    assert router.urls.count(document_url) == before + 1
+
+
+def test_html_form_25_path_safety_error_propagates(tmp_path: Path) -> None:
+    _, source, _ = _html_form_25(tmp_path, _HTML_FORM_25, document="../form25.htm")
+    with pytest.raises(edgar_raw.InvalidFilingReferenceError):
+        source.delistings()
+    assert source.unread_html_delistings == 0
+
+
+@pytest.mark.parametrize(("form", "document"), [("25-NSE", "form25.htm"), ("25", "form25.pdf")])
+def test_an_html_25nse_or_another_document_stays_pre_xml(
+    tmp_path: Path, form: str, document: str
+) -> None:
+    """Only an issuer's `25`/`25/A` as `.htm`/`.html` is read as HTML; an
+    exchange's 25-NSE is always the XML form."""
+    accession = "0005555581-26-000001"
+    router = _delisting_router(index_line(form, "Html Corp", 5555581, "2026-09-01", accession))
+    router.add(
+        f"{SUBMISSIONS_URL}CIK0005555581.json",
+        _document_payload(5555581, accession, "2026-09-01T20:00:00", form=form, document=document),
+    )
+    _add_klx_document(router)
+    source = _delisting_source(router, tmp_path)
+    assert accession not in {d.accession for d in source.delistings()}
+    assert source.pre_xml_delistings == 1
+    assert not any("Archives/edgar/data/5555581" in u for u in router.urls)
 
 
 def test_an_http_error_on_a_delisting_document_propagates(tmp_path: Path) -> None:
@@ -2079,3 +2210,108 @@ def test_a_bulk_payload_is_kept_when_the_api_404s(tmp_path: Path) -> None:
     fresh = _source(source._settings, router)
     _shares(fresh, APPLE)
     assert router.urls.count(api) == before + 1  # not cached as complete
+
+
+# --- #3259: a cache or FSN hit is a parse this run ---------------------------
+
+
+def _stored_cross_day_entries(accessions: list[str], *, kind: str = "fetch") -> dict[str, dict]:
+    return {
+        a: {
+            "error_class": "ValueError",
+            "base_form": "10-K",
+            "kind": kind,
+            "message_hash": "h",
+            "count": 1,
+            "last_counted_day": "2026-06-01",
+            "accepted": False,
+        }
+        for a in accessions
+    }
+
+
+def _cross_day_reasons(source: EdgarFilingSource) -> list[str]:
+    reasons: list[str] = []
+    source._check_cross_day_pairs(reasons)
+    return reasons
+
+
+def _store_with_hit(source: EdgarFilingSource, hit: str, *, kind: str = "fetch") -> None:
+    """Five stored failures (min_failed_filings): `hit` plus four others."""
+    others = [f"0000999999-26-00000{n}" for n in range(4)]
+    source._failed_filings_cache = _stored_cross_day_entries([hit, *others], kind=kind)
+
+
+def test_cover_cache_hit_marks_filing_succeeded_so_stored_failure_is_not_counted(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    source = _source(settings, _router())
+    accession = "0000320193-26-000777"
+    path = Path(settings.edgar.cache_dir) / "cover" / f"v{COVER_VERSION}" / f"{accession}.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": COVER_VERSION,
+                "accession": accession,
+                "cik": APPLE,
+                "entity_cik": APPLE,
+                "listings": [],
+                "facts": [],
+            }
+        )
+    )
+    _seed_stamps(source, APPLE, {accession: _record(accession, "10-K", INSIDE_LAG)})
+    _store_with_hit(source, accession)
+    assert _cross_day_reasons(source)  # before the parse: 5 stored failures count
+    source.cover_pages(APPLE)
+    assert accession in source._succeeded_this_run
+    assert _cross_day_reasons(source) == []  # 4 left, below min_failed_filings
+
+
+def test_fsn_hit_marks_filing_succeeded_so_stored_failure_is_not_counted(tmp_path: Path) -> None:
+    source = _source(_settings(tmp_path), _router())
+    _seed_stamps(source, APPLE, {APPLE_ACCESSION: _record(APPLE_ACCESSION, "10-K", APPLE_ACCEPTED)})
+    _store_with_hit(source, APPLE_ACCESSION)
+    assert _cross_day_reasons(source)
+    [_page] = source.cover_pages(APPLE)
+    assert APPLE_ACCESSION in source._succeeded_this_run
+    assert _cross_day_reasons(source) == []
+
+
+def test_fsn_header_hit_marks_filing_succeeded(tmp_path: Path) -> None:
+    source = _source(_settings(tmp_path), _router())
+    _seed_stamps(source, APPLE, {APPLE_ACCESSION: _record(APPLE_ACCESSION, "10-K", APPLE_ACCEPTED)})
+    _store_with_hit(source, APPLE_ACCESSION)
+    source.filing_headers(APPLE, ["10-K"])
+    assert _cross_day_reasons(source) == []
+
+
+def test_a_genuine_failure_this_run_still_counts_alongside_cache_hits(tmp_path: Path) -> None:
+    source = _source(_settings(tmp_path), _router())
+    _seed_stamps(source, APPLE, {APPLE_ACCESSION: _record(APPLE_ACCESSION, "10-K", APPLE_ACCEPTED)})
+    _store_with_hit(source, APPLE_ACCESSION)
+    source.cover_pages(APPLE)  # parses from FSN: stored entry dropped (4 left)
+    source._pending_failures["0000999999-26-000099"] = ("ValueError", "10-K", "new")
+    assert _cross_day_reasons(source)  # 4 stored + 1 failed this run = 5
+
+
+def test_a_stored_collision_still_counts_after_an_fsn_hit(tmp_path: Path) -> None:
+    source = _source(_settings(tmp_path), _router())
+    _seed_stamps(source, APPLE, {APPLE_ACCESSION: _record(APPLE_ACCESSION, "10-K", APPLE_ACCEPTED)})
+    _store_with_hit(source, APPLE_ACCESSION, kind="collision")
+    source.cover_pages(APPLE)
+    assert _cross_day_reasons(source)
+
+
+def test_a_quarantined_stored_failure_is_not_resolved_by_a_cache_hit_on_the_accession(
+    tmp_path: Path,
+) -> None:
+    """The success set is per accession, not per document: a quarantined entry
+    stays counted and unpruned though another document of it hit a cache."""
+    source = _source(_settings(tmp_path), _router())
+    _store_with_hit(source, APPLE_ACCESSION)
+    source._succeeded_this_run.add(APPLE_ACCESSION)
+    source._quarantined_this_run.add(APPLE_ACCESSION)
+    assert _cross_day_reasons(source)  # all 5 still count

@@ -15,11 +15,9 @@ computes:
 - the **dividend term**: over equity at close(T_i), the sum over
   `corporate_actions` dividend rows with `ex_date` in (T_i, T_{i+1}] and
   `known_at <= close(T_{i+1})` of amount x the ledger quantity held on the
-  ex-date (`positions_daily`), excluding any dividend the broker already
-  credited (an `adjustments` row of kind `dividend_cash` for the same name
-  that the T_{i+1} mark absorbed: `session <= T_{i+1}` and `known_at` no
-  later than that mark's, the residue term's cut; req 6: paper got the cash
-  already, so counting it again would double it);
+  ex-date (`positions_daily`), net of matched `dividend_cash` credits the
+  T_{i+1} mark absorbed. A credit matched to an older ex-date is subtracted
+  in the period that absorbs it, so it does not leave unexplained equity;
 - the **fill-timing term**: over equity at close(T_i), [sum over buys of
   (the paper fill price - the frozen `execution.fill_price` bar price on the
   fill's session) x filled quantity, less the same sum over sells], so a buy
@@ -46,7 +44,8 @@ with its names whichever rule applies, never excluded. A period whose
 T_{i+1} falls on or after `stop_session` is left out of the result
 entirely ("uncompared"): no term is computed for it. `window.frozen_json`
 is read for `paper.tracking_k` and `paper.tracking_rule` only, never live
-`Settings` (spec req 14).
+`Settings` (spec req 14). The dividend match also reads the window's frozen
+`risk.reconcile_dividend_credit_sessions` and `risk.reconcile_cash_tolerance`.
 """
 
 from __future__ import annotations
@@ -75,6 +74,7 @@ from tradepartner.calendar import (
     session_close,
 )
 from tradepartner.config import Cadence, RiskConfig, Settings
+from tradepartner.execution.dividend_dues import net_dividend_dues
 from tradepartner.execution.ledger import (
     Ledger,
     from_journal,
@@ -220,6 +220,10 @@ class PeriodRow:
     residue_untradable: tuple[str, ...] = ()
     #: Residue names with an absorbed quantity true-up.
     residue_trued_up: tuple[str, ...] = ()
+    #: Paper's and the trial's own period returns, whose difference is `raw` (#3180):
+    #: `economic_fidelity` compounds them. `None` only on a hand-built test row.
+    paper_return: float | None = None
+    trial_return: float | None = None
 
 
 @dataclass(frozen=True)
@@ -310,6 +314,7 @@ def _actions_as_of(actions: pl.DataFrame, t: datetime) -> pl.DataFrame:
 
 
 def _dividend_term(
+    window: PaperWindowRow,
     actions_as_of_next: pl.DataFrame,
     adjustments: Sequence[AdjustmentRow],
     marks: Sequence[PositionDailyRow],
@@ -318,17 +323,28 @@ def _dividend_term(
 ) -> float:
     if actions_as_of_next.is_empty():
         return 0.0
-    #: Sessions a `dividend_cash` adjustment was journaled for each name:
-    #: reconcile stamps it at the reconciliation session, on or after the
-    #: ex-date (`execution.reconcile_run._dividends`), never on the ex-date
-    #: itself, so the match is "on or after", not "equal to". A credit counts
-    #: when the T_{i+1} mark absorbed it (`session <= T_{i+1}` and `known_at`
-    #: no later than that mark's own `known_at`), the same cut the residue
-    #: term uses (spec amendment 2026-10-29, item 3). So a credit is either in
-    #: paper equity at T_{i+1} and not added back, or uncredited; a credit
-    #: journaled after that mark was written was not in the period's return.
+    frozen = json.loads(window.frozen_json)
+    risk = RiskConfig()
+    credit_sessions = int(
+        frozen.get(
+            "risk.reconcile_dividend_credit_sessions", risk.reconcile_dividend_credit_sessions
+        )
+    )
+    cash_tolerance = float(
+        frozen.get("risk.reconcile_cash_tolerance", risk.reconcile_cash_tolerance)
+    )
+    # Reconciliation keeps one extra credit window of older dues, so a late
+    # payment cannot consume a newer dividend on the same name.
+    lookback_start = t_next
+    for _ in range(2 * credit_sessions):
+        lookback_start = previous_session(lookback_start)
+    period_start = t_i
+    for _ in range(credit_sessions):
+        period_start = previous_session(period_start)
+    lookback_start = min(lookback_start, period_start)
     absorbed_at = max(m.known_at for m in marks if m.session == t_next)
-    credited: dict[str, list[date]] = {}
+    prior_absorbed_at = max(m.known_at for m in marks if m.session == t_i)
+    credited: dict[str, list[AdjustmentRow]] = {}
     for adjustment in adjustments:
         if (
             adjustment.kind == _DIVIDEND_CASH
@@ -336,23 +352,42 @@ def _dividend_term(
             and adjustment.session <= t_next
             and adjustment.known_at <= absorbed_at
         ):
-            credited.setdefault(adjustment.security_id, []).append(adjustment.session)
-    total = 0.0
+            credited.setdefault(adjustment.security_id, []).append(adjustment)
+            credit_start = adjustment.session
+            for _ in range(credit_sessions):
+                credit_start = previous_session(credit_start)
+            lookback_start = min(lookback_start, credit_start)
+    dues: dict[str, list[tuple[date, float]]] = {}
     for action_row in actions_as_of_next.filter(pl.col("action_type") == _DIVIDEND).iter_rows(
         named=True
     ):
         ex_date = action_row["ex_date"]
-        if not (t_i < ex_date <= t_next):
+        if not (lookback_start < ex_date <= t_next):
             continue
         security_id = action_row["security_id"]
-        if any(session >= ex_date for session in credited.get(security_id, ())):
-            continue
         #: Entitlement is held as of the session before the ex-date (the
         #: record date; `execution.reconcile_run._dividends` uses the same
         #: `previous_session(ex_date)` holding), never the ex-date's own close.
         quantity = _quantity_at(marks, security_id, previous_session(ex_date))
-        total += float(action_row["ratio_or_amount"]) * quantity
-    return total
+        if quantity:
+            dues.setdefault(security_id, []).append(
+                (ex_date, float(action_row["ratio_or_amount"]) * quantity)
+            )
+    remaining, matches = net_dividend_dues(
+        dues, credited, credit_sessions=credit_sessions, cash_tolerance=cash_tolerance
+    )
+    current_due = math.fsum(
+        amount
+        for dated in remaining.values()
+        for ex_date, amount in dated
+        if t_i < ex_date <= t_next
+    )
+    late_credit = math.fsum(
+        amount
+        for credit, ex_date, amount in matches
+        if ex_date <= t_i and not (credit.session <= t_i and credit.known_at <= prior_absorbed_at)
+    )
+    return current_due - late_credit
 
 
 def _short_terms(
@@ -665,6 +700,18 @@ def _residue_term(
         if a.window_id == window_id and a.session <= t_next and a.known_at <= k_next
     ]
     reversed_ids = reversed_true_up_ids(source_rows, t_next)
+    # A true-up and its reversal both inside the period cancel: neither moves quantity.
+    period_row_ids = {a.adjustment_id for a in period_rows if a.adjustment_id is not None}
+    cancelled_ids: set[int] = set()
+    for a in period_rows:
+        target = reversed_adjustment_id(a)
+        if (
+            a.adjustment_id is not None
+            and target is not None
+            and target in reversed_ids
+            and target in period_row_ids
+        ):
+            cancelled_ids.update((a.adjustment_id, target))
     for a in period_rows:
         if a.kind == "carried_residue":
             raise ValueError(f"{a.security_id} {t_i} to {t_next}: carried_residue inside period")
@@ -718,7 +765,7 @@ def _residue_term(
             )
             if not late and had_residue:
                 raise ValueError(f"{name} {t_i} to {t_next}: corporate_action_cash on unheld name")
-        if a.quantity:
+        if a.quantity and a.adjustment_id not in cancelled_ids:
             quantity_names.add(name)
         if a.kind not in {"merger_receipt", "spinoff_receipt"}:
             continue
@@ -750,7 +797,11 @@ def _residue_term(
         mark_next = marks_next.get(name)
         if mark_next is not None and mark_next.position_side == "short":
             raise ValueError(f"{name} {t_i} to {t_next}: short residue")
-        if mark_next is None and not has_fill and not any(a.quantity for a in rows):
+        if (
+            mark_next is None
+            and not has_fill
+            and not any(a.quantity and a.adjustment_id not in cancelled_ids for a in rows)
+        ):
             raise ValueError(f"{name} {t_i} to {t_next}: unexplained missing mark")
         if mark_i.tradable is not True or (
             mark_next is not None and mark_next.tradable is not True
@@ -953,7 +1004,12 @@ def compare_periods(
 
         dividend_term = (
             _dividend_term(
-                actions_as_of_next, journal.adjustments, journal.positions_daily, t_i, t_next
+                window,
+                actions_as_of_next,
+                journal.adjustments,
+                journal.positions_daily,
+                t_i,
+                t_next,
             )
             / paper_equity_i
         )
@@ -1009,6 +1065,8 @@ def compare_periods(
                 short_book=json.loads(window.frozen_json).get("portfolio.side") == "long_short",
                 residue_untradable=residue_untradable,
                 residue_trued_up=residue_trued_up,
+                paper_return=paper_return,
+                trial_return=trial_return,
             )
         )
 
@@ -1018,6 +1076,94 @@ def compare_periods(
         periods=tuple(periods),
         passed=all(m.passed for m in periods),
         failing_period=failing,
+    )
+
+
+# --- Cumulative economic fidelity (#3180; report only) -----------------------------
+
+FidelityVerdict = Literal["consistent", "divergent", "too_few_periods"]
+_BPS = 10_000.0
+
+
+@dataclass(frozen=True)
+class Fidelity:
+    """The window's cumulative paper return against the tracking trial's (#3180).
+
+    Report only: no check, exit code or stored row reads it, and it never changes a
+    per-period verdict of the `PeriodComparison` it is computed from. Both returns
+    compound every compared period, excluded ones included (a compounded return
+    cannot skip a period), and `excluded` names each excluded period with its reason
+    (`missed`, or `override` under the `residual` rule), so none is silently dropped.
+    """
+
+    paper_return: float
+    trial_return: float
+    #: (paper_return - trial_return) x 10,000.
+    gap_bps: float
+    periods: int
+    excluded: tuple[tuple[date, str], ...]
+    max_gap_bps: float
+    min_periods: int
+    verdict: FidelityVerdict
+
+    @property
+    def report_lines(self) -> tuple[str, ...]:
+        """The `paper report` lines: the cumulative line, then any excluded periods."""
+        head = (
+            f"  fidelity (report only): cumulative paper {self.paper_return:.6f} trial "
+            f"{self.trial_return:.6f} gap {self.gap_bps:+.1f} bp over {self.periods} "
+            f"period(s); {self.verdict.replace('_', ' ')} (max {self.max_gap_bps:g} bp, "
+            f"min {self.min_periods} periods)"
+        )
+        if not self.excluded:
+            return (head,)
+        listed = ", ".join(f"{session} ({reason})" for session, reason in self.excluded)
+        return (head, f"  fidelity excluded periods, kept in the cumulative: {listed}")
+
+
+def economic_fidelity(
+    comparison: PeriodComparison, *, max_gap_bps: float, min_periods: int
+) -> Fidelity:
+    """The cumulative fidelity line over `comparison.periods` (#3180), pure.
+
+    `verdict` is `too_few_periods` below `min_periods` compared periods, else
+    `consistent` when |gap| <= `max_gap_bps`, else `divergent`. The thresholds are
+    the caller's live `paper.fidelity_*` keys, never frozen: the line is a
+    diagnostic, not a rule. Raises `ValueError` for a row without both period
+    returns or with a non-finite one."""
+    paper_growth = 1.0
+    trial_growth = 1.0
+    excluded: list[tuple[date, str]] = []
+    for period in comparison.periods:
+        if period.paper_return is None or period.trial_return is None:
+            raise ValueError(f"period {period.rebalance_session} has no paper or trial return")
+        if not (math.isfinite(period.paper_return) and math.isfinite(period.trial_return)):
+            raise ValueError(f"period {period.rebalance_session} return is not finite")
+        paper_growth *= 1 + period.paper_return
+        trial_growth *= 1 + period.trial_return
+        if period.excluded:
+            reason = _MISSED if period.missed else _OVERRIDE
+            excluded.append((period.rebalance_session, reason))
+    paper_return = paper_growth - 1
+    trial_return = trial_growth - 1
+    gap_bps = (paper_return - trial_return) * _BPS
+    count = len(comparison.periods)
+    verdict: FidelityVerdict
+    if count < min_periods:
+        verdict = "too_few_periods"
+    elif abs(gap_bps) <= max_gap_bps:
+        verdict = "consistent"
+    else:
+        verdict = "divergent"
+    return Fidelity(
+        paper_return=paper_return,
+        trial_return=trial_return,
+        gap_bps=gap_bps,
+        periods=count,
+        excluded=tuple(excluded),
+        max_gap_bps=max_gap_bps,
+        min_periods=min_periods,
+        verdict=verdict,
     )
 
 
@@ -1206,6 +1352,8 @@ class Report:
     #: Set when the window was capped short of the last completed rebalance session
     #: because the book has no marks there (a halted session, #2448).
     window_note: str | None = None
+    #: The report-only cumulative fidelity line (#3180); None only in canned test reports.
+    fidelity: Fidelity | None = None
 
 
 class MarksMissing(ValueError):
@@ -1478,6 +1626,11 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
         prices = _price_of(conn, fill_price_key)
         comparison = compare_periods(window, trial, journal, actions, prices, stop_session)
         targets = compare_targets(window, trial, journal, conn)
+        fidelity = economic_fidelity(
+            comparison,
+            max_gap_bps=settings.paper.fidelity_max_gap_bps,
+            min_periods=settings.paper.fidelity_min_periods,
+        )
         fill_slippage, slippage_note = _slippage_for_report(conn, window_id)
 
     now = utc_now()
@@ -1499,4 +1652,5 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
         slippage=fill_slippage,
         slippage_note=slippage_note,
         window_note=window_note,
+        fidelity=fidelity,
     )

@@ -34,6 +34,7 @@ from tradepartner.ingest import FAILED, OK, STALE, IngestResult, RestampResult, 
 from tradepartner.store import journal, registry, schema
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.dividend_reviews import ReviewedGroup
+from tradepartner.store.retracted_rows import retract
 from tradepartner.store.schema import init_schema
 
 USER_AGENT = "Test Owner test-owner-ua@example.com"
@@ -746,6 +747,21 @@ def test_a_fill_holes_run_prints_each_month_and_exits_on_its_status(
     assert _invoke(secrets_set, args).exit_code == 0
 
 
+def test_a_fill_holes_run_prints_a_progress_line_as_each_month_ends(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    # #3234: a fill ran hours with nothing on stdout until it ended.
+    def fill(settings: Settings, **kwargs: Any) -> HoleFill:
+        kwargs["progress"]("alpaca holes 2018-08 (1/1): filled, 40 rows, 1.0 s")
+        return HoleFill((), (), False)
+
+    monkeypatch.setattr(cli, "fill_holes", fill)
+    args = ["ingest", "--backfill", "--since", "2016-01-01", "--source", "alpaca", "--fill-holes"]
+    result = _invoke(_with_store(secrets_set), args)
+    assert result.exit_code == 0, result.output
+    assert "alpaca holes 2018-08 (1/1): filled, 40 rows, 1.0 s" in result.output
+
+
 def test_a_fill_holes_dry_run_on_a_locked_store_says_so_and_lists_nothing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -993,6 +1009,61 @@ def test_health_prints_the_report_and_check_passes_on_the_fixture_store(
     assert checked.exit_code == 0, checked.output
 
 
+def test_health_check_fails_a_stale_store(tmp_path: Path, fixture_store_path: Path) -> None:
+    """#3329: a store N sessions behind (past `health.max_stale_sessions`) must not print OK."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    late = T_END + timedelta(days=7)  # 2020-07-07 evening: 4 sessions behind
+    failed = _invoke(settings, ["health", "--check"], clock=lambda: late)
+    assert failed.exit_code == 1, failed.output
+    assert "store_stale" in failed.output
+    assert "health: OK" not in failed.output
+
+
+def test_health_check_fails_the_morning_after_a_missed_ingest(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """#3329: one session behind passes only before tonight's ingest on the session's own day."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    before = session_close(date(2020, 7, 1)) + timedelta(hours=1)  # 17:00 ET, ingest not due
+    ok = _invoke(settings, ["health", "--check"], clock=lambda: before)
+    assert ok.exit_code == 0, ok.output
+    morning = session_close(date(2020, 7, 1)) + timedelta(hours=17)  # next morning
+    failed = _invoke(settings, ["health", "--check"], clock=lambda: morning)
+    assert failed.exit_code == 1, failed.output
+    assert "store_stale" in failed.output
+
+
+def test_health_check_fails_an_empty_store(tmp_path: Path) -> None:
+    """#3329: a store with no price bars fails `--check`."""
+    settings = _settings(tmp_path)
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+    failed = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert failed.exit_code == 1, failed.output
+    assert "store_stale" in failed.output
+    assert "health: OK" not in failed.output
+
+
+def test_health_prints_the_delisting_reasons_and_mergers_blocks(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """#3215: the report-only delisting-reasons block (T329) and the mergers
+    block (T248e) reach `health`'s output, not only the integrity list."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    plain = _invoke(settings, ["health"], clock=lambda: T_END)
+    assert plain.exit_code == 0, plain.output
+    with open_for_write(settings) as conn:
+        report = health.health_report(conn, T_END, settings)
+    assert report.delisting_reasons is not None
+    for line in report.delisting_reasons.lines():
+        assert line in plain.output, line
+    assert "unknown episodes: 8; conflicted: 0" in plain.output
+    assert "mergers: cash 1, stock 1, stock_and_cash 0" in plain.output
+    assert "  merger conflicts: 0" in plain.output
+    assert "  acquirees with a bar after their effective date: 1" in plain.output
+    assert "    SEC_DIV_CANCELLED effective 2020-02-14:" in plain.output
+
+
 def test_health_prints_the_figi_types_block_and_fails_only_with_the_threshold(
     tmp_path: Path, fixture_store_path: Path
 ) -> None:
@@ -1032,6 +1103,94 @@ def test_health_prints_the_figi_types_block_and_fails_only_with_the_threshold(
     failed = _invoke(gated, ["health", "--check"], clock=lambda: T_END)
     assert failed.exit_code == 1
     assert "figi_types_disagreements" in failed.output
+
+
+def test_health_prints_the_figi_identity_block(tmp_path: Path, fixture_store_path: Path) -> None:
+    """#3440: the `figi_identity` block (T399) reaches `health`'s output: the
+    counts by kind, the first rows of each kind and the cannot-check lines,
+    beside 'figi types'."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    with open_for_write(settings) as conn:
+        for sid, share_class, figi, composite in (
+            ("SEC_DUAL_A", "SC1", "BBG-A", "BBGSAME"),
+            ("SEC_DUAL_B", "SC1", "BBG-B", "BBG-BB"),
+            ("SEC_MTUM", "SC2", "BBG-M", "BBGSAME"),
+        ):
+            insert_row(
+                conn,
+                "openfigi_types",
+                {
+                    "security_id": sid,
+                    "ticker": sid,
+                    "figi": figi,
+                    "composite_figi": composite,
+                    "share_class_figi": share_class,
+                    "security_type": "Common Stock",
+                    "security_type2": "Common Stock",
+                    "market_sector": "Equity",
+                    "name": sid,
+                    "exch_code": "US",
+                    "mapped": True,
+                    "known_at": T_END - timedelta(days=1),
+                    "ingested_at": T_END - timedelta(days=1),
+                    "provenance": "openfigi",
+                    "source": "openfigi",
+                },
+            )
+        insert_row(
+            conn,
+            "openfigi_types",
+            {
+                "security_id": "SEC_FACTS_RESTATED",
+                "ticker": "FRST",
+                "figi": "",
+                "composite_figi": "",
+                "share_class_figi": "",
+                "security_type": "",
+                "security_type2": "",
+                "market_sector": "",
+                "name": "",
+                "exch_code": "US",
+                "mapped": False,
+                "known_at": T_END - timedelta(days=1),
+                "ingested_at": T_END - timedelta(days=1),
+                "provenance": "openfigi",
+                "source": "openfigi",
+            },
+        )
+        insert_row(
+            conn,
+            "successor_chains",
+            {
+                "predecessor_id": "SEC_DUAL_A",
+                "successor_id": "SEC_MTUM",
+                "evidence_accession": "SEC_MTUM-1",
+                "evidence_form": "8-K12B",
+                "known_at": T_END - timedelta(days=1),
+                "ingested_at": T_END - timedelta(days=1),
+                "source": "edgar",
+                "provenance": "filing",
+                "retracted": False,
+            },
+        )
+    plain = _invoke(settings, ["health"], clock=lambda: T_END)
+    assert plain.exit_code == 0, plain.output
+    assert "figi identity: 4 disagreements (report-only)" in plain.output
+    assert (
+        "share_class_same_cik 1, successor_share_class_differs 1, "
+        "unmapped_while_listed 1, figi_shared_across_ciks 1" in plain.output
+    )
+    assert "share_class_same_cik SEC_DUAL_A <-> SEC_DUAL_B: share_class_figi SC1" in plain.output
+    assert (
+        "successor_share_class_differs SEC_MTUM successor of SEC_DUAL_A: "
+        "share_class_figi SC2 vs SC1" in plain.output
+    )
+    assert (
+        "unmapped_while_listed SEC_FACTS_RESTATED: mapped FALSE "
+        "(cik CIK0001000016) (FRST NYSE)" in plain.output
+    )
+    assert "figi_shared_across_ciks SEC_DUAL_A <-> SEC_MTUM: composite_figi BBGSAME" in plain.output
+    assert "cannot check: ticker: OpenFIGI's stored ticker is our own query echo" in plain.output
 
 
 def test_health_check_enforces_rate_stamp_and_passes_fixture(
@@ -1308,14 +1467,23 @@ def _chain_store(settings: Settings) -> None:
 
 
 def test_health_prints_the_successor_chains_block_and_the_price_break_warning(
-    tmp_path: Path, fixture_store_path: Path
+    tmp_path: Path, fixture_store_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """#1922: every live chain is listed with its hand-over day and close
     ratio (hand-computed 19.33/15.41 = 1.25, 19.65/20.52 = 0.96,
     19.27/19.87 = 0.97), the latest EDGAR run's candidates sit beside it, and
-    the one break is a `warning: chain_price_break` line, never a failure."""
+    the one break is a `warning: chain_price_break` line, never a failure.
+    The three fixture chains are reviewed (#3142), so `chain_not_reviewed`
+    stays clean and only the display is under test."""
     settings = _settings(tmp_path, store=fixture_store_path)
     _chain_store(settings)
+    with duckdb.connect(str(settings.store.path), read_only=True) as conn:
+        chains = conn.execute(
+            "SELECT c.predecessor_id, c.successor_id, "
+            "(SELECT min(l.valid_from) FROM listings l WHERE l.security_id = c.successor_id) "
+            "FROM successor_chains c"
+        ).fetchall()
+    monkeypatch.setattr(health, "reviewed_chains", lambda: frozenset(chains))
     _run_row(
         settings,
         "r1",
@@ -2542,12 +2710,12 @@ def test_delete_master_rows_dry_run_then_delete(master_store: tuple[Settings, Pa
     args = ["delete-master-rows", "--manifest", str(manifest), "--release", _MASTER_RELEASE]
     dry = _invoke(settings, [*args, "--dry-run"], edgar_client=client)
     assert dry.exit_code == 0, dry.output
-    assert dry.output.startswith("would delete 1 listings and 0 delistings rows of 1 manifest")
+    assert dry.output.startswith("would retract 1 listings and 0 delistings rows of 1 manifest")
     assert f"listings {_VZ} VZ22A NYSE 2019-10-30" in dry.output
     assert asked and _stored_tickers(settings) == ["VZ", "VZ22A"]
     done = _invoke(settings, args, edgar_client=client)
     assert done.exit_code == 0, done.output
-    assert done.output.startswith("deleted 1 listings")
+    assert done.output.startswith("retracted 1 listings")
     assert _stored_tickers(settings) == ["VZ"]
 
 
@@ -2922,6 +3090,25 @@ def test_migrate_cache_apply_then_restore_round_trips_the_bytes(arch: _ArchiveRi
     assert (arch.cache / arch.dead).stat().st_mtime_ns == mtime
 
 
+def test_migrate_cache_apply_exits_non_zero_on_a_corrupt_archived_body(
+    arch: _ArchiveRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store import raw_archive, raw_archive_migrate
+
+    real = raw_archive_migrate.evict_uploaded
+
+    def corrupting(settings: Any, hashes: Sequence[str], icloud: Any) -> Any:
+        raw_archive.body_path(arch.root, hashes[0]).write_bytes(b"corrupt")
+        return real(settings, hashes, icloud)
+
+    monkeypatch.setattr(raw_archive_migrate, "evict_uploaded", corrupting)
+    result = arch.run("migrate-cache", "--apply")
+
+    assert result.exit_code == 1, result.output
+    assert "mismatched" in result.output
+    assert "INTEGRITY" in result.output
+
+
 @pytest.mark.parametrize("path", ["nothing/here", "stamps/v1/0001.json"])
 def test_restore_refuses_with_a_plain_message_and_writes_nothing(
     arch: _ArchiveRig, path: str
@@ -2942,6 +3129,42 @@ def test_archive_commands_refuse_when_the_archive_is_off(arch: _ArchiveRig) -> N
         result = arch.run(*args)
         assert result.exit_code != 0
         assert "TRADEPARTNER_RAW_ARCHIVE" in result.output
+
+
+# --- archive rederive (plan T352, #2714) ------------------------------------------
+
+
+def test_archive_rederive_dry_run_reports_and_a_refusal_exits_non_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lookahead.rederive_rig import ACC, WRONG_SHARES, Rig
+
+    rig = Rig(tmp_path, monkeypatch)
+    rig.form4_run(wrong=WRONG_SHARES)
+    before = rig.table()
+
+    def run(*args: str) -> Any:
+        return _invoke(rig.settings, ["archive", "rederive", *args], icloud=lambda _s: rig.icloud)
+
+    dry = run("--mode", "backfill", "--accession", ACC)
+    assert dry.exit_code == 0, dry.output
+    assert "raw re-derive (dry run), mode backfill" in dry.output
+    assert "corrections 1" in dry.output and "shares" in dry.output
+    assert str(rig.root) not in dry.output  # no archive path, no account
+    assert rig.table() == before
+
+    assert "digest " in dry.output
+    real = run(
+        "--mode", "backfill", "--accession", ACC, "--release", "nope", "--expect", "1",
+        "--expect-digest", "0" * 12,
+    )  # fmt: skip
+    assert real.exit_code == 1
+    assert "rederive refused" in real.output and "no release is open" in real.output
+    count_only = run("--mode", "backfill", "--accession", ACC, "--release", "x", "--expect", "1")
+    assert count_only.exit_code == 1 and "--expect-digest" in count_only.output
+    assert run("--mode", "backfill").exit_code == 1  # nothing named
+    assert run("--mode", "backfill", "--file-date", "2026-13-01").exit_code == 2
+    assert rig.table() == before
 
 
 # --- ingest --statement-backfill (#2826, plan T365) --------------------------
@@ -3004,3 +3227,568 @@ def test_ingest_statement_backfill_refusal_comes_before_the_migration(
     assert result.exit_code == 1
     assert "--rebuild-index" in result.output
     assert session.calls == []
+
+
+# --- the coverage check is mandatory at release close (ADR 0029, T393) ----------------
+
+_COV_DAYS = [date(2020, 1, 1) + timedelta(days=i) for i in range(20)]
+
+
+def _cov_bar(conn: duckdb.DuckDBPyConnection, sid: str, day: date) -> None:
+    insert_row(
+        conn,
+        "prices_daily",
+        {
+            "security_id": sid,
+            "session": day,
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1,
+            "known_at": NOW,
+            "ingested_at": NOW,
+            "source": "test",
+            "provenance": "bar",
+        },
+    )
+
+
+def _cov_security(conn: duckdb.DuckDBPyConnection, sid: str) -> None:
+    insert_row(
+        conn,
+        "securities",
+        {
+            "security_id": sid,
+            "cik": "1",
+            "name": f"{sid} Inc",
+            "known_at": NOW,
+            "ingested_at": NOW,
+            "source": "test",
+            "provenance": "snapshot",
+        },
+    )
+
+
+def _cov_dividend(conn: duckdb.DuckDBPyConnection, sid: str) -> None:
+    insert_row(
+        conn,
+        "corporate_actions",
+        {
+            "security_id": sid,
+            "action_type": "dividend",
+            "ex_date": date(2020, 1, 10),
+            "ratio_or_amount": 0.5,
+            "announced_at": None,
+            "source_action_id": "",
+            "cancelled": False,
+            "known_at": NOW,
+            "ingested_at": NOW,
+            "source": "test",
+            "provenance": "action",
+        },
+    )
+
+
+def _cov_open(tmp_path: Path) -> tuple[Settings, Path]:
+    """A store where A and B hold the same 20 bars (a duplicate pair), with release
+    `rel` open on its backup."""
+    settings = _settings(tmp_path)
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        for sid in ("A", "B"):
+            _cov_security(conn, sid)
+            for day in _COV_DAYS:
+                _cov_bar(conn, sid, day)
+    backup = _backup(settings, tmp_path, "rel")
+    opened = _invoke(
+        settings,
+        [
+            "decision",
+            "data-release",
+            "open",
+            "--name",
+            "rel",
+            "--backup",
+            str(backup),
+            "--reason",
+            "t",
+        ],
+    )
+    assert opened.exit_code == 0, opened.output
+    return settings, backup
+
+
+def _cov_run(settings: Settings, *extra: str) -> Any:
+    return _invoke(settings, ["decision", "data-release", "coverage", "--name", "rel", *extra])
+
+
+def _cov_close(settings: Settings) -> Any:
+    return _invoke(
+        settings,
+        [
+            "decision",
+            "data-release",
+            "close",
+            "--name",
+            "rel",
+            "--from",
+            "2020-06-01",
+            "--to",
+            "2020-06-30",
+        ],
+    )
+
+
+def _cov_edit(settings: Settings, sql: str) -> None:
+    with open_for_write(settings) as conn:
+        conn.execute(sql)
+
+
+def _cov_stages(settings: Settings) -> list[str]:
+    return [r.stage for r in reversed(_releases(settings))]
+
+
+def test_close_refuses_a_bar_change_without_a_coverage_record(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_edit(
+        settings, "DELETE FROM prices_daily WHERE security_id = 'A' AND session < '2020-01-4'"
+    )
+    result = _cov_close(settings)
+    assert result.exit_code == 1, result.output
+    assert "changed prices_daily and has no coverage record" in result.output
+    assert _cov_stages(settings) == ["before"]
+
+
+def test_a_passing_record_lets_the_close_through(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_edit(
+        settings, "DELETE FROM prices_daily WHERE security_id = 'A' AND session < '2020-01-4'"
+    )
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 0, checked.output
+    assert "coverage (passed)" in checked.output
+    closed = _cov_close(settings)
+    assert closed.exit_code == 0, closed.output
+    assert _cov_stages(settings) == ["before", "coverage", "after"]
+    after = _releases(settings)[0]
+    assert after.values["changed_tables"] == ["prices_daily"]
+
+
+def test_a_failing_record_does_not_let_the_close_through(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_edit(settings, "DELETE FROM prices_daily WHERE security_id = 'A'")
+    _cov_edit(settings, "DELETE FROM prices_daily WHERE security_id = 'B'")
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 1, checked.output
+    assert "coverage (failed)" in checked.output
+    closed = _cov_close(settings)
+    assert closed.exit_code == 1 and "coverage record failed" in closed.output
+
+
+def test_a_record_is_stale_once_the_store_changes(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_edit(
+        settings, "DELETE FROM prices_daily WHERE security_id = 'A' AND session < '2020-01-4'"
+    )
+    assert _cov_run(settings, "--record").exit_code == 0
+    _cov_edit(
+        settings, "DELETE FROM prices_daily WHERE security_id = 'A' AND session < '2020-01-6'"
+    )
+    closed = _cov_close(settings)
+    assert closed.exit_code == 1 and "stale" in closed.output
+
+
+def test_the_check_alone_writes_no_record(tmp_path: Path) -> None:
+    settings, backup = _cov_open(tmp_path)
+    _cov_edit(
+        settings, "DELETE FROM prices_daily WHERE security_id = 'A' AND session < '2020-01-4'"
+    )
+    before = (Path(settings.store.path).read_bytes(), backup.read_bytes())
+    assert _cov_run(settings).exit_code == 0
+    assert (Path(settings.store.path).read_bytes(), backup.read_bytes()) == before
+
+
+def test_a_release_with_no_backup_does_not_close(tmp_path: Path) -> None:
+    settings, backup = _cov_open(tmp_path)
+    _cov_edit(
+        settings, "DELETE FROM prices_daily WHERE security_id = 'A' AND session < '2020-01-4'"
+    )
+    assert _cov_run(settings, "--record").exit_code == 0
+    backup.unlink()
+    closed = _cov_close(settings)
+    assert closed.exit_code == 1 and "no backup does not close" in closed.output
+    assert _cov_stages(settings) == ["before", "coverage"]
+
+
+def test_a_count_only_release_closes_without_a_backup_or_a_record(tmp_path: Path) -> None:
+    settings, backup = _cov_open(tmp_path)
+    backup.unlink()  # no bar, action or master row changed: nothing to compare
+    closed = _cov_close(settings)
+    assert closed.exit_code == 0, closed.output
+    assert _cov_stages(settings) == ["before", "after"]
+    assert _releases(settings)[0].values["changed_tables"] == []
+
+
+def test_a_retracted_span_with_equal_bars_on_a_successor_passes(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    with open_for_write(settings) as conn:
+        retract(
+            conn,
+            "prices_daily",
+            [("A", day) for day in _COV_DAYS[:12]],
+            "A holds B's bars",
+            "rel",
+            "manifest line 3",
+        )
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 0, checked.output
+    assert "RETRACTED prices_daily A: 12 row(s)" in checked.output
+    assert "reason A holds B's bars, rule manifest line 3" in checked.output
+    assert "received by B" in checked.output
+    assert _cov_close(settings).exit_code == 0
+
+
+def test_a_retracted_span_no_id_receives_exits_1(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_edit(
+        settings, "DELETE FROM prices_daily WHERE security_id = 'B' AND session = '2020-01-02'"
+    )
+    with open_for_write(settings) as conn:
+        retract(conn, "prices_daily", [("A", _COV_DAYS[1])], "gone", "rel", "line 1")
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 1, checked.output
+    assert "1 of 1 sessions NOT RECEIVED (2020-01-02..2020-01-02)" in checked.output
+    assert _cov_close(settings).exit_code == 1
+
+
+def _cov_revised_receiver(
+    settings: Settings, *, open_: float, volume: int, receiver: str = "A:new"
+) -> None:
+    """A retracted and a new id C gaining the same session with another bar; B's bar
+    of that session is changed (it was already there: a receiver that held a bar)."""
+    with open_for_write(settings) as conn:
+        retract(conn, "prices_daily", [("A", _COV_DAYS[1])], "refetched", "rel", "line 1")
+        conn.execute(
+            "UPDATE prices_daily SET volume = 3 WHERE security_id = 'B' AND session = ?",
+            [_COV_DAYS[1]],
+        )
+        _cov_security(conn, receiver)
+        _cov_bar(conn, receiver, _COV_DAYS[1])
+        conn.execute(
+            "UPDATE prices_daily SET open = ?, high = 1.5, low = 0.9, volume = ? "
+            "WHERE security_id = ?",
+            [open_, volume, receiver],
+        )
+
+
+def test_a_vendor_revision_gained_by_another_id_counts_as_moved(tmp_path: Path) -> None:
+    """The refetched bar keeps the open and close but has another volume, high and low
+    (#3432: Alpaca now serves a different bar for 2022-01-24): moved, printed as such."""
+    settings, _ = _cov_open(tmp_path)
+    _cov_revised_receiver(settings, open_=1.0, volume=7)
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 0, checked.output
+    assert "1 sessions refetched as a vendor revision (2020-01-02..2020-01-02)" in checked.output
+    assert "NOT RECEIVED" not in checked.output
+
+
+def test_a_different_bar_gained_with_another_open_is_not_a_revision(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_revised_receiver(settings, open_=2.0, volume=7)
+    checked = _cov_run(settings)
+    assert checked.exit_code == 1, checked.output
+    assert "1 of 1 sessions NOT RECEIVED" in checked.output
+
+
+def test_a_revision_at_higher_precision_is_received_under_the_configured_decimals(
+    tmp_path: Path,
+) -> None:
+    """#3465: the retracted open 1.0 (4 decimals) is the receiver's 1.00005 cut to
+    `store.release_move_price_decimals`; one whole unit (1.0001) is another price."""
+    settings, _ = _cov_open(tmp_path)
+    _cov_revised_receiver(settings, open_=1.00005, volume=7)
+    checked = _cov_run(settings)
+    assert checked.exit_code == 0, checked.output
+    assert "1 sessions refetched as a vendor revision" in checked.output
+    other, _ = _cov_open(tmp_path / "unit")
+    _cov_revised_receiver(other, open_=1.0001, volume=7)
+    assert "1 of 1 sessions NOT RECEIVED" in _cov_run(other).output
+
+
+def test_a_revised_bar_the_receiver_already_held_is_not_a_vendor_revision(tmp_path: Path) -> None:
+    """B held a bar for the session in the backup (a collision, not a gain): unmoved."""
+    settings, _ = _cov_open(tmp_path)
+    with open_for_write(settings) as conn:
+        retract(conn, "prices_daily", [("A", _COV_DAYS[1])], "gone", "rel", "line 1")
+        conn.execute(
+            "UPDATE prices_daily SET volume = 3, high = 1.5 "
+            "WHERE security_id = 'B' AND session = ?",
+            [_COV_DAYS[1]],
+        )
+    checked = _cov_run(settings)
+    assert checked.exit_code == 1, checked.output
+    assert "1 of 1 sessions NOT RECEIVED" in checked.output
+
+
+def test_an_unrelated_issuers_bar_with_the_same_open_and_close_is_no_revision(
+    tmp_path: Path,
+) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_revised_receiver(settings, open_=1.0, volume=7, receiver="Z")
+    checked = _cov_run(settings)
+    assert checked.exit_code == 1, checked.output
+    assert "1 of 1 sessions NOT RECEIVED" in checked.output
+
+
+def test_a_successor_whose_bar_is_missing_that_session_fails(tmp_path: Path) -> None:
+    """The resolver assigns the span to B, but B holds no bar for part of it."""
+    settings, _ = _cov_open(tmp_path)
+    _cov_edit(
+        settings, "DELETE FROM prices_daily WHERE security_id = 'B' AND session >= '2020-01-15'"
+    )
+    with open_for_write(settings) as conn:
+        retract(conn, "prices_daily", [("A", d) for d in _COV_DAYS[10:]], "dup", "rel", "line 2")
+    checked = _cov_run(settings)
+    assert checked.exit_code == 1, checked.output
+    assert "NOT RECEIVED (2020-01-15..2020-01-20)" in checked.output
+
+
+def test_a_retracted_dividend_is_reported_with_reason_and_rule(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        _cov_security(conn, "A")
+        _cov_bar(conn, "A", _COV_DAYS[0])
+        _cov_dividend(conn, "A")
+    backup = _backup(settings, tmp_path, "rel")
+    args = ["decision", "data-release", "open", "--name", "rel", "--backup", str(backup)]
+    assert _invoke(settings, [*args, "--reason", "t"]).exit_code == 0
+    with open_for_write(settings) as conn:
+        retract(
+            conn,
+            "corporate_actions",
+            [("A", "", "dividend", date(2020, 1, 10))],
+            "dup",
+            "rel",
+            "r9",
+        )
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 0, checked.output
+    assert "RETRACTED corporate_actions A: 1 row(s), reason dup, rule r9" in checked.output
+    assert _releases(settings)[0].values["summary"]["retracted_rows"] == 1
+
+
+def test_a_bar_or_dividend_with_no_owner_fails_whatever_the_threshold(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    with open_for_write(settings) as conn:
+        _cov_bar(conn, "ORPHAN", _COV_DAYS[0])  # one bar, far below any threshold
+        _cov_dividend(conn, "ORPHAN2")
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 1, checked.output
+    assert "OWNERLESS prices_daily: 1 security id(s) with no master row: ORPHAN" in checked.output
+    assert "OWNERLESS corporate_actions: 1 security id(s)" in checked.output
+    assert _cov_close(settings).exit_code == 1
+
+
+def test_record_needs_the_open_release(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    assert _cov_close(settings).exit_code == 0
+    again = _cov_run(settings, "--record")
+    assert again.exit_code == 1 and "no release is open" in again.output
+
+
+def test_an_in_place_update_is_a_change_even_at_equal_counts(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_edit(settings, "UPDATE prices_daily SET close = 2.0, high = 2.0 WHERE security_id = 'A'")
+    closed = _cov_close(settings)
+    assert closed.exit_code == 1 and "no coverage record" in closed.output
+    assert _cov_run(settings, "--record").exit_code == 0
+    _cov_edit(settings, "UPDATE prices_daily SET close = 3.0, high = 3.0 WHERE security_id = 'A'")
+    stale = _cov_close(settings)
+    assert stale.exit_code == 1 and "stale" in stale.output
+
+
+def _cov_retract_unreceived(settings: Settings, days: list[date]) -> None:
+    """A's bars on `days` retracted while B's bar there differs: nobody receives them."""
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "UPDATE prices_daily SET close = 9.0, high = 9.0 "
+            "WHERE security_id = 'B' AND session IN "
+            f"({', '.join(repr(d.isoformat()) for d in days)})"
+        )
+        retract(conn, "prices_daily", [("A", d) for d in days], "orphan", "rel", "line 7")
+
+
+def _cov_approve(settings: Settings, days: list[date]) -> None:
+    with open_for_write(settings) as conn:
+        registry.record_approved_orphans(
+            conn, release="rel", allow_orphans=len(days), keys=[("A", d) for d in days]
+        )
+
+
+def test_the_owner_approved_orphans_are_accepted_and_only_those(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    days = _COV_DAYS[:12]
+    _cov_retract_unreceived(settings, days)
+    _cov_approve(settings, days)
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 0, checked.output
+    assert "accepted by the owner's count 12 on rel" in checked.output
+    assert "NOT RECEIVED" not in checked.output
+    assert _cov_close(settings).exit_code == 0
+
+
+def test_an_unreceived_retraction_outside_the_approved_set_still_fails(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    days = _COV_DAYS[:12]
+    _cov_retract_unreceived(settings, [*days, _COV_DAYS[13]])
+    _cov_approve(settings, days)
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 1, checked.output
+    assert "1 of 13 sessions NOT RECEIVED (2020-01-14..2020-01-14)" in checked.output
+    assert "accepted by the owner's count 12 on rel" in checked.output
+    assert _cov_close(settings).exit_code == 1
+
+
+def _cov_accept(settings: Settings, *extra: str) -> Any:
+    return _invoke(
+        settings, ["decision", "data-release", "accept-unreceived", "--name", "rel", *extra]
+    )
+
+
+def _orphan_rows(settings: Settings) -> list[registry.DataRelease]:
+    return [r for r in _releases(settings) if r.stage == "orphans"]
+
+
+def _cov_retract_b_unreceived(settings: Settings, day: date) -> None:
+    """B's bar on `day` retracted while A's bar there differs: nobody receives it."""
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "UPDATE prices_daily SET close = 7.0, high = 7.0 "
+            f"WHERE security_id = 'A' AND session = '{day.isoformat()}'"
+        )
+        retract(conn, "prices_daily", [("B", day)], "orphan", "rel", "line 8")
+
+
+def test_accept_unreceived_without_a_count_lists_the_keys_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_retract_unreceived(settings, _COV_DAYS[:2])
+    listed = _cov_accept(settings)
+    assert listed.exit_code == 1, listed.output
+    assert f"UNRECEIVED A {_COV_DAYS[0].isoformat()}" in listed.output
+    assert f"UNRECEIVED A {_COV_DAYS[1].isoformat()}" in listed.output
+    assert "release rel: 2 residual unreceived key(s)" in listed.output
+    assert "nothing written" in listed.output
+    assert _orphan_rows(settings) == []
+
+
+def test_accept_unreceived_and_coverage_agree_under_the_configured_decimals(
+    tmp_path: Path,
+) -> None:
+    """#3479: a receiver matching only under `store.release_move_price_decimals`
+    (1.00005 cut to 4 decimals) is received for coverage, so accept-unreceived lists
+    no key for it either; both commands report the same set."""
+    settings, _ = _cov_open(tmp_path)
+    _cov_revised_receiver(settings, open_=1.00005, volume=7)
+    checked = _cov_run(settings)
+    assert checked.exit_code == 0, checked.output
+    assert "NOT RECEIVED" not in checked.output
+    listed = _cov_accept(settings)
+    assert "UNRECEIVED" not in listed.output, listed.output
+    assert "release rel: 0 residual unreceived key(s)" in listed.output
+    other, _ = _cov_open(tmp_path / "unit")
+    _cov_revised_receiver(other, open_=1.0001, volume=7)
+    assert "1 of 1 sessions NOT RECEIVED" in _cov_run(other).output
+    unit = _cov_accept(other)
+    assert f"UNRECEIVED A {_COV_DAYS[1].isoformat()}" in unit.output
+    assert "release rel: 1 residual unreceived key(s)" in unit.output
+
+
+def test_accept_unreceived_refuses_a_count_that_is_not_the_key_count(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_retract_unreceived(settings, _COV_DAYS[:2])
+    for wrong in ("1", "3", "0"):
+        refused = _cov_accept(settings, "--count", wrong)
+        assert refused.exit_code == 1, refused.output
+        assert f"2 residual unreceived keys and --count is {wrong}" in refused.output
+    assert _orphan_rows(settings) == []
+    assert _cov_run(settings, "--record").exit_code == 1
+
+
+def test_accept_unreceived_with_the_exact_count_lets_coverage_pass(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_retract_unreceived(settings, _COV_DAYS[:2])
+    assert _cov_run(settings, "--record").exit_code == 1
+    accepted = _cov_accept(settings, "--count", "2")
+    assert accepted.exit_code == 0, accepted.output
+    assert "data_release rel orphans (accept-unreceived, count 2)" in accepted.output
+    (row,) = _orphan_rows(settings)
+    assert row.values["source"] == "accept-unreceived"
+    assert row.values["keys"] == [f"A|{d.isoformat()}" for d in _COV_DAYS[:2]]
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 0, checked.output
+    assert "2 sessions accepted by the owner's count 2 on rel" in checked.output
+    assert "NOT RECEIVED" not in checked.output
+    assert _cov_close(settings).exit_code == 0
+    again = _cov_accept(settings)  # nothing residual is left to accept
+    assert "release rel: 0 residual unreceived key(s)" in again.output
+
+
+def test_accept_unreceived_keeps_the_repair_orphans_and_adds_to_them(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_retract_unreceived(settings, _COV_DAYS[:3])
+    _cov_approve(settings, _COV_DAYS[:2])  # repair-resolution's count, before the fill
+    listed = _cov_accept(settings)
+    assert "release rel: 1 residual unreceived key(s)" in listed.output
+    assert _cov_accept(settings, "--count", "1").exit_code == 0
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 0, checked.output
+    assert "3 sessions accepted by the owner's count 3 on rel" in checked.output
+
+
+def test_accept_unreceived_by_security_id_leaves_the_other_ids_failing(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_retract_unreceived(settings, _COV_DAYS[:2])
+    _cov_retract_b_unreceived(settings, _COV_DAYS[15])
+    listed = _cov_accept(settings, "--security-id", "B")
+    assert "UNRECEIVED A" not in listed.output
+    assert "release rel: 1 residual unreceived key(s)" in listed.output
+    assert _cov_accept(settings, "--security-id", "B", "--count", "3").exit_code == 1
+    assert _cov_accept(settings, "--security-id", "B", "--count", "1").exit_code == 0
+    checked = _cov_run(settings, "--record")
+    assert checked.exit_code == 1, checked.output
+    assert "2 of 2 sessions NOT RECEIVED" in checked.output
+    assert _orphan_rows(settings)[0].values["keys"] == [f"B|{_COV_DAYS[15].isoformat()}"]
+
+
+def test_accept_unreceived_refuses_an_id_with_no_unreceived_bars(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    _cov_retract_unreceived(settings, _COV_DAYS[:2])
+    refused = _cov_accept(settings, "--security-id", "A", "--security-id", "Z", "--count", "2")
+    assert refused.exit_code == 1, refused.output
+    assert "no unreceived retracted bars for Z" in refused.output
+    assert _orphan_rows(settings) == []
+
+
+def test_accept_unreceived_refuses_a_closed_release(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    assert _cov_close(settings).exit_code == 0
+    refused = _cov_accept(settings, "--count", "0")
+    assert refused.exit_code == 1, refused.output
+    assert _orphan_rows(settings) == []
+
+
+def test_a_retracted_bar_with_an_empty_price_is_a_named_error(tmp_path: Path) -> None:
+    settings, _ = _cov_open(tmp_path)
+    with open_for_write(settings) as conn:
+        retract(conn, "prices_daily", [("A", _COV_DAYS[0])], "dup", "rel", "line 1")
+        conn.execute(
+            "UPDATE retracted_rows SET row_values = map_concat(row_values, MAP {'close': ''})"
+        )
+    checked = _cov_run(settings)
+    assert checked.exit_code == 1
+    assert "release refused" in checked.output and "unreadable price or volume" in checked.output
+    assert "Traceback" not in checked.output

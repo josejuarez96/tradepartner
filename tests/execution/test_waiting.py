@@ -7,6 +7,8 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig
 from tradepartner.execution import waiting
@@ -570,6 +572,23 @@ def test_an_immaterial_or_symbol_only_break_restricts_nothing() -> None:
     facts = _breaks(_break("opened", event_id=1, material=False), session=TUE)
     (item,) = build([BookFacts(book_id="main", breaks=facts)], None)
     assert "not restricted" in item.detail
+
+
+@pytest.mark.parametrize(
+    ("material", "security_id", "restricts"),
+    [(True, "SEC_A", True), (False, "SEC_A", False), (True, None, False)],
+)
+def test_a_break_item_says_whether_it_restricts_the_name(
+    material: bool, security_id: str | None, restricts: bool
+) -> None:
+    # #3189 exec-4: Home reads the flag, not the detail; an `unknown_symbol`
+    # break has no security and restricts nothing
+    facts = _breaks(
+        _break("opened", event_id=1, material=material, security_id=security_id), session=TUE
+    )
+    (item,) = build([BookFacts(book_id="main", breaks=facts)], None)
+    assert item.restricts is restricts
+    assert ("not restricted" in item.detail) is not restricts
 
 
 def test_a_break_sorts_after_the_kill_switch_and_before_a_lagging_order() -> None:

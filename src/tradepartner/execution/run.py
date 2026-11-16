@@ -10,9 +10,10 @@ through `stop_step` (T63f).
 takes the book (default `paper.book_id`), its broker is that book's, and it
 takes that book's run lock and reads that book's open window only.
 `every_book_run` is `paper run` with no `--book`: every book with an open window
-(`open_books`), in token order, each its own run under its own lock with its
-own `paper_runs` row; a crash in one book's run is that book's entry and never
-stops the next. With one book (`main`, H1's) both are the run before books.
+(`open_books`), in `run_order` (`month_end`, then `week_end`, then `daily`, ties
+by token), each its own run under its own lock with its own `paper_runs` row;
+a crash in one book's run is that book's entry and never stops the next. With
+one book (`main`, H1's) both are the run before books.
 
 **Entry.** The session is the clock's New York date. The run lock (T59) is
 taken first: a second instance writes a `locked` alert with no run id (its
@@ -177,7 +178,7 @@ the run's.
 
 **The fill-price band** (#1981). Every collection of the run (step 3, step 7b and the
 wrapper's sells and buys collections) passes `collect` a `PriceBand`: a fill it
-journals outside `paper.max_fill_price_deviation` (run-time, default 0.25) of its
+journals outside `paper.max_fill_price_deviation` (run-time, default 0.5, #3130) of its
 reference price raises `SystemFaultError` naming
 `fill_price_outside_band`, so the run takes the halt path (a `halted` alert, the kill
 switch) before the next phase sizes anything on the bad fill's cash.
@@ -267,10 +268,12 @@ from tradepartner.execution.outcomes import write_outcomes_and_lots
 from tradepartner.execution.plan import (
     DecisionState,
     RebalanceState,
+    State,
     decision_state,
     rebalance_state,
     residue,
     stop_session,
+    traded_at_lapse,
 )
 from tradepartner.execution.reconcile import (
     BREAKS,
@@ -363,6 +366,7 @@ __all__ = [
     "exits_step",
     "invoked_by",
     "open_books",
+    "run_order",
     "stop_session",
     "stop_step",
     "submit_window",
@@ -703,7 +707,11 @@ def _exit_book(context: StepContext) -> _ExitBook:
     with open_read_only(context.settings, retry=True) as conn:
         actions = live_actions_as_of(conn, cut)
         journaled = decisions_for(conn, window_id)
-        orders = orders_for(conn, window_id=None)
+        # This book's orders only: another book's open sell is its own account's
+        # (#3334, #2475, as the wrapper's `_own_book_rows`).
+        orders = [
+            o for o in orders_for(conn, window_id=None) if o.book_id == context.window.book_id
+        ]
         events = order_events_for(conn, window_id=None)
         fills = fills_for(conn)
         adjustments = adjustments_for(conn, window_id)
@@ -744,12 +752,17 @@ def _exit_book(context: StepContext) -> _ExitBook:
             if held
             else {}
         )
-        tickers, ambiguous = _current_symbols(conn, session, held, context.settings, window_id)
+        mapped = order_symbols(conn, session, held, context.settings, window_id)
+        tickers = {sid: symbol for sid, symbol in mapped.symbols.items() if symbol is not None}
+        ambiguous = dict(mapped.ambiguous)
         delisted = frozenset(sid for sid, row in ends.items() if row["status"] == DELISTED)
         if delisted:
             current = planning.current_listings(
                 listings_as_of(conn, cut, sorted(delisted)), session
             )
+            # A held predecessor's chain successor is no later issuer of the
+            # successor symbol the map sends it under (#3031, #3051), as in the
+            # wrapper's `_listings`.
             reused = _refuse_reused_tickers(
                 conn,
                 cut,
@@ -758,6 +771,7 @@ def _exit_book(context: StepContext) -> _ExitBook:
                 delisted,
                 tickers,
                 context.settings.alpaca.class_symbols,
+                mapped.chained,
             )
             for sid, note in reused.items():
                 ambiguous[sid] = f"{ambiguous[sid]}; {note}" if sid in ambiguous else note
@@ -1194,12 +1208,54 @@ def open_books(
             require_journal(conn)
         except JournalNotInitialised:
             return ()
-        rows = conn.execute(
-            "SELECT DISTINCT book_id FROM paper_windows WHERE window_id NOT IN "
-            "(SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))",
-            [list(CLOSING_STOP_STATES)],
-        ).fetchall()
+        return _open_book_ids(conn)
+
+
+def _open_book_ids(conn: duckdb.DuckDBPyConnection) -> tuple[str, ...]:
+    rows = conn.execute(
+        "SELECT DISTINCT book_id FROM paper_windows WHERE window_id NOT IN "
+        "(SELECT window_id FROM paper_window_stops WHERE state IN (SELECT unnest(?)))",
+        [list(CLOSING_STOP_STATES)],
+    ).fetchall()
     return tuple(sorted(str(row[0]) for row in rows))
+
+
+#: `run_order`'s rank per cadence (spec amendment 2026-11-07, #3118 item 6): the
+#: slower books first, so `main`'s buys do not wait behind `daily`'s run (#2886).
+_CADENCE_RUN_RANK: dict[Cadence, int] = {"month_end": 0, "week_end": 1, "daily": 2}
+#: The rank of a book whose cadence cannot be read: after every readable book.
+_UNREADABLE_RANK = len(_CADENCE_RUN_RANK)
+
+
+def run_order(
+    settings: Settings, *, on_wait: Callable[[str], None] | None = None
+) -> tuple[str, ...]:
+    """`open_books` in the order `every_book_run` runs them (spec amendment
+    2026-11-07, #3118 item 6): by the open window's frozen cadence, `month_end`,
+    then `week_end`, then `daily`, ties by token. A book with any error reading its
+    cadence (two open windows, a window naming no hypothesis, a cadence outside
+    `Cadence`, malformed stored params) goes last, ties by token, and is still
+    listed: its own run then fails closed on the same read, and no other book is
+    held back by it. Only the listing's own errors propagate. One short
+    read-only connection; empty on a store with no journal."""
+    with open_read_only(settings, retry=True, on_wait=on_wait) as conn:
+        try:
+            require_journal(conn)
+        except JournalNotInitialised:
+            return ()
+        books = _open_book_ids(conn)
+        ranks = {book: _run_rank(conn, book) for book in books}
+    return tuple(sorted(books, key=lambda book: (ranks[book], book)))
+
+
+def _run_rank(conn: duckdb.DuckDBPyConnection, book: str) -> int:
+    try:
+        window = open_window(conn, book)
+        if window is None:
+            return _UNREADABLE_RANK
+        return _CADENCE_RUN_RANK[window_cadence(conn, window)]
+    except Exception:  # any read error: the book's own run fails closed on it
+        return _UNREADABLE_RANK
 
 
 def every_book_run(
@@ -1211,7 +1267,8 @@ def every_book_run(
     sleep: Callable[[float], None] = time.sleep,
 ) -> tuple[BookRun, ...]:
     """`paper run` with no `--book` (ADR 0017 B.3): `tracking_run` for every
-    book of `open_books`, in token order, each with its own broker
+    book of `open_books`, in `run_order` (by cadence, `month_end` first, ties by
+    token; spec amendment 2026-11-07 item 6), each with its own broker
     (`broker_for(book)`, built inside that book's turn), its own run lock and its
     own `paper_runs` row. With no open book it is `paper.book_id`'s run alone,
     which writes its `no_window` alert as before books. A book whose broker
@@ -1222,7 +1279,7 @@ def every_book_run(
     `halted` result, or an unfinished row its next run closes `crashed`). Only
     `KeyboardInterrupt` stops the loop. The listing's own errors propagate
     before any book runs."""
-    books = open_books(settings) or (resolve_book(settings, None),)
+    books = run_order(settings) or (resolve_book(settings, None),)
     results: list[BookRun] = []
     for book in books:
         try:
@@ -1637,7 +1694,7 @@ class _Run:
         ledger = self._ledger_at(self.session, actions)
         self.assets_read(list(self._symbols(sorted(ledger.positions)).values()))
         self._mark(actions)
-        self._lapses()
+        self._lapses(actions)
         self._outcomes(actions)
         if self.engaged:
             return self._skipped()
@@ -1803,18 +1860,27 @@ class _Run:
         if context is None:
             return None
         prices: dict[str, float] = {}
+        bar_sessions: dict[str, date] = {}
         names = sorted({o.security_id for o in orders})
         with open_read_only(self.settings, retry=True) as conn:
             try:
                 prices = planning.reference_prices(
-                    conn, context.session, names, context.actions_as_of
+                    conn,
+                    context.session,
+                    names,
+                    context.actions_as_of,
+                    bar_sessions=bar_sessions,
                 )
             except ValueError:  # one name has no bar: price the others one by one
                 for name in names:
                     with suppress(ValueError):
                         prices.update(
                             planning.reference_prices(
-                                conn, context.session, [name], context.actions_as_of
+                                conn,
+                                context.session,
+                                [name],
+                                context.actions_as_of,
+                                bar_sessions=bar_sessions,
                             )
                         )
         return PriceBand(
@@ -1822,6 +1888,7 @@ class _Run:
             context.actions_as_of,
             context.session,
             self.settings.paper.max_fill_price_deviation,
+            bar_sessions.__getitem__,
         )
 
     def _collect(self) -> Collected:
@@ -1921,30 +1988,9 @@ class _Run:
         for t_i in rebalance_sessions(first, self.session, self.cadence):
             if fill_session(t_i, self.cadence) > self.session or t_i in settled:
                 continue
-            mine = [
-                d
-                for d in inputs.decisions
-                if d.decision.rebalance_session == t_i and d.decision.decision != _FORCED_EXIT
-            ]
-            if not mine:
+            states = self._decision_states(t_i, inputs, actions, prices)
+            if not states:
                 continue
-            states = [
-                (
-                    d.decision,
-                    decision_state(
-                        d.decision,
-                        list(d.events),
-                        inputs.orders,
-                        inputs.order_events,
-                        inputs.fills,
-                        actions,
-                        prices.__getitem__,
-                        self.frozen,
-                        session=self.session,
-                    ),
-                )
-                for d in mine
-            ]
             verdict = rebalance_state(
                 t_i,
                 self.window,
@@ -2261,8 +2307,39 @@ class _Run:
         self.engaged = True
         self._alert(_DRAWDOWN, crossing.reason)
 
-    def _lapses(self) -> None:
-        """The lapse rows from `marks.lapses`, with one `missed_rebalance` alert."""
+    def _decision_states(
+        self,
+        t_i: date,
+        inputs: WindowJournalInputs,
+        actions: pl.DataFrame,
+        prices: Mapping[str, float],
+    ) -> list[tuple[DecisionRow, DecisionState]]:
+        """Every decision of rebalance `t_i` (forced exits aside) with its state on S."""
+        return [
+            (
+                d.decision,
+                decision_state(
+                    d.decision,
+                    list(d.events),
+                    inputs.orders,
+                    inputs.order_events,
+                    inputs.fills,
+                    actions,
+                    prices.__getitem__,
+                    self.frozen,
+                    session=self.session,
+                ),
+            )
+            for d in inputs.decisions
+            if d.decision.rebalance_session == t_i and d.decision.decision != _FORCED_EXIT
+        ]
+
+    def _lapses(self, actions: pl.DataFrame) -> None:
+        """The lapse rows from `marks.lapses`, with one `missed_rebalance` alert. A
+        lapsing rebalance that traded (`plan.traded_at_lapse`: every order of every
+        open decision filled, #3141) is journaled `executed` instead, with a note
+        naming its open remainders, and goes through the unspent-cash check; only the
+        others are `missed`."""
         with open_read_only(self.settings, retry=True) as conn:
             runs = runs_for(conn, self.window_id)
             events = rebalance_events_for(conn, self.window_id)
@@ -2280,8 +2357,33 @@ class _Run:
         )
         if not missed:
             return
+        with open_read_only(self.settings, retry=True) as conn:
+            inputs = window_journal_inputs(conn, self.window_id)
+        prices = self._pending_prices(actions)
+        left: dict[date, list[tuple[str | None, str, float]]] = {}
+        for lapse in missed:
+            states = self._decision_states(lapse.rebalance_session, inputs, actions, prices)
+            if traded_at_lapse(states, inputs.orders, inputs.order_events, inputs.fills):
+                left[lapse.rebalance_session] = [
+                    (d.side, d.security_id, s.remainder.notional)
+                    for d, s in states
+                    if s.state is State.OPEN and s.remainder is not None
+                ]
+        traded = set(left)
+        missed = [lapse for lapse in missed if lapse.rebalance_session not in traded]
         stamp = self.gate.read_clock()
         with self.connect() as conn:
+            for t_i in sorted(traded):
+                append(
+                    conn,
+                    RebalanceEventRow(
+                        rebalance_session=t_i,
+                        run_id=self.run_id,
+                        status=_EXECUTED,
+                        known_at=stamp,
+                        ingested_at=stamp,
+                    ),
+                )
             for lapse in missed:
                 append(
                     conn,
@@ -2294,12 +2396,26 @@ class _Run:
                         ingested_at=stamp,
                     ),
                 )
-        self._alert(
-            "missed_rebalance",
-            "; ".join(
-                f"rebalance {m.rebalance_session.isoformat()} missed ({m.reason})" for m in missed
-            ),
-        )
+        for t_i in sorted(traded):
+            total = sum(notional for _, _, notional in left[t_i])
+            self.notes.append(
+                f"rebalance {t_i.isoformat()} executed at its lapse: every order filled; "
+                f"open remainders not traded further ({total:.2f} in all): "
+                + ", ".join(
+                    f"{side or 'no side'} {sid} {notional:.2f}" for side, sid, notional in left[t_i]
+                )
+            )
+        if missed:
+            self._alert(
+                "missed_rebalance",
+                "; ".join(
+                    f"rebalance {m.rebalance_session.isoformat()} missed ({m.reason})"
+                    for m in missed
+                ),
+            )
+        # After the missed alert, so a halting broker read here never swallows it. Idle
+        # cash of a rebalance executed here is judged like any other executed one.
+        self._unspent_cash(sorted(traded))
 
     def _outcomes(self, actions: pl.DataFrame) -> None:
         """The due outcomes and the lot-ledger write (T62). A lot-ledger error is
@@ -2472,9 +2588,14 @@ def _mark_symbols(
 
     A later issuer's asset cannot supply the former issuer's mark flag. Both
     the listing ticker and the mapped symbol matter after a ticker change.
-    Every listing and ending is read as known at close(S-1).
+    Every listing and ending is read as known at close(S-1). A held
+    predecessor's chain successor (#3031) is no later issuer of the successor
+    symbol the map sends it under.
     """
-    symbols, _ambiguous = _current_symbols(conn, session, names, settings, window_id)
+    if not names:
+        return {}
+    mapped = order_symbols(conn, session, names, settings, window_id)
+    symbols = {sid: symbol for sid, symbol in mapped.symbols.items() if symbol is not None}
     if not symbols:
         return symbols
     cut = calendar.session_close(previous_session(session))
@@ -2497,10 +2618,12 @@ def _mark_symbols(
         if own_listing_symbol is not None:
             own_tickers.add(own_listing_symbol)
         own_start = own["valid_from"]
+        successor = mapped.chained.get(sid)
         if any(
             other_sid != sid
             and (other_symbol := broker_symbol(row, settings.alpaca.class_symbols)) is not None
             and other_symbol in own_tickers
+            and not (other_sid == successor and other_symbol == symbols[sid])
             and row["valid_from"] is not None
             and (own_start is None or row["valid_from"] > own_start)
             for other_sid, row in listings.items()

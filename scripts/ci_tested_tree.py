@@ -14,7 +14,11 @@ but only when every one of these holds:
 3. this commit's tree equals the PR head's tree;
 4. one CI run (check suite) on the PR head, from GitHub Actions, has ``checks`` and every
    ``pytest-shard (i)``, ``i < PYTEST_SHARD_COUNT``, completed with ``success`` (a skipped
-   shard is not a pass: a docs-only PR's run never tested the tree).
+   shard is not a pass: a docs-only PR's run never tested the tree);
+5. the PR's diff (``parent...head``) touches the dashboard, so its shards ran
+   ``tests/dashboard`` (#3221: a PR that misses the dashboard skips those tests, and main
+   then runs the full suite); the rule is ``dashboard_tests_needed``, which CI's scope
+   job also calls (``--dashboard-tests-needed``).
 
 Fails closed: any other outcome, a failed or odd API answer, a missing input or an
 exception prints ``run`` and the full suite runs. The reason goes to stderr, which is the
@@ -25,6 +29,9 @@ Usage (CI)::
 
     GH_TOKEN=... GITHUB_REPOSITORY=owner/repo PYTEST_SHARD_COUNT=10 \\
         python3 scripts/ci_tested_tree.py <sha>
+    git diff --name-only origin/main...HEAD | \\
+        python3 scripts/ci_tested_tree.py --dashboard-tests-needed
+        # prints yes/no: whether a PR's shards run tests/dashboard (#3221)
 
 Standard library only: it runs before ``uv sync`` could matter, on the runner's python3.
 """
@@ -103,6 +110,14 @@ def decide(api: Api, repo: str, sha: str, shard_count: int) -> tuple[bool, str]:
             f"(compare status {compare.get('status')!r})"
         )
 
+    files = compare.get("files")
+    if not isinstance(files, list) or len(files) >= COMPARE_FILES_CAP:
+        return False, f"PR #{number}'s file list is missing or may be truncated"
+    paths = [str(f.get("filename") or "") for f in files]
+    paths += [str(f["previous_filename"]) for f in files if f.get("previous_filename")]
+    if not dashboard_tests_needed(paths):
+        return False, f"PR #{number} misses the dashboard, so its run skipped tests/dashboard"
+
     passed, why = _head_passed_in_full(api, repo, head, shard_count)
     if passed:
         return True, f"tree {tree[:7]} is PR #{number}'s head {head[:7]}; {why}"
@@ -132,6 +147,17 @@ def _head_passed_in_full(api: Api, repo: str, head: str, shard_count: int) -> tu
                 f"{head[:7]} passed checks and all {shard_count} shards in check suite {suite}",
             )
     return False, f"no CI run on {head[:7]} passed checks and every shard"
+
+
+# On a PR, CI's shards run tests/dashboard only when the diff touches one of these
+# (#3221, owner 2026-11-07: the dashboard's AppTest runs were the flakiest gate); every
+# push runs them. `.streamlit/config.toml` is the dashboard's config, read by its tests.
+DASHBOARD_TEST_PREFIXES = ("src/tradepartner/dashboard/", "tests/dashboard/", ".streamlit/")
+
+
+def dashboard_tests_needed(paths: Sequence[str]) -> bool:
+    """Whether a PR's CI run must include ``tests/dashboard``: its diff touches the dashboard."""
+    return any(p.startswith(DASHBOARD_TEST_PREFIXES) for p in paths)
 
 
 DOCS_PREFIXES = ("docs/", "changelog.d/")
@@ -203,6 +229,10 @@ class GhApi:
 def main(argv: Sequence[str] | None = None, api: Api | None = None) -> int:
     """Print ``skip`` or ``run``; always exit 0 so the workflow reads the word, not a code."""
     args = list(sys.argv[1:] if argv is None else argv)
+    if args == ["--dashboard-tests-needed"]:
+        paths = [line.strip() for line in sys.stdin if line.strip()]
+        print("yes" if dashboard_tests_needed(paths) else "no")
+        return 0
     try:
         refresh = args[:1] == ["--refresh"]
         if refresh:

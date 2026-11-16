@@ -771,8 +771,12 @@ def test_a_shares_fact_accepted_after_close_t_i_reaches_only_plans_after_t_i(
 #: `snapshot_sightings` and `delisting_reasons` tables' names, and T318 (#2740, version 45)
 #: by hashing the empty `filing_index` table's name; without them the hash is
 #: T306's f3c2dc45...42ff1ec. #2813 (version 46) adds a nullable column to the empty
-#: `filing_index` table, which the hash does not see: the pin is unchanged.
-TEMPLATE_FINGERPRINT = "b1109eb77a1118dc11867dc4b00ffafb4c7fd54edb2217186bb94387b3c1eb42"
+#: `filing_index` table, which the hash does not see: the pin is unchanged. #3076 (version
+#: 48) appends the nullable `classifications.issuer_class`, NULL on all 26 fixture rows
+#: (they load from the CSV, never through the classifier), so every row's repr gains a
+#: trailing `None`; hashed with that column left out the template is b1109eb7...c1eb42,
+#: the previous pin, so no row's content moved.
+TEMPLATE_FINGERPRINT = "3f6a682040aea8158898be1d23031e72cc8ac8d66db7ee45edb4fbdcd23f314c"
 
 
 def _bar_revisions(conn: duckdb.DuckDBPyConnection, sid: str, session: date) -> int:

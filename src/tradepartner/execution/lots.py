@@ -96,6 +96,7 @@ import polars as pl
 
 from tradepartner.adapters.broker import Asset
 from tradepartner.calendar import session_close
+from tradepartner.config import RiskConfig
 from tradepartner.execution.ledger import (
     TRUE_UP_KINDS,
     _split_ratio,
@@ -115,6 +116,7 @@ WASH_SALE_WINDOW_DAYS = 30
 
 _EXCHANGE_TZ = ZoneInfo("America/New_York")
 _ZERO = Fraction(0)
+_CIL_CASH_TOLERANCE = Fraction(str(RiskConfig().reconcile_cash_tolerance))
 _ONE = Fraction(1)
 
 # Event ranks within one session, the positions ledger's own order.
@@ -551,6 +553,7 @@ class _Ledger:
         boot = removal_cash - same_session_cil if kind == "stock_and_cash" else _ZERO
         later_cash = sum((_cash(row) for row in cash_rows if row.quantity is None), _ZERO)
         later_boot = _ZERO
+        rounding_tolerance = _ZERO
         if kind == "stock_and_cash" and "merger_cash_due" in terms:
             # Later cash first completes the boot the merger owed; only the
             # rest is cash in lieu of the fractional share.
@@ -564,6 +567,12 @@ class _Ledger:
                 later_cash if fraction_due <= _ZERO else min(later_cash, max(due - boot, _ZERO))
             )
             boot += later_boot
+            rounding_tolerance = min(
+                _CIL_CASH_TOLERANCE,
+                Fraction.from_float(
+                    math.ulp(float(due)) + math.ulp(float(boot)) + math.ulp(float(later_cash))
+                ),
+            )
         if boot > _ZERO:
             price = _merger_number(terms.get("acquirer_price"), removal, "acquirer_price")
             if price <= _ZERO:
@@ -611,9 +620,12 @@ class _Ledger:
         merged.extend(held)
         merged.sort(key=lambda lot: (lot.trade_at, lot.lot_id))
         self.longs[target] = []
-        cil_cash = (removal_cash if kind == "stock" else same_session_cil) + (
-            later_cash - later_boot
-        )
+        later_cil = later_cash - later_boot
+        if later_cil <= rounding_tolerance:
+            # Journaled float cash can leave a rounding-sized boot remainder. It is
+            # not payment for the fractional share, whose basis stays carried.
+            later_cil = _ZERO
+        cil_cash = (removal_cash if kind == "stock" else same_session_cil) + later_cil
         if cil_cash > _ZERO:
             fractional = _merger_number(
                 terms.get("fractional_shares"), removal, "fractional_shares"

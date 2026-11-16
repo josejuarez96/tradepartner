@@ -51,7 +51,7 @@ security_id,ex_date,amount,verdict,retract_source_action_id,ticker,evidence
 0001058057,2021-04-08,0.06,duplicate,ca889417-b74a-4464-9340-51dab337123d,MRVL,raw records differ by cusip only
 0001847398,2021-04-08,0.03,duplicate,40d4b6bb-5527-437a-9339-73feef13604d,NECB,raw records differ by cusip only
 0001040971,2021-04-29,0.3033,duplicate,ea19186f-3794-46a8-a592-8ef093ca41cf,SLG,raw records differ by cusip only
-0001137789,2021-05-11,0.67,unresolved,,STX,Alpaca no longer returns either id; only the issuer record settles it (#1613 Q25)
+0001137789,2021-05-11,0.67,duplicate,d08ea098-e6bd-4775-9bb6-abda5545428d,STX,an independent dividend history has one 0.67 entitlement on this ex-date (2026-11-03 store measurement); the owner-side raw export pairs the two ids (#3054)
 0001413898,2021-05-13,0.04,duplicate,b48977ca-6659-414b-8992-91ef07b714a4,AHC,raw records differ by cusip only
 0001372807,2021-05-18,0.06,unresolved,,,"no listing at the ex-date (#1597 listing gap), so no raw pair"
 0001040971,2021-05-27,0.3033,duplicate,8dfac438-2df5-4d5f-b816-88398a9fdd49,SLG,raw records differ by cusip only
@@ -173,14 +173,9 @@ security_id,ex_date,amount,verdict,retract_source_action_id,ticker,evidence
 0001973832,2026-03-13,0.125,duplicate,bf7eb002-fcb2-458b-9b9c-37780ca71f20,AU,raw records differ by foreign only
 0001973832,2026-03-13,1.605,duplicate,b9a9c417-fef5-43d6-b91c-7500ba18635a,AU,raw records differ by foreign only
 0001805651:class-a-common-stock,2026-03-18,0.2,duplicate,88361561-8a03-4a0b-a674-92cfd875b437,MKTW,one $0.20 special beside a $0.25 regular: https://investors.marketwise.com/news-releases/news-release-details/marketwise-reports-net-revenue-834-million-and-net-income-140/
-0001383414,2026-04-15,0.04,distinct,,PNNT,base plus supplemental: https://pnnt.pennantpark.com/dividends-splits
-0001383414,2026-05-15,0.04,distinct,,PNNT,base plus supplemental: https://pnnt.pennantpark.com/dividends-splits
 0000069891,2026-07-13,3.25,duplicate,2c2c37af-e110-46c6-8781-779bf59a8313,FIZZ,"raw records differ by special, process date only"
-0001383414,2026-07-15,0.04,distinct,,PNNT,base plus supplemental: https://pnnt.pennantpark.com/dividends-splits
-0001383414,2026-08-14,0.04,distinct,,PNNT,base plus supplemental: https://pnnt.pennantpark.com/dividends-splits
 0002035989,2026-08-18,0.11,duplicate,fc0ea498-d89f-4e78-a51c-e2dce12d2f0f,AMRZ,raw records differ by sub type only
 0001959455,2026-08-21,0.22,duplicate,f0ec1f75-c508-469f-8a3c-f5122ae85d4a,HSHP,raw records differ by sub type only
-0001383414,2026-09-15,0.04,distinct,,PNNT,base plus supplemental: https://pnnt.pennantpark.com/dividends-splits
 0001737924,2026-09-30,0.02,duplicate,97f29711-9861-4d3a-9107-73ae7e23f5c2,NCDL,one supplemental beside a separate regular: https://www.ncdl.com/news/press-releases/detail/149/nuveen-churchill-direct-lending-corp-announces-second-quarter-2026-results
 0000006769,2021-01-21,0.025,duplicate,e0d5f90c-787c-48aa-b7ff-a8d22f5a0589,APA,raw records differ by cusip only
 0001232582,2019-06-27,0.06,duplicate,e6a56b02-5eb9-4b62-bff6-d9c1268bd9b0,AHT,raw records differ by cusip only
@@ -192,5 +187,4 @@ security_id,ex_date,amount,verdict,retract_source_action_id,ticker,evidence
 0001496048,2019-11-27,0.33,duplicate,70fb9c80-db66-4c7f-bbea-6fe458d9ba73,BPR,same rate and ex-date under old symbol BPR and new BPYU; one quarterly payment
 0001496048,2020-02-27,0.3325,duplicate,fd1db0ac-43a5-4c23-ba50-5aca3529891f,BPR,same rate and ex-date under old symbol BPR and new BPYU; one quarterly payment
 0001514281,2019-06-27,0.5,duplicate,88cc3d07-5c7d-4cc7-9938-01e731b705b2,MITT,raw records differ by cusip only
-0001383414,2026-10-15,0.04,distinct,,PNNT,base plus supplemental: https://pnnt.pennantpark.com/dividends-splits
 0001504619,2026-10-15,0.0033,duplicate,764fdbfa-b7dd-47af-b79d-dd57095cc021,PFLT,one $0.0033 supplemental beside the $0.08 base: https://pflt.pennantpark.com/stock-information/dividends-splits

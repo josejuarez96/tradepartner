@@ -78,8 +78,10 @@ functions are the vintages' one home.
 fields: a `before` row (`open_data_release`), its `after` row
 (`close_data_release`, with the sessions the repair touched), or a closed
 `record` row naming the backup that holds a trial's state
-(`record_trial_state`). At most one release is open (`open_release`); a name is
-used once. `data_vintage` also takes the `made_at` of every command-written
+(`record_trial_state`), plus `coverage` rows (`record_release_coverage`, T393) that
+`close_data_release(enforce_coverage=True)` reads. At most one release is open
+(`open_release`); a name is used once. `data_vintage` also takes the `made_at` of every
+command-written
 `after` row whose `sessions_from` is on or before the cutoff, so a release that
 only deletes rows stales the trials whose window it touched. `plan_release_import`
 and `import_release` read the hand-written `data/releases.toml` once; imported
@@ -120,6 +122,7 @@ from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Final, Literal
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pyarrow as pa
@@ -133,9 +136,11 @@ from tradepartner.calendar import (
     session_close,
 )
 from tradepartner.config import ENGINE_FAMILIES, Cadence, Settings, get_settings
+from tradepartner.config_backtest import DelistingFailureReturn
 from tradepartner.config_edgar import PRE_2826_STATEMENT_FACTS
 from tradepartner.store.benchmarks import CHECK_ONLY_IDS
 from tradepartner.store.db import configure_connection, insert_row, utc_now
+from tradepartner.store.release_coverage import price_match_sql
 from tradepartner.store.schema import (
     REBALANCE_COUNT_COLUMNS,
     REBALANCE_COUNTS_TABLE_NAME,
@@ -183,6 +188,10 @@ CADENCE_KEY: Final = "schedule.rebalance_cadence"
 #: The opt-in frozen key whose `true` value makes a trial's data vintage count
 #: the stored `spinoff` rows it reads (backtest spec amendment #1894, item 6; T211d).
 SPIN_OFFS_KEY: Final = "adjust.apply_spin_offs"
+
+#: The frozen key whose value other than `none` makes a trial's data vintage count the
+#: stored `delisting_reasons` and `mergers` rows its exits read (#2670, plan T328d).
+DELISTING_POLICY_KEY: Final = "backtest.delisting_failure_return"
 
 #: The metric row each trial's annualisation reads (strategy-lab spec req 8).
 PERIODS_PER_YEAR_METRIC: Final = "periods_per_year"
@@ -517,7 +526,9 @@ def code_tree_sha256(repo_dir: Path | None = None) -> str | None:
 # registered trial reads. `openfigi_types` (#1713, T189c) joins them: a
 # check-only table whose one reader is the `health` types block.
 # `mergers` (#1762, T248c) joins them: its one reader is the paper
-# reconciliation, so a merger backfill stales no trial.
+# reconciliation, so a merger backfill stales no trial -- unless the trial's
+# frozen `backtest.delisting_failure_return` is not `none` (#2670, T328d), when
+# it and `delisting_reasons` count (`_DELISTING_POLICY_TABLES`).
 # `tests/store/test_registry.py` pins that this list
 # and the exclusions together cover every fact table.
 _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
@@ -541,6 +552,13 @@ _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
     # Owner-entered Form 8937 fractions change paper lots, not trial inputs.
     # spinoff_allocations deliberately remains outside this explicit list.
 )
+
+#: The conditional trial tables (#2670, plan T328d): the exit evidence a trial reads
+#: only under a frozen `backtest.delisting_failure_return` other than `none` (T328b's
+#: `delisting_reasons` and `merger_exits` reads), so they count toward its vintage
+#: then and only then, the same gate as `spin_offs`. At `none` a row of either moves
+#: no vintage, so every stored vintage and pinned digest is unchanged.
+_DELISTING_POLICY_TABLES: Final[tuple[str, ...]] = ("delisting_reasons", "mergers")
 
 #: The rows of a check-only security (`store.benchmarks.CHECK_ONLY_IDS`: RSP, stored for
 #: the index check alone; backtest spec amendment #1598, item 3, question 37) are left
@@ -573,7 +591,11 @@ _TRIAL_TABLE_ROWS: Final[dict[str, str]] = {
 
 
 def data_vintage(
-    conn: duckdb.DuckDBPyConnection, cutoff: datetime, *, spin_offs: bool = False
+    conn: duckdb.DuckDBPyConnection,
+    cutoff: datetime,
+    *,
+    spin_offs: bool = False,
+    delisting_policy: DelistingFailureReturn = "none",
 ) -> datetime | None:
     """The data vintage at `cutoff` (strategy-lab spec, Definitions "Vintage"): the
     latest of the `ingested_at` over trial-readable fact rows with `known_at <=
@@ -603,6 +625,12 @@ def data_vintage(
 
     `statement_facts` counts only `PRE_2826_STATEMENT_FACTS` (#2826, T366), so a
     new statement name's rows stale no trial.
+
+    `delisting_policy` (#2670, plan T328d) other than `none` adds the
+    `delisting_reasons` and `mergers` rows with `known_at <= cutoff`
+    (`_DELISTING_POLICY_TABLES`), the exit evidence such a trial reads; a caller
+    that has a trial passes its frozen `backtest.delisting_failure_return`, while the
+    release-level vintages stay `none`. At `none` neither table moves a vintage.
     """
     if cutoff.tzinfo is None:
         raise ValueError(f"cutoff must be timezone-aware, got {cutoff!r}")
@@ -614,8 +642,11 @@ def data_vintage(
                 f" AND action_type IN ('split', 'dividend', 'spinoff'){_NOT_CHECK_ONLY}"
             ),
         }
+    candidates = _TRIAL_FACT_TABLES
+    if delisting_policy != "none":
+        candidates = (*candidates, *_DELISTING_POLICY_TABLES)
     present = set(_present_fact_tables(conn))
-    tables = [table for table in _TRIAL_FACT_TABLES if table in present]
+    tables = [table for table in candidates if table in present]
     facts: datetime | None = None
     if tables:
         union = " UNION ALL ".join(
@@ -807,7 +838,9 @@ def register_hypothesis(
     real store. With a development boundary in force (ADR 0016 point 2), refuses
     (`BoundaryRefused`) an `in_sample_start` on or after it, or one with no
     rebalance session at the frozen cadence on or before it, so no
-    registration's default window is ever empty.
+    registration's default window is ever empty, and a non-oracle
+    `holdout_start` on or before it (points 3 and 8, #3151), so no exam month
+    is a development month.
     """
     settings = settings if settings is not None else get_settings()
     if family not in settings.hypotheses.families:
@@ -841,6 +874,11 @@ def register_hypothesis(
             raise BoundaryRefused(
                 f"{slug!r}: in_sample_start {in_sample_start} leaves no {cadence} rebalance "
                 f"session on or before the development boundary {boundary}"
+            )
+        if family != ORACLE_FAMILY and holdout_start <= boundary:
+            raise BoundaryRefused(
+                f"{slug!r}: holdout.start {holdout_start} is on or before the development "
+                f"boundary {boundary}: exam months never become development months"
             )
     families = conn.execute(
         "SELECT DISTINCT family FROM hypotheses WHERE slug = ?", [slug]
@@ -934,6 +972,38 @@ def _hypothesis_where(
 # --- trials ----------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class TrialSnapshot:
+    """Fact and code values shared by trials opened in one sweep read group."""
+
+    code_version: str
+    code_dirty: bool | None
+    code_tree_sha256: str | None
+    store_max_ingested_at: datetime | None
+    data_vintage: datetime | None
+
+
+def trial_snapshot(
+    conn: duckdb.DuckDBPyConnection,
+    cutoff: datetime | None,
+    gates: VintageGates,
+    repo_dir: Path | None = None,
+) -> TrialSnapshot:
+    """Capture one group's code identity and fact-table state before opening trials."""
+    version, dirty = code_version(repo_dir)
+    return TrialSnapshot(
+        version,
+        dirty,
+        code_tree_sha256(repo_dir),
+        store_max_ingested_at(conn),
+        data_vintage(
+            conn, cutoff, spin_offs=gates.spin_offs, delisting_policy=gates.delisting_policy
+        )
+        if cutoff is not None
+        else None,
+    )
+
+
 def open_trial(
     conn: duckdb.DuckDBPyConnection,
     *,
@@ -951,6 +1021,7 @@ def open_trial(
     settings: Settings | None = None,
     repo_dir: Path | None = None,
     detail_level: DetailLevel = DETAIL_LEVEL_FULL,
+    snapshot: TrialSnapshot | None = None,
 ) -> TrialHandle:
     """Insert a `trials` row for hypothesis `hypothesis_id` and return its
     handle. This is the moment a run becomes a trial (spec "Definitions").
@@ -971,7 +1042,8 @@ def open_trial(
     "Vintages"), and the development boundary in force (`development_boundary`,
     NULL when none; module docstring, "The development boundary"). Refuses an
     unknown detail level and `synthetic=True` on the real store. Commit it in its own write chunk
-    (module docstring, "Trial handle").
+    (module docstring, "Trial handle"). A sweep may pass a snapshot captured
+    for variants with the same cutoff and frozen vintage gates.
     """
     if detail_level not in DETAIL_LEVELS:
         raise ValueError(f"detail level must be one of {DETAIL_LEVELS}, got {detail_level!r}")
@@ -979,12 +1051,13 @@ def open_trial(
     hypothesis = get_hypothesis_by_id(conn, hypothesis_id)
     if synthetic and _is_real_store(conn, settings):
         raise RealStoreRefused("a synthetic trial is refused on the real store")
-    version, dirty = code_version(repo_dir)
-    max_ingested = store_max_ingested_at(conn)
-    spin_offs = bool(frozen_values(hypothesis)[SPIN_OFFS_KEY])
-    vintage = (
-        data_vintage(conn, data_cutoff, spin_offs=spin_offs) if data_cutoff is not None else None
+    snapshot = (
+        snapshot
+        if snapshot is not None
+        else trial_snapshot(conn, data_cutoff, vintage_gates(hypothesis), repo_dir)
     )
+    version, dirty = snapshot.code_version, snapshot.code_dirty
+    max_ingested, vintage = snapshot.store_max_ingested_at, snapshot.data_vintage
     boundary = development_boundary(conn)
     trial_id = max(
         _next_id(conn, "trials", "trial_id"), _next_id(conn, "trial_results", "trial_id")
@@ -1015,7 +1088,7 @@ def open_trial(
                 "note": note,
                 "detail_level": detail_level,
                 "data_vintage": vintage,
-                "code_tree_sha256": code_tree_sha256(repo_dir),
+                "code_tree_sha256": snapshot.code_tree_sha256,
                 "development_boundary": boundary.boundary if boundary is not None else None,
             },
         ),
@@ -1055,11 +1128,15 @@ def write_result(
     handle: TrialHandle,
     stats: ResultStatistics,
     message: str | None = None,
+    *,
+    store_changed: bool | None = None,
 ) -> str:
     """Record an `ok` outcome with `stats` and return `"ok"`; or, when the
     store changed under the run (`_store_changed`), record `failed` with
     `STORE_CHANGED_MESSAGE` and no statistics and return `"failed"`.
-    Refuses a trial opened without a `data_cutoff`: only refusals lack one."""
+    Refuses a trial opened without a `data_cutoff`: only refusals lack one.
+    `store_changed` is for a caller that checked under the same write lock;
+    omitting it performs the registry's normal check."""
     _check_open(conn, handle)
     cutoff = conn.execute(
         "SELECT data_cutoff FROM trials WHERE trial_id = ?", [handle.trial_id]
@@ -1069,18 +1146,50 @@ def write_result(
             f"trial {handle.trial_id} has no data_cutoff; an ok run needs its resolved end "
             "(it keys the trial's V pair)"
         )
-    if _store_changed(conn, handle, cutoff[0]):
+    if store_changed if store_changed is not None else _store_changed(conn, handle, cutoff[0]):
         _insert_result(conn, handle, "failed", STORE_CHANGED_MESSAGE, ResultStatistics())
         return "failed"
     _insert_result(conn, handle, "ok", message, stats)
     return "ok"
 
 
-def _registered_spin_offs(conn: duckdb.DuckDBPyConnection, hypothesis_id: int) -> bool:
-    """The hypothesis's frozen `adjust.apply_spin_offs` (backtest spec amendment
-    #1894, item 6; T211d), through `frozen_values`: the flag a trial of it reads
-    its data vintage under, so a `spinoff` row stales it only when `True`."""
-    return bool(frozen_values(get_hypothesis_by_id(conn, hypothesis_id))[SPIN_OFFS_KEY])
+@dataclass(frozen=True)
+class VintageGates:
+    """The frozen values a trial's data vintage is read under: `adjust.apply_spin_offs`
+    (backtest spec amendment #1894, item 6; T211d) and
+    `backtest.delisting_failure_return` (#2670, plan T328d)."""
+
+    spin_offs: bool = False
+    delisting_policy: DelistingFailureReturn = "none"
+
+
+def vintage_gates(hypothesis: HypothesisRecord) -> VintageGates:
+    """The registration's frozen vintage gates, through `frozen_values` (a key absent
+    from an older registration reads its table default: `False` and `none`)."""
+    values = frozen_values(hypothesis)
+    return VintageGates(
+        spin_offs=bool(values[SPIN_OFFS_KEY]),
+        delisting_policy=values.get(DELISTING_POLICY_KEY, "none"),
+    )
+
+
+def registered_data_vintage(
+    conn: duckdb.DuckDBPyConnection,
+    cutoff: datetime,
+    hypothesis_id: int,
+    *,
+    store: duckdb.DuckDBPyConnection | None = None,
+) -> datetime | None:
+    """`data_vintage` at `cutoff` under hypothesis `hypothesis_id`'s frozen gates
+    (`vintage_gates`), read on `store` (default `conn`; the backup re-check reads a
+    backup while the hypothesis lives on `conn`)."""
+    gates = vintage_gates(get_hypothesis_by_id(conn, hypothesis_id))
+    return data_vintage(
+        store if store is not None else conn,
+        cutoff,
+        spin_offs=gates.spin_offs,
+        delisting_policy=gates.delisting_policy,
+    )
 
 
 def _store_changed(conn: duckdb.DuckDBPyConnection, handle: TrialHandle, cutoff: datetime) -> bool:
@@ -1094,10 +1203,7 @@ def _store_changed(conn: duckdb.DuckDBPyConnection, handle: TrialHandle, cutoff:
     stricter one: the store's latest `ingested_at` at open and write."""
     if handle.data_vintage is None:
         return store_max_ingested_at(conn) != handle.store_max_ingested_at
-    return (
-        data_vintage(conn, cutoff, spin_offs=_registered_spin_offs(conn, handle.hypothesis_id))
-        != handle.data_vintage
-    )
+    return registered_data_vintage(conn, cutoff, handle.hypothesis_id) != handle.data_vintage
 
 
 def _insert_result(
@@ -1342,7 +1448,9 @@ DATA_RELEASE_KIND: Final = "data_release"
 DEVELOPMENT_BOUNDARY_KIND: Final = "development_boundary"
 
 #: A release entry's stage (runbook `docs/runbooks/data-releases.md`, "The record").
-ReleaseStage = Literal["before", "after", "record"]
+ReleaseStage = Literal["before", "after", "record", "coverage", "orphans"]
+#: The stages a hand-written import may carry; a `coverage` row (T393) is written
+#: only by `record_release_coverage`.
 RELEASE_STAGES: Final[tuple[ReleaseStage, ...]] = ("before", "after", "record")
 
 #: A release name: lowercase letters, digits and single hyphens (runbook).
@@ -1718,15 +1826,27 @@ def write_development_boundary(
     )
 
 
+#: The exchange calendar's zone, in which `holdout.start` dates are written.
+_NEW_YORK: Final = ZoneInfo("America/New_York")
+
+
+def registration_day(at: datetime) -> date:
+    """The New York calendar day of a registration stamp `at` (tz-aware): the day
+    `holdout.start` is compared with (ADR 0016 point 4, #3154)."""
+    return at.astimezone(_NEW_YORK).date()
+
+
 def family_registered_on(conn: duckdb.DuckDBPyConnection, family: str) -> date | None:
-    """The UTC day `family` was first registered (its earliest `hypotheses` row), or
-    None for a family with no registration: the day a holdout is forward from (ADR
-    0016 point 4, `holdout.Frozen.registered_on`)."""
+    """The New York day `family` was first registered (its earliest `hypotheses`
+    row), or None for a family with no registration: the day a holdout is forward
+    from (ADR 0016 point 4, `holdout.Frozen.registered_on`). New York's, not UTC's,
+    because `holdout.start` is a New York calendar date (#3154): a registration at
+    21:00 ET is on that day, so a `holdout.start` the next day is forward."""
     row = conn.execute(
         "SELECT MIN(registered_at) FROM hypotheses WHERE family = ?", [family]
     ).fetchone()
     first = row[0] if row is not None else None
-    return None if first is None else first.astimezone(UTC).date()
+    return None if first is None else registration_day(first)
 
 
 def _release_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime | None:
@@ -1739,17 +1859,34 @@ def _release_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datet
     trials were rerun by hand under the runbook's rule before T140b, and counting
     it now would stale every trial opened since its `made_at`, which read the
     repaired store, and rerun them into N (#1321 pass-2 follow-up)."""
+    found = latest_release_reaching(conn, cutoff)
+    return found.made_at if found is not None else None
+
+
+def vintage_releases(conn: duckdb.DuckDBPyConnection) -> list[DataRelease]:
+    """The closed releases that move a data vintage: every command-written `after`
+    row (an imported one, `IMPORTED_AT_KEY`, moves none; `_release_vintage`),
+    newest first as `data_releases` orders them."""
+    return [r for r in data_releases(conn) if r.stage == "after" and r.imported_at is None]
+
+
+def latest_release_reaching(
+    conn: duckdb.DuckDBPyConnection, cutoff: datetime
+) -> DataRelease | None:
+    """The newest of `vintage_releases` whose `sessions_from` is on or before
+    `cutoff`'s UTC date, or None: the release whose `made_at` is
+    `_release_vintage(conn, cutoff)`. A trial at `cutoff` whose recorded
+    `data_vintage` is earlier than that `made_at` was opened before this release
+    closed, so it read the store the release repaired (#3178)."""
     day = cutoff.astimezone(UTC).date()
-    latest: datetime | None = None
-    for release in data_releases(conn):
+    latest: DataRelease | None = None
+    for release in vintage_releases(conn):
         if (
-            release.stage == "after"
-            and release.imported_at is None
-            and release.sessions_from is not None
+            release.sessions_from is not None
             and release.sessions_from <= day
-            and (latest is None or release.made_at > latest)
+            and (latest is None or release.made_at > latest.made_at)
         ):
-            latest = release.made_at
+            latest = release
     return latest
 
 
@@ -1817,6 +1954,8 @@ def open_data_release(
         "store_max_ingested_at": live,
         "data_vintage": data_vintage(conn, now),
         "cutoff": now,
+        "counts": release_table_counts(conn),
+        "fingerprints": release_table_fingerprints(conn),
     }
     return _write_release(conn, values, reason, made_at=now)
 
@@ -1828,6 +1967,7 @@ def close_data_release(
     sessions_from: date,
     sessions_to: date,
     reason: str | None = None,
+    enforce_coverage: bool = False,
 ) -> int:
     """Write the open release's `after` row with the sessions the repair touched
     and return its id (runbook, step 7). The row records the store's latest
@@ -1835,7 +1975,14 @@ def close_data_release(
     the row is written. Its `made_at` then enters `data_vintage` for every cutoff
     on or after `sessions_from` (`_release_vintage`). Refuses a name that is not
     the open release, a session that is not an XNYS session and a reversed range.
-    `reason` defaults to the `before` row's."""
+    `reason` defaults to the `before` row's.
+
+    `enforce_coverage` (ADR 0029 point 2, T393; `decision data-release close` always
+    passes it) refuses a release that changed bars, actions or master rows
+    (`release_changed_tables`) unless its backup file exists and its newest
+    coverage record passed and still describes the store (`_require_coverage`); a
+    release that changed none of them (a count-only release) closes without a
+    backup. The `after` row records the counts and the changed tables."""
     current = open_release(conn)
     if current is None or current.name != name:
         found = "no release is open" if current is None else f"{current.name!r} is open"
@@ -1847,6 +1994,9 @@ def close_data_release(
         raise ReleaseRefused(f"--from {sessions_from} is after --to {sessions_to}")
     if reason is not None and not reason.strip():
         raise ReleaseRefused("--reason must not be blank")
+    changed = release_changed_tables(conn, current)
+    if enforce_coverage:
+        _require_coverage(conn, current, changed)
     cutoff = session_close(sessions_to)
     now = utc_now()
     values = {
@@ -1858,8 +2008,426 @@ def close_data_release(
         "cutoff": cutoff,
         "sessions_from": sessions_from,
         "sessions_to": sessions_to,
+        "counts": release_table_counts(conn),
+        "fingerprints": release_table_fingerprints(conn),
+        "changed_tables": changed,
     }
     return _write_release(conn, values, reason or current.reason, made_at=now)
+
+
+#: The tables a release's coverage record guards: bars, actions, master rows.
+RELEASE_COUNT_TABLES: Final[tuple[str, ...]] = (
+    "prices_daily",
+    "corporate_actions",
+    "securities",
+    "listings",
+    "delistings",
+)
+
+
+def release_table_counts(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
+    """Row counts of `RELEASE_COUNT_TABLES` plus `retracted_rows` (all rows) and
+    `retracted_rows_restored` (those with a `restored_at`), present tables only. A
+    `before` row records them at open and an `after` row at close, so the tables a
+    release changed are known without reading its backup."""
+    counts: dict[str, int] = {}
+    for table in RELEASE_COUNT_TABLES:
+        if _has_table(conn, table):
+            row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+            assert row is not None
+            counts[table] = int(row[0])
+    if _has_table(conn, "retracted_rows"):
+        row = conn.execute("SELECT COUNT(*), COUNT(restored_at) FROM retracted_rows").fetchone()
+        assert row is not None
+        counts["retracted_rows"], counts["retracted_rows_restored"] = int(row[0]), int(row[1])
+    return counts
+
+
+def release_table_fingerprints(conn: duckdb.DuckDBPyConnection) -> dict[str, str]:
+    """An order-free content hash of each `RELEASE_COUNT_TABLES` table (the sum of its
+    row hashes, as text), so an edit in place or an equal-count swap changes it
+    where a row count would not."""
+    out: dict[str, str] = {}
+    for table in RELEASE_COUNT_TABLES:
+        if _has_table(conn, table):
+            row = conn.execute(
+                f"SELECT coalesce(sum(hash(t)::HUGEINT), 0) FROM {table} t"
+            ).fetchone()
+            assert row is not None
+            out[table] = str(row[0])
+    return out
+
+
+def _retracted_tables(conn: duckdb.DuckDBPyConnection, where: str, params: list[str]) -> set[str]:
+    if not _has_table(conn, "retracted_rows"):
+        return set()
+    rows = conn.execute(
+        f"SELECT DISTINCT table_name FROM retracted_rows WHERE {where}", params
+    ).fetchall()
+    return {str(r[0]) for r in rows}
+
+
+def release_changed_tables(conn: duckdb.DuckDBPyConnection, before: DataRelease) -> list[str]:
+    """The `RELEASE_COUNT_TABLES` the release changed since its `before` row: those
+    whose count or content fingerprint differs from what it recorded, those a row of the release
+    was retracted from, and those a row was restored into. A `before` row without
+    `counts` (opened before T393, or imported) cannot say, so every table counts as
+    changed and its close needs a passing coverage record. Sorted."""
+    recorded = before.values.get("counts")
+    if recorded is None:
+        return sorted(RELEASE_COUNT_TABLES)
+    now = release_table_counts(conn)
+    changed = {t for t in RELEASE_COUNT_TABLES if now.get(t, 0) != recorded.get(t, 0)}
+    prints = before.values.get("fingerprints")
+    if prints is not None:
+        then = release_table_fingerprints(conn)
+        changed |= {t for t in RELEASE_COUNT_TABLES if then.get(t) != prints.get(t)}
+    changed |= _retracted_tables(conn, "release = ?", [before.name])
+    if now.get("retracted_rows_restored", 0) != recorded.get("retracted_rows_restored", 0):
+        changed |= _retracted_tables(conn, "restored_at IS NOT NULL", [])
+    return sorted(changed & set(RELEASE_COUNT_TABLES))
+
+
+def record_approved_orphans(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    release: str,
+    allow_orphans: int,
+    keys: Iterable[tuple[str, date]],
+    source: str = "repair-resolution",
+) -> int:
+    """Write an `orphans` row against the open release `release`: the bar keys
+    (`security_id`, session) that `repair-resolution` retracted under the owner's exact
+    `--allow-orphans` count, which no id receives (#3265), or (`source`
+    `accept-unreceived`, #3464) the residual unreceived retracted keys the owner accepts
+    after the fill with his exact `--count`. The coverage check accepts exactly these
+    retracted bars as unreceived (`approved_orphans`) and fails any other.
+    Refuses a name that is not the open release and a count that is not the key count."""
+    current = open_release(conn)
+    if current is None or current.name != release:
+        found = "no release is open" if current is None else f"{current.name!r} is open"
+        raise ReleaseRefused(f"cannot record approved orphans for {release!r}: {found}")
+    ordered = sorted({(str(sid), day) for sid, day in keys})
+    if not ordered or len(ordered) != allow_orphans:
+        raise ReleaseRefused(
+            f"{len(ordered)} orphan keys do not match the owner's count {allow_orphans}"
+        )
+    now = utc_now()
+    values = {
+        "name": release,
+        "stage": "orphans",
+        "made_at": now,
+        "allow_orphans": allow_orphans,
+        "source": source,
+        "keys": [f"{sid}|{day.isoformat()}" for sid, day in ordered],
+    }
+    return _write_release(
+        conn,
+        values,
+        f"owner-approved orphan bars ({source}): count {allow_orphans}",
+        made_at=now,
+    )
+
+
+def approved_orphans(
+    conn: duckdb.DuckDBPyConnection, release: str
+) -> tuple[int, set[tuple[str, date]]]:
+    """The owner-approved orphan count and bar keys recorded against `release` by
+    `record_approved_orphans` (all its `orphans` rows), or `(0, set())`."""
+    count = 0
+    keys: set[tuple[str, date]] = set()
+    for row in data_releases(conn):
+        if row.stage == "orphans" and row.name == release:
+            count += int(row.values["allow_orphans"])
+            for text in row.values["keys"]:
+                sid, _, day = str(text).rpartition("|")
+                keys.add((sid, date.fromisoformat(day)))
+    return count, keys
+
+
+def record_release_coverage(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    name: str,
+    passed: bool,
+    summary: Mapping[str, Any],
+) -> int:
+    """Write a `coverage` row against the open release `name` and return its id:
+    the verdict of `decision data-release coverage --record`, read by
+    `close_data_release`. It carries the store's `counts` and latest `ingested_at`
+    at the check, so a later change to the store makes the record stale. `summary`
+    is the check's own numbers (losses, unreceived retractions, ownerless rows).
+    Refuses a name that is not the open release."""
+    current = open_release(conn)
+    if current is None or current.name != name:
+        found = "no release is open" if current is None else f"{current.name!r} is open"
+        raise ReleaseRefused(f"cannot record coverage for {name!r}: {found}")
+    now = utc_now()
+    values = {
+        "name": name,
+        "stage": "coverage",
+        "made_at": now,
+        "passed": passed,
+        "store_max_ingested_at": store_max_ingested_at(conn),
+        "counts": release_table_counts(conn),
+        "fingerprints": release_table_fingerprints(conn),
+        "summary": dict(summary),
+    }
+    return _write_release(
+        conn, values, f"coverage {'passed' if passed else 'failed'} for {name}", made_at=now
+    )
+
+
+def _require_coverage(
+    conn: duckdb.DuckDBPyConnection, current: DataRelease, changed: Sequence[str]
+) -> None:
+    """Refuse the close of a release that changed `changed` tables unless its backup
+    file exists and its newest `coverage` row passed on the store as it is now."""
+    if not changed:
+        return
+    tables = ", ".join(changed)
+    if current.backup_path is None or not Path(current.backup_path).is_file():
+        raise ReleaseRefused(
+            f"release {current.name!r} changed {tables} and its pre-release backup "
+            f"{current.backup_path} is not a file: a release with no backup does not close"
+        )
+    rows = [r for r in data_releases(conn) if r.stage == "coverage" and r.name == current.name]
+    if not rows:
+        raise ReleaseRefused(
+            f"release {current.name!r} changed {tables} and has no coverage record: run "
+            f"`decision data-release coverage --name {current.name} --record` first"
+        )
+    newest = rows[0]
+    if not newest.values.get("passed"):
+        raise ReleaseRefused(
+            f"release {current.name!r}: the newest coverage record failed; repair, then "
+            "run the check again with --record"
+        )
+    if (
+        newest.values.get("counts") != release_table_counts(conn)
+        or newest.values.get("fingerprints") != release_table_fingerprints(conn)
+    ) or (newest.store_max_ingested_at != store_max_ingested_at(conn)):
+        raise ReleaseRefused(
+            f"release {current.name!r}: the coverage record is stale (the store changed "
+            "after it); run the check again with --record"
+        )
+
+
+@dataclass(frozen=True)
+class RetractedSpan:
+    """One security's rows retracted by a release from one table, with the reason and
+    rule that judged them. For `prices_daily`, `days` are the retracted sessions and
+    `unreceived` those no other id holds an equal bar for."""
+
+    table: str
+    security_id: str
+    count: int
+    reasons: tuple[str, ...]
+    rules: tuple[str, ...]
+    days: tuple[date, ...] = ()
+    unreceived: tuple[date, ...] = ()
+    received_by: tuple[str, ...] = ()
+    accepted: tuple[date, ...] = ()
+    accepted_note: str = ""
+    revised: tuple[date, ...] = ()
+
+    def describe(self) -> str:
+        """One report line: table, id, count, the reason and rule, and for bars where
+        they went (`RECEIVED` by other ids, or the unreceived span)."""
+        line = (
+            f"RETRACTED {self.table} {self.security_id}: {self.count} row(s), "
+            f"reason {'; '.join(self.reasons)}, rule {'; '.join(self.rules)}"
+        )
+        if self.table != "prices_daily":
+            return line
+        parts = [line]
+        if self.received_by:
+            parts.append(
+                f"{self.days[0]}..{self.days[-1]} received by {','.join(self.received_by)}"
+            )
+        if self.revised:
+            parts.append(
+                f"{len(self.revised)} sessions refetched as a vendor revision "
+                f"({self.revised[0]}..{self.revised[-1]})"
+            )
+        if self.accepted:
+            parts.append(f"{len(self.accepted)} sessions {self.accepted_note}")
+        if self.unreceived:
+            parts.append(
+                f"{len(self.unreceived)} of {len(self.days)} sessions NOT RECEIVED "
+                f"({self.unreceived[0]}..{self.unreceived[-1]})"
+            )
+        return ", ".join(parts)
+
+
+def release_retractions(
+    conn: duckdb.DuckDBPyConnection,
+    name: str,
+    *,
+    price_tolerance: float = 1e-6,
+    price_decimals: int | None = None,
+    backup_alias: str | None = None,
+) -> list[RetractedSpan]:
+    """The unrestored `retracted_rows` of release `name`, by table and security id.
+    A retracted bar is received when another security id holds a bar for that session
+    with the same volume and OHLC within `price_tolerance` (as `release_coverage`
+    decides a move), compared as sets of days; the rest are `unreceived`. With
+    `backup_alias` (the release backup, attached), a retracted bar is also received
+    when another id gained a bar for that session (none in the backup) with the same
+    open and close: the vendor now serves a revised bar (#3432), listed as `revised`.
+    Prices compare by `price_match_sql`: with `price_decimals`, a retracted price held
+    at that precision matches a newer one cut to it (#3465). Empty on a
+    store without the table. Reads only."""
+    if not _has_table(conn, "retracted_rows"):
+        return []
+    approved_count, approved_keys = approved_orphans(conn, name)
+    note = f"accepted by the owner's count {approved_count} on {name}"
+    rows = conn.execute(
+        "SELECT table_name, row_key, row_values, reason, rule FROM retracted_rows "
+        "WHERE release = ? AND restored_at IS NULL ORDER BY retraction_id",
+        [name],
+    ).fetchall()
+    groups: dict[tuple[str, str], list[Any]] = {}
+    for table, key, values, reason, rule in rows:
+        groups.setdefault((table, str(key[0])), []).append((key, values, reason, rule))
+    out: list[RetractedSpan] = []
+    for (table, sid), items in sorted(groups.items()):
+        reasons = tuple(sorted({str(i[2]) for i in items}))
+        rules = tuple(sorted({str(i[3]) for i in items}))
+        if table != "prices_daily":
+            out.append(RetractedSpan(table, sid, len(items), reasons, rules))
+            continue
+        latest = {date.fromisoformat(str(key[1])): values for key, values, _, _ in items}
+        days = sorted(latest)
+        unreceived: list[date] = []
+        accepted: list[date] = []
+        revised: list[date] = []
+        receivers: set[str] = set()
+        for day in days:  # one bar per session: its newest retracted revision
+            heard = _bar_receivers(conn, sid, day, latest[day], price_tolerance, price_decimals)
+            receivers |= set(heard)
+            if heard:
+                continue
+            if backup_alias is not None:
+                again = _revision_receivers(
+                    conn, backup_alias, sid, day, latest[day], price_tolerance, price_decimals
+                )
+                if again:
+                    receivers |= set(again)
+                    revised.append(day)
+                    continue
+            (accepted if (sid, day) in approved_keys else unreceived).append(day)
+        out.append(
+            RetractedSpan(
+                table,
+                sid,
+                len(items),
+                reasons,
+                rules,
+                tuple(days),
+                tuple(unreceived),
+                tuple(sorted(receivers)[:3]),
+                tuple(accepted),
+                note,
+                tuple(revised),
+            )
+        )
+    return out
+
+
+def _bar_receivers(
+    conn: duckdb.DuckDBPyConnection,
+    sid: str,
+    day: date,
+    values: Mapping[str, str],
+    tolerance: float,
+    decimals: int | None = None,
+) -> list[str]:
+    try:
+        o, h, lo, cl = (float(values[k]) for k in ("open", "high", "low", "close"))
+        volume = int(float(values["volume"]))
+    except (KeyError, TypeError, ValueError):
+        raise ReleaseRefused(
+            f"retracted bar {sid} {day} has a missing or unreadable price or volume field: "
+            f"{ {k: values.get(k) for k in ('open', 'high', 'low', 'close', 'volume')} }"
+        ) from None
+    same = {
+        c: price_match_sql(f"g.{c}", f"r.{c}", tolerance, decimals) for c in ("o", "h", "lo", "cl")
+    }
+    found = conn.execute(
+        f"""
+        WITH r AS (SELECT ?::DOUBLE AS o, ?::DOUBLE AS h, ?::DOUBLE AS lo, ?::DOUBLE AS cl)
+        SELECT DISTINCT g.security_id FROM (
+            SELECT security_id, arg_max(open, known_at) AS o, arg_max(high, known_at) AS h,
+                   arg_max(low, known_at) AS lo, arg_max(close, known_at) AS cl,
+                   arg_max(volume, known_at) AS v
+            FROM prices_daily WHERE session = ? AND security_id <> ? GROUP BY security_id) g, r
+        WHERE g.v = ? AND {same["o"]} AND {same["h"]} AND {same["lo"]} AND {same["cl"]}
+        """,
+        [o, h, lo, cl, day, sid, volume],
+    ).fetchall()
+    return [str(r[0]) for r in found]
+
+
+def _revision_receivers(
+    conn: duckdb.DuckDBPyConnection,
+    backup_alias: str,
+    sid: str,
+    day: date,
+    values: Mapping[str, str],
+    tolerance: float,
+    decimals: int | None = None,
+) -> list[str]:
+    """Ids other than `sid` that gained a bar for `day` since the backup (no bar of
+    that session in it) whose open and close equal the retracted bar's within
+    `tolerance`: the vendor's revised bar of the same session (#3432). Volume, high
+    and low may differ; prices compare by `price_match_sql` (#3465). `_bar_receivers`
+    has already parsed `values`."""
+    if re.fullmatch(r"[a-z_][a-z0-9_]*", backup_alias) is None:
+        raise ValueError(f"bad backup alias {backup_alias!r}")
+    o, cl = float(values["open"]), float(values["close"])
+    root = sid.split(":")[0].split("@")[0]
+    same_o = price_match_sql("g.o", "r.o", tolerance, decimals)
+    same_cl = price_match_sql("g.cl", "r.cl", tolerance, decimals)
+    found = conn.execute(
+        f"""
+        WITH r AS (SELECT ?::DOUBLE AS o, ?::DOUBLE AS cl)
+        SELECT DISTINCT g.security_id FROM (
+            SELECT security_id, arg_max(open, known_at) AS o, arg_max(close, known_at) AS cl
+            FROM prices_daily WHERE session = ? AND security_id <> ? GROUP BY security_id) g, r
+        WHERE split_part(split_part(g.security_id, ':', 1), '@', 1) = ?
+          AND NOT EXISTS (SELECT 1 FROM {backup_alias}.prices_daily b
+                          WHERE b.security_id = g.security_id AND b.session = ?)
+          AND {same_o} AND {same_cl}
+        """,
+        [o, cl, day, sid, root, day],
+    ).fetchall()
+    return [str(r[0]) for r in found]
+
+
+def ownerless_rows(conn: duckdb.DuckDBPyConnection) -> dict[str, list[str]]:
+    """Bar and dividend rows whose `security_id` has no `securities` row, by table
+    (`prices_daily`, `corporate_actions`), each the sorted ids. A check-only benchmark
+    id is not a security and is left out. Fails a release whatever the loss threshold:
+    a row nobody owns is a loss the before/after count cannot see. Reads only."""
+    if not _has_table(conn, "securities"):
+        return {}
+    skip = ", ".join(f"'{s}'" for s in sorted(CHECK_ONLY_IDS))
+    out: dict[str, list[str]] = {}
+    for table, where in (
+        ("prices_daily", ""),
+        ("corporate_actions", " AND action_type = 'dividend' AND NOT cancelled"),
+    ):
+        if not _has_table(conn, table):
+            continue
+        ids = conn.execute(
+            f"SELECT DISTINCT security_id FROM {table} WHERE security_id NOT IN "
+            f"(SELECT security_id FROM securities) AND security_id NOT IN ({skip}){where} "
+            "ORDER BY security_id"
+        ).fetchall()
+        if ids:
+            out[table] = [str(i[0]) for i in ids]
+    return out
 
 
 def _repair_runs(backup: duckdb.DuckDBPyConnection, since: datetime) -> list[dict[str, Any]]:
@@ -1909,7 +2477,7 @@ def record_trial_state(
     cutoff, trial_vintage, trial_max, start, end, started_at, hypothesis_id = row
     if cutoff is None:
         raise ReleaseRefused(f"trial {trial_id} has no data_cutoff (a refused window)")
-    vintage = data_vintage(backup, cutoff, spin_offs=_registered_spin_offs(conn, hypothesis_id))
+    vintage = registered_data_vintage(conn, cutoff, hypothesis_id, store=backup)
     now = utc_now()
     values = {
         "name": name,
@@ -2090,26 +2658,10 @@ def family_sharpes(
     pair's latest trial lacks a finite base-level period Sharpe or a positive
     `periods_per_year`.
     """
-    if pending is not None:
-        _check_trial_row(conn, pending)
-    counted = conn.execute(
-        f"SELECT t.trial_id, h.params_json, t.start_session, t.data_cutoff {_COUNTED_FROM} "
-        "ORDER BY t.trial_id",
-        [family, pending.trial_id if pending is not None else None],
-    ).fetchall()
-    latest: dict[tuple[str, date, datetime | None], tuple[int, float]] = {}
-    for trial_id, params_json, start, cutoff in counted:
-        params = json.loads(params_json)
-        cadence = frozen_values(_Stored(params, family))[CADENCE_KEY]
-        pair = (
-            _canonical_set_hash(params, family),
-            _first_rebalance_on_or_after(start, cadence),
-            cutoff,
-        )
-        latest[pair] = (trial_id, float(params[BASE_COST_KEY]))
+    n_series, latest = _counted_pairs(conn, family, pending)
     chosen = sorted(latest.values())
     return FamilySharpes(
-        n_trials=len(counted),
+        n_trials=n_series,
         raw=_annual_sharpes(conn, chosen, "raw"),
         excess_spy=_annual_sharpes(conn, chosen, "excess_spy"),
     )
@@ -2125,18 +2677,81 @@ _COUNTED_FROM: Final = (
 )
 
 
+def _counted_pairs(
+    conn: duckdb.DuckDBPyConnection, family: str, pending: TrialHandle | None
+) -> tuple[int, dict[tuple[str, date, datetime | None], tuple[int, float]]]:
+    """The number of distinct return series among the counted trials and, per
+    distinct (canonical frozen set, first rebalance, data cutoff) pair, its latest
+    trial id and base cost (V's pairs). A trial is the same series as an earlier one
+    only when it is an identical rerun: same pair, same `data_vintage`, same clean
+    `code_tree_sha256` and the same stored base-level outcome (`_outcome_digests`), so
+    a rerun whose returns moved where the vintage cannot see (a repair's deletions, an
+    imported release row) is still a new series (#3127). A rerun on new data or new
+    code, a dirty or unknown code tree, or a missing stamp or outcome is a new series
+    (fail-closed)."""
+    if pending is not None:
+        _check_trial_row(conn, pending)
+    counted = conn.execute(
+        "SELECT t.trial_id, h.params_json, t.start_session, t.data_cutoff, "
+        f"t.data_vintage, t.code_tree_sha256, t.code_dirty {_COUNTED_FROM} "
+        "ORDER BY t.trial_id",
+        [family, pending.trial_id if pending is not None else None],
+    ).fetchall()
+    digests = _outcome_digests(conn, [int(row[0]) for row in counted])
+    latest: dict[tuple[str, date, datetime | None], tuple[int, float]] = {}
+    series: set[tuple[object, ...]] = set()
+    # Many trials share a parameter set or a start: read each once (#3138's 10k-trial
+    # timing tests).
+    sets: dict[str, tuple[str, Cadence, float]] = {}
+    firsts: dict[tuple[date, Cadence], date] = {}
+    for trial_id, params_json, start, cutoff, vintage, code, dirty in counted:
+        if params_json not in sets:
+            params = json.loads(params_json)
+            sets[params_json] = (
+                _canonical_set_hash(params, family),
+                frozen_values(_Stored(params, family))[CADENCE_KEY],
+                float(params[BASE_COST_KEY]),
+            )
+        set_hash, cadence, base = sets[params_json]
+        if (start, cadence) not in firsts:
+            firsts[start, cadence] = _first_rebalance_on_or_after(start, cadence)
+        pair = (set_hash, firsts[start, cadence], cutoff)
+        latest[pair] = (trial_id, base)
+        digest = digests.get(int(trial_id))
+        known = vintage is not None and code is not None and dirty is False and digest
+        stamps = (vintage, code, digest) if known else (trial_id,)
+        series.add((*pair, *stamps))
+    return len(series), latest
+
+
+#: The stored base-level `strategy` metrics an identical rerun must reproduce.
+_OUTCOME_METRICS: Final = ("n_periods", "sharpe_period", "sharpe_period_excess_spy")
+
+
+def _outcome_digests(conn: duckdb.DuckDBPyConnection, trial_ids: Sequence[int]) -> dict[int, str]:
+    """Each trial's base-level `strategy` outcome (`_OUTCOME_METRICS`, exact values) as
+    one string, in one query; a trial with none of those rows is absent."""
+    if not trial_ids:
+        return {}
+    rows = conn.execute(
+        "SELECT trial_id, string_agg(metric || '=' || CAST(value AS VARCHAR), ';' "
+        "ORDER BY metric) FROM trial_metrics WHERE trial_id IN (SELECT UNNEST($ids::BIGINT[])) "
+        "AND series = 'strategy' AND cost_level_kind = 'base' "
+        "AND metric IN (SELECT UNNEST($metrics::VARCHAR[])) GROUP BY trial_id",
+        {"ids": list(trial_ids), "metrics": list(_OUTCOME_METRICS)},
+    ).fetchall()
+    return {int(trial_id): str(digest) for trial_id, digest in rows if digest is not None}
+
+
 def count_counted_trials(
     conn: duckdb.DuckDBPyConnection, family: str, pending: TrialHandle | None = None
 ) -> int:
-    """How many trials `family_sharpes` counts (same rows, same `pending` rule). The
-    DSR's N is `backtest.results.family_n`, which calls this; nothing else should."""
-    if pending is not None:
-        _check_trial_row(conn, pending)
-    row = conn.execute(
-        f"SELECT COUNT(*) {_COUNTED_FROM}",
-        [family, pending.trial_id if pending is not None else None],
-    ).fetchone()
-    return int(row[0]) if row is not None else 0
+    """N's backtest part: the distinct return series among the trials
+    `family_sharpes` counts (same rows, same `pending` rule), so an identical rerun
+    (same pair, data vintage and code tree) is not a second trial (strategy-lab spec,
+    amendment 2026-11-06, #3127). The DSR's N is
+    `backtest.results.family_n`, which calls this; nothing else should."""
+    return _counted_pairs(conn, family, pending)[0]
 
 
 @dataclass(frozen=True)

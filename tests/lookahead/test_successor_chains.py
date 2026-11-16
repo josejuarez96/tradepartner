@@ -262,16 +262,15 @@ def _settings(**universe: object) -> Settings:
     return Settings(_env_file=None, universe=universe)
 
 
-def test_before_the_known_at_the_pair_reads_under_its_own_ids(
+def test_before_the_known_at_the_predecessor_reads_under_its_own_id(
     chain_fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
     before = _CHAIN_KNOWN_AT - PROBE_EPSILON
     assert live_chains(chain_fixture_store, before) == ()
     predecessor = prices_as_of(chain_fixture_store, before, [_PREDECESSOR])
     successor = prices_as_of(chain_fixture_store, before, [_SUCCESSOR])
-    assert predecessor.height == 250 and successor.height > 0
+    assert predecessor.height == 250 and successor.is_empty()
     assert set(predecessor["security_id"].unique().to_list()) == {_PREDECESSOR}
-    assert set(successor["security_id"].unique().to_list()) == {_SUCCESSOR}
     assert facts_as_of(chain_fixture_store, before, [_PREDECESSOR]).height == 1
     assert facts_as_of(chain_fixture_store, before, [_SUCCESSOR]).is_empty()
 
@@ -488,6 +487,64 @@ def test_a_chained_successor_bar_before_its_first_listing_is_hidden(
     assert has_bar(later)
 
 
+def test_pre_listing_boundary_uses_only_known_live_listings(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """A later snapshot can expose a hole bar only from its known_at; a
+    retracted earlier listing cannot move the boundary at any time."""
+    successor = "0001000013"  # first listing March 18; chain known March 30
+    session = date(2020, 3, 10)
+    bar_known = datetime(2020, 3, 10, 21, tzinfo=UTC)
+    insert_row(
+        chain_fixture_store,
+        "prices_daily",
+        {
+            "security_id": successor,
+            "session": session,
+            "open": 10.0,
+            "high": 11.0,
+            "low": 9.0,
+            "close": 10.5,
+            "volume": 100_000,
+            "known_at": bar_known,
+            "ingested_at": bar_known,
+            "source": "alpaca",
+            "provenance": "bar",
+        },
+    )
+    retracted_known = datetime(2020, 3, 24, 20, 30, tzinfo=UTC)
+    snapshot_known = datetime(2020, 3, 26, 20, 30, tzinfo=UTC)
+    for valid_from, known_at, retracted in (
+        (date(2020, 2, 1), retracted_known, True),
+        (date(2020, 3, 1), snapshot_known, False),
+    ):
+        insert_row(
+            chain_fixture_store,
+            "listings",
+            {
+                "security_id": successor,
+                "ticker": "CHNE",
+                "exchange": "NYSE",
+                "class_title": "Common Stock",
+                "valid_from": valid_from,
+                "known_at": known_at,
+                "ingested_at": known_at,
+                "source": "edgar",
+                "provenance": "snapshot_static",
+                "retracted": retracted,
+            },
+        )
+
+    def has_bar(t: datetime) -> bool:
+        return session in prices_as_of(chain_fixture_store, t, [successor])["session"].to_list()
+
+    assert not has_bar(datetime(2020, 3, 22, 21, tzinfo=UTC))  # no listing yet known
+    assert not has_bar(datetime(2020, 3, 23, 21, tzinfo=UTC))
+    assert not has_bar(retracted_known)
+    assert not has_bar(snapshot_known - PROBE_EPSILON)
+    assert has_bar(snapshot_known)
+
+
 def test_a_post_handover_predecessor_fact_is_cut_off_by_the_successors_own(
     chain_fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
@@ -530,9 +587,9 @@ def test_the_chain_reads_are_truncation_invariant_from_the_known_at(
     chain_fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore
 ) -> None:
     """`f(T)` on the full store equals `f(T)` on the store truncated to
-    `known_at <= T`, at and after the chain's stamp (spec "Look-ahead"). Before
-    it the truncated store does not name the successor as a chained successor,
-    so the bar-hiding rule differs by construction and is not compared."""
+    `known_at <= T` (spec "Look-ahead"). Before the chain's stamp, the
+    truncated store does not name the successor as chained, so its own price
+    bars differ by construction; the unaffected reads still agree."""
     reads = [
         lambda c, t: prices_as_of(c, t, [_SUCCESSOR]),
         lambda c, t: prices_as_of(c, t, [_PREDECESSOR]),
@@ -550,7 +607,11 @@ def test_the_chain_reads_are_truncation_invariant_from_the_known_at(
         _CHAIN_KNOWN_AT + PROBE_EPSILON,
         _CHAIN_KNOWN_AT + timedelta(days=30),
     ):
-        for read in reads:
+        if t < _CHAIN_KNOWN_AT:
+            assert prices_as_of(chain_fixture_store, t, [_SUCCESSOR]).is_empty()
+            assert not prices_as_of(truncated.at(t), t, [_SUCCESSOR]).is_empty()
+        comparable = (reads[1], reads[3], reads[4]) if t < _CHAIN_KNOWN_AT else reads
+        for read in comparable:
             assert read(chain_fixture_store, t).equals(read(truncated.at(t), t)), (t, read)
         full = universe_as_of(chain_fixture_store, t, settings)
         seen = universe_as_of(truncated.at(t), t, settings)

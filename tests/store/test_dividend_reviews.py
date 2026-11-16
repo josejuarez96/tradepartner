@@ -17,7 +17,9 @@ from tradepartner.store.dividend_reviews import (
     ReviewedGroup,
     ReviewsError,
     equal_amount_groups,
+    parse_recurring_pairs,
     parse_reviews,
+    recurring_pairs,
     reviewed_groups,
 )
 
@@ -90,9 +92,9 @@ def test_the_amount_is_the_stored_double_exactly() -> None:
 
 
 def test_the_committed_list_pins_its_counts() -> None:
-    """195 groups (183 at the amendment, 10 by #1666, 2 by #1720): a later edit is deliberate."""
+    """189 hand groups; PNNT's seven pairs are covered by the recurring entry."""
     groups = reviewed_groups()
-    assert Counter(g.verdict for g in groups) == {"duplicate": 180, "distinct": 12, "unresolved": 3}
+    assert Counter(g.verdict for g in groups) == {"duplicate": 181, "distinct": 6, "unresolved": 2}
     assert all(g.evidence for g in groups)
     assert min(g.ex_date for g in groups) == date(2019, 6, 27)
     assert max(g.ex_date for g in groups) == date(2026, 10, 15)
@@ -104,12 +106,11 @@ def test_the_committed_list_pins_its_counts() -> None:
         ("AIV", date(2020, 11, 3), 8.2, "duplicate"),
         ("TDG", date(2025, 9, 2), 90.0, "duplicate"),
         ("MKTW", date(2026, 3, 18), 0.2, "duplicate"),
-        ("PNNT", date(2026, 10, 15), 0.04, "distinct"),
         ("PFLT", date(2026, 10, 15), 0.0033, "duplicate"),
         ("F", date(2025, 2, 18), 0.15, "distinct"),
         ("CHRD", date(2023, 11, 13), 1.25, "distinct"),
         ("MKTW", date(2025, 8, 15), 0.2, "distinct"),
-        ("STX", date(2021, 5, 11), 0.67, "unresolved"),
+        ("STX", date(2021, 5, 11), 0.67, "duplicate"),
     ],
 )
 def test_the_issues_named_cases_read_as_listed(
@@ -119,6 +120,16 @@ def test_the_issues_named_cases_read_as_listed(
         g for g in reviewed_groups() if (g.ticker, g.ex_date, g.amount) == (ticker, ex_date, amount)
     ]
     assert group.verdict == verdict
+
+
+def test_stx_2021_05_11_retracts_the_greater_of_its_two_ids() -> None:
+    """#3054: an independent dividend history has one $0.67 STX entitlement on
+    2021-05-11 (the 2026-11-03 store measurement, #3053 item 5), so the pair
+    is one payment stored twice; the greater id goes."""
+    [group] = [g for g in reviewed_groups() if g.key == ("0001137789", date(2021, 5, 11), 0.67)]
+    assert group.verdict == "duplicate"
+    assert group.retract_source_action_id == "d08ea098-e6bd-4775-9bb6-abda5545428d"
+    assert group.retract_source_action_id > "41b127bb-bd78-4967-9996-e4f2158e86c3"
 
 
 def test_the_listing_gap_groups_are_unresolved() -> None:
@@ -144,7 +155,7 @@ def test_every_retract_id_is_the_greater_of_its_groups_two_ids() -> None:
         for g in export
     }
     duplicates = [g for g in reviewed_groups() if g.verdict == "duplicate"]
-    assert len(duplicates) == 180
+    assert len(duplicates) == 181
     for group in duplicates:
         pair = ids.get(group.key)
         if pair is None:
@@ -249,3 +260,133 @@ def test_two_known_at_are_one_key_and_other_actions_are_ignored() -> None:
     splits = _live(("X", DAY, 2.0, "a", T1), ("X", DAY, 2.0, "b", T1), action_type="split")
     assert equal_amount_groups(splits, []) == ()
     assert equal_amount_groups(_live(("X", DAY, 0.25, "a", T1)).clear(), []) == ()
+
+
+def test_a_re_sent_retract_id_under_another_key_beside_a_payment_is_a_violation() -> None:
+    """#2980: the vendor re-sends a reviewed retract id with a noisy amount (or
+    another ex-date); ingest stores it on its own key, so the exact key no
+    longer joins the kept id. Beside another live payment on the reviewed or
+    the new ex-date it is one payment counted twice: both keys fail."""
+    later = date(2021, 6, 16)
+    live = _live(
+        ("NOISE", DAY, 0.25, "a", T1),  # kept id on the reviewed key
+        ("NOISE", DAY, 0.25 + 1e-12, "b", T2),  # retract id, noisy amount
+        ("MOVED", DAY, 0.25, "a", T1),  # kept id on the reviewed key
+        ("MOVED", later, 0.25, "b", T2),  # retract id, another ex-date
+        ("BOTH", later, 0.25, "a", T2),  # both re-sent on a new ex-date
+        ("BOTH", later, 0.25 + 1e-12, "b", T2),
+        ("ALONE", later, 0.25 + 1e-12, "b", T2),  # kept id gone: counted once
+    )
+    reviewed = [_listed(sid, "duplicate") for sid in ("NOISE", "MOVED", "BOTH", "ALONE")]
+    groups = equal_amount_groups(live, reviewed)
+    assert [
+        (
+            g.security_id,
+            g.ex_date,
+            g.amount,
+            g.group_class,
+            [i.source_action_id for i in g.identities],
+        )
+        for g in groups
+    ] == [
+        ("BOTH", later, 0.25, "violation", ["a"]),
+        ("BOTH", later, 0.25 + 1e-12, "violation", ["b"]),
+        ("MOVED", DAY, 0.25, "violation", ["a"]),
+        ("MOVED", later, 0.25, "violation", ["b"]),
+        ("NOISE", DAY, 0.25, "violation", ["a"]),
+        ("NOISE", DAY, 0.25 + 1e-12, "violation", ["b"]),
+    ]
+    # The re-sent key names the reviewed row it came from.
+    noisy = next(g for g in groups if g.security_id == "NOISE" and g.amount != 0.25)
+    assert noisy.reviewed == reviewed[0]
+
+
+PNNT = "0001383414"
+PAIRS_HEADER = "security_id,start_ex_date,group_size,ticker,evidence"
+#: A session after the committed hand rows end: the month nobody has listed yet.
+NEXT_MONTH = date(2026, 12, 15)
+T3 = datetime(2026, 12, 15, 20, tzinfo=UTC)
+
+
+def _pnnt(ex: date, *ids: str, amount: float = 0.04, sid: str = PNNT, known: datetime = T3) -> Any:
+    return _live(*((sid, ex, amount, i, known) for i in ids))
+
+
+def test_the_next_months_pnnt_pair_is_accepted_by_the_committed_entry() -> None:
+    """Fails before #3462: an unlisted pair is a violation until a hand row is added."""
+    [group] = equal_amount_groups(_pnnt(NEXT_MONTH, "a", "b"), reviewed_groups())
+    assert group.group_class == "accepted"
+    assert group.reviewed is not None
+    assert group.reviewed.verdict == "distinct"
+    assert "Accepted risk" in group.reviewed.evidence
+    assert group.reviewed.ticker == "PNNT"
+
+
+def test_the_committed_entry_starts_at_the_earliest_hand_row() -> None:
+    [entry] = recurring_pairs()
+    assert (entry.security_id, entry.group_size) == (PNNT, 2)
+    assert entry.start_ex_date == date(2026, 4, 15)
+
+
+def test_every_former_pnnt_hand_month_passes_health_without_hand_rows() -> None:
+    dates = [
+        date(2026, m, d)
+        for m, d in [(4, 15), (5, 15), (7, 15), (8, 14), (9, 15), (10, 15), (11, 13)]
+    ]
+    assert not [g for g in reviewed_groups() if g.security_id == PNNT]
+    rows = _live(*((PNNT, ex, 0.04, i, T3) for ex in dates for i in "ab"))
+    groups = equal_amount_groups(rows, reviewed_groups())
+    assert [g.ex_date for g in groups] == dates
+    assert {g.group_class for g in groups} == {"accepted"}
+
+
+def test_a_third_row_or_a_differing_amount_on_the_day_still_fails() -> None:
+    [three] = equal_amount_groups(_pnnt(NEXT_MONTH, "a", "b", "c"), [])
+    assert three.group_class == "violation"
+    odd = _live(
+        (PNNT, NEXT_MONTH, 0.04, "a", T3),
+        (PNNT, NEXT_MONTH, 0.04, "b", T3),
+        (PNNT, NEXT_MONTH, 0.05, "c", T3),
+    )
+    assert [g.group_class for g in equal_amount_groups(odd, [])] == ["violation"]
+    four = _pnnt(NEXT_MONTH, "a", "b", "c", "d")
+    assert [g.group_class for g in equal_amount_groups(four, [])] == ["violation"]
+
+
+def test_a_pair_before_the_start_or_of_another_security_fails() -> None:
+    before = date(2026, 4, 14)
+    [early] = equal_amount_groups(_pnnt(before, "a", "b"), [])
+    assert early.group_class == "violation"
+    [other] = equal_amount_groups(_pnnt(NEXT_MONTH, "a", "b", sid="0000000002"), [])
+    assert other.group_class == "violation"
+
+
+def test_the_entry_reads_only_the_rows_known_at_t() -> None:
+    """No look-ahead: the rows are the as-of frame, so a row not yet known never
+    joins the pair, and a later third row turns the same day into a violation."""
+    assert equal_amount_groups(_pnnt(NEXT_MONTH, "a"), []) == ()
+    assert [g.group_class for g in equal_amount_groups(_pnnt(NEXT_MONTH, "a", "b"), [])] == [
+        "accepted"
+    ]
+    assert [g.group_class for g in equal_amount_groups(_pnnt(NEXT_MONTH, "a", "b", "c"), [])] == [
+        "violation"
+    ]
+
+
+def test_the_pair_loader_refuses_malformed_rows_naming_them() -> None:
+    good = f"{PNNT},2026-04-15,2,PNNT,why"
+    [entry] = parse_recurring_pairs(f"{PAIRS_HEADER}\n{good}\n")
+    assert entry.group_size == 2
+    bad = [
+        (good.replace("2026-04-15", "2026-04-18"), "not an XNYS session"),
+        (good.replace(",2,", ",1,"), "below 2"),
+        (good.replace(",2,", ",x,"), "not an integer"),
+        (good.replace(",why", ","), "empty evidence"),
+        (f"{good}\n{good}", "listed again"),
+        ("a,b", "2 fields"),
+    ]
+    for row, why in bad:
+        with pytest.raises(ReviewsError, match=why):
+            parse_recurring_pairs(f"{PAIRS_HEADER}\n{row}\n")
+    with pytest.raises(ReviewsError, match="header"):
+        parse_recurring_pairs("x\n")

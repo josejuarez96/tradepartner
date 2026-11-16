@@ -69,6 +69,21 @@ SET_STAMP = datetime(2026, 12, 31, 22, tzinfo=UTC)
 CUSIP = "98422D105"
 
 
+#: The reviewed exam ledger `paper status` reads in these tests: empty, budget 4
+#: (the committed file's values), whatever the checkout's git state.
+EMPTY_LEDGER = 'budget = 4\nbudget_adr = "docs/decisions/0016.md#rule-5"\n'
+
+
+@pytest.fixture(autouse=True)
+def reviewed_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`paper status` reads `origin/main`'s ledger copy; pin it (plan T381a)."""
+    monkeypatch.setattr(
+        window,
+        "read_ledger_texts",
+        lambda root=None, *, fetch=True: window.LedgerTexts(EMPTY_LEDGER, EMPTY_LEDGER),
+    )
+
+
 @pytest.fixture(autouse=True)
 def live(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fixture_store_path: Path) -> Path:
     """The live store is the fixture copy; secrets are set so a leak is detectable."""
@@ -504,12 +519,20 @@ NO_WINDOW = cli.PAPER_REFUSAL_EXIT["no_window"]
 #: Every `paper` command's exact options (spec req 16: no endpoint, run-session,
 #: store-path or bypass flag; `override --session` is the override's rebalance session).
 PAPER_OPTIONS = {
+    "cost": {"--book", "--window", "--through"},
     "start": {"--hypothesis", "--book", "--now"},
     "stop": {"--reason", "--book"},
     "run": {"--book"},
     "reconcile": {"--book"},
     "kill": {"--reason", "--book", "--all"},
-    "resume": {"--reason", "--accept-broker-fills", "--accept-rejections", "--book"},
+    "resume": {
+        "--reason",
+        "--accept-broker-fills",
+        "--accept-rejections",
+        "--accept-fill-band",
+        "--accept-fill-mismatch",
+        "--book",
+    },
     "report": {"--book"},
     "check": {"--book", "--verbose"},
     "status": {"--book", "--all"},
@@ -567,7 +590,7 @@ def _paper(clock: _Clock, factory: _Factory, *args: str) -> Out:
     return out
 
 
-def _register_h1(tmp_path: Path, *, signed_off: bool) -> None:
+def _register_h1(tmp_path: Path, *, signed_off: bool, cadence: str = "month_end") -> None:
     s = _settings()
     with open_for_write(s) as conn:
         init_schema(conn)
@@ -584,6 +607,7 @@ def _register_h1(tmp_path: Path, *, signed_off: bool) -> None:
                 "costs.commission_per_order": 0.0,
                 "execution.fill_price": "close",
                 "strategy.top_fraction": 0.1,
+                "schedule.rebalance_cadence": cadence,
             },
             in_sample_start=date(2016, 1, 29),
             holdout_start=date(2023, 1, 3),
@@ -917,6 +941,31 @@ def test_override_refuses_a_reason_under_the_frozen_minimum(
     assert "override 1 written" in ok.output
 
 
+def test_daily_exclude_override_warns_when_it_will_run(
+    tmp_path: Path, clock: _Clock, factory: _Factory
+) -> None:
+    _register_h1(tmp_path, signed_off=True, cadence="daily")
+    started = _paper(clock, factory, "start", "--hypothesis", "h1")
+    assert started.exit_code == 0, started.output
+    written = _paper(
+        clock,
+        factory,
+        "override",
+        "--kind",
+        "exclude_name",
+        "--session",
+        "2026-10-02",
+        "--name",
+        "SEC_SPY",
+        "--reason",
+        LONG_REASON,
+    )
+    assert written.exit_code == 0, written.output
+    assert "override 1 written (exclude_name)" in written.output
+    assert "takes effect at the next session's run" in written.output
+    assert _count("overrides") == 1
+
+
 @pytest.mark.usefixtures("started")
 def test_kill_then_stop_is_refused_and_status_shows_the_switch(
     clock: _Clock, factory: _Factory
@@ -1232,13 +1281,23 @@ def test_commands_under_a_held_run_lock_exit_locked(clock: _Clock, factory: _Fac
     assert factory.fake.calls == before
 
 
-@pytest.mark.parametrize(("flags", "accepted"), [((), False), (("--accept-rejections",), True)])
+@pytest.mark.parametrize(
+    ("flags", "accepted", "band", "mismatch"),
+    [
+        ((), False, False, False),
+        (("--accept-rejections",), True, False, False),
+        (("--accept-fill-band",), False, True, False),
+        (("--accept-fill-mismatch",), False, False, True),
+    ],
+)
 def test_resume_passes_the_owners_flags_on_unchanged(
     monkeypatch: pytest.MonkeyPatch,
     clock: _Clock,
     factory: _Factory,
     flags: tuple[str, ...],
     accepted: bool,
+    band: bool,
+    mismatch: bool,
 ) -> None:
     seen: list[tuple[Any, ...]] = []
 
@@ -1249,14 +1308,27 @@ def test_resume_passes_the_owners_flags_on_unchanged(
     monkeypatch.setattr(paper_resume, "resume", recording)
     out = _paper(clock, factory, "resume", "--reason", LONG_REASON, *flags)
     assert out.exit_code == 0, out.output
-    assert seen == [(False, {"accept_rejections": accepted, "book_id": "main"})]
+    assert seen == [
+        (
+            False,
+            {
+                "accept_rejections": accepted,
+                "accept_fill_band": band,
+                "accept_fill_mismatch": mismatch,
+                "book_id": "main",
+            },
+        )
+    ]
 
 
-def test_accept_rejections_is_a_plain_off_by_default_flag() -> None:
+@pytest.mark.parametrize(
+    "flag", ["--accept-rejections", "--accept-fill-band", "--accept-fill-mismatch"]
+)
+def test_accept_rejections_is_a_plain_off_by_default_flag(flag: str) -> None:
     group: Any = typer.main.get_command(cli.make_app())
     resume_command = group.commands["paper"].commands["resume"]
-    (param,) = [p for p in resume_command.params if "--accept-rejections" in p.opts]
-    assert param.opts == ["--accept-rejections"]
+    (param,) = [p for p in resume_command.params if flag in p.opts]
+    assert param.opts == [flag]
     assert param.secondary_opts == []
     assert param.default is False
     assert param.envvar is None
@@ -1275,12 +1347,21 @@ def test_accept_rejections_ignores_an_auto_envvar_prefix(
 
     monkeypatch.setattr(paper_resume, "resume", recording)
     monkeypatch.setenv("TP_PAPER_RESUME_ACCEPT_REJECTIONS_FLAG", "1")
+    monkeypatch.setenv("TP_PAPER_RESUME_ACCEPT_FILL_BAND_FLAG", "1")
+    monkeypatch.setenv("TP_PAPER_RESUME_ACCEPT_FILL_MISMATCH_FLAG", "1")
     app = cli.make_app(clock=clock, broker=factory)
     result = CliRunner().invoke(
         app, ["paper", "resume", "--reason", LONG_REASON], auto_envvar_prefix="TP"
     )
     assert result.exit_code == 0, result.output
-    assert seen == [{"accept_rejections": False, "book_id": "main"}]
+    assert seen == [
+        {
+            "accept_rejections": False,
+            "accept_fill_band": False,
+            "accept_fill_mismatch": False,
+            "book_id": "main",
+        }
+    ]
 
 
 # --- `--book` and the multi-book `paper run` (ADR 0017 B.2 to B.5; plan T155b) -----------
@@ -1923,8 +2004,12 @@ STATUS_MAIN = (
     "reconciliation n/a\n"
     "slippage vs open (bp, adverse positive, per order): buy n=0; sell n=0; all n=0; "
     "no bar 0; off session 0; pending 0\n"
+    "slippage split at arrival (bp, open->arrival + arrival->fill = total, per order "
+    "with an arrival price): buy n=0; sell n=0; all n=0; no arrival price 0\n"
     "no successful EDGAR ingest yet; run `tradepartner ingest`\n"
     "alerts (0):\n"
+    "exam: tracking window; machine pass, edge unjudged\n"
+    "exam budget 0 of 4 (ledger), 0 exam windows in the store\n"
 )
 CHECK_MAIN = (
     "FAIL rebalance_count: 0 of 6 rebalance sessions done so far, about 6 months to go\n"
@@ -2034,6 +2119,9 @@ def test_status_all_prints_one_summary_line_per_book(
         f"last run n/a; {nxt}"
         f"book main: window 1 open; positions 0; open orders 0; kill switch released; "
         f"last run n/a; {nxt}"
+        "book b; exam: tracking window; machine pass, edge unjudged\n"
+        "book main; exam: tracking window; machine pass, edge unjudged\n"
+        "exam budget 0 of 4 (ledger), 0 exam windows in the store\n"
     )
 
 
@@ -2296,7 +2384,10 @@ def test_status_all_lists_two_waiting_items_byte_for_byte(
         f"book b: window {b_window} open; positions 0; open orders 0; kill switch engaged; "
         f"last run n/a; {nxt}"
         f"book main: window 1 open; positions 0; open orders 0; kill switch engaged; "
-        f"last run n/a; {nxt}",
+        f"last run n/a; {nxt}"
+        "book b; exam: tracking window; machine pass, edge unjudged\n"
+        "book main; exam: tracking window; machine pass, edge unjudged\n"
+        "exam budget 0 of 4 (ledger), 0 exam windows in the store\n",
     )
     assert _sha256(live) == before
 
@@ -2522,6 +2613,58 @@ def test_report_passes_the_book_and_prints_the_same_lines(
     assert "(residue trued up: 0001739445)" in trued_up_out.output
 
 
+def test_report_prints_the_fidelity_line_after_the_unchanged_period_lines(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    """#3180: the report-only cumulative line and its excluded periods follow the
+    period rows; the head and period lines are byte-identical to the format above."""
+    t0, t1 = date(2026, 10, 30), date(2026, 11, 30)
+    period = paper_report.PeriodRow(
+        rebalance_session=t0,
+        next_session=t1,
+        raw=0.001,
+        dividend_term=0.0,
+        fill_timing_term=-0.0005,
+        residual=0.0005,
+        residue_term=0.0,
+        modelled_cost=0.002,
+        missed=True,
+        override=False,
+        skip_names=(),
+        excluded=True,
+        passed=True,
+        paper_return=0.011,
+        trial_return=0.010,
+    )
+    comparison = paper_report.PeriodComparison(
+        tracking_rule="raw", tracking_k=2.0, periods=(period,), passed=True, failing_period=None
+    )
+    canned = paper_report.Report(
+        comparison=comparison,
+        targets=paper_report.TargetComparison(rows=()),
+        paper_report=journal.PaperReportRow(
+            window_id=1,
+            trial_id=7,
+            through_session=t1,
+            run_at=SESSION_CLOCK,
+            known_at=SESSION_CLOCK,
+            ingested_at=SESSION_CLOCK,
+        ),
+        fidelity=paper_report.economic_fidelity(comparison, max_gap_bps=100.0, min_periods=6),
+    )
+    monkeypatch.setattr(paper_report, "report", lambda *_a, **_k: canned)
+    out = _paper(clock, factory, "report")
+    assert out.exit_code == 0, out.output
+    assert out.output == (
+        "paper report: trial 7 through 2026-11-30; rule raw, k 2; passed\n"
+        "  2026-10-30: raw 0.001000 dividend 0.000000 fill -0.000500 residual 0.000500 "
+        "residue 0.000000 cost 0.002000 excluded missed pass\n"
+        "  fidelity (report only): cumulative paper 0.011000 trial 0.010000 gap +10.0 bp "
+        "over 1 period(s); too few periods (max 100 bp, min 6 periods)\n"
+        "  fidelity excluded periods, kept in the cumulative: 2026-10-30 (missed)\n"
+    )
+
+
 def test_short_report_prints_dividends_and_headline_fee(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
 ) -> None:
@@ -2714,7 +2857,8 @@ def test_status_bounds_the_slippage_read_to_the_configured_sessions(
 def test_report_prints_the_slippage_line(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
 ) -> None:
-    """#1733: a report that carries a slippage summary prints its one line last."""
+    """#1733: a report that carries a slippage summary prints its line, then its
+    arrival split (#3179), last."""
     side = paper_slippage.SideSlippage(2, 15.0, 12.5, 20.0)
     canned = paper_report.Report(
         comparison=paper_report.PeriodComparison(
@@ -2736,16 +2880,22 @@ def test_report_prints_the_slippage_line(
             no_bar=3,
             off_session=1,
             pending=2,
+            buy_split=paper_slippage.ArrivalSplit(1, 10.0, 4.0, 6.0),
+            overall_split=paper_slippage.ArrivalSplit(1, 10.0, 4.0, 6.0),
+            no_arrival=1,
         ),
     )
     monkeypatch.setattr(paper_report, "report", lambda *_a, **_k: canned)
     out = _paper(clock, factory, "report")
     assert out.exit_code == 0
-    assert out.output.splitlines()[-1] == (
+    assert out.output.splitlines()[-2:] == [
         "slippage vs open (bp, adverse positive, per order): "
         "buy n=2 wmean 15.00 median 12.50 p90 20.00; sell n=0; "
-        "all n=2 wmean 15.00 median 12.50 p90 20.00; no bar 3; off session 1; pending 2"
-    )
+        "all n=2 wmean 15.00 median 12.50 p90 20.00; no bar 3; off session 1; pending 2",
+        "slippage split at arrival (bp, open->arrival + arrival->fill = total, per order "
+        "with an arrival price): buy n=1 +4.00 + +6.00 = +10.00; sell n=0; "
+        "all n=1 +4.00 + +6.00 = +10.00; no arrival price 1",
+    ]
 
 
 # --- `paper shakedown` (ADR 0017 part E; plan T157b) --------------------------------
@@ -2984,6 +3134,23 @@ def test_paper_reconcile_accepts_a_breaks_row_as_a_cash_base_status(
     assert f"paper reconcile: {status}" in out.output
 
 
+def test_paper_reconcile_on_fills_lagging_names_the_collector(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    """#2996: a `fills_lagging` reconcile (fills the journal has not collected)
+    halts nothing; it still exits non-zero and says `paper resume` or the next
+    `paper run` collects them."""
+    from tradepartner.execution import reconcile_run
+    from tradepartner.execution.reconcile import FILLS_LAGGING, Reconciliation
+
+    result = Reconciliation(FILLS_LAGGING, None, (), ("tp-main-sell-1",), (), ())
+    monkeypatch.setattr(reconcile_run, "reconcile_command", lambda *_a, **_k: result)
+    out = _paper(clock, factory, "reconcile")
+    assert out.exit_code == 1, out.output  # CRASH_EXIT_CODE, as before #2996
+    assert "paper reconcile: fills_lagging" in out.output
+    assert "`paper resume` (or the next `paper run`) collects them" in out.output
+
+
 def test_book_sandbox_on_a_store_outside_temp_is_refused_before_any_broker(
     clock: _Clock, factory: _Factory, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: Any
 ) -> None:
@@ -3100,3 +3267,264 @@ def test_status_all_hides_phase_notes_but_keeps_other_run_notes() -> None:
     row.last_run_message = "paper_phase started=1"
     assert "check fill" not in cli._summary_lines((row,), SESSION_CLOCK)[0]
     assert "paper_phase" not in cli._summary_lines((row,), SESSION_CLOCK)[0]
+
+
+# --- paper cost (T383, #3118 item 3) --------------------------------------------------
+
+_COST = paper_slippage.MeasuredCost(
+    slippage=paper_slippage.Slippage(
+        buy=paper_slippage.SideSlippage(944, 49.5, 36.3, 120.0),
+        sell=paper_slippage.SideSlippage(900, 91.3, 14.4, 200.0),
+        overall=paper_slippage.SideSlippage(1844, 61.4, 10.5, 150.0),
+        no_bar=2,
+        off_session=1,
+        pending=3,
+        buy_split=paper_slippage.ArrivalSplit(900, 50.0, 0.0, 50.0),
+        sell_split=paper_slippage.ArrivalSplit(850, 90.0, 0.0, 90.0),
+        overall_split=paper_slippage.ArrivalSplit(1750, 60.0, 0.0, 60.0),
+        no_arrival=94,
+    ),
+    month_end=paper_slippage.SideSlippage(190, 70.0, 5.0, 100.0),
+    stop_run=142,
+    after_stop=4,
+    stop_session=date(2026, 11, 5),
+    figure_bp=60.0,
+)
+
+
+def _seed_books() -> None:
+    """Windows 1 (`daily`), 2 (`main`) and 3 (`daily`, the latest)."""
+    with open_for_write(_settings()) as conn:
+        init_schema(conn)
+        for book in ("daily", "main", "daily"):
+            journal.append(conn, replace(_window(None, WINDOW_START), book_id=book))
+
+
+@pytest.fixture
+def cost_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, datetime]]:
+    calls: list[tuple[int, datetime]] = []
+
+    def fake(_conn: object, window_id: int, cutoff: datetime) -> paper_slippage.MeasuredCost:
+        calls.append((window_id, cutoff))
+        return _COST
+
+    monkeypatch.setattr(paper_slippage, "window_cost", fake)
+    return calls
+
+
+def test_paper_cost_prints_the_sides_the_counts_and_the_figure_for_the_latest_window(
+    cost_calls: list[tuple[int, datetime]], clock: _Clock, factory: _Factory
+) -> None:
+    _seed_books()
+    out = _paper(clock, factory, "cost", "--book", "daily")
+    assert out.exit_code == 0, out.output
+    assert cost_calls == [(3, SESSION_CLOCK)]
+    assert "book daily, window 3" in out.stdout
+    assert "buys n=944 +49.5; sells n=900 +91.3; pooled n=1844 +61.4" in out.stdout
+    assert "left out: 142 orders of stop runs, 4 on or after the stop (stop session " in (
+        out.stdout
+    )
+    assert (
+        "split at arrival (open->arrival + arrival->fill = total, orders with an arrival "
+        "price): buys n=900 +0.00 + +50.00 = +50.00; sells n=850 +0.00 + +90.00 = +90.00; "
+        "pooled n=1750 +0.00 + +60.00 = +60.00; no arrival price 94"
+    ) in out.stdout
+    assert "counted apart: no bar 2, off session 1, pending 3" in out.stdout
+    assert "on sessions a month-end book also traded (in the pool) n=190 +70.0" in out.stdout
+    assert "figure to freeze: 60 bp per side (pooled, rounded to 5 bp)" in out.stdout
+    assert factory.clocks == []  # no broker is built
+
+
+def test_paper_cost_window_selects_the_window_and_through_bounds_the_read(
+    cost_calls: list[tuple[int, datetime]], clock: _Clock, factory: _Factory
+) -> None:
+    _seed_books()
+    clock.now = datetime(2026, 11, 7, 14, tzinfo=UTC)
+    out = _paper(
+        clock, factory, "cost", "--book", "daily", "--window", "1", "--through", "2026-11-04"
+    )
+    assert out.exit_code == 0, out.output
+    assert cost_calls == [(1, datetime(2026, 11, 4, 21, tzinfo=UTC))]  # close(11-04)
+
+
+def test_paper_cost_refuses_another_books_window_a_missing_one_and_a_bad_through(
+    cost_calls: list[tuple[int, datetime]], clock: _Clock, factory: _Factory
+) -> None:
+    _seed_books()
+    other = _paper(clock, factory, "cost", "--book", "daily", "--window", "2")
+    missing = _paper(clock, factory, "cost", "--book", "daily", "--window", "9")
+    no_book = _paper(clock, factory, "cost", "--book", "nobook")
+    weekend = _paper(clock, factory, "cost", "--book", "daily", "--through", "2026-11-07")
+    assert other.exit_code == cli.PAPER_REFUSAL_EXIT["refused"]
+    assert "window 2 is book 'main', not 'daily'" in other.output
+    assert (missing.exit_code, no_book.exit_code) == (cli.PAPER_REFUSAL_EXIT["no_window"],) * 2
+    assert weekend.exit_code == cli.USAGE_ERROR
+    assert cost_calls == []
+
+
+def test_paper_cost_opens_the_store_read_only_and_writes_nothing(
+    cost_calls: list[tuple[int, datetime]],
+    clock: _Clock,
+    factory: _Factory,
+    live: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_books()
+    before = _sha256(live)
+    opened: list[str] = []
+    real = cli.open_read_only
+
+    def read_only(settings: Settings) -> Any:
+        opened.append("read_only")
+        return real(settings)
+
+    def for_write(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("paper cost opened the store for writing")
+
+    monkeypatch.setattr(cli, "open_read_only", read_only)
+    monkeypatch.setattr(cli, "open_for_write", for_write)
+    monkeypatch.setattr(cli.store_migrate, "migrate", for_write)
+    out = _paper(clock, factory, "cost", "--book", "daily")
+    assert out.exit_code == 0, out.output
+    assert opened == ["read_only", "read_only"]  # the schema check, then the read
+    assert _sha256(live) == before
+
+
+# --- the exam line and the budget line (plan T381a; ADR 0016 decision 1, #3146) -------
+
+_EXAM_FROZEN = {
+    "exam_class": "exam",
+    "paper.exam_looks_months": [12, 24, 36],
+    "paper.exam_bounds": [4.762, 3.367, 2.75],
+    "paper.exam_futility_months": 6,
+}
+
+
+def _make_exam_window(frozen: dict[str, Any]) -> None:
+    with open_for_write(_settings()) as conn:
+        current = json.loads(
+            conn.execute("SELECT frozen_json FROM paper_windows WHERE window_id = 1").fetchone()[0]
+        )
+        current.pop("exam_class", None)
+        conn.execute(
+            "UPDATE paper_windows SET frozen_json = ? WHERE window_id = 1",
+            [json.dumps({**current, **frozen})],
+        )
+
+
+def _ledger_with(outcome: str) -> str:
+    on = "2026-10-30" if outcome == "running" else "2027-10-29"
+    return EMPTY_LEDGER + (
+        '\n[[exam]]\nseq = 1\nhypothesis = "h1"\nhypothesis_fingerprint = "fp"\n'
+        'family = "momentum"\nbook_id = "main"\nwindow_id = 1\nstart_date = 2026-10-30\n'
+        'kill_line = "https://github.com/x/y/issues/1#issuecomment-1"\ncampaign_k = -1\n'
+        f'outcome = "{outcome}"\noutcome_on = {on}\n'
+    )
+
+
+def _verdict(state: str, month: int | None, next_look: int | None, read: int) -> Any:
+    from tradepartner.execution.exam import ExamVerdict
+
+    return ExamVerdict(state, month, next_look, read, ())  # type: ignore[arg-type]
+
+
+@pytest.mark.usefixtures("started")
+@pytest.mark.parametrize(
+    ("verdict", "outcome", "line"),
+    [
+        (
+            ("running", None, 12, 3),
+            "running",
+            "exam: forward return exam running, month 3, next look at month 12; "
+            "machine pass, edge unjudged",
+        ),
+        (
+            ("passed", 12, None, 12),
+            "running",
+            "exam: forward return exam passed by T381, not yet recorded in the ledger; "
+            "machine pass, edge unjudged",
+        ),
+        (("passed", 12, None, 12), "passed", "exam: forward return exam passed at month 12"),
+        (
+            ("failed_futility", 6, None, 6),
+            "failed_futility",
+            "exam: forward return exam failed (futility) at month 6; machine pass, edge unjudged",
+        ),
+        (
+            ("failed_void", None, None, 20),
+            "failed_void",
+            "exam: forward return exam failed (void); machine pass, edge unjudged",
+        ),
+    ],
+)
+def test_status_prints_an_exam_window_s_verdict_and_reads_a_pass_only_from_the_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+    clock: _Clock,
+    factory: _Factory,
+    verdict: tuple[str, int | None, int | None, int],
+    outcome: str,
+    line: str,
+) -> None:
+    from tradepartner.execution import book_stats
+
+    _make_exam_window(_EXAM_FROZEN)
+    monkeypatch.setattr(book_stats, "exam_verdict_of", lambda *a, **k: _verdict(*verdict))
+    text = _ledger_with(outcome)
+    monkeypatch.setattr(
+        window, "read_ledger_texts", lambda root=None, *, fetch=True: window.LedgerTexts(text, text)
+    )
+    out = _paper(clock, factory, "status")
+    assert out.exit_code == 0, out.output
+    tail = out.output.splitlines()[-2:]
+    assert tail == [line, "exam budget 1 of 4 (ledger), 1 exam windows in the store"]
+
+
+@pytest.mark.usefixtures("started")
+def test_status_never_prints_a_pass_without_a_reviewed_ledger(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    """A passed verdict with `origin/main`'s copy unreadable is not "passed"; the
+    budget line says the ledger cannot be read."""
+    from tradepartner.execution import book_stats
+
+    _make_exam_window(_EXAM_FROZEN)
+    monkeypatch.setattr(
+        book_stats, "exam_verdict_of", lambda *a, **k: _verdict("passed", 12, None, 12)
+    )
+    monkeypatch.setattr(
+        window,
+        "read_ledger_texts",
+        lambda root=None, *, fetch=True: window.LedgerTexts(_ledger_with("passed"), None),
+    )
+    tail = _paper(clock, factory, "status").output.splitlines()[-2:]
+    assert tail == [
+        "exam: forward return exam passed by T381, not yet recorded in the ledger; "
+        "machine pass, edge unjudged",
+        "exam budget unreadable (no reviewed ledger), 1 exam windows in the store",
+    ]
+
+
+@pytest.mark.usefixtures("started")
+def test_status_labels_a_pre_t381a_exam_window_unexamined_counted(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    monkeypatch.setattr(window, "_forward", lambda _conn, _hyp: True)
+    _make_exam_window({})
+    tail = _paper(clock, factory, "status").output.splitlines()[-2:]
+    assert tail == [
+        "exam: exam window, unexamined, counted; machine pass, edge unjudged",
+        "exam budget 0 of 4 (ledger), 1 exam windows in the store",
+    ]
+
+
+@pytest.mark.usefixtures("started")
+def test_status_reports_an_unreadable_exam_series_as_edge_unjudged(
+    clock: _Clock, factory: _Factory
+) -> None:
+    """The window has no marks, SPY or rates for a month yet: not a crash, not a pass."""
+    _make_exam_window(_EXAM_FROZEN)
+    out = _paper(clock, factory, "status")
+    assert out.exit_code == 0, out.output
+    exam = out.output.splitlines()[-2]
+    assert exam.startswith("exam: forward return exam ")
+    assert exam.endswith("machine pass, edge unjudged")

@@ -71,7 +71,7 @@ JOURNAL_HIGH_WATER_TABLES: tuple[str, ...] = (
 _OPEN_WINDOWS_SQL = (
     "SELECT window_id, book_id, first_rebalance_session, started_at FROM paper_windows "
     "WHERE window_id NOT IN (SELECT window_id FROM paper_window_stops "
-    "WHERE list_contains(?, state)) ORDER BY window_id"
+    "WHERE state IN (SELECT unnest(?))) ORDER BY window_id"
 )
 
 
@@ -160,7 +160,7 @@ def read_instant_sources(conn: duckdb.DuckDBPyConnection) -> list[ReadInstant]:
     if not ids:
         return found
     runs = conn.execute(
-        "SELECT run_id, session FROM paper_runs WHERE list_contains(?, window_id) "
+        "SELECT run_id, session FROM paper_runs WHERE window_id IN (SELECT unnest(?)) "
         "AND session IS NOT NULL ORDER BY run_id",
         [ids],
     ).fetchall()
@@ -173,7 +173,7 @@ def read_instant_sources(conn: duckdb.DuckDBPyConnection) -> list[ReadInstant]:
         "SELECT p.run_id, t.data_cutoff FROM paper_plans p "
         "JOIN paper_runs r ON r.run_id = p.run_id "
         "LEFT JOIN trials t ON t.trial_id = p.plan_trial_id "
-        "WHERE list_contains(?, r.window_id) ORDER BY p.run_id",
+        "WHERE r.window_id IN (SELECT unnest(?)) ORDER BY p.run_id",
         [ids],
     ).fetchall()
     for run_id, cutoff in plans:
@@ -182,7 +182,7 @@ def read_instant_sources(conn: duckdb.DuckDBPyConnection) -> list[ReadInstant]:
         found.append(ReadInstant(_utc(cutoff, "data_cutoff"), f"plan {run_id} data_cutoff"))
     reports = conn.execute(
         "SELECT window_id, through_session FROM paper_reports "
-        "WHERE list_contains(?, window_id) ORDER BY window_id, through_session",
+        "WHERE window_id IN (SELECT unnest(?)) ORDER BY window_id, through_session",
         [ids],
     ).fetchall()
     for window_id, through in reports:
@@ -193,7 +193,7 @@ def read_instant_sources(conn: duckdb.DuckDBPyConnection) -> list[ReadInstant]:
         )
     recs = conn.execute(
         'SELECT reconciliation_id, "at" FROM reconciliations '
-        "WHERE list_contains(?, window_id) ORDER BY reconciliation_id",
+        "WHERE window_id IN (SELECT unnest(?)) ORDER BY reconciliation_id",
         [ids],
     ).fetchall()
     for rec_id, at in recs:

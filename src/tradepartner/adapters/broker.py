@@ -665,6 +665,13 @@ class Broker(abc.ABC):
         point 3's fetch)."""
 
     @abc.abstractmethod
+    def get_order_by_broker_id(self, broker_order_id: str) -> Order:
+        """The broker's current record of the order the broker itself numbered
+        `broker_order_id` (read-only). Raises `UnknownOrderError` when the broker
+        has no such order. It lets a confirmed order whose `client_order_id`
+        lookup lags be read in any state, terminal included (#3335)."""
+
+    @abc.abstractmethod
     def open_orders(self) -> list[Order]:
         """Every order whose status is not in `TERMINAL_STATUSES`."""
 

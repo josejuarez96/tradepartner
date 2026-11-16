@@ -16,10 +16,18 @@ from tradepartner.adapters import edgar_source
 from tradepartner.config import Settings
 from tradepartner.config_edgar import PRE_2826_STATEMENT_FACTS
 from tradepartner.store import schema
+from tradepartner.store.listing_reviews import reviewed_listings
 
 # Bump when a builder changes its derivation from unchanged inputs. Cache and
 # schema versions below are read from their owners at call time, never copied.
-BUILD_RULES_VERSION = 4  # 4: #2941, co-registrant and non-symbol filename prefixes refused
+# 12: #3325, fact class matching ignores later-known and retracted listing titles;
+# 11: #3390, a notes-only issuer's first note takes a suffixed id, not the main id;
+# 10: #3362, a relisting successor id starts at its 8-A12B session;
+# 9: #3363, split-off tracking classes (stale relistings dropped, dropped classes end);
+# 8: #3190, a class conflict fails closed with no pre-cover 10-K;
+# 7: #3076, issuer_class tags and rule 8 waits for a SIC or periodic report;
+# 6: #3084, issuer HTML Form 25s and unit/comma class titles; 5: #3056
+BUILD_RULES_VERSION = 12
 
 HASHED_SETTINGS_KEYS = (
     "benchmarks",
@@ -54,11 +62,10 @@ HASHED_SETTINGS_KEYS = (
     "edgar.filename_listings_since",
     "edgar.filename_listing_forms",
     "edgar.filename_document_max_bytes",
+    "edgar.form25_html_max_bytes",
     "events.sec_forms",
     "events.sec_forms_enabled",
     "events.sec_forms_backfill_start",
-    "events.form4_xml_price_below",
-    "events.form4_zero_price_xml_codes",
 )
 
 PER_NAME_KEYS = (
@@ -68,6 +75,11 @@ PER_NAME_KEYS = (
     "edgar.class_member_overrides",
     "edgar.filename_listings_refused",
 )
+
+#: The reviewed listing rows (`store.listing_reviews`, #3293) as a per-name
+#: list outside the settings: an edit to the packaged file touches only the
+#: CIKs its entries name, like an edit to `master.chains`.
+REVIEWED_LISTINGS_KEY = "master.reviewed_listings"
 
 # Hashed, and also stored whole on the run row beside the per-name lists, so a later
 # run knows its base names (#2826). They are not in PER_NAME_KEYS: an edit to them
@@ -90,6 +102,7 @@ EXCLUDED_SETTINGS_KEYS = (
     "edgar.bulk_stamp_threshold_ciks",
     "edgar.bulk_stamps_enabled",
     "edgar.stamp_sgml_check",
+    "edgar.unstampable_retry_days",  # #2865: when to stop re-asking a stamp, as above.
     "edgar.stamp_sgml_fallback_runs",
     "edgar.stamp_header_bytes",
     "edgar.max_filing_failures",
@@ -102,6 +115,17 @@ EXCLUDED_SETTINGS_KEYS = (
     "edgar.statement_backfill_chunk_ciks",  # T365: chunk size, not a derivation rule.
     "edgar.filename_fetch_workers",  # #2932: fetch concurrency, not a derivation rule.
     "edgar.filename_fetch_max_failed_share",  # #2932: a failure threshold.
+    "edgar.filename_fetch_outage_ciks",  # #2934: a failure threshold.
+    # #2994, #3012: the Form 4 writer is not a builder this fingerprint guards (only
+    # `ingest._form4_bulk` reads these), so its routing, multi-owner and rule 5 keys
+    # change Form 4 rows but no index row, and do not move the build hash.
+    "events.form4_xml_price_below",
+    "events.form4_zero_price_xml_codes",
+    "events.form4_multi_owner_xml",
+    "events.form4_compare_trusted",
+    "events.form4_compare_decimals",
+    "events.form4_compare_tolerance",
+    "events.form4_compare_threshold",
 )
 
 CACHE_VERSION_NAMES = (
@@ -109,6 +133,7 @@ CACHE_VERSION_NAMES = (
     "COVER_VERSION",
     "HEADER_VERSION",
     "DELISTING_VERSION",
+    "DELISTING_HTML_VERSION",  # #3084: a bump re-reads unread issuer HTML Form 25s
     "FSN_VERSION",
     "STAMPS_LAYOUT",
     # Not in the amendment's list of six, but a bump re-parses cached entries, so
@@ -156,7 +181,10 @@ def build_fingerprint(settings: Settings) -> BuildFingerprint:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
     return BuildFingerprint(
         hash=hashlib.sha256(encoded).hexdigest(),
-        per_name={key: _setting(settings, key) for key in (*PER_NAME_KEYS, *STORED_STATEMENT_KEYS)},
+        per_name={
+            **{key: _setting(settings, key) for key in (*PER_NAME_KEYS, *STORED_STATEMENT_KEYS)},
+            REVIEWED_LISTINGS_KEY: [row.entry for row in reviewed_listings()],
+        },
     )
 
 

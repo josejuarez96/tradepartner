@@ -78,6 +78,7 @@ _EXPOSURES_SCHEMA: Final[dict[str, pl.DataType]] = {
     "probe_verified": pl.Boolean(),
     "overlaps_holdout": pl.Boolean(),
     "post_boundary": pl.Boolean(),
+    "synthetic": pl.Boolean(),
     "desk read": pl.Utf8(),
     "read_at": _INSTANT,
     "known_at": _INSTANT,
@@ -551,6 +552,7 @@ def _exposures_table(rows: Sequence[research.ExposureRecord]) -> pl.DataFrame:
                 "probe_verified": row.probe_verified,
                 "overlaps_holdout": row.overlaps_holdout,
                 "post_boundary": row.post_boundary,
+                "synthetic": row.synthetic,
                 "desk read": (
                     f"https://github.com/josejuarez96/tradepartner/blob/main/{row.desk_read_path}"
                 ),

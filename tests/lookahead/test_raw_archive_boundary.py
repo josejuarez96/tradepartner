@@ -123,9 +123,10 @@ def test_the_source_scan_finds_no_archive_opener_outside_its_allowlists() -> Non
     assert "def read_body" in helper
 
 
-def test_every_listed_writer_exists() -> None:
-    """A renamed module must not leave a stale allowance behind."""
-    for relative in _WRITERS | {"config.py", "store/raw_archive_config.py"}:
+def test_every_listed_writer_and_reader_exists() -> None:
+    """A renamed module must not leave a stale allowance behind (T352 adds the
+    re-derive reader, `store/raw_rederive.py`)."""
+    for relative in _WRITERS | _READERS_ALLOWED | {"config.py", "store/raw_archive_config.py"}:
         assert (_SRC / relative).is_file(), relative
 
 

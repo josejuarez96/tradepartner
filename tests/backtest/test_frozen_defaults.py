@@ -68,8 +68,8 @@ def test_table_defaults_are_the_config_defaults() -> None:
     dumped = Settings(_env_file=None).model_dump(mode="json")  # type: ignore[call-arg]
     for key, default, _version in frozen.FROZEN_KEY_DEFAULTS:
         section, _, name = key.partition(".")
-        if key == RISK_FREE_SOURCE_KEY:
-            continue  # the one exception (T170d, #2011): see the test below
+        if key in (RISK_FREE_SOURCE_KEY, ISSUER_CLASS_KEYS[0]):
+            continue  # the two exceptions (T170d, #2011; #3076): see the tests below
         assert frozen.is_default(dumped[section][name], default), key
 
 
@@ -80,6 +80,16 @@ def test_risk_free_source_is_the_one_default_the_table_does_not_follow() -> None
     assert dumped["metrics"]["risk_free_source"] == "store"
     table = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
     assert table[RISK_FREE_SOURCE_KEY] == "constant"
+
+
+def test_issuer_classes_live_default_excludes_while_the_table_keeps_the_old_rule() -> None:
+    """#3076: the live default excludes BDCs, MLPs and foreign filers; the table entry is
+    `[]`, the rule a registration stored before the key ran, so no stored fingerprint
+    moves and a new registration leaving the key out freezes the exclusion."""
+    dumped = Settings(_env_file=None).model_dump(mode="json")  # type: ignore[call-arg]
+    assert dumped["universe"]["exclude_issuer_classes"] == ["bdc", "foreign", "mlp"]
+    table = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    assert table[ISSUER_CLASS_KEYS[0]] == []
 
 
 def test_frozen_module_is_a_leaf() -> None:
@@ -366,6 +376,10 @@ PORTFOLIO_KEYS = (
 )
 #: T328a's delisting failure-return policy key (#2670), a table entry at version 45.
 DELISTING_POLICY_KEYS = ("backtest.delisting_failure_return",)
+#: #3055's split-dating switch, a table entry at version 46.
+SPLIT_DATING_KEYS = ("universe.shares_split_dating",)
+#: #3076's issuer-class exclusion, a table entry at version 48.
+ISSUER_CLASS_KEYS = ("universe.exclude_issuer_classes",)
 #: T187's successor-chain keys (#821), table entries at version 31.
 CHAIN_KEYS = (
     "master.chains",
@@ -385,6 +399,8 @@ COMBINED_LATER_KEYS = (
     "strategy.hold_top_fraction",
     *PORTFOLIO_KEYS,
     *DELISTING_POLICY_KEYS,
+    *SPLIT_DATING_KEYS,
+    *ISSUER_CLASS_KEYS,
 )
 
 
@@ -394,7 +410,14 @@ def _before(params: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
 
 #: The pins describe the records on the owner's store, which store the old universe
 #: (ADR 0006 amendment 2026-10-11, #1540, property 6); the live default is now `[]`.
-_PINNED_UNIVERSE = {"exclude_sic_ranges": [[4900, 4999]]}
+#: Likewise #3076's issuer classes: those records predate the key, which they read at
+#: its table default `[]` while the live default excludes BDCs, MLPs and foreign filers.
+#: And #3384's exchange list: the records store the three venues, the live default adds TXSE.
+_PINNED_UNIVERSE = {
+    "exclude_sic_ranges": [[4900, 4999]],
+    "exclude_issuer_classes": [],
+    "exchanges": ["NYSE", "NASDAQ", "NYSE_AMERICAN"],
+}
 
 
 def _defaults_settings() -> Settings:
@@ -432,6 +455,8 @@ LATER_KEYS = (
     "strategy.hold_top_fraction",
     *PORTFOLIO_KEYS,
     *DELISTING_POLICY_KEYS,
+    *SPLIT_DATING_KEYS,
+    *ISSUER_CLASS_KEYS,
 )
 
 
@@ -642,6 +667,8 @@ def test_b3_fingerprint_canonical_set_and_hash_are_pinned(
                     "strategy.hold_top_fraction",
                     *PORTFOLIO_KEYS,
                     *DELISTING_POLICY_KEYS,
+                    *SPLIT_DATING_KEYS,
+                    *ISSUER_CLASS_KEYS,
                 ),
             )
         )
@@ -966,7 +993,7 @@ def test_cost_term_entries_are_last_and_pinned_by_value() -> None:
     (#1818) takes 29 and lands first; T187's four chain entries and T211c's
     spin-off key follow them."""
     assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:26], COST_ENTRIES)
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:-14], COST_ENTRIES)
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:-16], COST_ENTRIES)
 
 
 def test_post_registration_cost_keys_pinned_and_each_a_costs_table_key() -> None:
@@ -1100,7 +1127,7 @@ def test_the_chain_entries_are_pinned_and_move_no_fingerprint() -> None:
         assert table[key] == (default, version), key
     settings = _defaults_settings()
     keys = CHAIN_KEYS
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-14:-10], CHAIN_ENTRIES)
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-16:-12], CHAIN_ENTRIES)
     for family, params in (
         ("momentum", _new_params(settings)),
         ("combined", _combined_params(settings)),
@@ -1126,7 +1153,7 @@ def test_apply_spin_offs_entry_is_pinned_by_value() -> None:
     """Appended at version 31 at its default; T238's buffer entry and T219's five
     `portfolio.*` entries follow it."""
     assert frozen.is_default(
-        frozen.FROZEN_KEY_DEFAULTS[-10:-9], ((APPLY_SPIN_OFFS_KEY, False, 31),)
+        frozen.FROZEN_KEY_DEFAULTS[-12:-11], ((APPLY_SPIN_OFFS_KEY, False, 31),)
     )
 
 
@@ -1212,7 +1239,7 @@ def test_a_file_naming_true_is_a_new_fingerprint(tmp_path: Path, settings: Setti
 def test_buffer_entry_is_pinned_by_value() -> None:
     """Appended after the spin-off key, at the schema version current when it landed;
     T219's five `portfolio.*` entries follow it."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-9:-8], ((BUFFER_KEY, 0.0, 34),))
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-11:-10], ((BUFFER_KEY, 0.0, 34),))
     assert BUFFER_KEY in hypothesis.frozen_keys()
 
 
@@ -1276,7 +1303,7 @@ PORTFOLIO_ENTRIES = (
 def test_portfolio_entries_are_pinned_by_value() -> None:
     """Appended after T238's buffer entry (T221's two borrow entries follow them), at the
     schema version current when they landed, in the spec item 1 order."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-8:-3], PORTFOLIO_ENTRIES)
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-10:-5], PORTFOLIO_ENTRIES)
     for key, _default, _version in PORTFOLIO_ENTRIES:
         assert key in hypothesis.frozen_keys()
 
@@ -1356,7 +1383,7 @@ def test_borrow_entries_are_last_and_pinned_by_value() -> None:
     """Appended after T219's `portfolio.*` entries, at the current schema version (T328a's
     entry follows them); both are post-registration cost keys, the headline alone may
     only rise."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-3:-1], BORROW_ENTRIES)
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-5:-3], BORROW_ENTRIES)
     for key, _default, _version in BORROW_ENTRIES:
         assert key in hypothesis.frozen_keys()
         assert key in frozen.POST_REGISTRATION_COST_KEYS
@@ -1407,8 +1434,19 @@ DELISTING_POLICY_KEY = "backtest.delisting_failure_return"
 
 def test_delisting_policy_entry_is_last_and_pinned_by_value() -> None:
     """Appended after T221's borrow entries at schema version 45, at `none`."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-1:], ((DELISTING_POLICY_KEY, "none", 45),))
+    assert frozen.is_default(
+        frozen.FROZEN_KEY_DEFAULTS[-3:-2], ((DELISTING_POLICY_KEY, "none", 45),)
+    )
     assert DELISTING_POLICY_KEY in hypothesis.frozen_keys()
+
+
+def test_split_dating_entry_is_last_and_pinned_by_value() -> None:
+    """#3055: appended after T328a's entry at schema version 46, at `false` (today's rule);
+    #3076's issuer-class entry follows it."""
+    assert frozen.is_default(
+        frozen.FROZEN_KEY_DEFAULTS[-2:-1], (("universe.shares_split_dating", False, 46),)
+    )
+    assert "universe.shares_split_dating" in hypothesis.frozen_keys()
 
 
 def test_post_registration_backtest_keys_pinned_and_disjoint() -> None:

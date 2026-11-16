@@ -65,6 +65,16 @@ here is this module's and is stated once:
   effective date). Report-only, like `delisted_names`: no rule reads it,
   `health --check` does not fail on it, and it has no grace period, so a
   genuine relisting whose first bars are not in yet shows until they are.
+- **Spliced series** (`spliced_series`, #3056): each security's consecutive
+  traded bars known at `t` (latest revision, volume above zero) with more
+  than `master.transfer_window_sessions` XNYS sessions strictly between
+  them and a close ratio above `health.splice_max_price_ratio` or below
+  its inverse: another equity's prints chained onto the id at a ticker or
+  chain hand-over (post-bankruptcy equity on the old company's series:
+  GPOR, CBL, WW). One row per gap, raw ids (never re-keyed by a chain).
+  Report-only, like `listed_without_bars`: `health --check` does not fail
+  on it; `repair-resolution` removes the ones the resolver no longer
+  assigns, and the rest (no Form 25 to end the old line) are listed here.
 - **Price jumps** (`price_jumps`): the owner's review list (#787),
   `store.asof.price_jumps_as_of` at `t` over every security: each one-day
   close move between traded bars outside the `universe` jump bounds that no
@@ -80,6 +90,11 @@ here is this module's and is stated once:
   from `universe.accepted_shares_facts`. Universe rules 7 and 8 use the last
   accepted fact instead of an unaccepted one. `jumps_before` keeps only
   facts with an `as_of_date` before it.
+- **Shares cap jumps** (`shares_cap_jumps`, #3055): `universe.shares_cap_jumps`
+  at `t`, each shares fact whose implied cap (value x the raw close at its
+  `as_of_date`) is out of line with its neighbours by more than
+  `health.shares_cap_jump_ratio` (a halved, mis-dated or mis-scaled count).
+  Report only, no integrity rule; `jumps_before` keeps only facts before it.
 - **Accepted same-day pairs** (`accepted_same_day_pairs`, #855): every
   same-start pair of different tickers that `non_overlapping_listings` would
   fail but the owner accepted in `universe.accepted_same_day_pairs`
@@ -151,6 +166,18 @@ here is this module's and is stated once:
   it), `mergers_rates_match_kind`, `mergers_acquirer` (a stock kind names an
   acquirer, never the acquiree) and `mergers_unique` (one row per identity
   and stamp) run over every stored row.
+
+- **Delisting reasons** (`delisting_reasons`, spec amendment #2670, plan
+  T329): the latest reason revision of each Form 25 episode known at `t`
+  counted by reason and evidence source, the episodes with no or an `unknown`
+  reason, the ended-listing keys more than one revision answers (conflicted,
+  read `unknown` by the engine), the reason 8-K items no episode window or
+  reason corroborates, and the `merger_acquisition` episodes without usable
+  consideration (`DelistingReasonsHealth`). Report-only; the integrity rule
+  `delisting_reasons_known_at_from_acceptance` (no revision known before its
+  supporting acceptance) runs over every stored row. A backtest trial's own
+  coverage counts are its run-time snapshot (`backtest.run.EXIT_COVERAGE_COUNTS`);
+  this block is the current view.
 
 - **Coverage against a named reference** (`coverage_reference`, #1541,
   T180): the one check that compares the store with a list outside its own
@@ -241,9 +268,11 @@ derived at `t`, as the data is read.
   from the row before it) and `filing_index_timestamps_aware` (`known_at`,
   `accepted_at` and `ingested_at` are `TIMESTAMPTZ`). The frames carry
   (`cik`, `accession`, rows), except the last, which carries the columns. The
-  common `known_at <= ingested_at` rule covers the rest, as the restamp sets
-  `ingested_at` on every row it moves. A store without the table passes all
-  six; a clean store holding a revision passes them.
+  common `known_at <= ingested_at` rule covers the rest: the restamp sets
+  `ingested_at` on a moved row, except a moved fact with a later stored ingest
+  of the same fact (same security, name, class member and accession) or a
+  revision at its own ingest, which keeps its original `ingested_at` (#2985).
+  A store without the table passes all six; a clean store holding a revision passes them.
 - `bars_on_sessions`: every `prices_daily.session` is an XNYS session in the
   configured calendar range.
 - `no_duplicate_bars`: no two bars share `(security_id, session, known_at)`.
@@ -263,6 +292,13 @@ derived at `t`, as the data is read.
   tested against the next row that is neither; and a same-start OTC pair
   where one ticker is the other plus FINRA's fifth-letter `D` temporary
   symbol (`JFIL`/`JFILD`) is one line, the new quote a reverse split opens.
+  A same-start pair on one exchange whose tickers differ by a warrant, unit
+  or right letter (`TMPM`/`TMPMW`), or only by a space round a dot
+  (`DSAQ. WS`/`DSAQ.WS`), is one line too (#3243); such a partner is no "next
+  exchange line" for a late Form 25 either.
+  A listing a Form 25 ended as a transfer (the security traded on after its
+  effective day, `store.delistings`) is never a late Form 25 (#3242), and two
+  same-start rows one Form 25 ended are one line.
   Every other same-start pair of different tickers fails unless the owner
   lists it in
   `universe.accepted_same_day_pairs` (#855). An accepted pair counts as one
@@ -300,6 +336,17 @@ derived at `t`, as the data is read.
   `master.transfer_window_sessions` of `effective_on`, the same grace a
   genuine resumption gets. Zero rows hit this on the 2026-10-04 backfilled
   store.
+- `old_id_bars_after_successor` (#3251): a bar known at `t` stored under an
+  old id on or after the first session of its company's successor id
+  (`<cik>@<date>`, #3056), that `repair-resolution` has not moved. The old id
+  is a same-CIK id that started before the successor and shares one of its
+  class titles (case and spacing aside), so one class's successor never
+  covers another class's bars (a preferred's bars stay under the common's
+  successor: not flagged by it, and a preferred's own successor does not
+  flag the common). It reads raw listings and bars, whatever the old line's
+  status: `no_bars_after_delisting` does not see an old line read as a
+  transfer. Once the bars are deleted or moved the rule passes. Listings and
+  bars are those known at `t`, so a successor not yet known flags nothing.
 - `underived_master_rows` (#859): the stored `securities` and `listings` rows
   the latest master check finished by `t` (an EDGAR ingest chunk or a
   `master-retract --apply`) found the current rules no longer derive, and
@@ -358,8 +405,10 @@ derived at `t`, as the data is read.
   reviewed list (`store.dividend_reviews`, read at the edge so tests inject
   one) by `equal_amount_groups`: a key with more than one identity that the
   list does not hold, or a listed key with another identity count than the
-  two reviewed (a third record; a lost leg; a duplicate whose ids changed),
-  fails, one row per identity with its `known_at`. `known_at` and the id
+  two reviewed (a third record; a lost leg; a duplicate whose ids changed;
+  a reviewed retract id re-sent under another key, a noisy amount or
+  another ex-date, beside another live payment, #2980), fails, one row per
+  identity with its `known_at`. `known_at` and the id
   are never part of the key, and the rule has no date bound. The
   `duplicate_dividends` block lists the accepted (`distinct`) and
   unresolved keys, never hidden, and the pending ones (a listed `duplicate`
@@ -419,6 +468,19 @@ count over it, or the table holding no observation at `t` (a gate never
 passes on a check it did not make), fails; unset (the default), the block
 reports and fails nothing.
 
+**OpenFIGI identity** (`figi_identity`, plan T399, #3437): a check only, never
+a source. `store.figi_identity` compares each security's CIK, listing and
+successor chain, as the store knew them at the observation's exact `known_at`,
+with its latest `openfigi_types` FIGI, composite FIGI and share-class FIGI: one
+share class under one CIK, successors in different share classes, a listed id
+OpenFIGI could not map, one FIGI under two CIKs. `rows` has one row per
+disagreement, `counts` the number per kind, and `cannot_check` states what the
+data cannot show (OpenFIGI's stored ticker is our own query echo and its
+`exch_code` is always `US`). `figi_identity_disagreements` joins
+`HealthReport.failures` only while `openfigi.max_identity_disagreements` is
+set: the rows over it, or no observation at `t`, fails; unset (the default),
+the block reports and fails nothing.
+
 This module holds no threshold; the only numbers in it are 0 and 1, and
 EDGAR's own filing-date cutoff (`EDGAR_FILING_DATE_CUTOFF`).
 """
@@ -447,6 +509,7 @@ from tradepartner.adapters.alpaca_prices import (
     is_same_day_typo,
     same_alpaca_symbol,
 )
+from tradepartner.adapters.edgar import REASON_8K_ITEMS, eightk_item_codes
 from tradepartner.adapters.prices import announcement_date_known_at, spinoff_known_at_floor
 from tradepartner.adapters.rates import rate_known_at
 from tradepartner.backfill import BACKFILL
@@ -465,6 +528,7 @@ from tradepartner.config import (
     get_settings,
     parse_accepted_same_day_pair,
 )
+from tradepartner.config_backtest import DELISTING_POLICIES
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
 from tradepartner.ingest import ASSETS_IMPORT_MODE, DERIVED_FACTS, MODE, OK, SOURCES
 from tradepartner.store.asof import (
@@ -475,21 +539,30 @@ from tradepartner.store.asof import (
     _traded,
     _validate_t,
     borrow_status_as_of,
+    filing_events_as_of,
     form4_date_plausibility_sql,
     listings_as_of,
     live_actions_as_of,
+    live_chains,
     mergers_as_of,
     price_jumps_as_of,
     prices_as_of,
     statement_facts_as_of,
 )
 from tradepartner.store.classify import EQUITY, UNCLASSIFIABLE, classifications_as_of, listing_kind
+from tradepartner.store.delisting_reasons import (
+    MERGER,
+    UNKNOWN,
+    ReasonWindows,
+    delisting_reasons_as_of,
+)
 from tradepartner.store.delistings import (
     DELISTED,
     LISTED,
     TRANSFERRED,
     _filing_session,
     _window,
+    delistings_as_of,
     listing_ends_as_of,
 )
 from tradepartner.store.dividend_reviews import (
@@ -498,6 +571,18 @@ from tradepartner.store.dividend_reviews import (
     equal_amount_groups,
     reviewed_groups,
 )
+from tradepartner.store.figi_identity import (
+    CANNOT_CHECK as FIGI_CANNOT_CHECK,
+)
+from tradepartner.store.figi_identity import (
+    IDENTITY_SCHEMA as FIGI_IDENTITY_SCHEMA,
+)
+from tradepartner.store.figi_identity import (
+    KINDS as FIGI_KINDS,
+)
+from tradepartner.store.figi_identity import (
+    figi_identity_rows,
+)
 from tradepartner.store.index_members import (
     UNRESOLVED,
     IndexMembers,
@@ -505,15 +590,28 @@ from tradepartner.store.index_members import (
     normalize_ticker,
     resolve,
 )
-from tradepartner.store.master import first_session, securities_as_of, security_cik, session_of
+from tradepartner.store.listing_selection import prefer_current_listing
+from tradepartner.store.master import (
+    _norm_title,
+    first_session,
+    securities_as_of,
+    security_cik,
+    session_of,
+)
 from tradepartner.store.retraction import EDGAR, live_chains_as_of, underived_as_of
 from tradepartner.store.schema import (
     STATEMENT_FACT_BASIS_VALUES,
     TABLE_PROVENANCE_VALUES,
     has_retracted,
 )
+from tradepartner.store.successor_reviews import reviewed_chains
 from tradepartner.timeutil import ensure_tz_aware_utc
-from tradepartner.universe import shares_as_of, universe_as_of
+from tradepartner.universe import (
+    SHARES_CAP_JUMP_SCHEMA,
+    shares_as_of,
+    shares_cap_jumps,
+    universe_as_of,
+)
 
 STATIC = "snapshot_static"
 #: The classification ingest's staleness check counts, with benchmarks.
@@ -529,6 +627,11 @@ FINRA_TEMPORARY_SUFFIX = "D"
 #: The length of the base a FINRA temporary symbol is built on: the suffix
 #: is the base's *fifth* character, so the base itself is four letters.
 FINRA_TEMPORARY_BASE_LENGTH = 4
+#: The letters a SPAC's or issuer's cover page appends to the common ticker
+#: for its warrant (`TMPM` -> `TMPMW`), unit (`U`) or right (`R`) (#3243).
+DERIVATIVE_SUFFIXES: tuple[str, ...] = ("W", "U", "R")
+#: A stray space round a dot in a filer's ticker (`DSAQ. WS`, #3243).
+_DOT_SPACES = re.compile(r"\s*\.\s*")
 #: `_row_kind`'s result for a placeholder-ticker row (#846): never `EQUITY`,
 #: matching `ListingResolver`'s own `_PLACEHOLDER` kind.
 _PLACEHOLDER_KIND = "placeholder"
@@ -542,6 +645,7 @@ BARS_ON_SESSIONS = "bars_on_sessions"
 NO_DUPLICATE_BARS = "no_duplicate_bars"
 NON_OVERLAPPING_LISTINGS = "non_overlapping_listings"
 NO_BARS_AFTER_DELISTING = "no_bars_after_delisting"
+OLD_ID_BARS_AFTER_SUCCESSOR = "old_id_bars_after_successor"
 UNDERIVED_MASTER_ROWS = "underived_master_rows"
 STATEMENT_PERIOD_DAYS = "statement_period_days"
 STATEMENT_DERIVED_MATCHES_COMPONENTS = "statement_derived_matches_components"
@@ -572,6 +676,10 @@ COVERAGE_REFERENCE_NAMES = "coverage_reference_names"
 #: The index answer key's rule (#1682, T189b): reported from the
 #: `coverage_reference` block's `index_members`, never from `INTEGRITY_RULES`.
 INDEX_MEMBERS_MISSING = "index_members_missing"
+#: The freshness rule (#3329): the store has no price bars or is more than
+#: `health.max_stale_sessions` sessions behind. Reported by `check_failures`
+#: only, so the verdict line and the page keep describing the lag in words.
+STORE_STALE = "store_stale"
 #: The session-hole rule (#1575): an XNYS session in the universe history
 #: window whose `prices_daily` row count is below
 #: `health.min_session_rows_share` of the previous session's.
@@ -589,6 +697,12 @@ MERGER_KNOWN_AT = "mergers_known_at_from_process_date"
 MERGER_RATES_MATCH_KIND = "mergers_rates_match_kind"
 MERGER_ACQUIRER = "mergers_acquirer"
 MERGER_UNIQUE = "mergers_unique"
+#: The delisting-reason stamp rule (spec amendment #2670, plan T329): no stored
+#: reason revision is known before its supporting acceptance (the Form 25's for a
+#: `form25_*` source, the cited 8-K's `filing_events.accepted_at` for `eightk_item`).
+#: An 8-K-supported revision may precede its Form 25 (T327's item windows reach back);
+#: the reason read shows it only once that episode is known.
+DELISTING_REASON_KNOWN_AT_FROM_ACCEPTANCE = "delisting_reasons_known_at_from_acceptance"
 #: The duplicate-dividends rule (#1613, T186b): `duplicate_dividends`.
 DUPLICATE_DIVIDENDS = "duplicate_dividends"
 #: The borrow-status key rule (#1506, T171e): `borrow_status_unique`.
@@ -597,11 +711,17 @@ BORROW_STATUS_UNIQUE = "borrow_status_unique"
 #: block, never from `INTEGRITY_RULES`, and only while
 #: `openfigi.max_disagreements` is set.
 FIGI_TYPES_DISAGREEMENTS = "figi_types_disagreements"
+
+#: The OpenFIGI identity rule (plan T399, #3437): reported from the
+#: `figi_identity` block, failing only while
+#: `openfigi.max_identity_disagreements` is set.
+FIGI_IDENTITY_DISAGREEMENTS = "figi_identity_disagreements"
 #: The successor-chain rules (#821, T187c), over raw rows: distinct CIKs,
 #: the row's own stamp order, its stamp against its successor's rows, the
 #: successor listing under the predecessor's ticker, and no predecessor bar
 #: after the hand-over.
 CHAIN_IDS_DISTINCT_CIKS = "chain_ids_distinct_ciks"
+CHAIN_NOT_REVIEWED = "chain_not_reviewed"
 CHAIN_KNOWN_AT_LE_INGESTED_AT = "chain_known_at_le_ingested_at"
 CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS = "chain_known_at_ge_successor_rows"
 CHAIN_SUCCESSOR_LISTED_UNDER_PREDECESSOR_TICKER = "chain_successor_listed_under_predecessor_ticker"
@@ -621,6 +741,7 @@ INTEGRITY_RULES: tuple[str, ...] = (
     NO_DUPLICATE_BARS,
     NON_OVERLAPPING_LISTINGS,
     NO_BARS_AFTER_DELISTING,
+    OLD_ID_BARS_AFTER_SUCCESSOR,
     UNDERIVED_MASTER_ROWS,
     STATEMENT_PERIOD_DAYS,
     STATEMENT_DERIVED_MATCHES_COMPONENTS,
@@ -653,8 +774,10 @@ INTEGRITY_RULES: tuple[str, ...] = (
     MERGER_RATES_MATCH_KIND,
     MERGER_ACQUIRER,
     MERGER_UNIQUE,
+    DELISTING_REASON_KNOWN_AT_FROM_ACCEPTANCE,
     DUPLICATE_DIVIDENDS,
     BORROW_STATUS_UNIQUE,
+    CHAIN_NOT_REVIEWED,
     CHAIN_IDS_DISTINCT_CIKS,
     CHAIN_KNOWN_AT_LE_INGESTED_AT,
     CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS,
@@ -705,6 +828,12 @@ _AFTER_DELISTING_SCHEMA: dict[str, Any] = {
     "ticker": pl.Utf8,
     "exchange": pl.Utf8,
     "effective_on": pl.Date,
+}
+_OLD_ID_BARS_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "successor_id": pl.Utf8,
+    "session": pl.Date,
+    "successor_start": pl.Date,
 }
 _STATEMENT_PERIOD_SCHEMA: dict[str, Any] = {
     "cik": pl.Utf8,
@@ -849,6 +978,77 @@ class ListedWithoutBars:
 
 
 @dataclass(frozen=True, eq=False)
+class SplicedSeries:
+    """Bar gaps with a close jump on one security at `t` (#3056; module
+    docstring), one row per gap."""
+
+    frame: pl.DataFrame
+
+    @property
+    def count(self) -> int:
+        """How many gaps look spliced."""
+        return self.frame.height
+
+
+_SPLICED_SCHEMA: dict[str, Any] = {
+    "security_id": pl.String,
+    "prev_session": pl.Date,
+    "session": pl.Date,
+    "prev_close": pl.Float64,
+    "close": pl.Float64,
+    "ratio": pl.Float64,
+    "gap_sessions": pl.Int64,
+}
+
+
+def spliced_series(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings
+) -> SplicedSeries:
+    """The `spliced_series` block at `t` (#3056; module docstring): only
+    bars known at `t` are read, so a later bar never adds a gap to an
+    earlier report. A bare date raises `TypeError`, a naive datetime
+    `ValueError`."""
+    t = _validate_t(t)
+    window = settings.master.transfer_window_sessions
+    maximum = settings.health.splice_max_price_ratio
+    sessions = pl.DataFrame(
+        {"session": list(all_sessions())}, schema={"session": pl.Date}
+    ).with_row_index("idx")
+    conn.register("_splice_sessions", sessions)
+    try:
+        frame = conn.execute(
+            """
+            WITH latest AS (
+                SELECT security_id, session, close, volume, ROW_NUMBER() OVER (
+                    PARTITION BY security_id, session ORDER BY known_at DESC
+                ) AS _rn
+                FROM prices_daily WHERE known_at <= ?
+            ), traded AS (
+                SELECT l.security_id, l.session, l.close, CAST(s.idx AS BIGINT) AS idx
+                FROM latest l JOIN _splice_sessions s ON s.session = l.session
+                WHERE l._rn = 1 AND l.volume > 0 AND l.close > 0
+            ), paired AS (
+                SELECT security_id, session, close, idx,
+                    LAG(session) OVER w AS prev_session,
+                    LAG(close) OVER w AS prev_close,
+                    LAG(idx) OVER w AS prev_idx
+                FROM traded WINDOW w AS (PARTITION BY security_id ORDER BY session)
+            )
+            SELECT security_id, prev_session, session, prev_close, close,
+                close / prev_close AS ratio, idx - prev_idx - 1 AS gap_sessions
+            FROM paired
+            WHERE prev_idx IS NOT NULL AND idx - prev_idx - 1 > ?
+                AND (close / prev_close > ? OR close / prev_close < ?)
+            ORDER BY security_id, session
+            """,
+            [t, window, maximum, 1 / maximum],
+        ).pl()
+    finally:
+        conn.unregister("_splice_sessions")
+    return SplicedSeries(frame=pl.DataFrame(frame.rows(), schema=_SPLICED_SCHEMA, orient="row"))
+
+
+@dataclass(frozen=True, eq=False)
 class PriceJumps:
     """The price-jump review list at `t` (#787), one row per jump, only sessions
     before `before` when it is set."""
@@ -874,6 +1074,16 @@ class SharesOutliers:
     def pending(self) -> pl.DataFrame:
         """The out-of-line facts the owner has not accepted."""
         return self.frame.filter(~pl.col("accepted"))
+
+
+@dataclass(frozen=True, eq=False)
+class SharesCapJumps:
+    """The shares cap-jump review list at `t` (#3055, `universe.shares_cap_jumps`),
+    one row per fact whose implied cap is out of line, only `as_of_date`s before
+    `before` when it is set. Report only: no integrity rule reads it."""
+
+    frame: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=SHARES_CAP_JUMP_SCHEMA))
+    before: date | None = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -1269,6 +1479,318 @@ def _mergers_report(
     )
 
 
+_EPISODE_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "delisting_form": pl.Utf8,
+    "delisting_class_title": pl.Utf8,
+    "delisting_exchange": pl.Utf8,
+    "delisting_filed_at": pl.Datetime("us", "UTC"),
+}
+_CONFLICT_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "delisting_form": pl.Utf8,
+    "delisting_exchange": pl.Utf8,
+    "delisting_filed_at": pl.Datetime("us", "UTC"),
+    "reasons": pl.List(pl.Utf8),
+}
+_CONSIDERATION_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "delisting_form": pl.Utf8,
+    "delisting_filed_at": pl.Datetime("us", "UTC"),
+    "end_session": pl.Date,
+    "detail": pl.Utf8,
+}
+_MISSING_EIGHTK_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "reason_evidence_accession": pl.Utf8,
+}
+_REASON_STAMP_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "delisting_form": pl.Utf8,
+    "delisting_filed_at": pl.Datetime("us", "UTC"),
+    "reason_source": pl.Utf8,
+    "reason_evidence_accession": pl.Utf8,
+    "known_at": pl.Datetime("us", "UTC"),
+    "accepted_at": pl.Datetime("us", "UTC"),
+}
+#: The engine's merger match window (plan T328c): the widest version's, the same
+#: (10 trading sessions after `end_session`) in every version so far.
+_MERGER_WINDOW_SESSIONS = max(p.merger_window_sessions for p in DELISTING_POLICIES.values())
+
+
+@dataclass(frozen=True, eq=False)
+class DelistingReasonsHealth:
+    """The delisting-reason block at `t` (spec amendment #2670, "Health and
+    acceptance"; plan T329): report only, nothing here fails `--check` (the stamp
+    rule `delisting_reasons_known_at_from_acceptance` is an integrity rule).
+
+    `by_reason_source` counts the latest reason revision of each Form 25 episode
+    known at `t` by `(reason, reason_source)`. `unknown` lists the episodes with no
+    revision or an `unknown` one. `conflicted` lists the ended-listing keys the
+    engine matches on (`security_id`, `delisting_form`, `delisting_exchange`,
+    `delisting_filed_at`) that more than one revision answers, which the engine
+    reads as `unknown` (`n_reason_conflicts`). `unmatched_items` counts, per reason
+    8-K item, each `(security, 8-K)` of a security with an episode whose item falls
+    outside every episode's `ReasonWindows`, or, for Item 2.01, inside one whose
+    reason is not `merger_acquisition` (uncorroborated). `missing_consideration`
+    lists each `merger_acquisition` episode the engine would value at the last
+    close (a transferred listing is never an exit and is skipped): no delisted
+    listing end, not exactly one acquiree `mergers` row in
+    [`end_session`, `end_session` + the window], or a stock component without the
+    acquirer's raw traded close on `effective_date`. `missing_eightk_evidence`
+    names 8-K sourced reasons whose accession has no filing event visible at `t`."""
+
+    by_reason_source: dict[tuple[str, str], int]
+    unknown: pl.DataFrame
+    conflicted: pl.DataFrame
+    unmatched_items: dict[str, int]
+    missing_consideration: pl.DataFrame
+    missing_eightk_evidence: pl.DataFrame
+
+    def lines(self) -> list[str]:
+        """The block as text lines."""
+        counts = ", ".join(
+            f"{reason}/{source} {n}"
+            for (reason, source), n in sorted(self.by_reason_source.items())
+        )
+        items = ", ".join(f"{item} {n}" for item, n in self.unmatched_items.items())
+        missing = ", ".join(
+            f"{row['security_id']} ({row['reason_evidence_accession']})"
+            for row in self.missing_eightk_evidence.iter_rows(named=True)
+        )
+        return [
+            f"delisting reasons: {counts or 'none'}",
+            f"  unknown episodes: {self.unknown.height}; conflicted: {self.conflicted.height}",
+            f"  unmatched 8-K items: {items}",
+            f"  missing merger consideration: {self.missing_consideration.height}",
+            f"  missing 8-K evidence: {self.missing_eightk_evidence.height}",
+            *([f"    {missing}"] if missing else []),
+        ]
+
+
+def delisting_reasons_report(
+    conn: duckdb.DuckDBPyConnection, t: datetime, listings: pl.DataFrame
+) -> DelistingReasonsHealth:
+    """The delisting-reason block at `t` (`DelistingReasonsHealth`); `listings` is
+    `listing_ends_as_of(conn, t, settings)`."""
+    t = _validate_t(t)
+    tables = _present_tables(conn)
+    unmatched = dict.fromkeys(REASON_8K_ITEMS, 0)
+    if "delisting_reasons" not in tables:
+        return DelistingReasonsHealth(
+            {},
+            pl.DataFrame(schema=_EPISODE_SCHEMA),
+            pl.DataFrame(schema=_CONFLICT_SCHEMA),
+            unmatched,
+            pl.DataFrame(schema=_CONSIDERATION_SCHEMA),
+            pl.DataFrame(schema=_MISSING_EIGHTK_SCHEMA),
+        )
+    reasons = delisting_reasons_as_of(conn, t)
+    by_reason_source = dict(
+        Counter(zip(reasons["reason"].to_list(), reasons["reason_source"].to_list(), strict=True))
+    )
+    episodes = (
+        delistings_as_of(conn, t)
+        .rename(
+            {
+                "form": "delisting_form",
+                "class_title": "delisting_class_title",
+                "exchange": "delisting_exchange",
+                "filed_at": "delisting_filed_at",
+            }
+        )
+        .select(list(_EPISODE_SCHEMA))
+        .unique()
+    )
+    known = reasons.filter(pl.col("reason") != UNKNOWN).select(list(_EPISODE_SCHEMA))
+    unknown = episodes.join(known, on=list(_EPISODE_SCHEMA), how="anti").sort(
+        "security_id", "delisting_filed_at"
+    )
+    engine_key = ["security_id", "delisting_form", "delisting_exchange", "delisting_filed_at"]
+    conflicted = (
+        reasons.group_by(engine_key)
+        .agg(pl.col("reason").sort().alias("reasons"))
+        .filter(pl.col("reasons").list.len() > 1)
+        .sort(engine_key)
+    )
+    return DelistingReasonsHealth(
+        by_reason_source,
+        unknown.cast(pl.Schema(_EPISODE_SCHEMA)),
+        conflicted.select(list(_CONFLICT_SCHEMA)).cast(pl.Schema(_CONFLICT_SCHEMA)),
+        _unmatched_items(conn, t, episodes, reasons, unmatched),
+        _missing_consideration(conn, t, reasons, listings),
+        _missing_eightk_evidence(conn, t, reasons),
+    )
+
+
+def _missing_eightk_evidence(
+    conn: duckdb.DuckDBPyConnection, t: datetime, reasons: pl.DataFrame
+) -> pl.DataFrame:
+    """Visible 8-K sourced reasons whose accession has no visible filing event."""
+    candidates = reasons.filter(pl.col("reason_source") == "eightk_item").select(
+        list(_MISSING_EIGHTK_SCHEMA)
+    )
+    if candidates.is_empty() or "filing_events" not in _present_tables(conn):
+        return candidates.sort("security_id", "reason_evidence_accession")
+    accessions = candidates["reason_evidence_accession"].drop_nulls().unique().to_list()
+    if not accessions:
+        return candidates.sort("security_id", "reason_evidence_accession")
+    placeholders = ", ".join("?" for _ in accessions)
+    found = {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT accession FROM filing_events WHERE known_at <= ? "
+            f"AND accession IN ({placeholders})",
+            [t, *accessions],
+        ).fetchall()
+    }
+    return candidates.filter(~pl.col("reason_evidence_accession").is_in(found)).sort(
+        "security_id", "reason_evidence_accession"
+    )
+
+
+def _unmatched_items(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    episodes: pl.DataFrame,
+    reasons: pl.DataFrame,
+    unmatched: dict[str, int],
+) -> dict[str, int]:
+    """`DelistingReasonsHealth.unmatched_items`, filling `unmatched` (every item at 0)."""
+    if "filing_events" not in _present_tables(conn) or episodes.is_empty():
+        return unmatched
+    merger_reason = {
+        (row["security_id"], row["delisting_form"], row["delisting_filed_at"])
+        for row in reasons.filter(pl.col("reason") == MERGER).iter_rows(named=True)
+    }
+    by_security: dict[str, list[tuple[str, datetime]]] = defaultdict(list)
+    for row in episodes.iter_rows(named=True):
+        by_security[row["security_id"]].append((row["delisting_form"], row["delisting_filed_at"]))
+    windows = ReasonWindows()
+    events = filing_events_as_of(conn, t, ("8-K", "8-K/A"), REASON_8K_ITEMS)
+    for row in events.iter_rows(named=True):
+        own = by_security.get(row["security_id"])
+        if not own:
+            continue
+        codes = eightk_item_codes(row["items"])
+        for item in REASON_8K_ITEMS:
+            if item not in codes:
+                continue
+            near = [e for e in own if windows.holds(item, e[1], row["accepted_at"])]
+            if item == "2.01":
+                near = [e for e in near if (row["security_id"], *e) in merger_reason]
+            unmatched[item] += not near
+    return unmatched
+
+
+def _missing_consideration(
+    conn: duckdb.DuckDBPyConnection, t: datetime, reasons: pl.DataFrame, listings: pl.DataFrame
+) -> pl.DataFrame:
+    """`DelistingReasonsHealth.missing_consideration` (its docstring)."""
+    mergers_wanted = reasons.filter(pl.col("reason") == MERGER)
+    if mergers_wanted.is_empty():
+        return pl.DataFrame(schema=_CONSIDERATION_SCHEMA)
+    ends: dict[tuple[str, str, datetime, str], tuple[str, date | None]] = {
+        (row["security_id"], row["delisting_form"], row["delisting_filed_at"], row["exchange"]): (
+            row["status"],
+            row["end_session"],
+        )
+        for row in listings.filter(pl.col("delisting_form").is_not_null()).iter_rows(named=True)
+    }
+    ids = sorted(set(mergers_wanted["security_id"].to_list()))
+    rows = (
+        mergers_as_of(conn, t, ids).filter(pl.col("security_id").is_in(ids))
+        if "mergers" in _present_tables(conn)
+        else pl.DataFrame()
+    )
+    chains = dict(live_chains(conn, t))
+    out: list[dict[str, Any]] = []
+    pending: list[tuple[int, str, date]] = []
+    for reason in mergers_wanted.iter_rows(named=True):
+        sid = reason["security_id"]
+        key = (sid, reason["delisting_form"], reason["delisting_filed_at"])
+        status, end = ends.get((*key, reason["delisting_exchange"]), (None, None))
+        if status == TRANSFERRED:
+            continue  # a transfer is never an exit: nothing is valued
+        detail: str | None = None
+        if status != DELISTED or end is None:
+            detail = "no delisted listing end"
+        else:
+            every = all_sessions()
+            last = every[min(bisect_left(every, end) + _MERGER_WINDOW_SESSIONS, len(every) - 1)]
+            found = (
+                []
+                if rows.is_empty()
+                else [
+                    r
+                    for r in rows.filter(pl.col("security_id") == sid).iter_rows(named=True)
+                    if end <= r["effective_date"] <= last
+                ]
+            )
+            if len(found) != 1:
+                detail = f"{len(found)} merger rows in the window"
+            elif found[0]["share_ratio"] is not None:
+                acquirer = found[0]["acquirer_security_id"]
+                if acquirer is None:
+                    detail = "no acquirer raw close on the effective date"
+                else:
+                    pending.append(
+                        (len(out), chains.get(acquirer, acquirer), found[0]["effective_date"])
+                    )
+        out.append(
+            {
+                "security_id": sid,
+                "delisting_form": key[1],
+                "delisting_filed_at": key[2],
+                "end_session": end,
+                "detail": detail,
+            }
+        )
+    if pending:
+        bars = prices_as_of(
+            conn,
+            t,
+            sorted({acquirer for _, acquirer, _ in pending}),
+            traded_only=True,
+            sessions_from=min(effective for _, _, effective in pending),
+        )
+        closes = set(bars.select("security_id", "session").iter_rows())
+        for index, acquirer, effective in pending:
+            if (acquirer, effective) not in closes:
+                out[index]["detail"] = "no acquirer raw close on the effective date"
+    return pl.DataFrame(
+        [row for row in out if row["detail"] is not None], schema=_CONSIDERATION_SCHEMA
+    )
+
+
+def _reason_stamps(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
+    """`delisting_reasons_known_at_from_acceptance` over every stored revision."""
+    tables = _present_tables(conn)
+    if "delisting_reasons" not in tables:
+        return pl.DataFrame(schema=_REASON_STAMP_SCHEMA)
+    eightk = (
+        "(SELECT max(f.accepted_at) FROM filing_events f "
+        "WHERE f.accession = r.reason_evidence_accession)"
+        if "filing_events" in tables
+        else "NULL"
+    )
+    rows = conn.execute(
+        f"""
+        SELECT security_id, delisting_form, delisting_filed_at, reason_source,
+            reason_evidence_accession, known_at,
+            CASE WHEN reason_source = 'eightk_item' THEN {eightk}
+                ELSE delisting_filed_at END AS accepted_at
+        FROM delisting_reasons r
+        """
+    ).fetchall()
+    found = [
+        dict(zip(_REASON_STAMP_SCHEMA, row, strict=True))
+        for row in rows
+        if row[6] is not None and row[5] < row[6]
+    ]
+    return pl.DataFrame(found, schema=_REASON_STAMP_SCHEMA)
+
+
 _FIGI_DISAGREEMENT_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "ticker": pl.Utf8,
@@ -1439,6 +1961,74 @@ def _figi_types_report(
         unmapped,
         pl.DataFrame(rows, schema=_FIGI_DISAGREEMENT_SCHEMA),
     )
+
+
+@dataclass(frozen=True, eq=False)
+class FigiIdentity:
+    """The `figi_identity` block at `t` (module docstring, "OpenFIGI identity").
+
+    `rows` is `store.figi_identity`'s frame, one row per disagreement;
+    `observations` how many ids have a stored row known at `t`;
+    `max_identity_disagreements` is `openfigi.max_identity_disagreements` as the
+    block was computed -- only while it is set does the block fail."""
+
+    max_identity_disagreements: int | None
+    observations: int
+    rows: pl.DataFrame
+
+    @property
+    def disagreements(self) -> int:
+        """How many disagreement rows there are."""
+        return self.rows.height
+
+    @property
+    def counts(self) -> dict[str, int]:
+        """Rows per kind, every kind present (0 when none)."""
+        return {kind: self.rows.filter(pl.col("kind") == kind).height for kind in FIGI_KINDS}
+
+    @property
+    def cannot_check(self) -> tuple[str, ...]:
+        """What the stored OpenFIGI data cannot show."""
+        return FIGI_CANNOT_CHECK
+
+    def first_rows(self, count: int) -> pl.DataFrame:
+        """The first `count` rows, in kind order."""
+        return self.rows.head(count)
+
+    @property
+    def checked(self) -> bool:
+        """Whether any observation is known at `t`."""
+        return self.observations > 0
+
+    @property
+    def failed(self) -> bool:
+        """While the threshold is set: nothing observed at `t`, or the rows
+        over it. Never while it is unset."""
+        if self.max_identity_disagreements is None:
+            return False
+        return not self.checked or self.disagreements > self.max_identity_disagreements
+
+    @property
+    def verdict(self) -> str:
+        """`nothing checked`, `<n> disagreements (report-only)`, then
+        `pass (max <m>)` or `fail (max <m>)` while a threshold is set."""
+        if not self.checked:
+            return "nothing checked: fail" if self.failed else "nothing checked"
+        head = f"{self.disagreements} disagreements"
+        if self.max_identity_disagreements is None:
+            return f"{head} (report-only)"
+        verdict = "fail" if self.failed else "pass"
+        return f"{head}: {verdict} (max {self.max_identity_disagreements})"
+
+
+def figi_identity(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings | None = None
+) -> FigiIdentity:
+    """The `figi_identity` block at `t` (module docstring)."""
+    t = _validate_t(t)
+    settings = settings if settings is not None else get_settings()
+    observations, rows = figi_identity_rows(conn, t, settings)
+    return FigiIdentity(settings.openfigi.max_identity_disagreements, observations, rows)
 
 
 _INDEX_SAMPLE_SCHEMA: dict[str, Any] = {
@@ -1994,6 +2584,20 @@ class HealthReport:
     incremental_edgar: IncrementalEdgar = field(default_factory=lambda: IncrementalEdgar({}))
     #: The latest Form 4 writer run's rule 5 comparison (T351); `None` before one ran.
     form4_compare: Form4Compare | None = None
+    #: The shares cap-jump review list (#3055).
+    shares_cap_jumps: SharesCapJumps = field(default_factory=SharesCapJumps)
+    #: Bar gaps with a close jump on one id (#3056); report-only.
+    spliced: SplicedSeries = field(
+        default_factory=lambda: SplicedSeries(pl.DataFrame([], schema=_SPLICED_SCHEMA))
+    )
+    #: Delisting reasons and their evidence (plan T329); report-only.
+    delisting_reasons: DelistingReasonsHealth | None = None
+    #: `health.max_stale_sessions` at report time (#3329), read by `check_failures`.
+    max_stale_sessions: int = 0
+    #: The OpenFIGI identity cross-check (plan T399); report-only while unset.
+    figi_identity: FigiIdentity = field(
+        default_factory=lambda: FigiIdentity(None, 0, pl.DataFrame([], schema=FIGI_IDENTITY_SCHEMA))
+    )
 
     @property
     def failures(self) -> tuple[str, ...]:
@@ -2004,7 +2608,8 @@ class HealthReport:
         (`IndexMembersCheck.failed`: only while `coverage.index_max_missing`
         is set), then `figi_types_disagreements` when the `figi_types` block
         failed (`FigiTypes.failed`: only while `openfigi.max_disagreements`
-        is set)."""
+        is set), then `figi_identity_disagreements` when the `figi_identity` block
+        failed (only while `openfigi.max_identity_disagreements` is set)."""
         failed = tuple(check.rule for check in self.integrity if not check.passed)
         block = self.coverage_reference
         if block is not None and block.check_enabled and block.failed:
@@ -2013,12 +2618,26 @@ class HealthReport:
             failed += (INDEX_MEMBERS_MISSING,)
         if self.figi_types.failed:
             failed += (FIGI_TYPES_DISAGREEMENTS,)
+        if self.figi_identity.failed:
+            failed += (FIGI_IDENTITY_DISAGREEMENTS,)
         return failed
 
     @property
     def ok(self) -> bool:
         """True when nothing in `failures` fails."""
         return not self.failures
+
+    @property
+    def check_failures(self) -> tuple[str, ...]:
+        """What `health --check` fails on: `failures`, then `store_stale` when
+        the store has no price bars or is more than `health.max_stale_sessions`
+        sessions behind; the one-session gap before tonight's ingest
+        (`stale_gap_expected`) is never a failure (#3329)."""
+        stale = stale_sessions(self)
+        limit = self.max_stale_sessions
+        if stale is None or (stale > limit and not stale_gap_expected(self)):
+            return (*self.failures, STORE_STALE)
+        return self.failures
 
 
 #: When the scheduled ingest runs (America/New_York). Source: the launchd plist in
@@ -2137,7 +2756,9 @@ def health_report(
         delisted=_delisted_names(current),
         listed_without_bars=_listed_without_bars(conn, t, session, listings, current),
         price_jumps=_price_jumps(conn, t, settings, jumps_before),
+        spliced=spliced_series(conn, t, settings),
         shares_outliers=_shares_outliers(conn, t, settings, jumps_before),
+        shares_cap_jumps=_shares_cap_jumps(conn, t, settings, jumps_before),
         accepted_same_day_pairs=AcceptedSameDayPairs(accepted_pairs),
         settings={
             "liquidity_rule_enabled": settings.universe.liquidity_rule_enabled,
@@ -2150,6 +2771,12 @@ def health_report(
         rates=_rates_report(conn, t, settings),
         borrow=_borrow_report(conn, t, session, settings),
         mergers=_mergers_report(conn, t, ingests),
+        delisting_reasons=delisting_reasons_report(conn, t, listings),
+        max_stale_sessions=settings.health.max_stale_sessions,
+        figi_identity=FigiIdentity(
+            settings.openfigi.max_identity_disagreements,
+            *figi_identity_rows(conn, t, settings),
+        ),
         figi_types=_figi_types_report(conn, t, session, settings, current, classes),
         duplicate_dividends=dividends,
         implausible_form4_dates=int(
@@ -2240,6 +2867,15 @@ def _shares_outliers(
     if before is not None:
         frame = frame.filter(pl.col("as_of_date") < before)
     return SharesOutliers(frame, before)
+
+
+def _shares_cap_jumps(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings, before: date | None
+) -> SharesCapJumps:
+    frame = shares_cap_jumps(conn, t, settings)
+    if before is not None:
+        frame = frame.filter(pl.col("as_of_date") < before)
+    return SharesCapJumps(frame, before)
 
 
 #: `statement_<name>: <N>` (T77b's run-message convention, not yet built:
@@ -2972,7 +3608,7 @@ def _current_from(listings: pl.DataFrame, session: date) -> dict[str, dict[str, 
         if row["valid_from"] > session:
             continue
         held = current.get(row["security_id"])
-        if held is None or row["valid_from"] > held["valid_from"]:
+        if prefer_current_listing(row, held, session):
             current[row["security_id"]] = row
     return current
 
@@ -3270,6 +3906,7 @@ def _integrity_checks(
         NO_DUPLICATE_BARS: _duplicate_bars(conn),
         NON_OVERLAPPING_LISTINGS: overlaps,
         NO_BARS_AFTER_DELISTING: _bars_after_delisting(conn, t, listings, window),
+        OLD_ID_BARS_AFTER_SUCCESSOR: _old_id_bars_after_successor(conn, t, listings),
         UNDERIVED_MASTER_ROWS: underived_as_of(conn, t),
         STATEMENT_PERIOD_DAYS: _statement_period_days(conn),
         STATEMENT_DERIVED_MATCHES_COMPONENTS: _statement_derived_matches_components(conn),
@@ -3281,11 +3918,46 @@ def _integrity_checks(
         **_rate_rules(conn),
         **_new_action_stamp_rules(conn),
         **_merger_rules(conn),
+        DELISTING_REASON_KNOWN_AT_FROM_ACCEPTANCE: _reason_stamps(conn),
         DUPLICATE_DIVIDENDS: dividends.violations,
         BORROW_STATUS_UNIQUE: _borrow_duplicates(conn),
+        CHAIN_NOT_REVIEWED: _unreviewed_chains(conn),
         **_chain_rule_rows(conn, t),
     }
     return tuple(IntegrityCheck(rule=rule, violations=violations[rule]) for rule in INTEGRITY_RULES)
+
+
+def _unreviewed_chains(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
+    """Every stored chain without a matching reviewed predecessor, successor and session."""
+    reviewed = reviewed_chains()
+    if "successor_chains" not in _present_tables(conn):
+        return pl.DataFrame(
+            [
+                {
+                    "predecessor_id": "<missing table>",
+                    "successor_id": "",
+                    "known_at": None,
+                    "detail": "successor_chains table is required; #3097 #3108 #3142",
+                }
+            ],
+            schema=_CHAIN_RULE_SCHEMA,
+        )
+    rows = conn.execute(
+        "SELECT c.predecessor_id, c.successor_id, c.known_at, "
+        "(SELECT min(l.valid_from) FROM listings l WHERE l.security_id = c.successor_id) "
+        "FROM successor_chains c ORDER BY c.predecessor_id, c.successor_id, c.known_at"
+    ).fetchall()
+    violations = [
+        {
+            "predecessor_id": predecessor,
+            "successor_id": successor,
+            "known_at": known_at,
+            "detail": f"effective_session {session}; review #3097 #3108 #3142",
+        }
+        for predecessor, successor, known_at, session in rows
+        if (predecessor, successor, session) not in reviewed
+    ]
+    return pl.DataFrame(violations, schema=_CHAIN_RULE_SCHEMA)
 
 
 _RATE_RULE_SCHEMA: dict[str, Any] = {
@@ -3694,7 +4366,43 @@ def _same_day_typo_pair(
     pair_kind = EQUITY if EQUITY in (current_kind, following_kind) else current_kind
     held = _held_ticker(ordered, index, day, pair_kind)
     return is_same_day_typo(held, tickers) or same_alpaca_symbol(
-        str(current["ticker"]), str(following["ticker"])
+        _DOT_SPACES.sub(".", str(current["ticker"])),
+        _DOT_SPACES.sub(".", str(following["ticker"])),
+    )
+
+
+def _derivative_suffix_pair(current: dict[str, Any], following: dict[str, Any]) -> bool:
+    """True when a same-start pair on one exchange is a ticker and the same
+    ticker plus a warrant, unit or right letter (`TMPM`/`TMPMW`, #3243): the
+    derivative's symbol on the common line's cover page, one line, not two
+    listings, when the suffixed row's own title is non-equity.
+    Exchange lines only: an off-exchange pair has its own rules."""
+    if current["exchange"] != following["exchange"] or current["exchange"] in OFF_EXCHANGE:
+        return False
+    shorter_row, longer_row = sorted((current, following), key=lambda r: len(str(r["ticker"])))
+    shorter, longer = (_resolver_ticker(str(r["ticker"])) for r in (shorter_row, longer_row))
+    # The suffixed row must be non-equity by its own title: two equity rows
+    # with no held ticker are unassigned by the resolver, never one line.
+    return _row_kind(longer_row) != EQUITY and any(
+        longer == shorter + suffix for suffix in DERIVATIVE_SUFFIXES
+    )
+
+
+def _one_line_pair(
+    ordered: list[dict[str, Any]], index: int, current: dict[str, Any], following: dict[str, Any]
+) -> bool:
+    """True when `current` and `following` (same start) are one line by any
+    of the tolerated shapes (also the test of a late Form 25's
+    partner row): a filer's typo or spelling, FINRA's temporary symbol, a derivative's suffix."""
+    filed = current.get("delisting_filed_at")
+    return (
+        _same_line(current, following)
+        # One Form 25 ended both rows (#3242): it names the line, so the
+        # same-day tickers on its exchange are that line's spellings.
+        or (filed is not None and filed == following.get("delisting_filed_at"))
+        or _same_day_typo_pair(ordered, index, current, following)
+        or _finra_temporary_pair(current, following)
+        or _derivative_suffix_pair(current, following)
     )
 
 
@@ -3754,10 +4462,7 @@ def _overlapping_listings(
             same_start = current["valid_from"] == following["valid_from"]
             flagged = (
                 following
-                if same_start
-                and not _same_line(current, following)
-                and not _same_day_typo_pair(ordered, i, current, following)
-                and not _finra_temporary_pair(current, following)
+                if same_start and not _one_line_pair(ordered, i, current, following)
                 else None
             )
             filed = current["delisting_filed_at"]
@@ -3770,13 +4475,19 @@ def _overlapping_listings(
             if flagged is not None and accepted_day:
                 accepted.append(_overlap_row(current, flagged, filing_session))
                 flagged = None
-            if flagged is None and filing_session is not None:
+            # A Form 25 read as a transfer (the security traded on, #3242) is
+            # no second live line however late it was filed.
+            if flagged is None and filing_session is not None and current["status"] != TRANSFERRED:
                 exchange_line = next(
                     (
                         r
                         for r in ordered[i + 1 :]
                         if r["exchange"] not in OFF_EXCHANGE
                         and not _same_line(current, r)
+                        and not (
+                            r["valid_from"] == current["valid_from"]
+                            and _one_line_pair(ordered, i, current, r)
+                        )
                         and r["valid_from"] != one_line_day
                     ),
                     None,
@@ -3827,7 +4538,8 @@ def _bars_after_delisting(
     conn: duckdb.DuckDBPyConnection, t: datetime, listings: pl.DataFrame, window_sessions: int
 ) -> pl.DataFrame:
     bounds: list[dict[str, Any]] = []
-    for ordered in _by_security(listings).values():
+    by_security = _by_security(listings)
+    for ordered in by_security.values():
         for row in ordered:
             if row["status"] != DELISTED:
                 continue
@@ -3885,6 +4597,65 @@ def _bars_after_delisting(
         )
     ]
     return pl.DataFrame(rows, schema=_AFTER_DELISTING_SCHEMA).sort("security_id", "session")
+
+
+_SUCCESSOR_ID = re.compile(r"^[^:@]+@\d{4}-\d{2}-\d{2}")
+
+
+def _cik_of(security_id: str) -> str:
+    return security_id.split(":")[0].split("@")[0]
+
+
+def _class_titles(rows: list[dict[str, Any]]) -> set[str]:
+    """The rows' normalised class titles (the master's own `_norm_title`, so
+    two wordings of one class match); a missing title names no class."""
+    titles = {_norm_title(str(r["class_title"])) for r in rows if r.get("class_title")}
+    return titles - {""}
+
+
+def _old_id_bars_after_successor(
+    conn: duckdb.DuckDBPyConnection, t: datetime, listings: pl.DataFrame
+) -> pl.DataFrame:
+    """`old_id_bars_after_successor` (module docstring, #3251): per successor
+    id, the bars known at `t` under a same-CIK, same-class old id from the
+    successor's first listing day on."""
+    by_security = _by_security(listings)
+    by_cik: dict[str, list[str]] = defaultdict(list)
+    for sid in by_security:
+        by_cik[_cik_of(sid)].append(sid)
+    pairs: list[tuple[str, str, date]] = []
+    for successor, rows in by_security.items():
+        if not _SUCCESSOR_ID.match(successor):
+            continue
+        start = min(r["valid_from"] for r in rows)
+        titles = _class_titles(rows)
+        for old in by_cik[_cik_of(successor)]:
+            old_rows = by_security[old]
+            if (
+                old != successor
+                and min(r["valid_from"] for r in old_rows) < start
+                and _class_titles(old_rows) & titles
+            ):
+                pairs.append((old, successor, start))
+    if not pairs:
+        return pl.DataFrame([], schema=_OLD_ID_BARS_SCHEMA)
+    rows_out: list[dict[str, Any]] = []
+    for old, successor, start in pairs:
+        found = conn.execute(
+            """
+            SELECT DISTINCT session FROM prices_daily
+            WHERE known_at <= ? AND security_id = ? AND session >= ?
+            ORDER BY session
+            """,
+            [t, old, start],
+        ).fetchall()
+        rows_out.extend(
+            {"security_id": old, "successor_id": successor, "session": s, "successor_start": start}
+            for (s,) in found
+        )
+    return pl.DataFrame(rows_out, schema=_OLD_ID_BARS_SCHEMA).sort(
+        "security_id", "successor_id", "session"
+    )
 
 
 def _statement_period_days(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:

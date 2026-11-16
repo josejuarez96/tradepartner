@@ -74,7 +74,7 @@ class StoreConfig(_ClosedConfig):
     case, e.g. `"6GB"`); `threads` is a positive integer.
     """
 
-    path: str = "data/tradepartner.duckdb"
+    path: str = Field(default="data/tradepartner.duckdb")
     lock_retry_seconds: int = Field(default=60, ge=0)
     writer_lock_retry_seconds: int = Field(default=300, ge=0)
     lock_retry_initial_delay_seconds: float = Field(default=0.05, gt=0)
@@ -83,6 +83,31 @@ class StoreConfig(_ClosedConfig):
     threads: int | None = Field(default=None, ge=1)
     pre_migration_backups_to_keep: int = Field(default=2, ge=1)
     backup_disk_margin_bytes: int = Field(default=1_000_000_000, ge=0)
+    # #3274: `decision data-release coverage` lists a security that lost more than this
+    # many trading days across a release, and fails when more than this many are unmoved.
+    release_max_lost_sessions: int = Field(default=5, ge=0)
+    # Total unmoved sessions across all securities, including those below the
+    # per-security reporting threshold.
+    release_max_total_lost_sessions: int = Field(default=5, ge=0)
+    # A lost bar counts as moved only to an id that gained the same bar (equal volume,
+    # OHLC within this relative tolerance, with an absolute floor at price 1 so
+    # sub-dollar and zero prices remain comparable at the same configured precision.
+    release_move_price_tolerance: float = Field(default=1e-6, ge=0)
+    # #3465: the precision an older stored bar may hold its prices at (Alpaca first
+    # served SNTI/JTAI 2026-11-05 at 4 decimals, now at 5). A lost price on this grid
+    # matches a newer one that truncates or rounds to it; None turns it off.
+    release_move_price_decimals: int | None = Field(default=4, ge=0, le=8)
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, value: str) -> str:
+        # `duckdb.connect("")` and ":memory:" open a throwaway in-memory DB, and
+        # `Path("").exists()` is True, so a blank path would pass the missing check.
+        if not value.strip() or value.strip().lower().startswith(":memory:"):
+            raise ValueError(
+                "path must be a file path, not blank or an in-memory ':memory:' name (#3331)"
+            )
+        return value
 
     @field_validator("memory_limit")
     @classmethod
@@ -111,13 +136,13 @@ class StoreConfig(_ClosedConfig):
 class IngestConfig(_ClosedConfig):
     """Daily ingest staleness and reference-symbol settings."""
 
-    settle_delay_minutes: int = 60
+    settle_delay_minutes: int = Field(default=60, ge=0)
     reference_symbol: str = "SPY"
     # #2196: search only this many prior XNYS sessions for EDGAR-gap bars.
     edgar_gap_lookback_sessions: int = Field(default=5, ge=0, le=20)
     # Spec default, unmeasured. On SIP history a listed name should lack a bar only on a
     # halt or suspension; measure over ~20 real sessions and tighten (T3, #86).
-    max_missing_share: float = 0.05
+    max_missing_share: float = Field(default=0.05, ge=0.0, le=1.0)
     # #796 (owner, option i a): a cap on the names a chunk reports instead of counting
     # (dark plus snapshot-only, as a share of the chunk's listed names), so a gradual
     # dropout that keeps `max_missing_share` under its limit still ends in a stale run.
@@ -211,21 +236,39 @@ def parse_accepted_same_day_pair(entry: str) -> tuple[str, date]:
     return _parse_id_at_day(entry, "accepted same-day pair")
 
 
+#: `classifications.issuer_class` tags (`store.classify.ISSUER_CLASSES`, #3076).
+IssuerClass = Literal["spac", "bdc", "mlp", "foreign"]
+_DEFAULT_EXCLUDED_ISSUER_CLASSES: tuple[IssuerClass, ...] = ("bdc", "foreign", "mlp")
+
+
 class UniverseConfig(_ClosedConfig):
     """ADR 0006 universe-construction thresholds, rules 1-8, in order."""
 
     security_types: list[str] = Field(default_factory=lambda: ["common"])
-    exchanges: list[str] = Field(default_factory=lambda: ["NYSE", "NASDAQ", "NYSE_AMERICAN"])
+    # Rule 2. TXSE (Texas Stock Exchange) joined 2026-11-14 (ADR 0006 amendment, #3384).
+    exchanges: list[str] = Field(
+        default_factory=lambda: ["NYSE", "NASDAQ", "NYSE_AMERICAN", "TXSE"]
+    )
     # Rule 3, a per-hypothesis choice; default none (ADR 0006 amendment 2026-10-11,
     # #1540). Frozen in each registration (guard a); shape-checked below.
     exclude_sic_ranges: tuple[tuple[int, int], ...] = ()
-    min_price: float = 5
+    # Rule 1's issuer classes (#3076, #3053 item 6): a security whose latest
+    # classification's `issuer_class` (`store.classify`, "Issuer class") is listed fails
+    # rule 1 whatever its `security_type`. A per-hypothesis choice: BDCs, MLPs and
+    # foreign filers are out of the default common-stock universe. The frozen-key table
+    # default is `[]` (`backtest/frozen.py`), the rule before #3076, so a registration
+    # stored without the key runs as it always did; a new registration freezes this
+    # live value. Stored sorted and without duplicates, so one set hashes one way.
+    exclude_issuer_classes: list[IssuerClass] = Field(
+        default_factory=lambda: list(_DEFAULT_EXCLUDED_ISSUER_CLASSES)
+    )
+    min_price: float = Field(default=5, ge=0)
     # On since T3 (#84): historical bars come from the consolidated SIP feed, so the
     # 20-session median dollar volume is a real liquidity measure (IEX-only volume,
     # ~2.5% of the tape, would not have been).
     liquidity_rule_enabled: bool = True
     min_median_dollar_volume: float = 5_000_000
-    liquidity_window: int = 20
+    liquidity_window: int = Field(default=20, gt=0)
     min_history_months: int = 12
     max_shares_age_days: int = 400
     # Shares plausibility (#845), part of rule 7: a shares fact whose value over the
@@ -236,7 +279,15 @@ class UniverseConfig(_ClosedConfig):
     # accepted fact, still subject to `max_shares_age_days`. `health` lists them all.
     max_shares_ratio: float = Field(default=100, gt=1, allow_inf_nan=False)
     accepted_shares_facts: list[str] = Field(default_factory=list)
-    top_n_by_cap: int = 1000
+    # Split dating (#3055), part of rule 7: a fact dated before a split's ex-date but
+    # accepted on or after it, whose value over the last accepted fact (split-moved to its
+    # own date) is closer to that split's ratio than to 1, already carries the split (SHW
+    # 2021-03-31, TJX 2018-11-03). On, its value is divided by the ratio at its own
+    # `as_of_date`, so rule 8's move gives back the filed count instead of applying the
+    # split twice. Frozen at `false` (`backtest/frozen.py`), today's rule, so no stored
+    # fingerprint moves; the flip repins the twin hashes and lands with the data sitting.
+    shares_split_dating: bool = False
+    top_n_by_cap: int = Field(default=1000, gt=0)
     # Rule 8's ranking (ADR 0023 D4, T212): `cap` is ADR 0006's market-cap rank (needs
     # rule 7's shares fact); `dollar_volume` ranks by median dollar volume from bars alone
     # and intersects with Alpaca's tradable assets as of T, for forward books. Frozen with
@@ -278,6 +329,11 @@ class UniverseConfig(_ClosedConfig):
             parse_accepted_same_day_pair(entry)
         return value
 
+    @field_validator("exclude_issuer_classes")
+    @classmethod
+    def _sorted_issuer_classes(cls, value: list[IssuerClass]) -> list[IssuerClass]:
+        return sorted(set(value))
+
     @field_validator("exclude_sic_ranges")
     @classmethod
     def _check_exclude_sic_ranges(
@@ -303,10 +359,28 @@ class HealthConfig(_ClosedConfig):
     """
 
     min_session_rows_share: float = Field(default=0.0, ge=0.0, le=1.0)
+    # #3329: `health --check` fails once the store has no price bars or its last bar is
+    # more than this many sessions before the last completed one, and any lag at all
+    # fails unless it is the one session before tonight's scheduled ingest.
+    max_stale_sessions: int = Field(default=0, ge=0)
     # #2454: `health` warns once the store's disk has less free space than this many GB,
     # well above `ingest.min_free_disk_gb` and `paper.min_free_disk_gb` so there is time
     # to act. 0 turns the warning off.
     warn_free_disk_gb: float = Field(default=15.0, ge=0)
+    # #3055: the shares cap-jump review list (`universe.shares_cap_jumps`). A shares
+    # fact's implied cap (its value x the raw close of the last traded bar at most
+    # `shares_cap_close_days` before its `as_of_date`) out of line with both its
+    # neighbours' by more than `shares_cap_jump_ratio` either way, or with the one
+    # before it when it is the latest, is listed. Report only.
+    shares_cap_jump_ratio: float = Field(default=2.0, gt=1, allow_inf_nan=False)
+    shares_cap_close_days: int = Field(default=10, ge=0)
+    # #3056: the close ratio across a bar gap of more than
+    # `master.transfer_window_sessions` sessions on one security above which
+    # `health` lists it in `spliced_series` (the ratio or its inverse). A
+    # post-bankruptcy equity spliced onto the old company's id jumps ~100x
+    # across the months it was off the exchange (GPOR, CBL, WW); 5, so a
+    # five-fold move across a gap is reviewed. Report-only, never frozen.
+    splice_max_price_ratio: float = Field(default=5.0, gt=1, allow_inf_nan=False)
 
 
 class BorrowConfig(_ClosedConfig):
@@ -359,6 +433,8 @@ class IndexCheckConfig(_ClosedConfig):
     worst_months: int = Field(default=10, ge=1)
     names_per_month: int = Field(default=5, ge=1)
     extreme_name_return: float = Field(default=0.60, gt=0.0)
+    # #3077: `close-gap` flags a stored close this far (a fraction) from the official one.
+    max_close_gap: float = Field(default=0.005, gt=0.0)
 
     @model_validator(mode="after")
     def _validate_window(self) -> IndexCheckConfig:
@@ -378,6 +454,9 @@ class OpenfigiConfig(_ClosedConfig):
     window_seconds: float | None = Field(default=None, gt=0)
     jobs_per_request: int | None = Field(default=None, ge=1)
     max_disagreements: int | None = Field(default=None, ge=0)
+    #: The identity cross-check's gate (plan T399, #3437): unset, it reports and
+    #: fails nothing.
+    max_identity_disagreements: int | None = Field(default=None, ge=0)
 
     def limits(self, *, keyed: bool) -> tuple[int, float, int]:
         """Mapping API's documented defaults, bounded even when configured."""
@@ -419,8 +498,8 @@ class AdjustConfig(_ClosedConfig):
 class GapConfig(_ClosedConfig):
     """Survivorship-gap reporting thresholds."""
 
-    missing_tail_sessions: int = 5
-    count_share_threshold: float = 0.05
+    missing_tail_sessions: int = Field(default=5, ge=0)
+    count_share_threshold: float = Field(default=0.05, ge=0.0, le=1.0)
     # ADR 0003 amendment #1199: a live listing dark longer than this many sessions,
     # its last bar before the window, counts as ended at that bar for the gap only.
     stale_listing_sessions: int = Field(default=63, ge=0)
@@ -688,3 +767,16 @@ class EventsConfig(_ClosedConfig):
         if any(not v.is_finite() or v < 0 for v in value.values()):
             raise ValueError("form4_compare_tolerance must be finite and not negative")
         return value
+
+    @model_validator(mode="after")
+    def _check_compare_bulk_trust(self) -> EventsConfig:
+        # #2994: with the threshold set a bulk-trusted field's row would be stored as
+        # `sec_form4_xml` under the XML body's hash, which no re-derive reproduces.
+        bulk = sorted(n for n, src in self.form4_compare_trusted.items() if src == "bulk")
+        if self.form4_compare_threshold is not None and bulk:
+            raise ValueError(
+                f"form4_compare_trusted has fields trusted to the bulk set {bulk}; with "
+                "form4_compare_threshold set their rows would be stored under the XML's "
+                "provenance (#2994)"
+            )
+        return self

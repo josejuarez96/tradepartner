@@ -14,6 +14,7 @@ from typing import Any, ClassVar
 
 import duckdb
 import pytest
+from conftest import open_paper_window
 from pydantic import SecretStr
 from typer.testing import CliRunner
 
@@ -242,6 +243,23 @@ def test_the_apply_writes_only_inside_the_open_release_of_its_name(store: Settin
         assert conn.execute(
             "SELECT count(*) FROM ingestion_runs WHERE mode = ?", [RETRACT]
         ).fetchone() == (0,)
+
+
+def test_the_apply_refuses_inside_an_open_paper_window_and_writes_nothing(
+    store: Settings,
+) -> None:
+    open_paper_window(store, datetime(2019, 7, 1, 14, tzinfo=UTC))
+    with pytest.raises(RetractRefused, match="open paper window"):
+        _apply(store, RETRACT_AT)
+    assert FALSE_ID in _listed(store, AFTER)
+    with _read(store) as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM ingestion_runs WHERE mode = ?", [RETRACT]
+        ).fetchone() == (0,)
+        assert conn.execute("SELECT count(*) FROM master_underived").fetchone() == (0,)
+    # a dry run is read-only and still lists the rows
+    dry = master_retract(store, filings=_filings(), clock=lambda: RETRACT_AT)
+    assert dry.rows == 2
 
 
 def test_the_digest_names_the_set_not_the_count() -> None:

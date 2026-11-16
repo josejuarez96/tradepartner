@@ -35,6 +35,7 @@ import shutil
 import subprocess
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -42,8 +43,9 @@ from typing import Any
 import duckdb
 import pytest
 from conftest import load_universe_fixtures, mark_pre_lab
+from pydantic import ValidationError
 
-from tradepartner.backtest import engine, frozen, hypothesis, lab, sweep
+from tradepartner.backtest import engine, frozen, hypothesis, lab, sweep, sweep_report
 from tradepartner.backtest.holdout import Flags
 from tradepartner.backtest.results import family_n
 from tradepartner.backtest.run import run_hypothesis
@@ -55,6 +57,23 @@ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 SWEEP_SOURCE = FIXTURES / "sweeps" / "fixture-sweep.md"
 TWIN_SOURCE = FIXTURES / "hypotheses" / "fixture-momentum.md"
 SLUG = "fixture-sweep"
+
+
+@pytest.mark.parametrize("store_path", ["", "   "])
+def test_on_store_refuses_blank_path(tmp_path: Path, store_path: str) -> None:
+    live = Settings(_env_file=None, store={"path": str(tmp_path / "live.duckdb")})
+    with pytest.raises(ValidationError, match="path must be a file path"):
+        lab._on_store(live, store_path)
+
+
+def test_on_store_accepts_file_path(tmp_path: Path) -> None:
+    live = Settings(_env_file=None, store={"path": str(tmp_path / "live.duckdb")})
+    path = tmp_path / "fixture.duckdb"
+    updated = lab._on_store(live, path)
+    assert updated.store.path == str(path)
+    assert lab._on_store(live, None) is live
+
+
 #: The window the full-size smoke test's fixture files are copied with, today's inputs:
 #: a ~15-month in-sample window (2018-01-31..2019-04-30) and the four extra per-side
 #: cost levels.
@@ -391,6 +410,95 @@ def _by_group(outcome: lab.SweepRunOutcome) -> dict[int, list[int]]:
 # --- sweep run and accounting ---------------------------------------------------
 
 
+def test_sweep_group_reuses_registry_snapshot_and_close_scan(
+    store: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    names = ("data_vintage", "store_max_ingested_at", "code_version", "code_tree_sha256")
+    calls = {name: 0 for name in names}
+    originals = {name: getattr(registry, name) for name in calls}
+
+    def counted(name: str) -> Callable[..., Any]:
+        def call(*args: Any, **kwargs: Any) -> Any:
+            calls[name] += 1
+            return originals[name](*args, **kwargs)
+
+        return call
+
+    for name in calls:
+        monkeypatch.setattr(registry, name, counted(name))
+    outcome = lab.run_sweep(SLUG, clock=clock)
+    assert outcome.n_ok == 4
+    assert len(_by_group(outcome)) == 2
+    assert calls == {
+        "data_vintage": 4,  # one open and one close read per group
+        "store_max_ingested_at": 2,
+        "code_version": 2,
+        "code_tree_sha256": 3,  # run preflight plus one per group
+    }
+
+    with _read(store) as conn:
+        rows = conn.execute(
+            "SELECT s.read_group_index, t.data_cutoff, t.data_vintage, "
+            "t.store_max_ingested_at, t.code_version, t.code_dirty, t.code_tree_sha256 "
+            "FROM sweep_trials s JOIN trials t USING (trial_id) "
+            "WHERE s.sweep_run_id = ? ORDER BY s.read_group_index, t.trial_id",
+            [outcome.sweep_run_id],
+        ).fetchall()
+        assert len(rows) == 4
+        for group_rows in (rows[:2], rows[2:]):
+            assert group_rows[0] == group_rows[1]
+            _, cutoff, vintage, maximum, version, dirty, tree = group_rows[0]
+            assert vintage == originals["data_vintage"](conn, cutoff)
+            assert maximum == originals["store_max_ingested_at"](conn)
+            assert (version, dirty) == originals["code_version"]()
+            assert tree == originals["code_tree_sha256"]()
+
+
+def test_sweep_group_write_failure_retries_each_trial(
+    store: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_write = lab.write_results
+    calls = 0
+
+    def fail_once(*args: Any, **kwargs: Any) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            real_write(*args, **kwargs)
+            raise RuntimeError("temporary write failure")
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(lab, "write_results", fail_once)
+    outcome = lab.run_sweep(SLUG, clock=clock)
+    assert outcome.n_ok == 4 and outcome.completed
+    with _read(store) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT trial_id) FROM sweep_trials WHERE sweep_run_id = ?",
+            [outcome.sweep_run_id],
+        ).fetchone()
+        assert row == (4, 4)
+
+
+def test_sweep_group_detects_vintage_appearing_after_empty_open(
+    store: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_vintage = registry.data_vintage
+    calls = 0
+
+    def empty_first_open(*args: Any, **kwargs: Any) -> datetime | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        return real_vintage(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "data_vintage", empty_first_open)
+    outcome = lab.run_sweep(SLUG, clock=clock)
+    first_group = next(iter(_by_group(outcome).values()))
+    statuses = {trial.variant_index: trial for trial in outcome.trials}
+    assert {statuses[index].message for index in first_group} == {registry.STORE_CHANGED_MESSAGE}
+
+
 def test_a_plain_run_runs_every_variant_then_nothing_then_rerun_runs_all(
     store: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -465,7 +573,9 @@ def test_a_plain_run_runs_every_variant_then_nothing_then_rerun_runs_all(
     third = lab.run_sweep(SLUG, rerun=True, clock=clock)
     assert (third.n_planned, third.n_ok) == (4, 4)
     assert third.completed
-    assert _n(store) == n_before + 8
+    # An identical rerun (same pairs, data vintage and code tree) is not a new return
+    # series, so it adds nothing to N (#3127, strategy-lab spec amendment 2026-11-06).
+    assert _n(store) == n_before + 4
     with _read(store) as conn:
         assert len(registry.family_sharpes(conn, "momentum").excess_spy) == 5
 
@@ -775,6 +885,117 @@ def test_a_row_after_the_cutoff_inserted_mid_group_fails_nothing(
     monkeypatch.setattr(lab._PausingProvider, "listing_ends", inserting)
     outcome = lab.run_sweep(SLUG, clock=clock)
     assert outcome.n_ok == 4
+
+
+#: The sweep `_policy_sweep` registers: the fixture sweep with its fixed block at
+#: `backtest.delisting_failure_return = "failure_v1"` (#2670, T328d; the key is not a
+#: sweepable axis, so a whole sweep carries it).
+POLICY_SLUG = "fixture-sweep-policy"
+
+
+def _policy_sweep(path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Register `POLICY_SLUG` on the store at `path`. Two refusals are lifted, as the
+    guard under test reads only the frozen value: `load_frozen` refuses
+    `backtest.delisting_failure_return` off `none` until T328c wires the engine
+    (`NOT_YET_APPLIED_KEYS`; the engine, ignoring the policy today, runs a
+    `failure_v1` variant as last-close), and the key is a family rule the fixture
+    family fixes at `none` (`_rule_differences`)."""
+    real_differences = sweep._rule_differences
+
+    def differences(*args: Any, **kwargs: Any) -> list[str]:
+        found = real_differences(*args, **kwargs)
+        return [d for d in found if not d.startswith("backtest.delisting_failure_return")]
+
+    monkeypatch.setattr(hypothesis, "NOT_YET_APPLIED_KEYS", frozenset())
+    monkeypatch.setattr(sweep, "_rule_differences", differences)
+    text = _copy_file(path.parent / "files", SWEEP_SOURCE, EDITS_SMALL).read_text()
+    text = text.replace(f'slug = "{SLUG}"', f'slug = "{POLICY_SLUG}"', 1).replace(
+        "[grid]\n", '[backtest]\ndelisting_failure_return = "failure_v1"\n\n[grid]\n', 1
+    )
+    source = path.parent / "files" / f"{POLICY_SLUG}.md"
+    source.write_text(text)
+    with open_for_write(Settings()) as conn:
+        sweep.register(conn, source, Settings(_env_file=None), registered_by="test")
+
+
+def _insert_exit_evidence(path: Path, table: str, known_at: datetime, security_id: str) -> None:
+    """One `delisting_reasons` or `mergers` row known at `known_at`, ingested now, of
+    `security_id`, which no variant reads: it moves the data vintage at a cutoff at or after
+    `known_at` only under a delisting policy other than `none`."""
+    common = {"security_id": security_id, "known_at": known_at, "ingested_at": utc_now()}
+    rows: dict[str, dict[str, Any]] = {
+        "delisting_reasons": {
+            "delisting_form": "25",
+            "delisting_class_title": "Common Stock",
+            "delisting_exchange": "NYSE",
+            "delisting_filed_at": known_at,
+            "reason": "performance_failure",
+            "reason_evidence_form": "8-K",
+            "reason_evidence_accession": "acc-lab-test",
+            "reason_source": "eightk_item",
+            "reason_known_at": known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+        "mergers": {
+            "kind": "cash",
+            "acquirer_security_id": None,
+            "acquiree_symbol": "LABT",
+            "acquiree_cusip": "",
+            "acquirer_symbol": "",
+            "acquirer_cusip": "",
+            "share_ratio": None,
+            "cash_per_share": 10.0,
+            "effective_date": known_at.date(),
+            "process_date": known_at.date(),
+            "payable_date": None,
+            "source_action_id": "lab-test",
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    }
+    with open_for_write(Settings(_env_file=None, store={"path": str(path)})) as conn:
+        insert_row(conn, table, rows[table] | common)
+
+
+@pytest.mark.parametrize("table", ["delisting_reasons", "mergers"])
+@pytest.mark.parametrize(
+    ("known_at", "in_window"), [(_close(IN_WINDOW), True), (_close(date(2020, 7, 1)), False)]
+)
+def test_exit_evidence_mid_group_fails_only_a_policy_variant_known_by_its_cutoff(
+    store: Path,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+    table: str,
+    known_at: datetime,
+    in_window: bool,
+) -> None:
+    """#2670, T328d: a `delisting_reasons` or `mergers` row known by the cutoff,
+    ingested mid-group, fails that group of a `failure_v1` sweep `store changed`,
+    while the same insertion leaves the `none` fixture sweep `ok`; a row known after
+    the cutoff fails neither."""
+    _policy_sweep(store, monkeypatch)
+    real = lab._PausingProvider.listing_ends
+    inserted: list[bool] = []
+    runs: list[str] = []
+
+    def inserting(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if not inserted:
+            inserted.append(True)
+            self.end_step()
+            _insert_exit_evidence(store, table, known_at, f"SEC_LAB_TEST_{len(runs)}")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(lab._PausingProvider, "listing_ends", inserting)
+    for slug, fails in ((SLUG, False), (POLICY_SLUG, in_window)):
+        inserted.clear()
+        runs.append(slug)
+        outcome = lab.run_sweep(slug, clock=clock)
+        status = {t.variant_index: (t.status, t.message) for t in outcome.trials}
+        first_group, second_group = list(_by_group(outcome).values())
+        expected = ("failed", registry.STORE_CHANGED_MESSAGE) if fails else ("ok", None)
+        assert {status[i] for i in first_group} == {expected}, slug
+        assert {status[i] for i in second_group} == {("ok", None)}, slug
 
 
 def test_a_one_group_budget_stops_at_the_group_boundary(
@@ -1173,3 +1394,99 @@ def test_a_sweep_whose_fixed_block_sets_a_delay_tags_every_variant_row(
 
         assert notes(shocked) == [("signal_delay=1",)] * 2
         assert notes(plain) == [(None,)] * 4
+
+
+# --- delisting exit coverage (plan T329, #2670) ----------------------------------------
+
+
+def test_every_variant_gets_its_exit_coverage_from_one_read_per_group_and_the_grid_shows_it(
+    store: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under `none`, each run variant's base level gets the three coverage counts at its
+    last rebalance session, from one `delisting_reasons` read per read group at the
+    group's cutoff, and the sweep report's grid row shows the unknown count and share.
+    The shrunk window books no delisting exit, so the engine's results are given one
+    (SEC_TRANSFER's Form 25, decided at the 2019-03-29 read); its bankruptcy reason is
+    known after that read but by every cutoff."""
+    filed_at = datetime(2018, 10, 23, 20, 30, tzinfo=UTC)
+    known_at = _close(date(2019, 4, 15))
+    with open_for_write(Settings(_env_file=None, store={"path": str(store)})) as conn:
+        insert_row(
+            conn,
+            "delisting_reasons",
+            {
+                "security_id": "SEC_TRANSFER",
+                "delisting_form": "25",
+                "delisting_class_title": "Common Stock",
+                "delisting_exchange": "NYSE",
+                "delisting_filed_at": filed_at,
+                "reason": "bankruptcy",
+                "reason_evidence_form": "8-K",
+                "reason_evidence_accession": "acc-lab-coverage",
+                "reason_source": "eightk_item",
+                "reason_known_at": known_at,
+                "known_at": known_at,
+                "ingested_at": utc_now(),
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+    booked = engine.DelistingExit(
+        security_id="SEC_TRANSFER",
+        read_time=_close(date(2019, 3, 29)),
+        end_session=date(2018, 10, 31),
+        exchange="NYSE",
+        delisting_form="25",
+        delisting_filed_at=filed_at,
+    )
+    real_run_many = engine.run_many
+
+    def run_many(*args: Any, **kwargs: Any) -> engine.RunManyResults:
+        results = real_run_many(*args, **kwargs)
+        for levels in results.values():
+            for level, result in levels.items():
+                levels[level] = replace(result, delisting_exits=(booked,))
+        return results
+
+    real = lab._PausingProvider.delisting_reasons
+    reads: list[tuple[datetime, list[str]]] = []
+
+    def spy(self: Any, t: datetime, ids: Any) -> Any:
+        reads.append((t, list(ids)))
+        return real(self, t, ids)
+
+    monkeypatch.setattr(engine, "run_many", run_many)
+    monkeypatch.setattr(lab._PausingProvider, "delisting_reasons", spy)
+    outcome = lab.run_sweep(SLUG, clock=clock)
+
+    assert {t.status for t in outcome.trials} == {"ok"}
+    assert sorted(t for t, _ in reads) == sorted(
+        _close(session) for session in LAST_SESSION.values()
+    )
+    assert all(ids == ["SEC_TRANSFER"] for _, ids in reads)
+    with _read(store) as conn:
+        rows = conn.execute(
+            "SELECT trial_id, session, name, value FROM trial_rebalance_counts "
+            "WHERE name LIKE 'n_exit_coverage%'"
+        ).fetchall()
+        last = dict(
+            conn.execute(
+                "SELECT trial_id, max(session) FROM trial_rebalances GROUP BY trial_id"
+            ).fetchall()
+        )
+        report = sweep_report.sweep_report(conn, SLUG)
+    by_trial: dict[int, dict[str, int]] = {}
+    for trial_id, session, name, value in rows:
+        assert session == last[trial_id]
+        by_trial.setdefault(trial_id, {})[name] = value
+    expected = {
+        "n_exit_coverage_exits": 1,
+        "n_exit_coverage_unknown": 0,
+        "n_exit_coverage_after_read": 1,
+    }
+    ran = {t.trial_id for t in outcome.trials}
+    assert {k: v for k, v in by_trial.items() if k in ran} == dict.fromkeys(ran, expected)
+    assert [(r.exit_coverage_unknown, r.exit_coverage_exits) for r in report.rows] == [
+        (0, 1)
+    ] * len(report.rows)
+    assert {r.exit_coverage_unknown_share for r in report.rows} == {0.0}

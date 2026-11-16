@@ -40,8 +40,8 @@ interrupted one for that book's own `paper resume`. A wrapper with no
    distinct from a crash's (`SystemExit(WRITE_FAILED_EXIT_CODE)`, `!=
    CRASH_EXIT_CODE`, #515) with nothing else done. The
    `engaged` row is where the fault is journaled with its type; the result row
-   (step 5) repeats the type with the full message. `StaleDataError` writes no
-   `engaged` row: it is a data fault the next ingest cures;
+   (step 5) repeats the type with the full message. `StaleDataError` initially
+   writes no `engaged` row; a bad fill found by its halt read engages the switch;
 2. best-effort cancels of the run's **acknowledged** non-terminal orders,
    oldest first. A `pending` order (no broker-acknowledged event) gets neither
    a cancel nor a read: `paper resume` settles it. Before every cancel call a
@@ -60,7 +60,8 @@ interrupted one for that book's own `paper resume`. A wrapper with no
    which every read of the account-wide feed meets again) is not a new fault:
    the halt stands, the switch stays engaged, and the alert and the result row
    name it (#375). A rejection verdict a read returns is named in the alert
-   too (T58's handoff: a halt-path caller never drops one). With
+   too (T58's handoff: a halt-path caller never drops one). An out-of-band fill
+   engages the switch with its band violation as the reason. With
    `write_offs`, each read back-fills the `written_off` row of a terminal buy
    of a pending rebalance that lacks one (T58);
 4. the alert, run-scoped, after one checked clock reading (so a clock gone bad
@@ -342,6 +343,7 @@ __all__ = [
     "CRASH_EXIT_CODE",
     "FILLS_ALLOWLIST",
     "GET_ORDER_ALLOWLIST",
+    "GET_ORDER_BY_BROKER_ID_ALLOWLIST",
     "OPEN_ORDERS_ALLOWLIST",
     "POSITIONS_ALLOWLIST",
     "SUBMIT_ALLOWLIST",
@@ -374,6 +376,7 @@ _REFUSAL_REASONS: tuple[tuple[type[Exception], str], ...] = (
 _ALERTED_SKIPS = frozenset(reason for _, reason in _REFUSAL_REASONS)
 CANCEL_ALLOWLIST: tuple[type[Exception], ...] = (OrderNotOpenError,)
 GET_ORDER_ALLOWLIST: tuple[type[Exception], ...] = ()
+GET_ORDER_BY_BROKER_ID_ALLOWLIST: tuple[type[Exception], ...] = ()
 OPEN_ORDERS_ALLOWLIST: tuple[type[Exception], ...] = ()
 FILLS_ALLOWLIST: tuple[type[Exception], ...] = ()
 POSITIONS_ALLOWLIST: tuple[type[Exception], ...] = ()
@@ -391,6 +394,7 @@ ALLOWLISTS: Mapping[str, tuple[type[Exception], ...]] = MappingProxyType(
         Broker.submit.__name__: SUBMIT_ALLOWLIST,
         Broker.cancel.__name__: CANCEL_ALLOWLIST,
         Broker.get_order.__name__: GET_ORDER_ALLOWLIST,
+        Broker.get_order_by_broker_id.__name__: GET_ORDER_BY_BROKER_ID_ALLOWLIST,
         Broker.open_orders.__name__: OPEN_ORDERS_ALLOWLIST,
         Broker.fills.__name__: FILLS_ALLOWLIST,
         Broker.positions.__name__: POSITIONS_ALLOWLIST,
@@ -673,6 +677,7 @@ class _Book:
     actions: pl.DataFrame
     ledger: Ledger
     prices: Mapping[str, float]
+    bar_sessions: Mapping[str, date]
     unpriced: Mapping[str, str]
     states: Mapping[int, DecisionState]
     residues: Mapping[str, float]
@@ -1719,9 +1724,12 @@ class RiskGatedBroker:
             # if it can be; a missing one halts only where a number reads it
             # (the reserve, the open-sell check), via `price_of` (#569 (b)).
             names = {d.security_id for d in rows} | set(ledger.positions)
-            prices = reference_prices(conn, session, names, actions)
+            bar_sessions: dict[str, date] = {}
+            prices = reference_prices(conn, session, names, actions, bar_sessions=bar_sessions)
             open_names = {o.security_id for o in orders if o.client_order_id not in terminal}
-            optional, unpriced = _optional_prices(conn, session, open_names - names, actions)
+            optional, unpriced = _optional_prices(
+                conn, session, open_names - names, actions, bar_sessions=bar_sessions
+            )
             prices = {**prices, **optional}
             symbols, unmappable, ended, ambiguous = _listings(
                 conn, session, sorted({d.security_id for d in rows}), self._settings, window_id
@@ -1774,6 +1782,7 @@ class RiskGatedBroker:
             actions,
             ledger,
             prices,
+            bar_sessions,
             unpriced,
             states,
             residues,
@@ -1936,7 +1945,7 @@ class RiskGatedBroker:
             else:
                 if on_submit is not None:
                     on_submit()
-                if not self._acknowledge(run, request.client_order_id):
+                if not self._acknowledge(run, request.client_order_id, placed.broker_order_id):
                     self._recheck = True
                     self._set_aside.add(request.client_order_id)
                     submitted.append(request.client_order_id)
@@ -2015,13 +2024,17 @@ class RiskGatedBroker:
             )
         return Skip(row.decision_id, row.security_id, reason)
 
-    def _acknowledge(self, run: PaperRunRow, coid: str) -> bool:
+    def _acknowledge(
+        self, run: PaperRunRow, coid: str, confirmed_broker_order_id: str | None = None
+    ) -> bool:
         """Poll `get_order` until the broker knows the order, then journal its
         `accepted` event and check its shape (module docstring); True once
         acknowledged. At `paper.accept_wait_max_seconds` the run's first
         timeout journals one `pending_unresolved` event and one alert and
         returns False; a second raises `AcknowledgementTimeoutError`, the
-        order left `pending`."""
+        order left `pending`. `confirmed_broker_order_id` is the id of the broker's
+        reply to `submit`, journaled on the `pending_unresolved` event so a later
+        run never closes a confirmed order `not_received` (#3335)."""
         paper = self._settings.paper
         deadline = self.read_clock() + timedelta(seconds=paper.accept_wait_max_seconds)
         while True:
@@ -2030,7 +2043,7 @@ class RiskGatedBroker:
             except UnknownOrderError:
                 now = self.read_clock()
                 if now >= deadline:
-                    self._leave_unresolved(run, coid)
+                    self._leave_unresolved(run, coid, confirmed_broker_order_id)
                     return False
                 self._sleep(min(paper.poll_interval_seconds, (deadline - now).total_seconds()))
                 continue
@@ -2051,9 +2064,12 @@ class RiskGatedBroker:
             _refuse_shape(order, Broker.get_order.__name__)
             return True
 
-    def _leave_unresolved(self, run: PaperRunRow, coid: str) -> None:
-        """Journal the run's one `pending_unresolved` event for `coid` and its
-        alert, or raise `AcknowledgementTimeoutError` when the run already has one."""
+    def _leave_unresolved(
+        self, run: PaperRunRow, coid: str, broker_order_id: str | None = None
+    ) -> None:
+        """Journal the run's one `pending_unresolved` event for `coid` (carrying
+        the submit reply's `broker_order_id`, #3335) and its alert, or raise
+        `AcknowledgementTimeoutError` when the run already has one."""
         assert run.run_id is not None
         wait = self._settings.paper.accept_wait_max_seconds
         with self._journal() as conn:
@@ -2076,6 +2092,7 @@ class RiskGatedBroker:
                 OrderEventRow(
                     client_order_id=coid,
                     status=_PENDING_UNRESOLVED,
+                    broker_order_id=broker_order_id,
                     known_at=stamp,
                     ingested_at=stamp,
                 ),
@@ -2092,7 +2109,9 @@ class RiskGatedBroker:
         self, run: PaperRunRow, sells: Sequence[OrderRow], book: _Book, notes: list[str]
     ) -> None:
         """Poll this run's sells until each is terminal or
-        `paper.sell_wait_seconds` has passed since the open, then collect them."""
+        `paper.sell_wait_seconds` has passed since the open, then collect them.
+        Each round reads the open-orders list once; a sell not on it is read
+        with `get_order` and leaves the wait only if that read is terminal."""
         assert run.session is not None
         paper = self._settings.paper
         deadline = self._calendar.session_open(run.session) + timedelta(
@@ -2103,8 +2122,14 @@ class RiskGatedBroker:
         ]
         round_number = 0
         while waiting:
+            # One list read per round, not one read per open sell (#2614 item 1). A
+            # sell leaves the wait only when its own read says terminal, so a list
+            # that lags or leaves a sell out never ends the wait early (fail closed).
+            listed = {order.client_order_id for order in self._broker.open_orders()}
             waiting = [
-                c for c in waiting if self._broker.get_order(c).status not in TERMINAL_STATUSES
+                c
+                for c in waiting
+                if c in listed or self._broker.get_order(c).status not in TERMINAL_STATUSES
             ]
             now = self.read_clock()
             round_number += 1
@@ -2126,6 +2151,7 @@ class RiskGatedBroker:
             book.actions,
             run.session,
             self._settings.paper.max_fill_price_deviation,
+            book.bar_sessions.__getitem__,
         )
 
     def _collect(
@@ -2334,6 +2360,26 @@ class RiskGatedBroker:
     ) -> None:
         coid = order.client_order_id
         assert run.run_id is not None
+        band: PriceBand | None = None
+        try:
+            assert run.session is not None
+            cut = session_close(previous_session(run.session))
+            with self._journal() as conn:
+                actions = live_actions_as_of(conn, cut)
+                bar_sessions: dict[str, date] = {}
+                prices, unpriced = _optional_prices(
+                    conn, run.session, [order.security_id], actions, bar_sessions=bar_sessions
+                )
+            band = PriceBand(
+                _price_lookup(prices, unpriced),
+                actions,
+                run.session,
+                self._settings.paper.max_fill_price_deviation,
+                bar_sessions.__getitem__,
+            )
+        except Exception as exc:
+            # A halt still reads back fills when its reference-price read fails.
+            notes.append(f"halt read of {coid} has no price band ({type(exc).__name__})")
         try:
             collected = collect(
                 self._broker,
@@ -2345,6 +2391,7 @@ class RiskGatedBroker:
                 self._frozen,
                 self._settings,
                 write_offs=write_offs,
+                price_band=band,
             )
         except ClockError as exc:
             # Every later read of the account-wide feed meets the same skew:
@@ -2352,6 +2399,31 @@ class RiskGatedBroker:
             if not any(note.startswith(_READ_CLOCK_NOTE) for note in notes):
                 notes.append(f"{_READ_CLOCK_NOTE}: {exc}")
             stamp.trip()
+            return
+        except SystemFaultError as exc:
+            if "fill_price_outside_band:" in str(exc):
+                reason = self._scrub(str(exc))
+                engaged = switch.engage(
+                    self._settings,
+                    stamp,
+                    window_id=run.window_id,
+                    source=_FAULT,
+                    fault_type=type(exc).__name__,
+                    reason=reason,
+                    run_id=run.run_id,
+                )
+                if isinstance(engaged, switch.WriteFailed):
+                    self._alerter.deliver_without_store(
+                        "kill_switch_write_failed",
+                        f"run {run.run_id} halt read found {reason}; the engaged row could not be "
+                        f"written ({engaged.error})",
+                    )
+                    raise SystemExit(WRITE_FAILED_EXIT_CODE) from exc
+            else:
+                self._event(coid, _CANCEL_FAILED, stamp, notes)
+            notes.append(
+                f"halt read of {coid} failed ({type(exc).__name__}: {self._scrub(str(exc))})"
+            )
             return
         except Exception as exc:
             self._event(coid, _CANCEL_FAILED, stamp, notes)
@@ -2362,6 +2434,7 @@ class RiskGatedBroker:
             )
             return
         notes.extend(breach.message for breach in collected.rejections)
+        note_unjudged(collected, notes)
 
     def _event(
         self, coid: str, status: str, stamp: Callable[[], datetime], notes: list[str]
@@ -2525,6 +2598,8 @@ def _optional_prices(
     session: date,
     names: Collection[str],
     actions: pl.DataFrame,
+    *,
+    bar_sessions: dict[str, date] | None = None,
 ) -> tuple[dict[str, float], dict[str, str]]:
     """The reference prices of the names only a non-terminal order brings into
     the book (#569, owner option (b)): each priced on its own, so one name
@@ -2535,7 +2610,9 @@ def _optional_prices(
     unpriced: dict[str, str] = {}
     for security_id in sorted(names):
         try:
-            priced.update(reference_prices(conn, session, [security_id], actions))
+            priced.update(
+                reference_prices(conn, session, [security_id], actions, bar_sessions=bar_sessions)
+            )
         except ValueError as exc:
             unpriced[security_id] = str(exc)
     return priced, unpriced
@@ -2572,7 +2649,14 @@ def _listings(
     if delisted:
         current = current_listings(listings_as_of(conn, cut, sorted(delisted)), session)
         reused = _refuse_reused_tickers(
-            conn, cut, session, current, delisted, symbols, settings.alpaca.class_symbols
+            conn,
+            cut,
+            session,
+            current,
+            delisted,
+            symbols,
+            settings.alpaca.class_symbols,
+            mapped.chained,
         )
         for sid, note in reused.items():
             ambiguous[sid] = f"{ambiguous[sid]}; {note}" if sid in ambiguous else note
@@ -2587,6 +2671,7 @@ def _refuse_reused_tickers(
     delisted: frozenset[str],
     symbols: Mapping[str, str | None],
     class_symbols: Mapping[str, str] | None,
+    chained: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """For each `delisted` name, mark ambiguous when another security's current
     listing (as of close(S-1), across the whole universe) names the same
@@ -2597,7 +2682,9 @@ def _refuse_reused_tickers(
     An earlier owner of the same ticker (this name itself took it over from
     someone even older) is not a collision, and neither is a coincidental
     match with a security that has never been this name's own listing's
-    ticker since."""
+    ticker since. A held predecessor's chain successor (`chained`, #3031) is
+    no later issuer of the successor symbol the order map sends it under: that
+    listing is the one the reconciliation on S matched the position to."""
     if not delisted:
         return {}
     universe = current_listings(listings_as_of(conn, cut), session)
@@ -2611,11 +2698,14 @@ def _refuse_reused_tickers(
         if symbols.get(sid):
             tickers.add(canonical_symbol(str(symbols[sid])))
         own_valid_from = row["valid_from"]
+        successor = (chained or {}).get(sid)
+        sent = canonical_symbol(str(symbols[sid])) if symbols.get(sid) else None
         for ticker in sorted(tickers):
             reused_by = sorted(
                 other
                 for other, other_row in universe.items()
                 if other != sid
+                and not (other == successor and ticker == sent)
                 and (broker_symbol(other_row, class_symbols) or str(other_row["ticker"])) == ticker
                 and other_row["valid_from"] is not None
                 and (own_valid_from is None or other_row["valid_from"] > own_valid_from)

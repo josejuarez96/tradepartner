@@ -235,6 +235,13 @@ def test_edgar_defaults() -> None:
     assert s.edgar.retry_max_attempts == 5
     assert s.edgar.retry_backoff_cap_seconds == pytest.approx(60.0)
     assert s.edgar.rate_limit_wait_seconds == pytest.approx(600.0)
+    assert s.edgar.form25_html_max_bytes == 2_000_000
+
+
+@pytest.mark.parametrize("max_bytes", [0, -1])
+def test_edgar_form25_html_max_bytes_is_positive(max_bytes: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, edgar={"form25_html_max_bytes": max_bytes})
 
 
 def test_edgar_filing_source_defaults() -> None:
@@ -243,6 +250,7 @@ def test_edgar_filing_source_defaults() -> None:
     s = _settings()
     assert s.edgar.index_first_year == 1993
     assert s.edgar.index_settle_days == 3
+    assert s.edgar.unstampable_retry_days == 30
     assert s.edgar.reconcile_recent_quarters == 8
     assert s.edgar.bulk_stamp_threshold_ciks == 500
     assert s.edgar.bulk_stamps_enabled is False
@@ -675,6 +683,7 @@ def test_edgar_failure_policy_defaults() -> None:
     [
         ("index_first_year", 1992),
         ("index_settle_days", -1),
+        ("unstampable_retry_days", -1),
         ("reconcile_recent_quarters", 0),
         ("bulk_stamp_threshold_ciks", 0),
         ("fsn_first_year", 2008),
@@ -900,7 +909,7 @@ def test_execution_fill_price_rejects_invalid_value() -> None:
 def test_universe_defaults() -> None:
     u = _settings().universe
     assert u.security_types == ["common"]
-    assert u.exchanges == ["NYSE", "NASDAQ", "NYSE_AMERICAN"]
+    assert u.exchanges == ["NYSE", "NASDAQ", "NYSE_AMERICAN", "TXSE"]
     assert u.min_price == 5
     assert u.liquidity_rule_enabled is True
     assert u.min_median_dollar_volume == 5_000_000
@@ -2191,6 +2200,66 @@ def test_paper_defaults() -> None:
     assert p.max_universe_drop_fraction == pytest.approx(0.5)
 
 
+def test_paper_exam_keys_default_to_the_pinned_values() -> None:
+    """ADR 0016 amendment 2026-11-07 (#3143, T381): the group-sequential exam's five keys."""
+    p = _settings().paper
+    assert p.exam_looks_months == [12, 24, 36]
+    assert p.exam_bounds == [4.762, 3.367, 2.750]
+    assert p.exam_futility_months == 6
+    assert p.exam_max_count == 4
+    assert p.exam_min_insample_skew == -0.85
+    # T381a freezes them into exam windows only; they are not req 14's keys.
+    assert not {
+        "exam_looks_months",
+        "exam_bounds",
+        "exam_futility_months",
+        "exam_max_count",
+        "exam_min_insample_skew",
+    } & set(FROZEN_PAPER_KEYS)
+
+
+@pytest.mark.parametrize(
+    ("override", "names"),
+    [
+        ({"exam_looks_months": [12, 24]}, "exam_looks_months"),
+        ({"exam_looks_months": [12, 24, 48]}, "exam_looks_months"),
+        ({"exam_looks_months": [6, 12, 24, 36]}, "exam_looks_months"),
+        ({"exam_looks_months": [24, 12, 36]}, "exam_looks_months"),
+        ({"exam_bounds": [4.761, 3.367, 2.750]}, "exam_bounds at month 12"),
+        ({"exam_bounds": [4.762, 3.366, 2.750]}, "exam_bounds at month 24"),
+        ({"exam_bounds": [4.762, 3.367, 2.749]}, "exam_bounds at month 36"),
+        ({"exam_bounds": [4.762, 3.367]}, "one bound per look"),
+        ({"exam_bounds": [4.762, 3.367, 2.750, 2.0]}, "one bound per look"),
+        ({"exam_futility_months": 5}, "exam_futility_months"),
+        ({"exam_futility_months": 12}, "exam_futility_months"),
+        ({"exam_max_count": 5}, "exam_max_count"),
+        ({"exam_min_insample_skew": -0.851}, "exam_min_insample_skew"),
+        ({"exam_min_insample_skew": -1.0}, "exam_min_insample_skew"),
+    ],
+)
+def test_paper_exam_keys_refuse_a_looser_exam(override: dict[str, object], names: str) -> None:
+    """The exam can be made stricter in config, never looser (ADR 0016, #3143)."""
+    with pytest.raises(ValidationError, match=names):
+        Settings(_env_file=None, paper=override)
+
+
+def test_paper_exam_keys_accept_a_stricter_exam() -> None:
+    """Higher bounds, a smaller budget and a higher skew guard are all stricter."""
+    stricter = {
+        "exam_bounds": [5.0, 3.367, 3.0],
+        "exam_max_count": 2,
+        "exam_min_insample_skew": -0.5,
+    }
+    p = Settings(_env_file=None, paper=stricter).paper
+    assert p.exam_bounds == [5.0, 3.367, 3.0]
+    assert p.exam_max_count == 2
+    assert p.exam_min_insample_skew == -0.5
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, paper={"exam_max_count": -1})
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, paper={"exam_bounds": [float("inf"), 3.367, 2.750]})
+
+
 def test_paper_tracking_rule_residual_accepted_and_others_rejected() -> None:
     assert Settings(_env_file=None, paper={"tracking_rule": "raw"}).paper.tracking_rule == "raw"
     assert Settings(_env_file=None, paper={"tracking_rule": "residual"}).paper.tracking_rule == (
@@ -2623,6 +2692,24 @@ def test_a_books_pair_loads_from_the_environment_and_the_env_file(
     assert b.api_secret is not None and b.api_secret.get_secret_value() == "ps-b-444"
     assert c.api_key is not None and c.api_key.get_secret_value() == "pk-c-555"
     assert c.api_secret is None
+
+
+def test_the_openfigi_key_loads_from_the_env_file_and_is_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3153: `OPENFIGI_API_KEY` set in `.env` (spec data-foundation, `.env.example`)
+    reaches `Settings`, is in `secret_values` and never in repr/str."""
+    monkeypatch.delenv("OPENFIGI_API_KEY", raising=False)
+    env_file = tmp_path / "figi.env"
+    env_file.write_text("OPENFIGI_API_KEY=figi-synthetic-4242\n", encoding="utf-8")
+    s = Settings(_env_file=env_file)
+    assert s.openfigi_api_key is not None
+    assert s.openfigi_api_key.get_secret_value() == "figi-synthetic-4242"
+    assert "figi-synthetic-4242" in secret_values(s)
+    assert "figi-synthetic-4242" not in repr(s) and "figi-synthetic-4242" not in str(s)
+    assert Settings(_env_file=None).openfigi_api_key is None
+    example = (Path(__file__).resolve().parents[1] / ".env.example").read_text(encoding="utf-8")
+    assert "# OPENFIGI_API_KEY=" in example
 
 
 def test_book_pairs_default_empty_and_never_fall_back(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3144,7 +3231,8 @@ def test_a_window_frozen_with_a_bad_short_key_is_refused(key: str, value: float)
 # --- the known-answer index check (#1598, T243) ---------------------------------
 
 
-def test_index_check_defaults_are_the_amendments_eight_keys() -> None:
+def test_index_check_defaults_are_the_amendments_eight_keys_plus_close_gap() -> None:
+    """The T243 amendment's eight keys, plus `max_close_gap` (#3077) for `close-gap`."""
     cfg = Settings(_env_file=None).index_check
     assert cfg.model_dump() == {
         "start_month": "2019-08",
@@ -3155,6 +3243,7 @@ def test_index_check_defaults_are_the_amendments_eight_keys() -> None:
         "worst_months": 10,
         "names_per_month": 5,
         "extreme_name_return": 0.60,
+        "max_close_gap": 0.005,
     }
 
 
@@ -3737,6 +3826,18 @@ def test_events_form4_compare_keys_refuse_nonsense() -> None:
             Settings(_env_file=None, events=bad)
 
 
+def test_events_form4_compare_threshold_refuses_a_field_trusted_to_bulk() -> None:
+    """#2994: under the threshold a bulk-trusted field would be stored under the XML's
+    provenance, so the pair is refused at load; either key alone still loads."""
+    with pytest.raises(ValueError, match="trusted to the bulk set"):
+        Settings(
+            _env_file=None,
+            events={"form4_compare_threshold": 0.5, "form4_compare_trusted": {"shares": "bulk"}},
+        )
+    Settings(_env_file=None, events={"form4_compare_trusted": {"shares": "bulk"}})
+    Settings(_env_file=None, events={"form4_compare_threshold": 0.5})
+
+
 def test_paper_execution_defaults_and_opg_cutoff() -> None:
     s = _settings()
     assert s.paper.execution == {}
@@ -3873,3 +3974,57 @@ def test_an_open_book_ignores_the_midsession_keys_bounds() -> None:
 def test_submit_at_closing_is_not_offered() -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, paper={"execution": {"daily": {"submit_at": "close"}}})  # type: ignore[arg-type]
+
+
+# --- #3331: shares, counts and the store path refuse nonsense ---
+
+
+@pytest.mark.parametrize("value", [5, -0.1, 1.01])
+def test_ingest_max_missing_share_is_a_share(value: float) -> None:
+    with pytest.raises(ValidationError, match="max_missing_share"):
+        Settings(_env_file=None, ingest={"max_missing_share": value})
+
+
+@pytest.mark.parametrize("value", [-3, 0])
+def test_universe_top_n_by_cap_is_positive(value: int) -> None:
+    with pytest.raises(ValidationError, match="top_n_by_cap"):
+        Settings(_env_file=None, universe={"top_n_by_cap": value})
+
+
+@pytest.mark.parametrize("value", [1.5, -0.01])
+def test_gap_count_share_threshold_is_a_share(value: float) -> None:
+    with pytest.raises(ValidationError, match="count_share_threshold"):
+        Settings(_env_file=None, gap={"count_share_threshold": value})
+
+
+@pytest.mark.parametrize("value", ["", "   ", ":memory:", " :MEMORY: ", ":memory:paper"])
+def test_store_path_refuses_blank_and_memory(value: str) -> None:
+    with pytest.raises(ValidationError, match="path"):
+        Settings(_env_file=None, store={"path": value})
+
+
+def test_store_path_blank_from_env_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STORE__PATH", "")
+    with pytest.raises(ValidationError, match="path"):
+        Settings(_env_file=None)
+
+
+def test_repo_default_settings_still_load() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.store.path
+    assert settings.universe.top_n_by_cap > 0
+    assert 0 <= settings.ingest.max_missing_share <= 1
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("universe", "liquidity_window", 0),
+        ("universe", "min_price", -1),
+        ("ingest", "settle_delay_minutes", -1),
+        ("gap", "missing_tail_sessions", -1),
+    ],
+)
+def test_other_counts_refuse_nonsense(section: str, key: str, value: int) -> None:
+    with pytest.raises(ValidationError, match=key):
+        Settings(_env_file=None, **{section: {key: value}})

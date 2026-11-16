@@ -11,6 +11,7 @@ owns the writes and the alerts this task's outputs feed.
   one broker read a mark needs, taken once by the caller and reused for
   every back-filled session). An untradable held name past its last bar is
   marked at its last close (spec req 7, #678); any other missing bar raises.
+  A held chained predecessor reads its successor's bars (#3051).
 - `lapses` finds the rebalance sessions a window's catch-up window has run
   out on as of `session`: `catch_up_lapsed` when the frozen
   `paper.max_catch_up_sessions` elapsed with the switch clear throughout,
@@ -44,6 +45,7 @@ import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import duckdb
 import polars as pl
@@ -55,7 +57,7 @@ from tradepartner.errors import StaleDataError
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.lots import SHORT
 from tradepartner.execution.switch import ENGAGED, FAULTED_RUN_STATUSES, RELEASED
-from tradepartner.store.asof import prices_as_of
+from tradepartner.store.asof import chained_read_ids, prices_as_of
 from tradepartner.store.journal import (
     KillSwitchRow,
     PaperRunResultRow,
@@ -75,6 +77,7 @@ _CATCH_UP_LAPSED = "catch_up_lapsed"
 _KILL_SWITCH = "kill_switch"
 _SPLIT = "split"
 _KNOWN_STATUSES = frozenset({_EXECUTED, _MISSED})
+_NEW_YORK = ZoneInfo("America/New_York")
 
 
 @dataclass(frozen=True)
@@ -224,12 +227,77 @@ def _last_bars(
     )
     if not held:
         return {}
+    cut = session_close(sessions[-1])
+    filed = _filed_under(conn, cut, held)
     last: dict[str, date] = {}
-    for row in prices_as_of(conn, session_close(sessions[-1]), held).iter_rows(named=True):
-        name, bar_session = row["security_id"], row["session"]
-        if name not in last or bar_session > last[name]:
-            last[name] = bar_session
+    for row in prices_as_of(conn, cut, sorted(filed)).iter_rows(named=True):
+        for name in filed[row["security_id"]]:
+            bar_session = row["session"]
+            if name not in last or bar_session > last[name]:
+                last[name] = bar_session
     return last
+
+
+def _filed_under(
+    conn: duckdb.DuckDBPyConnection, at: datetime, names: Sequence[str]
+) -> dict[str, list[str]]:
+    """Each id the chain-aware price read at `at` files `names` under, with the
+    names it prices (#3051): a held chained predecessor's bars are its one live
+    successor's at `at` (#821, `store.asof.chained_read_ids`), every other
+    name's its own. A predecessor of more than one live chain at `at` raises
+    `StaleDataError` (the run's halt path), never a guessed successor."""
+    ids, forked = chained_read_ids(conn, at, names)
+    if forked:
+        raise StaleDataError(
+            "; ".join(
+                f"{sid}: more than one live successor chain known at {at.isoformat()} "
+                f"({', '.join(successors)}), so it cannot be marked"
+                for sid, successors in sorted(forked.items())
+            )
+        )
+    filed: dict[str, list[str]] = {}
+    for name in names:
+        filed.setdefault(ids[name], []).append(name)
+    return filed
+
+
+def _refuse_uncounted_splits(
+    conn: duckdb.DuckDBPyConnection,
+    window: PaperWindowRow,
+    books: Mapping[date, Ledger],
+    sessions: Sequence[date],
+    actions: pl.DataFrame,
+) -> None:
+    """Raise `StaleDataError` when a held chained predecessor's successor has a
+    split the ledger cannot count (#3051). `actions` is read at the run's cut,
+    close(S-1), the last of `sessions`; a chain known then keys every split of
+    the pair to the successor (#821), while the ledger states the predecessor's
+    quantity from the splits under the predecessor's own id. A successor split
+    from the window's start on would put the mark's close and the ledger's
+    quantity on different bases, so the mark halts rather than misstate it."""
+    held = sorted(
+        {name for book in books.values() for name in (*book.positions, *book.short_holdings)}
+    )
+    if not held or actions.is_empty():
+        return
+    ids, _forked = chained_read_ids(conn, session_close(sessions[-1]), held)
+    chained = {name: successor for name, successor in ids.items() if successor != name}
+    if not chained:
+        return
+    start = window.started_at.astimezone(_NEW_YORK).date()
+    found = sorted(
+        f"{name}: its chain successor {successor}'s split ex {row['ex_date'].isoformat()}"
+        for name, successor in chained.items()
+        for row in actions.iter_rows(named=True)
+        if row["security_id"] == successor
+        and row["action_type"] == _SPLIT
+        and start <= row["ex_date"] <= sessions[-1]
+    )
+    if found:
+        raise StaleDataError(
+            "the ledger's quantity does not count a chained successor's split, so the "
+            "held predecessor cannot be marked: " + "; ".join(found)
+        )
 
 
 def _split_factor(actions: pl.DataFrame, security_id: str, after: date, through: date) -> float:
@@ -308,15 +376,27 @@ def marks_for(
     bar, or a name with no bar at all) raises `ValueError`, so a stale mark is
     never carried silently. A held name whose priced close is not finite and
     positive raises `StaleDataError` naming the security and session (#1983).
+
+    A held chained predecessor (#3051) is priced where the store files it: a
+    chain known at close(session) keys its bars to its one live successor
+    (#821), so that session's mark reads the successor's bars under the
+    predecessor's (the ledger's) id; a chain known only later re-keys nothing
+    for that session, so no read looks ahead. A predecessor of more than one
+    live chain, or one whose successor has a split from the window's start on
+    (which the ledger's quantity cannot count), raises `StaleDataError`: the
+    run halts with an alert and sends nothing, never a guessed mark.
     """
     books = {session: ledger(session) for session in sessions}
+    if sessions:
+        _refuse_uncounted_splits(conn, window, books, sessions, actions)
     own: dict[date, dict[str, float]] = {}
     last_known: dict[date, dict[str, tuple[date, float]]] = {}
     for session in sessions:
         held = sorted(set(books[session].positions) | set(books[session].short_holdings))
         if not held:
             continue
-        prices = prices_as_of(conn, session_close(session), held)
+        filed = _filed_under(conn, session_close(session), held)
+        prices = prices_as_of(conn, session_close(session), sorted(filed))
         # `prices_as_of` returns the latest-known revision of *every* session's
         # bar on or before this close, one row per (security_id, session), not
         # only `session`'s own: a security missing a bar for `session` would
@@ -326,10 +406,11 @@ def marks_for(
         own[session] = {}
         last_known[session] = {}
         for row in prices.sort("session").iter_rows(named=True):
-            security_id, bar_session, close = row["security_id"], row["session"], row["close"]
-            last_known[session][security_id] = (bar_session, close)
-            if bar_session == session:
-                own[session][security_id] = close
+            bar_session, close = row["session"], row["close"]
+            for security_id in filed[row["security_id"]]:
+                last_known[session][security_id] = (bar_session, close)
+                if bar_session == session:
+                    own[session][security_id] = close
     last_bar = _last_bars(conn, books, sessions)
     marks: list[Mark] = []
     for session in sessions:

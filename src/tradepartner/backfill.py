@@ -130,19 +130,20 @@ refreshes one series only; its outcome is printed instead.
 from __future__ import annotations
 
 import re
+import time
 import uuid
 from collections import Counter, defaultdict
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import duckdb
 
 from tradepartner.adapters.alpaca_prices import ListingResolver, alpaca_symbol
 from tradepartner.adapters.filings import FilingSource
-from tradepartner.adapters.prices import ActionType, PriceSource
+from tradepartner.adapters.prices import ActionType, CorporateAction, PriceSource
 from tradepartner.calendar import is_session, next_session
 from tradepartner.config import Settings
 from tradepartner.ingest import (
@@ -179,7 +180,7 @@ from tradepartner.ingest import (
     _write_run,
     expected_session,
 )
-from tradepartner.repair import store_resolver
+from tradepartner.repair import _held_tickers, bar_owners, store_resolver
 from tradepartner.store.asof import listings_as_of
 from tradepartner.store.benchmarks import (
     BenchmarkIdentityError,
@@ -189,7 +190,9 @@ from tradepartner.store.benchmarks import (
 from tradepartner.store.classify import EQUITY, classifications_as_of, listing_kind
 from tradepartner.store.db import StoreLockedError, insert_row, open_for_write, utc_now
 from tradepartner.store.delistings import DELISTED, LISTED, TRANSFERRED, listing_ends_as_of
+from tradepartner.store.dividend_reviews import REVIEWED_IDENTITIES
 from tradepartner.store.master import first_session, securities_as_of
+from tradepartner.store.registry import open_release
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import on_list_ids
@@ -378,6 +381,13 @@ class HoleFill:
 HALTED = "not filled: the fill halted first"
 
 
+_RETRACTED_MARK = "with a retracted session no id holds"
+
+
+def _retracted_note(retr: Collection[str]) -> str:
+    return f"; {len(retr)} {_RETRACTED_MARK}" if retr else ""
+
+
 def _dropped_note(dropped: dict[str, int]) -> str:
     if not dropped:
         return ""
@@ -432,6 +442,83 @@ def _month(month: date) -> str:
     return month.strftime("%Y-%m")
 
 
+@dataclass
+class _Resolvers:
+    """The store's resolver for a hole fill's months (#3234), rebuilt only
+    when a month could read a different one: the `store_resolver` at
+    `started`, as `_price_chunk` read it, is the one read at an earlier
+    `at` of the same day while the store file and its WAL are byte-for-byte
+    the same files (no commit since, by this process or another) and no
+    stored row of a table with `known_at` became known in between (a row
+    stored before the read but known only after it). Its inputs are rows
+    filtered on `known_at <= at` and `at`'s day, so those are every way two
+    reads can differ. `drop` forgets it after this process writes."""
+
+    settings: Settings
+    resolver: ListingResolver | None = None
+    at: datetime | None = None
+    stamp: tuple[object, ...] | None = None
+    builds: int = 0
+
+    def get(self, conn: duckdb.DuckDBPyConnection, at: datetime) -> ListingResolver:
+        """The resolver as of `at` over `conn` (a read of the store)."""
+        if self.resolver is not None and self._reusable(conn, at):
+            return self.resolver
+        self.stamp = _store_stamp(self.settings)  # before the read: a later write rebuilds
+        self.resolver = store_resolver(conn, at, self.settings)
+        self.at = at
+        self.builds += 1
+        return self.resolver
+
+    def drop(self) -> None:
+        """Forget the resolver: the next `get` builds one."""
+        self.resolver = None
+
+    def _reusable(self, conn: duckdb.DuckDBPyConnection, at: datetime) -> bool:
+        if self.at is None or at < self.at or at.date() != self.at.date():
+            return False
+        if _store_stamp(self.settings) != self.stamp:
+            return False
+        return not _known_between(conn, self.at, at)
+
+
+def _store_stamp(settings: Settings) -> tuple[object, ...]:
+    """The store file's and its WAL's identity, size and change times: any
+    commit changes one of them."""
+    out: list[object] = []
+    for path in (Path(settings.store.path), Path(f"{settings.store.path}.wal")):
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            out.append(None)
+            continue
+        out.append((st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+    return tuple(out)
+
+
+def _known_between(conn: duckdb.DuckDBPyConnection, after: datetime, through: datetime) -> bool:
+    """True when a row of any store table with a `known_at` column has
+    `after < known_at <= through`."""
+    tables = [
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT c.table_name FROM duckdb_columns() c "
+            "JOIN duckdb_tables() t ON t.table_name = c.table_name "
+            "AND t.schema_name = c.schema_name "
+            "WHERE c.column_name = 'known_at' AND c.schema_name = 'main' ORDER BY 1"
+        ).fetchall()
+    ]
+    for table in tables:
+        quoted = '"' + table.replace('"', '""') + '"'
+        hit = conn.execute(
+            f"SELECT 1 FROM {quoted} WHERE known_at > ? AND known_at <= ? LIMIT 1",
+            [after, through],
+        ).fetchone()
+        if hit is not None:
+            return True
+    return False
+
+
 def fill_holes(
     settings: Settings,
     *,
@@ -440,10 +527,12 @@ def fill_holes(
     clock: Callable[[], datetime] = utc_now,
     dry_run: bool = False,
     securities: Collection[str] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> HoleFill:
     """Refetch the holes in the committed months of the backfill for
     `since` (the module docstring's **Holes**), only those of `securities`
-    when given; with `dry_run`, list them and fetch nothing."""
+    when given; with `dry_run`, list them and fetch nothing. A real fill
+    hands `progress` one line per month as it ends (#3234)."""
     if isinstance(since, datetime) or not isinstance(since, date):
         raise TypeError(f"since must be a date, got {since!r}")
     if isinstance(securities, str):
@@ -458,11 +547,17 @@ def fill_holes(
         run = SourceRun("alpaca", LOCKED, 0, cursor, _clean(str(exc), settings))
         return HoleFill((), (run,), dry_run)
     windows = month_windows(since, end - timedelta(days=1)) if end > since else []
+    try:
+        tail = _tail_windows(_retracted_at(settings, clock), since, end)
+    except StoreLockedError as exc:
+        run = SourceRun("alpaca", LOCKED, 0, cursor, _clean(str(exc), settings))
+        return HoleFill((), (run,), dry_run)
+    windows += tail
     tally = _Tally()
     if dry_run:
         try:
             t = ensure_tz_aware_utc(clock(), field_name="clock()")
-            holes, known = _holes(settings, windows, t, only, tally)
+            holes, known = _holes(settings, windows, t, only, tally, frozenset(tail))
         except StoreLockedError as exc:
             run = SourceRun("alpaca", LOCKED, 0, cursor, _clean(str(exc), settings))
             return HoleFill((), (run,), dry_run)
@@ -480,18 +575,51 @@ def fill_holes(
             return HoleFill((), (run,), dry_run)
     runs: list[SourceRun] = []
     halted = False
-    for window in windows:
+    resolvers = _Resolvers(settings)
+    for n, window in enumerate(windows, start=1):
+        began = time.monotonic()
         chunk = _price_chunk(
-            settings, prices, since, window, clock, fill=True, only=only, tally=tally
+            settings,
+            prices,
+            since,
+            window,
+            clock,
+            fill=True,
+            only=only,
+            tally=tally,
+            resolvers=resolvers,
+            tail=window in tail,
         )
+        if progress is not None:
+            progress(_progress_line(window, n, len(windows), chunk, time.monotonic() - began))
         if chunk is None:
             continue
+        resolvers.drop()  # this month wrote (bars, or its run row): read the store again
         runs.append(chunk)
         if chunk.status != FILLED:
             halted = True
             break
     named = _named(only, known, tally, halted=halted)
     return HoleFill((), tuple(runs), dry_run, tally.totals(), named)
+
+
+def _retracted_at(settings: Settings, clock: Callable[[], datetime]) -> list[tuple[str, date]]:
+    """`_retracted_sessions` as of the clock; none when the store is absent."""
+    if not Path(settings.store.path).exists():
+        return []
+    t = ensure_tz_aware_utc(clock(), field_name="clock()")
+    with _read(settings) as conn:
+        return _retracted_sessions(conn, t)
+
+
+def _progress_line(
+    window: tuple[date, date], n: int, of: int, run: SourceRun | None, seconds: float
+) -> str:
+    """`alpaca holes 2019-06 (3/130): filled, 46 rows, 2.1 s`, or `no hole`."""
+    head = f"alpaca holes {_month(window[0])} ({n}/{of}): "
+    if run is None:
+        return f"{head}no hole, {seconds:.1f} s"
+    return f"{head}{run.status}, {run.rows_added} rows, {seconds:.1f} s"
 
 
 def _sessions_in(window: tuple[date, date]) -> list[date]:
@@ -581,7 +709,7 @@ def _rename_gaps(
     stored: dict[str, list[date]] = defaultdict(list)
     for sid, session in conn.execute(
         "SELECT DISTINCT security_id, session FROM prices_daily "
-        "WHERE session BETWEEN ? AND ? AND known_at <= ? AND list_contains(?, security_id) "
+        "WHERE session BETWEEN ? AND ? AND known_at <= ? AND security_id IN (SELECT unnest(?)) "
         "ORDER BY session",
         [window[0], window[1] + timedelta(days=horizon), t, sorted(led)],
     ).fetchall():
@@ -621,7 +749,7 @@ def _interior_gaps(
         sid: (lo, hi)
         for sid, lo, hi in conn.execute(
             "SELECT security_id, min(session), max(session) FROM prices_daily "
-            "WHERE known_at <= ? AND volume > 0 AND list_contains(?, security_id) GROUP BY ALL",
+            "WHERE known_at <= ? AND volume > 0 AND security_id IN (SELECT unnest(?)) GROUP BY ALL",
             [t, ordered],
         ).fetchall()
     }
@@ -629,7 +757,7 @@ def _interior_gaps(
     for sid, session in conn.execute(
         "SELECT DISTINCT security_id, session FROM prices_daily "
         "WHERE session BETWEEN ? AND ? AND known_at <= ? AND volume > 0 "
-        "AND list_contains(?, security_id)",
+        "AND security_id IN (SELECT unnest(?))",
         [window[0], window[1], t, ordered],
     ).fetchall():
         traded[sid].add(session)
@@ -671,16 +799,150 @@ def _month_holes(
     return sorted({*empty, *gaps, *handed}), gaps, stored, dropped, handed
 
 
+def _retracted_sessions(conn: duckdb.DuckDBPyConnection, t: datetime) -> list[tuple[str, date]]:
+    """The (security_id, session) bars the open release retracted by `t`
+    (`retracted_rows`, ADR 0029) and has not restored, sorted; none without an
+    open release or a `retracted_rows` table (#3431). `retracted_at <= t`: a fill
+    as of `t` knows no later retraction."""
+    tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
+    if "retracted_rows" not in tables:
+        return []
+    release = open_release(conn)
+    if release is None:
+        return []
+    rows = conn.execute(
+        "SELECT DISTINCT row_key[1], CAST(row_key[2] AS DATE) FROM retracted_rows "
+        "WHERE table_name = 'prices_daily' AND release = ? AND restored_at IS NULL "
+        "AND retracted_at <= ? ORDER BY 1, 2",
+        [release.name, t],
+    ).fetchall()
+    return [(str(sid), day) for sid, day in rows]
+
+
+def _retracted_holes(
+    conn: duckdb.DuckDBPyConnection,
+    resolver: ListingResolver,
+    t: datetime,
+    window: tuple[date, date],
+    ids: Collection[str],
+    only: frozenset[str] | None,
+    retracted: Collection[tuple[str, date]],
+) -> set[str]:
+    """Those of `ids` (of `only`, when given) that a bar retracted in `window`
+    (`_retracted_sessions`) now belongs to by the resolver at `t` and that hold no
+    bar known at `t` on that session: a hole whatever the id stores in the rest of
+    the month or the backfill cursor says (#3431). The retracted bar's ticker is
+    its security's listing live on the session; a session whose ticker is not an
+    Alpaca symbol, or that the resolver (rename lead included) gives to no id, is
+    none: a fetched bar could not land on it."""
+    first, last = window
+    days = [(sid, day) for sid, day in retracted if first <= day <= last]
+    if not days:
+        return set()
+    tickers_of = _held_tickers(conn, t)
+    held = {
+        (str(sid), day): (o, c, ingested)
+        for sid, day, o, c, ingested in conn.execute(
+            "SELECT security_id, session, arg_max(open, known_at), arg_max(close, known_at), "
+            "max(ingested_at) FROM prices_daily "
+            "WHERE session BETWEEN ? AND ? AND known_at <= ? GROUP BY security_id, session",
+            [first, last, t],
+        ).fetchall()
+    }
+    was = _retracted_prices(conn, t, window)
+    answered = conn.execute(
+        "SELECT max(finished_at) FROM ingestion_runs WHERE source = 'alpaca' AND mode = ? "
+        "AND status = ? AND finished_at <= ? AND chunk_cursor LIKE ? AND message LIKE ?",
+        [HOLES, FILLED, t, f"%;through={last.isoformat()}", f"%{_RETRACTED_MARK}%"],
+    ).fetchone()
+    fetched_at = None if answered is None else answered[0]
+    fetched = set(ids)
+    out: set[str] = set()
+    for sid, day in days:
+        tickers = [tk for tk in tickers_of(sid, day) if alpaca_symbol(tk) is not None]
+
+        def holds(owner: str, session: date, sid: str = sid) -> bool:
+            # An owner with its own bar there takes no refetch (#3455); a foreign
+            # bar (the retracted line under the receiver) is still a hole.
+            have = held.get((owner, session))
+            return have is not None and not _foreign(have, was.get((sid, session)), fetched_at)
+
+        owners = bar_owners(resolver, tickers, day, holds)
+        # The id's own bar goes back to it only where no other id receives it (a
+        # mixed-ticker id whose other ticker is owned elsewhere drops itself).
+        for receiver in sorted((owners - {sid}) or owners):
+            if receiver in fetched and (only is None or receiver in only):
+                out.add(receiver)
+    return out
+
+
+def _retracted_prices(
+    conn: duckdb.DuckDBPyConnection, t: datetime, window: tuple[date, date]
+) -> dict[tuple[str, date], tuple[float, float, datetime]]:
+    """The (open, close, retracted_at) of each bar the open release retracted by
+    `t` in `window` (the newest revision of a key)."""
+    release = open_release(conn)
+    if release is None:
+        return {}
+    rows = conn.execute(
+        "SELECT row_key[1], CAST(row_key[2] AS DATE), "
+        "arg_max(CAST(row_values['open'] AS DOUBLE), retracted_at), "
+        "arg_max(CAST(row_values['close'] AS DOUBLE), retracted_at), max(retracted_at) "
+        "FROM retracted_rows WHERE table_name = 'prices_daily' AND release = ? "
+        "AND restored_at IS NULL AND retracted_at <= ? "
+        "AND CAST(row_key[2] AS DATE) BETWEEN ? AND ? GROUP BY ALL",
+        [release.name, t, *window],
+    ).fetchall()
+    return {(str(sid), day): (o, c, at) for sid, day, o, c, at in rows}
+
+
+def _foreign(
+    have: tuple[float, float, datetime],
+    was: tuple[float, float, datetime] | None,
+    answered: datetime | None,
+) -> bool:
+    """True when the bar a receiver holds on a retracted session is not the
+    retracted line's: a different open or close (a vendor revision keeps both,
+    #3432) that was fetched before the retraction, so no fill has answered it yet
+    (#3431: a foreign line under the id that trades every session). A month a
+    retracted-session fill finished after the retraction has answered it: the vendor
+    may serve the same bar again, which writes nothing."""
+    if was is None or (answered is not None and answered > was[2]):
+        return False
+    close = 1e-6
+    same = abs(have[0] - was[0]) <= close * max(1.0, abs(was[0])) and abs(have[1] - was[1]) <= (
+        close * max(1.0, abs(was[1]))
+    )
+    return not same and have[2] < was[2]
+
+
+def _tail_windows(
+    retracted: Collection[tuple[str, date]], since: date, end: date
+) -> list[tuple[date, date]]:
+    """The months from `end` (the day after the last committed backfill month)
+    holding a retracted session on or after `since`: each from the month's first
+    day (or `end`) to its last retracted session, so a fetch stops at a session
+    that has a bar (#3431)."""
+    last: dict[date, date] = {}
+    for _, day in retracted:
+        if day >= max(since, end):
+            month = day.replace(day=1)
+            last[month] = max(day, last.get(month, day))
+    return [(max(month, end), last[month]) for month in sorted(last)]
+
+
 def _holes(
     settings: Settings,
     windows: list[tuple[date, date]],
     t: datetime,
     only: frozenset[str] | None = None,
     tally: _Tally | None = None,
+    tail: frozenset[tuple[date, date]] = frozenset(),
 ) -> tuple[list[Hole], set[str]]:
     """Every hole in `windows` as of `t` that a fetched bar could land on
     (of the `only` ids, when given), a short read per month; the dropped
-    ones are added to `tally`. Also the ids with a listing known at `t`."""
+    ones are added to `tally`. A `tail` window (past the backfill cursor) lists
+    only the holes of retracted sessions (#3431). Also the ids with a listing known at `t`."""
     if not windows and only is None:
         return [], set()
     with _read(settings) as conn:
@@ -703,9 +965,19 @@ def _holes(
         first, last = window
         with _read(settings) as conn:
             ids, *_ = _window_names(conn, t, window, settings, resolver)
-            kept, gaps, _, dropped, handed = _month_holes(
-                conn, resolver, t, window, ids, only, settings.alpaca.rename_lead_days
+            retr = _retracted_holes(
+                conn, resolver, t, window, ids, only, _retracted_sessions(conn, t)
             )
+            gaps: set[str]
+            dropped: dict[str, str]
+            handed: set[str]
+            if window in tail:
+                kept, gaps, dropped, handed = sorted(retr), set(), {}, set()
+            else:
+                kept, gaps, _, dropped, handed = _month_holes(
+                    conn, resolver, t, window, ids, only, settings.alpaca.rename_lead_days
+                )
+                kept = sorted({*kept, *retr})
         if tally is not None:
             tally.add((), dropped)
         for sid in kept:
@@ -763,6 +1035,8 @@ def _price_chunk(
     fill: bool = False,
     only: frozenset[str] | None = None,
     tally: _Tally | None = None,
+    resolvers: _Resolvers | None = None,
+    tail: bool = False,
 ) -> SourceRun | None:
     """One month. The store is read as of the clock when the month starts
     (after the EDGAR chunk committed) and rows are stamped with the clock
@@ -771,7 +1045,12 @@ def _price_chunk(
     ids, when given: `_month_holes`, the store's resolver then) are
     fetched, with the reference; the dropped ones are counted in the message and `tally`; the
     stored bars count toward the staleness share; and a month with no hole
-    to fetch is skipped (`None`)."""
+    to fetch is skipped (`None`). `resolvers` (a fill's, #3234) serves the
+    store's resolver at the month's start, reusing the last one read when
+    the store cannot have changed since (`_Resolvers`). A hole fill also fetches
+    the ids a retracted session of the open release now belongs to and that hold
+    no bar on it (#3431); with `tail` (a month past the backfill cursor) only
+    those."""
     first, last = window
     mode, done = (HOLES, FILLED) if fill else (BACKFILL, OK)
     cursor = f"{HOLES};{_cursor(since, last)}" if fill else _cursor(since, last)
@@ -783,7 +1062,11 @@ def _price_chunk(
 
     try:
         with _read(settings) as conn:
-            resolver = store_resolver(conn, started, settings)
+            resolver = (
+                store_resolver(conn, started, settings)
+                if resolvers is None
+                else resolvers.get(conn, started)
+            )
             ids, listed, static_only, may_count, reference = _window_names(
                 conn, started, window, settings, resolver
             )
@@ -793,10 +1076,18 @@ def _price_chunk(
             dropped: dict[str, str] = {}
             handed: set[str] = set()
             windows8: dict[str, list[tuple[date, date]]] = {}
+            retr: set[str] = set()
             if fill:
-                holes, renames, stored, dropped, handed = _month_holes(
-                    conn, resolver, started, window, ids, only, settings.alpaca.rename_lead_days
+                retr = _retracted_holes(
+                    conn, resolver, started, window, ids, only, _retracted_sessions(conn, started)
                 )
+                if tail:
+                    stored = _with_bars(conn, started, window)
+                else:
+                    holes, renames, stored, dropped, handed = _month_holes(
+                        conn, resolver, started, window, ids, only, settings.alpaca.rename_lead_days
+                    )
+                holes = sorted({*holes, *retr})
                 windows8 = {
                     sid: [(h.start, h.end) for h in resolver.handovers(sid)] for sid in handed
                 }
@@ -859,8 +1150,8 @@ def _price_chunk(
             empty8 = len(handed - landed)
             renamed += f"; {empty8} rule8_window holes with nothing stored" if empty8 else ""
             filled = (
-                f"holes of {len(set(holes) - renames - (handed & stored))} names with no "
-                f"stored bar{renamed}"
+                f"holes of {len(set(holes) - renames - retr - (handed & stored))} names with no "
+                f"stored bar{renamed}{_retracted_note(retr)}"
                 f"{_dropped_note(dict(Counter(dropped.values())))}: "
                 if fill
                 else ""
@@ -1271,3 +1562,563 @@ def _benchmark_chunk(
         return outcome(LOCKED, 0, str(exc))
     except Exception as exc:  # any source or parse failure halts the run
         return outcome(FAILED, 0, _with_frames(f"{type(exc).__name__}: {exc}", exc, settings))
+
+
+#: `refetch_actions`' run mode (#3054); its committed months are `filled`, never `ok`.
+ACTIONS_REFETCH = "actions_refetch"
+
+
+class RefetchRefused(RuntimeError):
+    """`refetch_actions` may not write: no open data release of that name."""
+
+
+@dataclass(frozen=True)
+class ActionsRefetch:
+    """What `refetch_actions` added (or, dry, would add) per month, or over
+    its one span (#3074)."""
+
+    runs: tuple[SourceRun, ...]
+    dry_run: bool
+    #: Rows added (would be added) by action type, over every month run.
+    added: tuple[tuple[str, int], ...] = ()
+    #: Each row written (dry: that would be), `"<security> <type> <ex-date>
+    #: <amount>"`, sorted: what the sitting reviews before the real run (#3074).
+    rows: tuple[str, ...] = ()
+    span: bool = False
+    #: Collision rows (a new id on a type and ex-date the security already
+    #: holds live) that no allow entry or reviewed `distinct` group covers
+    #: (#3246): a real run writes none of a month holding one and fails; a
+    #: dry run lists them here, not in `rows`.
+    refused: tuple[str, ...] = ()
+    #: With `skip_collisions` (#3484): the collision rows left unwritten (a dry
+    #: run: that would be), same line format as `refused`. The stored row and
+    #: its `known_at` are untouched.
+    skipped: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        """True when every month ran to its end (`filled`)."""
+        return all(run.status == FILLED for run in self.runs)
+
+    def summary(self) -> str:
+        """One line for the terminal."""
+        verb = "would add" if self.dry_run else "added"
+        counts = ", ".join(f"{n} {kind}" for kind, n in self.added) or "nothing"
+        unit = "span" if self.span else "month(s)"
+        skips = f"; {len(self.skipped)} collision(s) skipped" if self.skipped else ""
+        return f"actions refetch over {len(self.runs)} {unit}: {verb} {counts}{skips}"
+
+
+def span_settings(settings: Settings, *, through: date, today: date) -> Settings:
+    """`settings` with `alpaca.actions_process_lag_days` widened so a request
+    for ex-dates up to `through` also asks every `process_date` up to `today`
+    (#3074): never narrower than the configured lag. Alpaca filters on
+    `process_date` (#101), so a record processed after `through` plus the
+    configured lag (re-processed or loaded late) is in no month's answer;
+    `refetch_actions(span=True)` asks with these settings. The lag only
+    widens the request; the parse keeps splits and dividends by ex-date and
+    stamps them by the first-seen proxy of the ex-date, as before."""
+    alpaca = settings.alpaca
+    lag = max(alpaca.actions_process_lag_days, (today - through).days)
+    if lag == alpaca.actions_process_lag_days:
+        return settings
+    wide = alpaca.model_copy(update={"actions_process_lag_days": lag})
+    return settings.model_copy(update={"alpaca": wide})
+
+
+def refetch_actions(
+    settings: Settings,
+    *,
+    prices: PriceSource,
+    since: date,
+    through: date,
+    release: str,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+    securities: Collection[str] | None = None,
+    span: bool = False,
+    allow_collisions: Collection[tuple[str, date]] = (),
+    skip_collisions: bool = False,
+) -> ActionsRefetch:
+    """Ask the source again for the splits and dividends of the committed
+    months `since..through` (#3054), with no bars: a month the backfill
+    resumed past keeps the actions its first fetch got, so an action the
+    resolver of the day missed (a pre-rename symbol it never asked, before
+    the alias) never arrives.
+
+    `span` (#3074) asks once for the whole `since..through` instead of per
+    month, for the named `securities` only (required: refused before any
+    fetch without them), so a source built with `span_settings` (a
+    process-date window reaching the run's day) answers each security's
+    every symbol over the span in one request rather than the whole history
+    once per month. Its run row's cursor names `span`. Writes, timing and the
+    release rule are the month mode's.
+
+    Per calendar month: the store's resolver and the window names at the
+    clock (`_window_names`, the backfill's own fetch list; only `securities`
+    of them when given), `prices.corporate_actions` with no store connection
+    open, and `ingest._add_actions` in one write transaction, so an
+    identity already stored adds nothing and every row keeps the source's
+    timing rule (a first-seen row its first-seen proxy, a revision the
+    clock). A real run writes only inside the open data release `release`
+    (`repair.release_refusal`) and records one `ingestion_runs` row per
+    month, mode `ACTIONS_REFETCH`, status `filled` (never `ok`); a dry run
+    fetches the same and rolls every write and its run row back, so its
+    counts are the run's. Halts at the first month that is not `filled`.
+
+    A `collision` row (#3246: a new id on a security, type and ex-date that
+    already holds a live identity, so the event would apply twice; #3304:
+    also a new event that repeats a live one, same ex-date, type and amount
+    or ratio, on another id of the same CIK) is
+    refused unless its dividend is a `distinct` group of the reviewed list
+    or an accepted recurring pair (`store.dividend_reviews`), or its `(security, ex-date)` is in
+    `allow_collisions`: a dry run lists it in `ActionsRefetch.refused`; a
+    real run asks every month first (a dry pass, `_refuse_ahead`, #3303) and
+    refuses the whole run before writing any month, ending one `failed` run.
+
+    `skip_collisions` (#3484): such an uncovered collision is instead left
+    unwritten (the stored live row and its `known_at` stay), every other row
+    writes, and each skipped row is listed in `ActionsRefetch.skipped`; no
+    refusal, no pre-pass. A covered collision still writes."""
+    if isinstance(since, datetime) or not isinstance(since, date):
+        raise TypeError(f"since must be a date, got {since!r}")
+    if isinstance(through, datetime) or not isinstance(through, date) or through < since:
+        raise ValueError("through must be a date on or after since")
+    if isinstance(securities, str):
+        raise TypeError("securities must be a collection of ids, not one string")
+    only = None if securities is None else frozenset(securities)
+    if only is not None and not only:
+        raise ValueError("securities, when given, must name at least one id")
+    if span and only is None:
+        raise ValueError("a span needs --security: it asks the whole history in one request")
+    totals: Counter[str] = Counter()
+    written: list[str] = []
+    refused: list[str] = []
+    skipped: list[str] = []
+    runs: list[SourceRun] = []
+    windows = [(since, through)] if span else month_windows(since, through)
+    allowed = _allowed_collisions(allow_collisions)
+    if not dry_run and not skip_collisions:
+        # #3303: a real run asks every month first, as the dry run does, and
+        # refuses the whole run before writing if any month would refuse.
+        # #3312: the write reuses those answers, so each month is asked once.
+        once = _AskedOnce(prices)
+        asked = cast(PriceSource, once)
+        early = _refuse_ahead(settings, asked, since, windows, release, clock, only, span, allowed)
+        if early is not None:
+            return early
+        once.replay = True
+        prices = asked
+    for window in windows:
+        run = _refetch_month(
+            settings,
+            prices,
+            since,
+            window,
+            release,
+            clock,
+            dry_run,
+            only,
+            totals,
+            written,
+            span,
+            allowed,
+            refused,
+            skipped if skip_collisions else None,
+        )
+        runs.append(run)
+        if run.status != FILLED:
+            break
+    return ActionsRefetch(
+        tuple(runs),
+        dry_run,
+        tuple(sorted(totals.items())),
+        tuple(sorted(written)),
+        span,
+        tuple(sorted(refused)),
+        tuple(sorted(skipped)),
+    )
+
+
+class _AskedOnce:
+    """A `PriceSource` that remembers each `corporate_actions` answer, with
+    the source's `resolution_summary()` after it, while `replay` is False
+    and, once it is True, hands each remembered answer back once (then asks
+    the source as before): the dry pass of a real `refetch_actions` run
+    (#3303) feeds its write (#3312). `resolution_summary()` follows the last
+    answer given, remembered or fresh, so each month reports its own counts.
+    Every other call goes to the wrapped source."""
+
+    def __init__(self, inner: PriceSource) -> None:
+        self._inner = inner
+        self._kept: dict[tuple[tuple[str, ...], date, date], tuple[list[CorporateAction], str]] = {}
+        self._replayed: str | None = None
+        self.replay = False
+
+    def corporate_actions(
+        self, security_ids: Sequence[str], start: date, end: date
+    ) -> list[CorporateAction]:
+        key = (tuple(security_ids), start, end)
+        if self.replay and key in self._kept:
+            got, self._replayed = self._kept.pop(key)
+            return got
+        self._replayed = None
+        got = self._inner.corporate_actions(security_ids, start, end)
+        if not self.replay:
+            self._kept[key] = (list(got), self._inner.resolution_summary())
+        return got
+
+    def resolution_summary(self) -> str:
+        if self.replay and self._replayed is not None:
+            return self._replayed
+        return self._inner.resolution_summary()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _refuse_ahead(
+    settings: Settings,
+    prices: PriceSource,
+    since: date,
+    windows: Sequence[tuple[date, date]],
+    release: str,
+    clock: Callable[[], datetime],
+    only: frozenset[str] | None,
+    span: bool,
+    allowed: tuple[frozenset[tuple[str, date]], frozenset[tuple[str, date, float]]],
+) -> ActionsRefetch | None:
+    """The refusal of a real `refetch_actions` run, or None to go ahead (#3303).
+
+    Skips a closed release (the real run refuses it), then runs every window
+    as a dry run (every write and run row rolled back) and collects the
+    collision rows no allow entry or reviewed group covers. Any: the run
+    refuses before writing a month, returned as one `failed` run with the
+    rows in `refused`. A window that fails otherwise (a source error) is
+    left to the real run to report."""
+    from tradepartner.repair import release_refusal
+
+    with _read(settings) as conn:
+        if release_refusal(conn, release) is not None:
+            return None  # the real run records that refusal, before any fetch
+    totals: Counter[str] = Counter()
+    refused: list[str] = []
+    unchecked = ""
+    for window in windows:
+        run = _refetch_month(
+            settings,
+            prices,
+            since,
+            window,
+            release,
+            clock,
+            True,
+            only,
+            totals,
+            [],
+            span,
+            allowed,
+            refused,
+        )
+        if run.status != FILLED:
+            unchecked = f"{run.chunk_cursor}: {run.message}"
+            break
+    if not refused and not unchecked:
+        return None
+    message = "nothing written in any month"
+    if refused:
+        message = (
+            f"{len(refused)} collision row(s): a new id on a security, type and ex-date that "
+            f"already holds a live one; {message}: {'; '.join(sorted(refused))}"
+        )
+    if unchecked:
+        # A month that could not be asked leaves later months unchecked: refuse, don't half-write.
+        message += f"; a month could not be checked ({unchecked})"
+    failed = SourceRun(
+        "alpaca", FAILED, 0, f"{ACTIONS_REFETCH};since={since};through={windows[-1][1]}", message
+    )
+    return ActionsRefetch((failed,), False, (), (), span, tuple(sorted(refused)))
+
+
+def _allowed_collisions(
+    allow: Collection[tuple[str, date]],
+) -> tuple[frozenset[tuple[str, date]], frozenset[tuple[str, date, float]]]:
+    """The collisions a refetch may write (#3246): the caller's
+    `(security, ex-date)` allow entries, and the reviewed list's `distinct`
+    dividend groups (two declared payments, both kept), as
+    `(security, ex-date, amount)`."""
+    from tradepartner.store.dividend_reviews import DISTINCT, reviewed_groups
+
+    for entry in allow:
+        sid, ex = entry
+        if not sid or isinstance(ex, datetime) or not isinstance(ex, date):
+            raise ValueError(f"allow_collisions entry must be (security, date), got {entry!r}")
+    distinct = frozenset(g.key for g in reviewed_groups() if g.verdict == DISTINCT)
+    return frozenset(allow), distinct
+
+
+def _refetch_month(
+    settings: Settings,
+    prices: PriceSource,
+    since: date,
+    window: tuple[date, date],
+    release: str,
+    clock: Callable[[], datetime],
+    dry_run: bool,
+    only: frozenset[str] | None,
+    totals: Counter[str],
+    written: list[str],
+    span: bool = False,
+    allowed: tuple[frozenset[tuple[str, date]], frozenset[tuple[str, date, float]]] = (
+        frozenset(),
+        frozenset(),
+    ),
+    refused: list[str] | None = None,
+    skipped: list[str] | None = None,
+) -> SourceRun:
+    """One month (or the one span) of `refetch_actions`; adds the rows it
+    moved to `totals` and names each row written in `written`."""
+    from tradepartner.repair import RepairRefused, refuse_inside_open_window, release_refusal
+
+    prepared: dict[str, Any] = {}
+    started = ensure_tz_aware_utc(clock(), field_name="clock()")
+
+    def prepare() -> None:
+        with _read(settings) as conn:
+            # Refused before any fetch; checked again under the write lock.
+            if not dry_run and (why := release_refusal(conn, release)) is not None:
+                raise RefetchRefused(why)
+            resolver = store_resolver(conn, started, settings)
+            ids = _window_names(conn, started, window, settings, resolver)[0]
+        wanted = sorted(set(ids) & only) if only is not None else sorted(ids)
+        fetched = prices.corporate_actions(wanted, *window) if wanted else []
+        # Splits and dividends only: spin-offs keep their own path (#3053 item 2).
+        actions = [a for a in fetched if a.action_type in (ActionType.SPLIT, ActionType.DIVIDEND)]
+        with _read(settings) as conn:
+            plan = _replay_plan(conn, actions, window)
+        prepared["actions"], prepared["covered"] = _replay_actions(prices, actions, window, plan)
+        prepared["names"] = len(wanted)
+
+    def write(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
+        if not dry_run and (why := release_refusal(conn, release)) is not None:
+            raise RefetchRefused(why)
+        try:  # a refetch rewrites past reads of its months (#3330), dry runs too
+            refuse_inside_open_window(conn, [a.ex_date for a in prepared["actions"]])
+        except RepairRefused as exc:
+            raise RefetchRefused(str(exc)) from exc
+        before = _action_counts(conn)
+        stats: dict[str, int] = {}
+        stamp = ensure_tz_aware_utc(clock(), field_name="clock()")
+        prior_stamp = conn.execute(
+            "SELECT count(*) FROM corporate_actions WHERE ingested_at = ?", [stamp]
+        ).fetchone()
+        if skipped is not None and prior_stamp is not None and prior_stamp[0]:
+            raise ValueError(
+                f"refetch-actions skip-collisions stamp {stamp.isoformat()} already holds rows"
+            )
+
+        def add(actions: Sequence[CorporateAction]) -> int:
+            return _add_actions(
+                conn,
+                actions,
+                window,
+                ingested_at=stamp,
+                covered=prepared["covered"],
+                stats=stats,
+            )
+
+        added = add(prepared["actions"])
+        lines, blocked, drop = _rows_written(conn, stamp, allowed)
+        if skipped is not None and blocked:
+            # #3484: undo this write whole (every row it stamped), then write
+            # again without the collision actions: a skipped row must not leave
+            # its side effects (a cancel of a stored key) behind.
+            conn.execute("DELETE FROM corporate_actions WHERE ingested_at = ?", [stamp])
+            stats.clear()
+            # Every revision of a skipped id goes with it (not only the one
+            # that collided); an id-less action is matched by type and ex-date.
+            ids = {(sid, src) for sid, _k, _e, src in drop if src}
+            keys = {(sid, kind, ex) for sid, kind, ex, src in drop if not src}
+            keep = [
+                a
+                for a in prepared["actions"]
+                if (a.security_id, a.source_action_id) not in ids
+                and (
+                    a.source_action_id
+                    or (a.security_id, a.action_type.value, a.ex_date) not in keys
+                )
+            ]
+            added = add(keep)
+            lines, again, _ = _rows_written(conn, stamp, allowed)
+            if again:
+                raise ValueError("a collision row survived its own removal")
+            skipped.extend(blocked)
+        moved = _action_counts(conn) - before
+        if skipped is None and refused is not None:
+            refused.extend(blocked)
+        if blocked and not dry_run and skipped is None:
+            raise ValueError(
+                f"{len(blocked)} collision row(s): a new id on a security, type and ex-date "
+                f"that already holds a live one; nothing written: {'; '.join(blocked)}"
+            )
+        # A dry run's refused rows would not be written: they are not "would add".
+        moved.subtract(Counter(line.split()[2] for line in (blocked if skipped is None else ())))
+        totals.update(+moved)
+        written.extend(lines)
+        by_type = ", ".join(f"{kind}={n}" for kind, n in sorted(moved.items())) or "none"
+        extra = "".join(f"; {key}={value}" for key, value in sorted(stats.items()))
+        message = (
+            f"{window[0]}..{window[1]}: {len(prepared['actions'])} action(s) for "
+            f"{prepared['names']} names; added {by_type}; release {release}{extra}"
+        )
+        if resolution := prices.resolution_summary():
+            message += f"; {resolution}"
+        return added, message
+
+    return _run_source(
+        "alpaca",
+        write,
+        settings,
+        started,
+        clock,
+        f"{ACTIONS_REFETCH};{'span;' if span else ''}since={since};through={window[1]}",
+        dry_run,
+        mode=ACTIONS_REFETCH,
+        prepare=prepare,
+        success_status=FILLED,
+    )
+
+
+def _rows_written(
+    conn: duckdb.DuckDBPyConnection,
+    stamp: datetime,
+    allowed: tuple[frozenset[tuple[str, date]], frozenset[tuple[str, date, float]]] = (
+        frozenset(),
+        frozenset(),
+    ),
+) -> tuple[list[str], list[str], set[tuple[str, str, date, str]]]:
+    """The `corporate_actions` rows this write stamped at `stamp`, one line
+    each: `"<tag> <security> <type> <ex-date> <amount> known_at=<stamp>"`
+    with the exact stored amount (#3074 review). The tag is `revision` when
+    the row's identity (#108: the source id, else security, type and
+    ex-date) was stored before; `collision` when it is new but another live
+    identity of the security already holds that type and ex-date, or (#3304)
+    a live event stored before this write on another id of the same CIK
+    holds that type, ex-date and amount or ratio (a source re-issuing an
+    event under a new id would apply it twice); else `new`.
+    Returns the lines to write, the lines refused (#3246), and the refused
+    rows' source identities: a live `collision` that `allowed`
+    (`_allowed_collisions`) does not cover."""
+    allow_pairs, distinct = allowed
+    rows = conn.execute(
+        """
+        WITH ident AS (
+            SELECT *, CASE WHEN coalesce(source_action_id, '') <> '' THEN source_action_id
+                      ELSE action_type || '|' || CAST(ex_date AS VARCHAR) END AS key
+            FROM corporate_actions
+        ),
+        latest AS (
+            SELECT * FROM ident
+            QUALIFY row_number() OVER (
+                PARTITION BY security_id, key ORDER BY ingested_at DESC, known_at DESC
+            ) = 1
+        ),
+        ciks AS (
+            SELECT security_id, cik FROM securities
+            QUALIFY row_number() OVER (PARTITION BY security_id ORDER BY known_at DESC) = 1
+        )
+        SELECT w.security_id, w.action_type, w.ex_date, w.ratio_or_amount, w.cancelled,
+               w.known_at, coalesce(w.source_action_id, ''),
+               EXISTS (
+                   SELECT 1 FROM ident o
+                   WHERE o.security_id = w.security_id AND o.key = w.key
+                     AND o.ingested_at < w.ingested_at
+               ) AS revision,
+               EXISTS (
+                   SELECT 1 FROM latest l
+                   WHERE l.security_id = w.security_id AND l.action_type = w.action_type
+                     AND l.ex_date = w.ex_date AND l.key <> w.key AND NOT l.cancelled
+               ) AS same_id,
+               EXISTS (
+                   SELECT 1 FROM latest l
+                   JOIN ciks lc ON lc.security_id = l.security_id
+                   WHERE lc.cik = (SELECT cik FROM ciks WHERE security_id = w.security_id)
+                     AND l.security_id <> w.security_id AND l.action_type = w.action_type
+                     AND l.ex_date = w.ex_date AND NOT l.cancelled
+                     AND abs(l.ratio_or_amount - w.ratio_or_amount) < 1e-9
+                     AND l.ingested_at < w.ingested_at
+               ) AS same_cik,
+               (
+                   SELECT count(*) FROM latest l
+                   WHERE l.security_id = w.security_id AND l.action_type = w.action_type
+                     AND l.ex_date = w.ex_date AND NOT l.cancelled
+               ) AS live
+        FROM ident w WHERE w.ingested_at = ?
+        ORDER BY 1, 2, 3, 6
+        """,
+        [stamp],
+    ).fetchall()
+    from tradepartner.store.asof import live_actions_as_of
+    from tradepartner.store.dividend_reviews import (
+        equal_amount_groups,
+        recurring_pairs,
+        reviewed_groups,
+    )
+
+    # Classify the complete live day after the tentative write. The same
+    # as-of rule used by health checks the size, amount and start date; a
+    # third identity or a different amount cannot inherit a pair's allowance.
+    pair_ids = {entry.security_id for entry in recurring_pairs()}
+    pair_ids.intersection_update(sid for sid, kind, *_ in rows if kind == ActionType.DIVIDEND)
+    recurring_distinct = (
+        {
+            group.key
+            for group in equal_amount_groups(
+                live_actions_as_of(conn, stamp, sorted(pair_ids)), reviewed_groups()
+            )
+            if group.group_class == "accepted"
+        }
+        if pair_ids
+        else set()
+    )
+    lines: list[str] = []
+    blocked: list[str] = []
+    blocked_identities: set[tuple[str, str, date, str]] = set()
+    for (
+        sid,
+        kind,
+        ex,
+        amount,
+        cancelled,
+        known_at,
+        source_id,
+        revision,
+        same_id,
+        same_cik,
+        live,
+    ) in rows:
+        collision = same_id or same_cik
+        tag = "revision" if revision else "collision" if collision else "new"
+        line = (
+            f"{tag} {sid} {kind} {ex} {amount!r}{' cancelled' if cancelled else ''} "
+            f"known_at={known_at.astimezone(UTC).isoformat()}"
+        )
+        covered = (sid, ex) in allow_pairs or (
+            # A reviewed group was judged as exactly two identities: a third is not covered.
+            kind == ActionType.DIVIDEND
+            and (sid, ex, float(amount)) in (distinct | recurring_distinct)
+            and (live <= REVIEWED_IDENTITIES or not same_id)
+        )
+        if tag == "collision" and not cancelled and not covered:
+            blocked.append(line)
+            blocked_identities.add((sid, kind, ex, source_id))
+        else:
+            lines.append(line)
+    return lines, blocked, blocked_identities
+
+
+def _action_counts(conn: duckdb.DuckDBPyConnection) -> Counter[str]:
+    rows = conn.execute(
+        "SELECT action_type, count(*) FROM corporate_actions GROUP BY action_type"
+    ).fetchall()
+    return Counter({str(kind): int(n) for kind, n in rows})

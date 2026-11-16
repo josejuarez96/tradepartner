@@ -19,7 +19,10 @@ for the `traded_only` bars, `shares_rows` (`security_id`, `as_of_date`, `value`,
 revision, with none of rule 7's class or plausibility handling) and `split_rows`
 (`security_id`, `action_id`, `ex_date`, `ratio`, `cancelled`, `known_at`; the latest
 revision per `(security_id, action_id)` known at `t`, dropped when cancelled, so a
-re-dated split counts once).
+re-dated split counts once). `late_splits` (#3096) diffs the same rows' live splits
+with an ex-date at or before `t_prev`'s session, as known at `t_prev` and at `t`; the
+fake's frames are the test's own, so a test that plants a late split also plants the
+adjusted bar revisions that go with it.
 
 The exit-evidence reads (T328b) work over `delisting_reason_rows` (the
 `DELISTING_REASON_COLUMNS`; the latest revision per Form 25 episode known at `t`) and
@@ -70,6 +73,12 @@ _UNVALUED_SPIN_OFF_SCHEMA: dict[str, Any] = {
     "ex_date": pl.Date,
     "reason": pl.Utf8,
     "known_at": pl.Datetime("us", "UTC"),
+}
+#: `late_splits`' rows (#3096): the `LATE_SPLIT_COLUMNS`.
+_LATE_SPLIT_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "ex_date": pl.Date,
+    "ratio": pl.Float64,
 }
 #: `late_spin_offs`'s rows (T211e): `security_id` is the parent.
 _LATE_SPIN_OFF_SCHEMA: dict[str, Any] = {
@@ -332,6 +341,33 @@ class FakeProvider:
             (pl.col("first_known_at") > t_prev) & (pl.col("ex_date") <= prev_session)
         ).select(key)
         return _latest(known.join(late_keys, on=key, how="semi"), key)
+
+    def late_splits(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        """`(security_id, ex_date)` whose live split factor on `split_rows` changed between
+        `t_prev` and `t`, for ex-dates at or before `t_prev`'s session; `ratio` is the
+        factor at `t` over the factor at `t_prev` (#3096)."""
+        t = self._record("late_splits", t, ids=ids, t_prev=t_prev)
+        t_prev = check_t(t_prev, name="t_prev")
+        prev_session = last_completed_session(t_prev)
+
+        def factors(at: datetime) -> dict[tuple[str, date], float]:
+            key = ["security_id", "action_id"]
+            live = _latest(_for_ids(_known(self.split_rows, at), ids), key).filter(
+                ~pl.col("cancelled") & (pl.col("ex_date") <= prev_session)
+            )
+            out: dict[tuple[str, date], float] = {}
+            for sid, ex_date, ratio in live.select("security_id", "ex_date", "ratio").iter_rows():
+                out[(sid, ex_date)] = out.get((sid, ex_date), 1.0) * ratio
+            return out
+
+        now, before = factors(t), factors(t_prev)
+        rows = [
+            (sid, ex_date, now.get((sid, ex_date), 1.0) / before.get((sid, ex_date), 1.0))
+            for sid, ex_date in sorted(set(now) | set(before))
+        ]
+        return pl.DataFrame(
+            [row for row in rows if row[2] != 1.0], schema=_LATE_SPLIT_SCHEMA, orient="row"
+        )
 
     def unvalued_spin_offs(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         """The declared unvalued spin-off rows (`unvalued_spin_offs_rows`) of the

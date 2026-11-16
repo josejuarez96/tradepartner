@@ -1,6 +1,6 @@
 # 0016. One development boundary, frozen in the store; exams for frozen finalists only; forward exams judged by the paper book
 
-**Status:** Accepted (2026-10-08, by the owner's merge of PR #1320; header set by #1331; the open questions below are his, and nothing here pre-empts them)  ·  **Date:** 2026-10-08  ·  **Amended:** 2026-10-28 (#2444, the owner's decision of that date: point 8, a new family's frozen finalist may take one historical exam on the post-boundary months; points 1 to 7 stand)  ·  **Issue:** #1319  ·  **Plan:** the history-and-identity amendment to the [data-foundation plan](../plans/data-foundation.md) (#1319, its second PR) holds the code tasks  ·  **Related:** #1301 (the owner's discussion of 2026-10-08 and his research-governance brief, comment 6065810154), #1303 (the decision record of 2026-10-08, its newest comment: the data-architecture evaluation accepted as direction), #1292 (B4, parked), [strategy-lab spec](../specs/strategy-lab.md) (family rules, req 1, req 5), [backtest spec](../specs/backtest.md) (holdout, trial registry, `owner_decisions`), [research-registry spec](../specs/research-registry.md) (sealed periods, the same shape for research runs), [ADR 0005](0005-objective-benchmark-stop-criteria.md) (the paper tracking check, `paper.min_rebalances`), [ADR 0009](0009-price-vendor.md) (history from 2016-01-04), [ADR 0014](0014-strategies-as-registered-objects.md) (families and lineage), [ADR 0015](0015-expansion-seams.md) (the book id)
+**Status:** Accepted (2026-10-08, by the owner's merge of PR #1320; header set by #1331; the open questions below are his, and nothing here pre-empts them)  ·  **Date:** 2026-10-08  ·  **Amended:** 2026-10-28 (#2444, the owner's decision of that date: point 8, a new family's frozen finalist may take one historical exam on the post-boundary months; points 1 to 7 stand); 2026-11-06 (#3125, #3128, the orchestrator's fail-closed decision for the owner's word: no live choice until a returns-judging exam passes, the forward return exam, point 8 not qualified until a return rule; see the amendment of that date); 2026-11-07 (#3143, the orchestrator's decision for the owner's word: the forward return exam becomes group-sequential at 12/24/36 months, total size 1.25%; see the amendment of that date); 2026-11-07 (#3146, the orchestrator's fail-closed decision for the owner's word: the four-exam budget counts every exam window ever started and is kept in a git-tracked ledger, `docs/research/exam-ledger.toml`; see the amendment at the end)  ·  **Issue:** #1319  ·  **Plan:** the history-and-identity amendment to the [data-foundation plan](../plans/data-foundation.md) (#1319, its second PR) holds the code tasks  ·  **Related:** #1301 (the owner's discussion of 2026-10-08 and his research-governance brief, comment 6065810154), #1303 (the decision record of 2026-10-08, its newest comment: the data-architecture evaluation accepted as direction), #1292 (B4, parked), [strategy-lab spec](../specs/strategy-lab.md) (family rules, req 1, req 5), [backtest spec](../specs/backtest.md) (holdout, trial registry, `owner_decisions`), [research-registry spec](../specs/research-registry.md) (sealed periods, the same shape for research runs), [ADR 0005](0005-objective-benchmark-stop-criteria.md) (the paper tracking check, `paper.min_rebalances`), [ADR 0009](0009-price-vendor.md) (history from 2016-01-04), [ADR 0014](0014-strategies-as-registered-objects.md) (families and lineage), [ADR 0015](0015-expansion-seams.md) (the book id)
 
 ## Context
 
@@ -74,3 +74,274 @@ We will take option 3.
 - Reversibility of point 8: a family registered with `exam_kind = historical` can never get a forward exam of record, and its spend cannot be undone.
 - Reversibility: cheap for the code (a default argument, a refusal, a nullable column and one `paper start` branch); one-way for anything spent, as always: a window that read sessions past a boundary cannot be unread, which is why the refusal is hard.
 - Revisit if: the vendor ADR (#1303 item 5) lands and the re-split (item 7) sets a new boundary for the longer history; the owner registers a family whose signal needs a different development end for a stated reason (that is a new row with the reason, not a per-family key); or a reviewer finds a run path that builds an in-sample window without reading the boundary (a defect).
+
+## Amendment 2026-11-06 (#3125, #3128): no live choice until an exam judges returns on unseen data; the forward return exam
+
+*The orchestrator's decision on #3125 (the owner delegated it, fail-closed), recorded for the owner's word on this class-B PR. Points 1 to 8 stand except where this section says otherwise. Promotions so far: 0, so nothing is unwound.*
+
+**Why.** Audit B (2026-11-06, read-only, origin/main `fdb40479`; the report is `~/tradepartner-probes/auditB/99-report.md` on the owner's machine) ran pure-noise ideas through TP's own gate code. The validation: "800 of 800 sweep verdicts agree; the largest |ΔDSR| is 1.1e-16". A researcher who keeps every written rule gets a noise candidate through promotion, rung 4 and rung 5 **19.0%** of the time per idea at H1-like costs, **32.7%** at zero cost and **1.6%** at B10-like fast-book costs (path A). "Across a programme of four independent ideas, the chance that at least one noise finalist reaches the owner's live choice is **about 57%** at H1-like costs and **about 6%** at B10-like costs." A stricter floor does not fix it: "Path A passes 51.0% at threshold 0.5 and 7.6% at 0.95" for a true IR of 0.5, against 0.9% for noise at 0.95. "The in-sample screen cannot discriminate in either direction at these costs and lengths."
+
+Nothing after the screen judges returns:
+- point 4's forward exam of record is ADR 0005's tracking check, which compares a book with its own backtest, and every hypothesis file says the tracking check "neither retires nor promotes";
+- point 8's historical exam is not built (no `exam_kind` in `src/`), and as written it fixes a window but no pass rule;
+- ADR 0023 asks an exam of record for "a kill rule in its file" but does not say what the rule tests;
+- momentum's spent exam (H1's trial 4) was read under H1's Q10, "no numeric cut-off".
+
+The [strategy-lab spec](../specs/strategy-lab.md)'s open question 4 keeps the 0.5 promotion floor "because the promoted hypothesis is never judged by the selecting statistic: its single holdout spend and its paper tracking are the judges". Today that premise is false. This amendment makes it true. The floor itself (#3127) and the root/child call (#3126) are not changed here.
+
+**Decision 1: the block.** From 2026-11-06, no hypothesis is named in the owner's live choice ([ADR 0023](0023-break-first-fast-books-paper-exam.md) D6, the Phase 6 live ADR T163, [ADR 0017](0017-fast-paper-and-machine-readiness-gate.md) part F) unless its family's exam of record has **passed a returns-judging exam**: the forward return exam of decision 2, or a historical exam that a later amendment qualifies under decision 3.
+- **What does not qualify**, alone or together: the in-sample screen, the kill ladder's rungs, promotion and ADR 0005's tracking check.
+- **What stays allowed:** `sweep promote` to a paper book (that is how the exam runs), paper books, tracking windows and the shakedown.
+- **Until T381 and T381a are merged, no exam can pass,** so no hypothesis can be chosen for live money.
+- **Enforced in code, not only in text.** T163b's live switch refuses (`exam_not_passed`) to name a book whose hypothesis has no `passed` verdict from T381's exam (the paper-trading plan's T163b line, amended in this PR).
+- **H1 is covered too, and so is every `momentum` book.** Momentum's holdout is spent without a return rule, and a spent family has no forward exam of record (ADR 0023). H1 therefore cannot qualify under this record (open question 8).
+- **Labels.** Until a book's exam passes, every report of its tracking result says **"machine pass, edge unjudged"**, never "exam passed". This covers `paper status`, `lab status` (T381a) and every `TP-` claim (checked at review). An exam's own verdict is reported as "forward return exam passed", "failed", "failed (futility)" or "failed (void)".
+- **What this changes in the roadmap and the charter, said plainly.** The [roadmap](../roadmap.md)'s Phase 6 entry gate reads "the machine, not a strategy's months of tracking, is what is gated". Decision 1 adds a strategy gate beside the machine gate. Since a live book needs a strategy, Phase 6's first live order now waits for a passed exam, and that is at least 12 months of paper. The roadmap row carries a dated note saying so (this PR). The [charter](../charter.md)'s line that beating a benchmark is "never a phase-exit criterion" is untouched: no phase's exit criteria change. What changes is which strategy may carry live money, which serves the charter's first objective, "disciplined, evidence-based decisions". Choosing a strategy on gates that pass noise more than half the time across a programme is not an evidence-based decision. The owner's word on this PR is his word on that roadmap change. The other route, a live machine test with an unjudged strategy, is open question 8.
+
+**Decision 2: the forward return exam.** *(Amended 2026-11-07, #3143 (the UTC date of the decision): the horizon, the pass rule, the futility and void rules and the pinned values below are replaced by the [group-sequential exam](#amendment-2026-11-07-3143-the-forward-return-exam-becomes-group-sequential); the rest of this decision stands.)* It is pre-registered and runs over a fixed horizon of 12 months. It applies to a book that is an exam of record under ADR 0023: a forward, unspent holdout (point 4), frozen parameters, and at least `paper.min_rebalances` and `paper.min_exam_fills`.
+- **The kill line is frozen first.** Before the window's first session, the kill line is posted on the finalist's issue. It carries the values below, the benchmark, and the finalist's in-sample monthly net excess skewness. T381a then freezes the same values into the window at `paper start`. Nothing in the line is chosen after a return of the window is seen.
+- **The series.** The exam reads H = 12 monthly net excess returns:
+  - month m is the book's return from one month-end to the next, net of every fill, fee and dividend the journal books, minus the total return of the benchmark the finalist's file froze over the same dates (SPY under ADR 0005, unless the file names another);
+  - the first month starts at the first month-end on or after the window's first rebalance session, and the stub before it is reported but not tested;
+  - months with a missed rebalance or an override stay in the series.
+- **The pass rule.** Both legs must pass, each one-sided at a nominal α = 0.0025:
+  - (i) the t-statistic of the 12 returns' mean (sample standard deviation, 11 degrees of freedom) is at least t₀.₉₉₇₅,₁₁ = **3.497**;
+  - (ii) the intercept of the OLS regression of the same 12 returns on the benchmark's monthly return over the T-bill rate ([ADR 0020](0020-fred-risk-free-rate.md)) has a t-statistic of at least t₀.₉₉₇₅,₁₀ = **3.581**. This leg stops a book whose only edge is more market beta than its benchmark in a rising year.
+  - If both legs pass, the exam is passed. Otherwise it is failed.
+- **Why the nominal α is 0.25%, not 1%.** The t-test is anti-conservative when returns are negatively skewed. In the sizing run below, a nominal 1% test passed a zero-mean skew −0.85 null **2.68%** of the time at 12 months. At 0.25% the same null passes **1.10%**.
+- **The skew guard.** `paper start` refuses an exam window (`exam_skew_out_of_range`) when the finalist's in-sample monthly net excess skewness is below −0.85, the most negative skew at which the rate below is stated. Such a finalist cannot take this exam, so it cannot reach the live choice.
+- **The futility kill.** At month 6, if the sum of the first six returns is below 0, the exam is failed (futility). The rule can only stop a pass, so it cannot raise the false-pass rate. In the sizing run it ended a noise exam at month 6 in 54.20% of runs at a 1.1%/yr drag. It cost a true IR of 2 nothing: 13.49% with or without it, in the futility block's own draw. The power table's 13.41% is a separate draw of the same cell.
+- **A void exam is a failed exam.** A window that ends before month 12, or that has not met ADR 0023's minimums by month 12, is failed (void).
+- **One exam per family, no retry** (points 3 and 8 (b)). A changed strategy is a new hypothesis whose trials count (strategy-lab req 4), and its exam counts too.
+- **The programme budget: four exams.** *(Amended 2026-11-07, #3146: what counts, the ledger, the refusals and the two changes a fifth exam needs are in [the exam ledger](#amendment-2026-11-07-3146-the-four-exam-budget-is-counted-in-the-store-and-in-a-git-tracked-ledger).)* `paper start` refuses a fifth exam window under this rule (`exam_budget_spent`, `paper.exam_max_count` = 4). Every started exam counts, whatever its outcome. A fifth exam needs a new dated amendment with a smaller per-exam rate.
+- **The values are pinned.** The config validator refuses an `exam_alpha` above 0.0025, a horizon other than 12, a futility month other than 6, a `paper.exam_max_count` above 4 and a skew guard below −0.85. So the exam can be made stricter in config, never looser.
+
+**The arithmetic: why the rate is under 5% for four ideas.**
+- **Fresh data breaks the selection link.** A noise finalist's 12 exam months come after its frozen kill line. They also come after every in-sample window (which ends 2023-12-29) and every rung-2 window (which ends 2025-12). So they are independent of every selection that brought the finalist to the exam, and its pass rate is the test's rate under the null, whatever the screen did. A cost drag makes a noise book's true mean negative, which only lowers the rate.
+- **The sizing run.** The script is `exam_sizing.py` (sha256 `e202f68217a8e7c64c87951758094a17c22ef05494ea7d11c7a66e2b4cc4b7ef`). It used seed 3125, 300,000 replicates per cell, Audit B's noise model (Student-t df 5, 8%/yr tracking error) and skew-normal nulls. The script and its full output are posted on PR #3129. Leg (i) alone at H = 12 and 0.25% passed the nulls as follows: 0.17% at zero cost, 0.13% at 1.1%/yr, 0.07% at 2.2%/yr, **1.10%** at skew −0.85 and 1.25% at skew −0.96. The two legs together pass no more often than leg (i) alone.
+- **Worst case for four ideas, inside the skew guard.** If all four finalists are noise with skew −0.85 and each takes the exam, the rate is 1 − (1 − 0.0110)⁴ = **4.33%**. The union bound gives at most 4 × 1.10% = 4.40%, whatever the dependence between the exams. Both are under 5%. For symmetric noise, it is 1 − (1 − 0.0017)⁴ = 0.68%.
+- **Counted from the start of four ideas, as Audit B counts its 57%.** At H1-like costs, path A's 19.0% gives 1 − (1 − 0.190 × 0.0110)⁴ = **0.83%** (against about 57% today). At zero cost, 32.7% gives 1 − (1 − 0.327 × 0.0110)⁴ = **1.43%**.
+- **Why not a nominal 1%.** At skew −0.85 it gives 2.68% per exam, and 1 − (1 − 0.0268)⁴ = 10.3% for four.
+
+**Power, said plainly.** The same run measured how often leg (i) at 0.25% passes a real edge (cost 1.1%/yr):
+
+| True IR | 6 months | **12 months** | 18 months | 24 months |
+|---|---|---|---|---|
+| 0.5 | 0.36% | **0.55%** | 0.73% | 0.95% |
+| 1.0 | 0.86% | **1.98%** | 3.49% | 5.26% |
+| 2.0 | 3.49% | **13.41%** | 26.21% | 39.33% |
+
+- **What the exam is.** It bounds false passes. It is not a discovery tool: a real IR-0.5 edge almost always fails it, as H1's own file already says of every window this project can afford (a +1 pp/yr excess "would need about 280 years of data to reach t ≈ 2").
+- **Why accept that.** The live account is $100 and the objective is learning (ADR 0005). A gate that passes a noise idea more than half the time across a programme is worse than one that rarely passes a weak real one.
+- **Why 12 months.** It is the shortest horizon in the table at which a strong edge (IR 2) has a real chance to pass (13.41%). At 6 months it is 3.49%, which is close to the 1.10% at which a skewed null passes, so a pass at 6 months would say almost nothing. A longer horizon keeps the rate under 5% too and buys power: IR 2 passes 26.21% at 18 months and 39.33% at 24, for 6 or 12 more months per finalist. That choice is the owner's (open question 10). The futility kill ends about half of the noise exams at month 6 whatever the horizon.
+- **Assumptions behind the rate.** The returns are independent month to month. Their skew is no lower than −0.85, a bound the skew guard checks on the in-sample series, whose own sampling error is real. Paper fills cannot make a zero-gross book positive in expectation. A book that breaks one of these assumptions is outside the stated rate, and the sizing run states nothing about it.
+
+**Decision 3: point 8 is not this gate, and #3128's overlap is disclosed.** A point-8 historical exam, if built, is not a returns-judging exam under decision 1 until a new amendment gives it:
+- a pre-registered return rule;
+- a false-pass rate stated conditional on the overlap below;
+- a place in the same four-exam programme budget as the forward exams.
+
+The rest of point 8 stands. The reasons:
+- **The window overlaps rung 2's (#3128, Audit B finding 4).** "The #3100 window (2009-01..2025-12) contains all 40 store in-sample months and 24 of the 33 historical-exam months." `scripts/b3_overlap.py` (400k null signals, seed 3092), given a null rung-2 pass:
+
+  | Link correlation | 0.25 | 0.5 | 1.0 |
+  |---|---|---|---|
+  | P(store in-sample mean > 0) | 72% | 81% | 89% |
+  | P(exam-window mean > 0) | 65% | 70% | 77% |
+
+  "An independent check would give 50%." So for a rung-2-sourced idea, the rung-4 store run and a point-8 exam partly re-confirm rung-2 false positives: 65% to 89% instead of 50%. "The end-to-end effect is small today (≈ 5.8% per 20-read programme, because rung 2 is strict)."
+- **The overlap moves a nominal test's false-pass rate above 5% for four exams.** This approximation is ours, not the report's, and it assumes a normal null whose median is shifted. If the shift makes P(mean > 0) equal 65%, 70% or 77%, a nominal one-sided 1% test passes noise about 2.6%, 3.6% or 5.6% of the time. Across four exams that is about 10.0%, 13.6% or 20.7%. No point-8 rate can therefore be stated under 5% from Audit B's numbers without a per-finalist conditional-null calibration (#3128's fix: exclude or down-weight the 24 overlapping months, or test against the conditional null). Excluding them would leave 9 months (2026-01 to 2026-09), and those are "not virgin" either (point 8, contamination), which cannot be sized at all.
+- **It is not cheaper.** It needs point 8's seven code consequences (one of them on the order path), a return rule it does not have and that calibration. It also does not shorten the road to live money: point 8's finalist "still opens a paper book", and open question 4 recommends no shortening. Idea-pipeline candidates forgo it anyway (that spec's D10).
+- **The forward exam has none of this.** Its months start after `paper start` (2026-11 at the earliest), after every rung-2 and in-sample window. The only build it needs is T381 and T381a, in the [paper-trading plan](../plans/paper-trading.md).
+- **Rung 4's share of the overlap is unchanged here.** Its fix (a rung-4 report prints the conditional null pass rate) stays on #3128.
+
+**Open questions (the owner's; a recommendation beside each).**
+
+8. **H1 and a $100 machine test before any exam passes.** Decision 1 leaves H1, and every `momentum` book, with no route to the live choice. It also delays Phase 6's first live order by at least 12 months. Recommend keeping the block. If the owner wants live fills on the machine before an exam passes, he amends this record in T163 and names the book "machine test, edge unjudged". It is not left implied.
+9. **Should fast books get a looser rate, given their 1.6% screen rate?** Recommend no. Use one rule and one budget, so that no book type earns a cheaper exam by being labelled fast.
+10. **A longer horizon for more power?** Recommend 12 months now, the cheapest horizon that is not near-useless. Move to 18 or 24 only by a new amendment before the first exam's kill line is posted, never during an exam. *(Answered 2026-11-07, #3143: [group-sequential looks at 12, 24 and 36 months](#amendment-2026-11-07-3143-the-forward-return-exam-becomes-group-sequential), before any kill line was posted.)*
+
+**Consequences of this amendment.**
+- **Good:**
+  - the 0.5 floor's stated premise becomes true;
+  - *(amended 2026-11-07, #3143: 4.9% worst case under the [group-sequential exam](#amendment-2026-11-07-3143-the-forward-return-exam-becomes-group-sequential))* a noise idea reaches the live choice at most about 4.4% of the time across four exams (inside the skew guard), against about 57% today;
+  - the exam reads only months that did not exist when its line was frozen;
+  - the build is one pure function, pinned keys, three refusals and two labels.
+- **Bad / accepted:**
+  - every live candidate now waits at least 12 months of paper (6 months for a futility kill), and so does Phase 6's first live order;
+  - *(amended 2026-11-07, #3143: these are gross-IR figures; at the 60 bp paper cost a net IR-0.5 slow book passes 0.29% as written and 0.84% under the [group-sequential exam](#amendment-2026-11-07-3143-the-forward-return-exam-becomes-group-sequential))* a real IR-0.5 edge passes about 0.55% of the time and an IR-2 edge 13.41%, so the likely outcome for a year or more is that nothing is chosen;
+  - H1 cannot be chosen at all under this record (open question 8);
+  - a strongly negatively skewed finalist cannot take the exam;
+  - after four exams the budget is spent until a new amendment *(amended 2026-11-07, #3146: and a config change; both are named in [the exam ledger](#amendment-2026-11-07-3146-the-four-exam-budget-is-counted-in-the-store-and-in-a-git-tracked-ledger), rule 5)*.
+- **Reversibility:** cheap before any exam starts. After one starts, its frozen line and its place in the budget stand.
+- **Revisit if:**
+  - a fifth exam is wanted *(only through [the exam ledger](#amendment-2026-11-07-3146-the-four-exam-budget-is-counted-in-the-store-and-in-a-git-tracked-ledger), rule 5)*;
+  - a sequential rule (SPRT or alpha-spending) is calibrated with Audit B's `paths.py` and the skewed nulls, and shown to keep the same family-wise rate with more power *(taken up 2026-11-07, #3143, at a worst-case 4.9% for four exams rather than the same rate: [the group-sequential exam](#amendment-2026-11-07-3143-the-forward-return-exam-becomes-group-sequential))*;
+  - longer history (#1303 items 4 and 5) gives point 8 virgin months;
+  - the live account's size grows past the charter's $100.
+
+## Amendment 2026-11-07 (#3143): the forward return exam becomes group-sequential
+
+*The orchestrator's decision on #3143, recorded for the owner's word on this class-B PR (proposals A and B of the strictness check, adopted together; B is recorded in [ADR 0023's amendment of this date](0023-break-first-fast-books-paper-exam.md#amendment-2026-11-07-3143-rung-1-prices-cost-at-the-exams-paper-basis)). It replaces decision 2's horizon, pass rule, futility rule, void rule and pinned values. Decision 1, decision 3, the series definition, the skew guard, one exam per family and the four-exam budget stand. **This is allowed now by open question 10 of the 2026-11-06 amendment: no exam's kill line has been posted.** On 2026-11-07, T381 and T381a have no PR, so no exam window can have started, and an issue search for exam kill lines found only rung kill lines.*
+
+**Why.** The strictness check (2026-11-06/07, read-only, simulated; rules read from origin/main `9354ac7e`, which includes #3100 and #3129; the report is `~/tradepartner-probes/strictness/report.md` on the owner's machine, sha256 `635df286168e6e3cd52b20763750f457d50cd340188069cc9ec1b5e77b27c771`) ran a slow monthly long-only book and an event book through the ladder, promotion and the exam as written, with TP's own gate code. Its findings, quoted:
+- End to end, a real edge of net IR 0.5 at the frozen backtest cost reaches a live order in **1.45%** (slow) and **0.18%** (event) of four-exam programmes ("Every idea real at the stated IR"). "In 98.5% (slow) and 99.8% (event) of programmes, the four exams are spent with no pass."
+- "The 12-month exam at 0.25% per leg needs a paper-net IR of about 3.5 to pass half the time" (written rule: **3.50**, 3.55 at skew −0.3). "A net IR of 3.5 against SPY is about 3-5 times what the best long-only managers sustain."
+- "#3129's power table is optimistic. Its IR is gross IR before a 1.1%/yr drag … At the real 60 bp paper cost, a net IR 0.5 slow book passes 0.29%, not 0.55%."
+- "The size budget is not fully spent. At the skew −0.85 null, the full written rule (both legs plus futility) passes 0.76% per exam, against #3129's leg-(i)-only 1.10%. Four noise finalists then pass 3.0%, so about 2 pp of the 5% budget is unused."
+- "No exam design that keeps four ideas under 5% can confirm an IR 0.5 edge within 3 years."
+
+**The group-sequential exam (design D4 of the report).**
+- **Looks.** The exam reads the monthly net excess series of decision 2 at three looks, after **12, 24 and 36** months.
+- **The pass rule at a look.** At look L, both legs are computed on months 1 to L, as decision 2 defines them: (i) the t-statistic of the mean (sample standard deviation, L − 1 degrees of freedom), and (ii) the t-statistic of the OLS intercept on the benchmark's monthly return over the T-bill rate. The exam passes at the first look where **both** legs reach that look's bound. Both legs use the same bound; the calibration applied the same per-look value to both legs.
+- **The bounds (O'Brien-Fleming shape, c × √(36 / L)).** t ≥ **4.76 / 3.37 / 2.75** at 12 / 24 / 36 months. The calibrated scale is c = 2.74903 (`exam_grid.json`), which gives 4.7614, 3.3668 and 2.7490. The pinned values are these rounded **up** to three decimals, **4.762, 3.367 and 2.750**, so no pinned bound is looser than the calibration.
+- **Total size 1.25%, calibrated to the skew −0.85 null.** The bound scale was found by bisection on 400,000 zero-mean skew-normal nulls at skew −0.85 (the worst case the skew guard admits), 8%/yr tracking error, with both futility rules applied (calibration seed 20261107). "Calibrated variants … were checked again on fat-tailed skew −0.85 nulls, where every one came in at or below its size." On the 200,000-replicate evaluation draw, the design passed **1.252%** of skew-normal −0.85 nulls, **0.986%** of fat-tailed skew −0.85 nulls and **0.343%** of symmetric fat-tailed nulls (`exam_grid.txt`, D4 row).
+- **Futility.** At month 6, if the sum of months 1 to 6 is below 0, the exam is failed (futility), as before. At the 12- and 24-month looks, if the exam has not passed and the sum of months 1 to L is below 0, it is failed (futility). Otherwise it continues to the next look. A futility stop can only stop a pass, so it cannot raise the false-pass rate.
+- **Void.** A look can pass only if ADR 0023's minimums (`paper.min_rebalances`, `paper.min_exam_fills`) are met by that look. A window that ends before month 36 without a pass or a futility stop, or that has not met the minimums by month 36, is failed (void).
+- **The kill line** posted before the window's first session carries the three looks, the three bounds, the futility rules, the benchmark and the finalist's in-sample skew. T381a freezes the same values at `paper start`.
+- **The values are pinned.** The config validator refuses looks other than 12, 24 and 36, a bound below 4.762, 3.367 or 2.750 at its look, a futility month other than 6, a `paper.exam_max_count` above 4 and a skew guard below −0.85. So the exam can be made stricter in config, never looser. `paper.exam_alpha` and `paper.exam_horizon_months` are replaced by `paper.exam_looks_months` and `paper.exam_bounds` (T381).
+- **The labels are unchanged**, with one addition: an exam that is running reports its next look ("forward return exam running, next look at month 24").
+
+**The arithmetic: four exams.**
+- **Worst case, inside the skew guard.** Four noise finalists at skew −0.85 give 1 − (1 − 0.0125)⁴ = **4.9%**. The union bound gives at most 4 × 1.25% = 5.0%, whatever the dependence between the exams. The written rule gave 3.0% (the report's run) and 4.33% (#3129, leg (i) only). The design spends the budget the written rule left unused; it does not raise it.
+- **Fresh data still breaks the selection link** (decision 2's arithmetic): every exam month comes after the frozen kill line and after every in-sample and rung-2 window.
+
+**Before and after, quoted from the report.** "Exam" is the per-finalist pass rate at net IR 0.5 / 0.75; "programme" is P(a live order) over four exams with every idea real at IR 0.5; costs are paper costs per side.
+
+| | Worst-case false-pass (four exams) | Slow: exam at IR 0.5 / 0.75 (60 bp) | Event: exam at IR 0.5 / 0.75 (60 bp) | Slow: programme at IR 0.5, 60 bp / 24 bp | Time to a pass |
+|---|---:|---:|---:|---:|---|
+| As written (12 months, 0.25% per leg) | 3.0% (the report's run); 4.3% (#3129, leg i) | 0.29 / 0.56% | 0.04 / 0.10% | 1.45% / 2.9% | 12 months (6 on futility) |
+| Group-sequential (A) | 4.9% | 0.84 / 2.43% | 0.03 / 0.11% | 3.2% / 12.1% | a strong edge can still pass at 12; exam length mean 18 months, median 12 (the report says "median exam 18 months", corrected below); a pass needs up to 36 |
+
+**Correction to the report's "median exam 18 months".** In `exam_grid.json` (slow book, 60 bp, net IR 0.5, D4), 18.2 months is the **mean** exam length (`mean_months` 18.23). The median is 12: 46.4% of exams stop at month 6, 12.0% at 12, 8.1% at 24 and 33.5% at 36. Of the 0.84% that pass, about 71% pass at month 36 (`pass_hist`: 0.04% at 12, 0.20% at 24, 0.60% at 36).
+
+The paper-net IR at which the exam passes half the time falls from 3.50 (written) to 1.60 (D4, skew 0; 1.63 at skew −0.3; `exam_grid.txt`).
+
+**Programme pass rates, with B's 24 bp paper cost (A + B), quoted from the report's combinations table:**
+
+| | Slow programme at IR 0.5 / 0.75 / 1.0 | Event programme at IR 0.5 / 1.0 | False pass |
+|---|---:|---:|---|
+| **A + B** (24 bp paper cost, sequential 1.25%) | **12.1% / 25.5% / 45.8%** | 8.6% / 38.3% | worst case 4.9% |
+| Today | 1.45% / 2.70% / 4.08% | 0.18% / 0.90% | — |
+
+- **A alone does not help the event book at 60 bp.** At 60 bp "a net IR 0.5 event book has a paper-net IR of −0.58", and the sequential exam passes it 0.03%, against 0.04% as written. Its gain needs B's cost work: with A at 24 bp it passes 2.17%.
+- **The time cost, said plainly.** These times are the report's programme model with every idea real at the stated IR. "Given a pass, the median time to the first live order rises from about 22 to about 42-46 months. This is the honest price of power." In the programme output, the median given a pass is 24.0 / 22.5 / 19.5 months today (slow, 60 bp, IR 0.5 / 0.75 / 1.0) and 46.5 / 43.5 / 40.5 months under A + B. The floor stays about 15 months: an edge strong enough to pass at the 12-month look still can.
+- **An exam slot is held longer.** A running exam occupies one of the four slots for up to 36 months. The budget counts started exams, as before.
+
+**Reproduce.** From the report ("Reproduce" section), in team worktree `strict1` with `PYTHONPATH=~/tradepartner-probes/auditB/scripts:~/tradepartner-probes/strictness/scripts`: `python -I scripts/exam_grid.py 200000 20261107 out/exam_grid.json` (calibration seed 20261107) and `python -I scripts/programme.py out/screen_main.json out/exam_grid.json out/programme.json` (4,000 programmes per cell). The files are pinned by sha256 and the key output lines are posted on PR #3144's thread:
+- `scripts/exam.py` `ebceab12ca5075d454d1fb69cf3297d8d91cf348f3d274662b9281ddccb56139`
+- `scripts/exam_grid.py` `230c986f14f4666e674c435fe431495932ac9d11d948b760ed97b7e0ee041ac2`
+- `scripts/programme.py` `1be18d54e82cdb8b60f6f950bfca7afda0c4a19899078378e75f8fb6b9f42b6c`
+- `scripts/screen.py` `ebcacc2e70948cc91e43e21f13898bfcc37603920e4037ea48e17992f9b101a2`
+- `out/exam_grid.json` `26d56fa6f59fcdfb44a6cfe829271d2bd5899d1cfa6e5a344a489875b6868bdc`
+- `out/exam_grid.txt` `64909dddce51af71b2c9bb7fd8c728e4244d1ad2b365a79ac84e44800e0f5393`
+- `out/programme.json` `2f9e1077901a971a614559329d46340d554e1726da80fc980f73b60e0b9903c7`
+- `out/programme.txt` `54f0742a60951b4d588dc94e8f5195fa7e1d63dc4018a6a0f81062f885230ae5`
+- `out/screen_main.json` `64439b7807544009a1f01378cf3f9f14dd149797b74002ffff2e2e4c6322d0fa`
+
+**Limits, quoted.** "Returns are simulated. Tracking error, turnover, skew, delay loss and the rung-2 link are assumptions." "The 60 bp is #3118's pooled figure. The validation calls it fragile (48 bp without the top 5 names)." "The programme model is stylised: one idea every 1.5 months, 2 slots, fixed lags. Pass probabilities are insensitive to these because the budget binds; times are not." Not modelled: rung 3, rung 5's top-names-removed test, researcher forking, and β ≠ 1 outside the report's conjunction table (where, at β 0.8, D4 passes 2.97% with both legs against 6.13% with leg (ii) only).
+
+**Open questions (the owner's; not decided here).**
+
+11. **Proposal C: credit the screen, per-exam size 2.5%.** Design D6: sequential bounds 4.07 / 2.88 / 2.35 (output: 4.071 / 2.879 / 2.351), "justified by assuming the screen passes no more than 50% of noise ideas (measured: 0.24% slow, 2.7% event; 19% in Audit B's worst rule-keeping path)". False pass: "9.4% if all four finalists are noise; **≤ 4.8%** from the start at a ≤ 50% screen; 0.03-0.3% at the measured rates". Slow exam at IR 0.5 / 0.75 (60 bp): 1.96 / 4.96%; event: 0.10 / 0.37%. Slow programme at IR 0.5, 60 bp / 24 bp: 7.8% / 22.1%. With B (C + B): slow programme 22.1% / 41.1% / 65.6% at IR 0.5 / 0.75 / 1.0, event 18.5% / 54.5% at IR 0.5 / 1.0. The report: "C is a policy choice for the owner. It trades the worst-case guarantee for a from-the-start bound." No recommendation is made here.
+12. **Open question 8 (a $100 machine test, edge unjudged), with the report's numbers.** "The one lever that brings the first live order to about 3 months. It does it by not judging edge before $100 goes live; the exam still judges any scale-up. It changes no false-pass rate of the edge claim." Open question 8 stays open; this amendment decides nothing about it.
+
+**Open question 10 of the 2026-11-06 amendment is answered** by this amendment: the horizon is now the three looks.
+
+**Consequences.**
+- **Good:** a real IR-0.5 slow edge reaches a live order in about 12.1% of programmes with B, against 1.45% today; a strong edge can still pass at 12 months; the worst-case false-pass rate stays at or under the 5% budget.
+- **Bad / accepted:** the median time to the first live order, given a pass, rises from about 22 to about 42-46 months; an exam slot can be held for 36 months; the event book gains nothing until paper cost falls; T381 and T381a change before they are built.
+- **Reversibility:** cheap until the first exam's kill line is posted. After that, the posted line and its slot stand.
+
+## Amendment 2026-11-07 (#3146): the four-exam budget is counted in the store and in a git-tracked ledger
+
+*The orchestrator's fail-closed decision on #3146 (a sub-issue of #3125; the owner delegated it), recorded for the owner's word on this class-B PR. It replaces the budget bullet of the 2026-11-06 amendment's decision 2 and the budget lines of that amendment's consequences. The group-sequential exam, the skew guard, one exam per family and `paper.exam_max_count` = 4 stand. **No exam has started**, as far as git shows (origin/main `1e8eeeea`): `src/` counts no exams; the committed files of the registered families, `momentum` and `profitability`, have historical holdouts only; and the two files with forward holdouts, B9 and the B4 sweep, are unregistered. Whether the store has an exam window is a fact about the store, not about git. It is checked by the read-only query in [rule 6](#rule-6-the-store-check-before-this-lands) before this PR lands. So nothing is unwound and the ledger starts empty.*
+
+**Why.** The family-vet review (2026-11-06/07, read-only, origin/main `1e8eeeea`; `~/tradepartner-probes/family-vet/review.md` on the owner's machine, sha256 `647d2fa3f3ef208b4ee18b052c1485aabd54aa4d3407de6562060a4d0816097a`), Q3: "Today it is not enforced at all. `paper.exam_max_count` and `exam_budget_spent` exist only in ADR 0016 l.116 and plan line T381a. Nothing in `src/` counts exams." Once built, it is "relabel-able in at least five ways": by amendment ("ADR 0016 l.116, l.175 and l.178 make a fifth exam an amendment away"), by window class, by timing ("A window started before T381a counts as unexamined"), by store ("a store-only count [is] as durable as the store") and by exam kind (point 8). Each rule below closes one of them.
+
+**Rule 1: what counts.** The budget counts **every exam window ever started**, whatever its outcome and whenever it started:
+- an exam window is a `paper_windows` row whose hypothesis's holdout is forward (`_forward()`, ADR 0016 point 4) when the window starts. The class is decided once, at start, from the stored holdout and the family's first registration day. T381a stores it as the frozen key `exam_class` (`exam` or `tracking`) in the window's `frozen_json`, and the count reads that key, never `_forward()` again. A later spend of that holdout (open question 2) or a later-imported older registration does not move the window;
+- a window with no `exam_class` key (started before T381a) is classed by re-running `_forward()` on today's store. That re-derivation can flip if an older registration of the family is imported later. If it flips, rule 4's ledger match fails, and the start is refused (fail-closed);
+- a forward holdout that is already spent when its window starts still gives an exam window and counts. Like a pre-T381a window, it is recorded as `unexamined` (rule 3), because a spent holdout is not an unspent exam of record (ADR 0023) and cannot pass;
+- `passed`, `failed`, `failed_futility` and `failed_void` windows all count, and so does a running one;
+- a window started before T381a is built counts. It froze no exam line, so it can never pass. It is reported as "exam window, unexamined, counted" (this replaces "a window started before T381a counts as unexamined" in plan line T381a), and it is recorded by the backfill entry of rule 3;
+- the four are a **programme** budget across all families, and never reset.
+
+**Rule 2: a relabelled window counts.** A window, run or verdict counts toward the budget **unless it can never be read as edge evidence**, whatever it is called (a "shakedown", an "operations book", a "machine test", or a kind named in a new ADR). This is checked in three places, all mechanical except the last:
+- **(a) The class comes from dates, not from names.** Rule 1's test reads only the stored holdout and the family's first registration day, so a file name, a label or a book id cannot move a window out of the count. A holdout that starts on or before its family's first registration day can never be an exam on unseen data, because its months existed when the family was registered. Moving a book there makes it a tracking window, which decision 1 already bars from the live choice. Operations files and the shakedown cannot reach a forward holdout today (`hypothesis.py`'s forward-holdout refusal for operations files). T381a re-runs that refusal's test, `test_hypothesis.py`'s operations-file forward-holdout case, unchanged.
+- **(b) The live switch reads a pass only through the ledger.** T163b's `exam_not_passed` refusal accepts only a `passed` verdict whose window has a ledger entry (rule 3) marked `passed`. A result outside the ledger, whatever it is called, cannot name a book for live money, so it can never be read as edge evidence by the code that matters. The same holds for "forward return exam passed" in `paper status` and `lab status`: they print it only for a ledger entry marked `passed`. While T381's verdict is `passed` but the entry still says `running`, they print "forward return exam passed by T381, not yet recorded in the ledger", and the live switch still refuses.
+- **(c) A new kind of exam is an amendment that names its slots.** Any ADR, spec or plan amendment that creates a route by which a result can be named in the live choice (decision 1), including a point-8 historical exam (decision 3), states in its own text that each start of that route takes a ledger entry and a budget slot, and names the count after it. The class-B review checks this: spec-critic on every `docs/decisions`, `docs/specs` and `docs/plans` PR, and the owner's word. This is the one judgment-based part. Rules (a) and (b) mean that skipping it gives a route that cannot reach the live switch.
+
+**Rule 3: the exam ledger.** [`docs/research/exam-ledger.toml`](../research/exam-ledger.toml) is git-tracked and append-only, with one `[[exam]]` entry per exam start. It holds the budget too, so a store rebuild, restore or copy cannot reset the count:
+- **The fields.** Each entry has:
+  - `seq`: 1, 2, ..., contiguous;
+  - `hypothesis`: the file's slug;
+  - `hypothesis_fingerprint`: its registry fingerprint;
+  - `family`;
+  - `book_id`;
+  - `window_id`: the store's `paper_windows.window_id`, 0 while `pending`;
+  - `start_date`: the window's first rebalance session, `T_0`;
+  - `kill_line`: the URL of the kill line comment posted on the finalist's issue, or `"none"` for an `unexamined` entry only;
+  - `campaign_k`: the k its kill line states under the idea-pipeline multiplicity rule, or −1 when the line states none;
+  - `outcome`: one of `pending`, `running`, `passed`, `failed`, `failed_futility`, `failed_void`, `unexamined` or `not_started`;
+  - `outcome_on`: the date the outcome was last set, or the start date while `pending` or `running`.
+- **The order of work for one exam.** The ledger leads the store, so it cannot lag the store:
+  1. The kill line is posted on the issue (decision 2).
+  2. A class-B PR appends the entry with `outcome = "pending"` and `window_id = 0`. It lands on the owner's word.
+  3. `paper start` runs from a checkout that has that entry.
+  4. A class-B PR sets `window_id` and `outcome = "running"`.
+  5. A class-B PR sets the terminal outcome when T381's verdict is final.
+- **The backfill entry for an unexamined window.** An exam window that froze no exam line is recorded by one class-B PR. This covers a window started before T381a and a forward holdout spent at start (rule 1). The PR appends the entry with its real `window_id`, `kill_line = "none"` and the terminal outcome `unexamined`, which counts toward the budget. Until that PR lands, every later exam start is refused `exam_ledger_mismatch` (fail-closed).
+- **Append-only means:**
+  - an entry is never removed or reordered, and no field other than `window_id`, `outcome` and `outcome_on` changes;
+  - `window_id` changes once, from 0 to the store's id;
+  - `outcome` moves only forward: `pending` → `running` or `not_started`, then `running` → a terminal state, and a terminal state never changes. `unexamined` is terminal from the moment it is appended;
+  - the top-level `budget` changes only together with `budget_adr`, under rule 5;
+  - `not_started` is allowed only for an entry whose `paper start` never succeeded (its `window_id` is 0). Such an entry stays in the file, and it does not count toward the budget because it read no exam month.
+- **The file is class B whatever its path.** `docs/research/` is class A by default (git-workflow rule 7). The ledger is an exception: every change to it lands only on the owner's word, never in an orchestrator train. The merge-train classifier gains this exception in #3147. Until that lands, the orchestrator treats the file as class B by this rule.
+- **Append-only is checked by code, on every PR.** T381b's pure `check_append_only(old, new)` compares the ledger on `origin/main` with the PR's copy. It refuses a removed or reordered entry, a change to any field but the three, a second `window_id` change, and a backward or illegal outcome move. `scripts/ready_pr.py` runs it on any PR that touches the file (#3147, class B). T381a depends on #3147, so no exam can start before this check exists.
+- **The budget lives in the file too.** The ledger's top-level `budget` (4 today) and `budget_adr` (the link to the rule that sets it) are the programme budget of record.
+
+**Rule 4: what T381a refuses (fail-closed).** At `paper start` of an exam window (rule 1), before any broker call or write, T381a loads the ledger and checks it against the store. The file is found at `docs/research/exam-ledger.toml` under the repository root of the running code (the checkout the `tradepartner` package is installed from in editable mode), never under the working directory. A missing file is refused as invalid.
+- **`exam_ledger_invalid`** refuses a start when one copy of the file breaks any rule-3 invariant:
+  - the file is missing or does not parse;
+  - a field is missing, ill-typed or unknown;
+  - `seq` is not contiguous from 1;
+  - a non-zero `window_id` is repeated;
+  - an `outcome` is unknown;
+  - a `pending` or `not_started` entry has a non-zero `window_id`;
+  - a `running`, terminal or `unexamined` entry has `window_id = 0`;
+  - `kill_line` is `"none"` on an entry that is not `unexamined`, or is not a URL;
+  - `campaign_k` is below −1;
+  - `budget` is not an integer of at least 1, or `budget_adr` is empty.
+- **`exam_ledger_unreviewed`** refuses a start when the ledger read differs from the committed copy on the last fetched `origin/main` (`git show origin/main:docs/research/exam-ledger.toml`), or when git cannot be read. So a local, unreviewed `pending` entry cannot open an exam, and neither can a checkout whose ledger lags `origin/main`.
+- **`exam_ledger_mismatch`** refuses a start when the store and the ledger disagree:
+  - the store's exam windows (rule 1, in `started_at` order) must match, one to one and in order, the entries whose outcome is not `pending` or `not_started` (`unexamined` included), on `window_id`, `hypothesis_fingerprint`, `book_id` and `start_date`;
+  - exactly one `pending` entry must exist, and it must name this start's hypothesis fingerprint, book and `T_0`;
+  - `paper.exam_max_count` must not be above the ledger's `budget`.
+- **`exam_budget_spent`**: the count is every entry that is not `not_started`, this start's `pending` entry included. A start is refused when the count is above `min(paper.exam_max_count, budget)`. So the fourth exam starts, and with four counted a fifth `pending` entry is refused.
+- A tracking window (rule 1's test false) reads no ledger and is never refused by it.
+
+**Rule 5: a fifth exam needs two changes, both on the owner's word:**
+- **(i) A class-B amendment of this ADR that names the count.** It states the new budget, lists the ledger entries already spent by `seq`, and gives the smaller per-exam rate that keeps the family-wise rate (decision 2, as amended 2026-11-07).
+- **(ii) A config change.** This means a new pinned maximum for `paper.exam_max_count` in the config validator (T381), plus the ledger's `budget` and `budget_adr` updated to name that amendment. The ledger change is class B (rule 3).
+- **Neither works alone.** Rule 4's `exam_ledger_mismatch` refuses a config whose `paper.exam_max_count` is above the ledger's `budget`. A higher `budget` with the validator's pin at 4 is still refused at 4.
+
+<a id="rule-6-the-store-check-before-this-lands"></a>**Rule 6: the store check before this lands.** Before the owner's merge, the orchestrator runs one read-only query on the real store (`duckdb.connect(..., read_only=True)`, under a minute, outside the ingest windows): the `paper_windows` rows whose hypothesis's `holdout_start` is after its family's `MIN(registered_at)`. He posts the count and the time on #3146. It must be 0 for the ledger to land empty. If it is not 0, each such window gets a backfill `unexamined` entry in this PR before merge.
+
+**Display (diagnostic only).** `lab status` prints **"campaign k <k>"** beside each family's N. The value is the family's latest ledger entry's `campaign_k`, or "campaign k not recorded" when the family has no entry or its entry says −1. `paper status` prints "exam budget <count> of <budget> (ledger), <S> exam windows in the store". No refusal, gate or verdict reads campaign k; it is shown so that a reader sees how many looks lie behind a family's finalist (the review, Q2 point 1: "campaign k is a draft").
+
+**What is not changed.** The point-8 historical exam stays outside the budget until an amendment under decision 3, which must follow rule 2(c). Family N, SR\* and the 0.5 floor are not changed here.
+
+**Consequences.**
+- **Good:**
+  - the budget survives a store rebuild, restore or copy, because the ledger is in git;
+  - the five relabelling routes of the review are each closed or made visible (amendment: rule 5; window class: rules 1 and 2(a); timing: rule 1; store: rules 3 and 4; exam kind: rule 2(c));
+  - each exam start gets the owner's word on a named entry before the window opens.
+- **Bad / accepted:**
+  - every exam start now needs a class-B PR before `paper start`, and two more afterwards;
+  - exam starts happen one at a time, a class-B PR round-trip apart, because only one `pending` entry may exist;
+  - a `paper start` from a checkout whose ledger differs from the last fetched `origin/main` (ahead or behind) is refused;
+  - rule 2(c) is still a review judgment, and rule 2(b) is its backstop;
+  - until #3147 lands, the class-B status of the ledger and its append-only check are written rules, not code. T381a depends on #3147, so no exam starts in that gap.
+- **Reversibility:** cheap before the first `pending` entry. After it, the entry and its slot stand.

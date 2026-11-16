@@ -175,8 +175,10 @@ def family_n_split(
     conn: duckdb.DuckDBPyConnection, family: str, *, pending: TrialHandle | None = None
 ) -> FamilyN:
     """`family`'s N in its three parts (module docstring, "Research runs raise N"):
-    its `ok`, non-synthetic, in-sample trials, reruns and every variant's included
-    (backtest spec req 8; strategy-lab spec req 3), with `pending` counted as
+    its distinct return series among the `ok`, non-synthetic, in-sample trials, every
+    variant's included and an identical rerun once (`registry.count_counted_trials`;
+    backtest spec req 8; strategy-lab spec req 3 and amendment 2026-11-06), with
+    `pending` counted as
     `registry.family_sharpes` does; `research.family_run_count`, None when the
     store has no research tables; and `research.family_exposure_count`, None when
     it has no `research_exposures` table."""
@@ -225,11 +227,14 @@ def next_trial_cost(
     basis: Basis,
     added: int = 1,
     floor: float = 0.0,
+    undefined_floor: float | None = None,
 ) -> NextTrialCost:
     """The SR\\* `family` has now and the SR\\* `added` more counted trials would give.
     N is `family_n` (the one N function); V is `family_sharpes(conn, family).variance(basis)`
-    at today's trials, floored at `floor` when `floor` is above zero exactly as
-    `lab.run_sweep`'s close floors it (a None V is the floor). Unfloored, a None V (fewer
+    at today's trials, floored at `floor` when `floor` is above zero; a None V (fewer
+    than two pairs) is `undefined_floor` when given, else `floor`, exactly as
+    `lab.run_sweep`'s close does through `lab_registry.floored_variance` (#3127).
+    Unfloored, a None V (fewer
     than two pairs) gives 0 for both and `note` says so. `expected_max_sharpe` is never
     called with fewer than one trial (a family with no counted trial has SR\\* 0 now).
     Read-only."""
@@ -241,16 +246,19 @@ def next_trial_cost(
     n_next = n_now + added
     variance = registry.family_sharpes(conn, family).variance(basis)
     note: str | None = None
-    if variance is None and floor <= 0:
+    if undefined_floor is not None and (not math.isfinite(undefined_floor) or undefined_floor < 0):
+        raise ValueError(f"undefined_floor must be finite and non-negative, got {undefined_floor}")
+    stand_in = max(undefined_floor, floor) if undefined_floor is not None else floor
+    if variance is None and stand_in <= 0:
         note = "V is unknown (fewer than two pairs) and no floor applies: SR* is 0"
         used: float | None = None
     else:
-        used = max(variance if variance is not None else 0.0, floor)
+        used = max(variance, floor) if variance is not None else stand_in
 
     def at(n: int) -> float:
         return expected_max_sharpe(n, used) if used is not None and n >= 1 else 0.0
 
-    floored = floor > 0 and (variance is None or variance < floor)
+    floored = (variance is None and stand_in > 0) or (variance is not None and variance < floor)
     return NextTrialCost(
         n_now=n_now,
         n_next=n_next,
@@ -596,6 +604,7 @@ def write_results(
     family_sharpes: FamilySharpesFn = registry.family_sharpes,
     *,
     detail_level: DetailLevel = "full",
+    store_changed: bool | None = None,
 ) -> str:
     """Write one run's rows for `handle` at `detail_level` and its result row; return
     the recorded status, `"ok"`, or `"failed"` when the store changed during the run
@@ -609,6 +618,8 @@ def write_results(
     by `metric_rows`, its equity and rebalance rows as a ladder level's. N, V,
     DSR and the red flag stay the base level's (module docstring, step 4), so a
     measured level is never in them.
+    `store_changed` may be passed only when the caller checked the store under
+    the same write lock; otherwise the registry checks it during `write_result`.
     Raises `ValueError` before any write when `params` are not those frozen settings,
     a level or benchmark is missing or the detail level is unknown, and
     `ResearchNotInitialised` when the store has no research tables (module docstring,
@@ -648,4 +659,5 @@ def write_results(
         conn,
         handle,
         _StatisticsWithResearch(**asdict(stats), n_research=n.research, n_exposure=n.exposures),
+        store_changed=store_changed,
     )

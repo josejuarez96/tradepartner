@@ -28,6 +28,7 @@ from typing import Any
 import duckdb
 import httpx
 import pytest
+from pydantic import SecretStr
 
 from tradepartner import ingest as ingest_module
 from tradepartner.adapters.alpaca_raw import AssetsFetch
@@ -381,11 +382,13 @@ def test_openfigi_history_window_anchors_to_last_completed_session(settings: Set
         )
 
     seen: list[list[str]] = []
+    keys: list[object] = []
 
     def fake_mapping(
-        tickers: list[str], _config: object, **_kwargs: object
+        tickers: list[str], _config: object, **kwargs: object
     ) -> list[tuple[list[object], datetime, datetime]]:
         seen.append(tickers)
+        keys.append(kwargs.get("api_key"))
         sent = datetime(2026, 10, 28, 1, tzinfo=UTC)
         return [
             (
@@ -396,7 +399,11 @@ def test_openfigi_history_window_anchors_to_last_completed_session(settings: Set
             for i in range(len(tickers))
         ]
 
+    # #3153: the key is the one `Settings` read (shell or `.env`), passed through.
+    key = SecretStr("figi-synthetic-key")
+    enabled = enabled.model_copy(update={"openfigi_api_key": key})
     result = ingest_module.ingest_openfigi(enabled, clock=lambda: now, mapping=fake_mapping)
+    assert keys == [key]
     # Both securities should be mapped because the history window correctly starts
     # at 2025-10-27 (last completed session - 12 months), which includes S_BOUNDARY's bar.
     assert seen == [["BOUND", "LATER"]]
@@ -2502,16 +2509,18 @@ def test_edgar_run_message_carries_the_exchange_axis_mismatch_counts(settings: S
 
 
 def test_edgar_run_message_carries_the_pre_xml_delistings_count(settings: Settings) -> None:
-    """T11f: a Form 25/25-NSE skipped pre-fetch (not XML)."""
+    """T11f: a Form 25/25-NSE skipped pre-fetch (not XML); #3084: an issuer's
+    HTML Form 25 read with no class or exchange."""
 
     class Delistings(FixtureFilingSource):
         pre_xml_delistings = 7
+        unread_html_delistings = 3
         unstamped_delistings = 2
 
     message = _run(settings, filings=_filings(cls=Delistings), source="edgar").runs[0].message
     assert (
-        "; pre-XML delistings: 7; unstamped delistings: 2; chain_candidates: none; missing"
-        in message
+        "; pre-XML delistings: 7; unread HTML delistings: 3; unstamped delistings: 2; "
+        "chain_candidates: none; missing" in message
     )
 
 
@@ -3078,6 +3087,38 @@ def test_a_later_cover_title_never_names_an_earlier_facts_class(settings: Settin
     assert with_later == without
 
 
+def test_a_later_listing_title_never_names_an_earlier_facts_class(settings: Settings) -> None:
+    source = _filings()
+    master = build_master(source, settings, ingested_at=NOW)
+    classes = build_classifications(source, master, settings, ingested_at=NOW)
+    later = _at(2019, 5, 1)
+    listing = next(row for row in master.listings if row["security_id"] == ACME)
+    retitled = listing | {"class_title": "Class A Common Stock", "known_at": later}
+    with_later = replace(master, listings=(*master.listings, retitled))
+    early = _fact(ACME, "us-gaap:CommonClassAMember", 7, f"{ACME}-19-2", later - timedelta(days=1))
+    after = _fact(ACME, "us-gaap:CommonClassAMember", 8, f"{ACME}-19-3", later + timedelta(days=1))
+
+    early_rows, early_unmatched = fact_rows([early], with_later, classes, ingested_at=NOW)
+    baseline = fact_rows([early], master, classes, ingested_at=NOW)
+    after_rows, after_unmatched = fact_rows([after], with_later, classes, ingested_at=NOW)
+
+    assert (early_rows, early_unmatched) == baseline == ((), (early,))
+    assert [(row["security_id"], row["value"]) for row in after_rows] == [(ACME, 8)]
+    assert after_unmatched == ()
+
+
+def test_a_retracted_listing_title_never_names_a_facts_class(settings: Settings) -> None:
+    source = _filings()
+    master = build_master(source, settings, ingested_at=NOW)
+    classes = build_classifications(source, master, settings, ingested_at=NOW)
+    listing = next(row for row in master.listings if row["security_id"] == ACME)
+    retracted = listing | {"class_title": "Class A Common Stock", "retracted": True}
+    master = replace(master, listings=(*master.listings, retracted))
+    fact = _fact(ACME, "us-gaap:CommonClassAMember", 7, f"{ACME}-19-2", _at(2019, 5, 1))
+
+    assert fact_rows([fact], master, classes, ingested_at=NOW) == ((), (fact,))
+
+
 def test_an_owner_override_sends_the_named_member_to_the_sole_common_class(
     settings: Settings,
 ) -> None:
@@ -3536,7 +3577,16 @@ def test_filename_evidence_is_fetched_before_freeze_only_when_enabled(
 
     h1 = Path(__file__).resolve().parents[1] / "docs/hypotheses/h1-momentum-12-1.md"
     parsed = hypothesis.parse_file(h1)
-    pinned = Settings(_env_file=None, universe={"exclude_sic_ranges": [[4900, 4999]]})
+    # H1's stored record: the old universe, before #1540's live default and before
+    # #3076's key (which it reads at its table default `[]`).
+    pinned = Settings(
+        _env_file=None,
+        universe={
+            "exclude_sic_ranges": [[4900, 4999]],
+            "exclude_issuer_classes": [],
+            "exchanges": ["NYSE", "NASDAQ", "NYSE_AMERICAN"],
+        },
+    )
     params = hypothesis.frozen_params(parsed, pinned)
     assert frozen.fingerprint("momentum", params, parsed.in_sample_start) == (
         "534917a58a4f8c5dfe17330b3e2d06faf38111de553fd467886a06c147f609a4"
@@ -3613,7 +3663,7 @@ def test_shares_after_new_equity_go_to_the_successor(settings: Settings) -> None
     rows, unmatched = fact_rows([before, after], master, classes, ingested_at=ingested_at)
     assert [(r["security_id"], r["value"]) for r in rows] == [
         (cik, 49_000_000),
-        (f"{cik}@2020-11-05", 83_000_000),
+        (f"{cik}@2020-10-27", 83_000_000),
     ]
     assert unmatched == ()
 
@@ -6660,6 +6710,53 @@ def test_actions_backfill_floor_dry_run_and_idempotent_month(
         ]
         * 3
     )
+
+
+def test_actions_backfill_name_changes_only_asks_name_changes_from_their_floor(
+    fixture_store_path: Path,
+) -> None:
+    """#3054: the pre-2020 name-change scan asks only name changes, from
+    `alpaca.name_change_backfill_floor`; spin-offs and mergers keep their floor."""
+    from alpaca.data.enums import CorporateActionsType
+
+    from tradepartner.ingest import ingest_actions_backfill
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    calls: list[tuple[CorporateActionsType, ...]] = []
+
+    def scan(types: Sequence[CorporateActionsType], start: date, end: date) -> dict[str, Any]:
+        calls.append(tuple(types))
+        return {"name_changes": []}
+
+    now = datetime(2020, 7, 2, 20, tzinfo=UTC)
+    with pytest.raises(ValueError, match="2016-01-01"):
+        ingest_actions_backfill(
+            settings,
+            since=date(2015, 12, 1),
+            through=date(2015, 12, 31),
+            clock=lambda: now,
+            scan=scan,
+            name_changes_only=True,
+        )
+    result = ingest_actions_backfill(
+        settings,
+        since=date(2019, 5, 1),
+        through=date(2019, 5, 31),
+        clock=lambda: now,
+        scan=scan,
+        dry_run=True,
+        name_changes_only=True,
+    )
+    assert [run.status for run in result.runs] == ["filled"]
+    assert calls == [(CorporateActionsType.NAME_CHANGE,)]
+    with pytest.raises(ValueError, match="2020-06-01"):
+        ingest_actions_backfill(
+            settings,
+            since=date(2019, 5, 1),
+            through=date(2019, 5, 31),
+            clock=lambda: now,
+            scan=scan,
+        )
 
 
 def test_daily_fixture_stores_spinoff_and_symbol_change_once(
@@ -11784,3 +11881,112 @@ def test_form4_rule5_marker_count_rides_with_the_digest_on_every_writer_message(
         path.unlink()
     with pytest.raises(RuntimeError, match="unreadable"):
         case.run(fixture_store, case.now + timedelta(days=2), "writer-3")
+
+
+# --- #2994: a marked accession re-fetched as XML ------------------------------------
+
+
+def _marked_unstored(
+    case: _Form4Xml, conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run 1: the disagreeing accession is in the order sample (two bulk rows), so its
+    XML is fetched, compared and marked, but the route's stamp has no submissions
+    filing date, so it is never stored."""
+    record = _disagreeing(case, case.accession)
+    sampled = replace(record, rows=(object(), object()))  # type: ignore[arg-type]
+    case.bulk = InsiderBulk(
+        {case.accession: sampled, _RULE5_OTHER: _disagreeing(case, _RULE5_OTHER, agree=True)}
+    )
+    fetch = case.source._fetch_submissions
+
+    def undated(*args: Any) -> Any:
+        records = dict(fetch(*args).records)
+        if case.accession in records:
+            records[case.accession] = replace(records[case.accession], filing_date=None)
+        return SimpleNamespace(records=records)
+
+    monkeypatch.setattr(case.source, "_fetch_submissions", undated)
+    _added, message, _p = case.run(conn, case.now)
+    monkeypatch.setattr(case.source, "_fetch_submissions", fetch)
+    assert "form4_compare_markers=1" in message
+    held = conn.execute(
+        "SELECT count(*) FROM sec_form4_transactions WHERE accession = ?", [case.accession]
+    ).fetchone()
+    assert held is not None and held[0] == 0  # marked, never stored
+
+
+@pytest.mark.parametrize("still_disagrees", [True, False])
+def test_form4_rule5_marked_accession_refetched_as_xml_updates_its_marker(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    still_disagrees: bool,
+) -> None:
+    """Run 1 marks a sampled accession it cannot store (no stamp). Run 2 routes it to XML
+    as a marked accession and compares it again: agreeing sources leave a resolved
+    marker and no unresolved count; a disagreement stays unresolved."""
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
+    _marked_unstored(case, fixture_store, monkeypatch)
+    case.bulk = InsiderBulk(
+        {
+            case.accession: _disagreeing(case, case.accession, agree=not still_disagrees),
+            _RULE5_OTHER: _disagreeing(case, _RULE5_OTHER, agree=True),
+        }
+    )
+    from tradepartner.adapters.form4_bulk_route import Form4CompareThresholdError
+
+    later = case.now + timedelta(days=1)
+    if still_disagrees:  # the run's only comparison disagrees: 1 of 1 fails the run
+        with pytest.raises(Form4CompareThresholdError, match="form4_compare_markers=1"):
+            case.run(fixture_store, later, "writer-2")
+    else:
+        _added, message, _p = case.run(fixture_store, later, "writer-2")
+        assert "form4_compare_markers=0" in message
+        assert "sec_forms_compare_marker_resolved: 1" in message
+    latest = next(
+        m for m in _manifests(tmp_path / "archive") if m["writer"]["run_id"] == "writer-2"
+    )
+    statuses = {m["status"] for m in _markers(latest) if m["accession"] == case.accession}
+    assert statuses == ({"unresolved"} if still_disagrees else {"resolved"})
+
+
+def test_form4_rule5_marked_accession_refetched_uncompared_stays_marked_and_counts(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A marked accession whose bulk record is no longer a fair comparison side (here
+    its identity check now fails) is stored from XML but not compared: the marker stays
+    unresolved and the run counts it."""
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
+    _marked_unstored(case, fixture_store, monkeypatch)
+    case.bulk = InsiderBulk(
+        {
+            case.accession: replace(_disagreeing(case, case.accession), identity_bad=True),
+            _RULE5_OTHER: _disagreeing(case, _RULE5_OTHER, agree=True),
+        }
+    )
+    _added, message, _p = case.run(fixture_store, case.now + timedelta(days=1), "writer-2")
+    assert "form4_compare_markers=1" in message
+    assert "sec_forms_compare_marker_uncompared: 1" in message
+
+
+def test_form4_rule5_threshold_refuses_a_field_trusted_to_bulk(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A field trusted to the bulk set would be stored as `sec_form4_xml` under the XML
+    body's hash, a row no re-derive from the kept XML reproduces: with the threshold
+    set (the only case the declaration changes a stored row) the writer refuses it."""
+    case = _rule5_case(settings, tmp_path, monkeypatch, "0.6")
+    events = case.settings.events.model_copy(update={"form4_compare_trusted": {"shares": "bulk"}})
+    case.settings = case.settings.model_copy(update={"events": events})
+    with pytest.raises(ValueError, match="trusted to the bulk set"):
+        case.run(fixture_store, case.now)
+    assert not (tmp_path / "archive" / "manifests").exists() or not any(
+        (tmp_path / "archive" / "manifests").iterdir()
+    )

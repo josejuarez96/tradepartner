@@ -132,8 +132,38 @@ def test_reversed_activity_is_unseen_until_rebooked_and_column_stays_unique(
     )
     assert (
         "cash-1"
-        not in reconcile_run._seen_activities([booked, reversed_row], base, frozen_window)[0]
+        not in reconcile_run._seen_activities([booked, reversed_row], base, frozen_window, S)[0]
     )
+    # #2961: a reversal stated at S+1 un-sees the activity from S+1 on only, the
+    # ledger's `reversed_true_up_ids(.., through)` cut; through S it stays seen.
+    later = replace(reversed_row, session=next_session(S))
+    assert "cash-1" in reconcile_run._seen_activities([booked, later], base, frozen_window, S)[0]
+    assert (
+        "cash-1"
+        not in reconcile_run._seen_activities(
+            [booked, later], base, frozen_window, next_session(S)
+        )[0]
+    )
+    # #3014: a booking or rebook stated at S+1 is seen from S+1 on only, the
+    # ledger's `adjustment.session > through` cut; through S it is unseen (no base).
+    booked_later = replace(booked, session=next_session(S))
+    assert "cash-1" not in reconcile_run._seen_activities([booked_later], None, frozen_window, S)[0]
+    assert (
+        "cash-1"
+        in reconcile_run._seen_activities([booked_later], None, frozen_window, next_session(S))[0]
+    )
+    rebook_later = replace(
+        booked,
+        adjustment_id=84,
+        session=next_session(S),
+        broker_activity_id=None,
+        explanation_json=json.dumps({"rebooked_activity_id": "cash-1"}),
+        known_at=stamp + timedelta(seconds=3),
+        ingested_at=stamp + timedelta(seconds=3),
+    )
+    trio = [booked, reversed_row, rebook_later]
+    assert "cash-1" not in reconcile_run._seen_activities(trio, base, frozen_window, S)[0]
+    assert "cash-1" in reconcile_run._seen_activities(trio, base, frozen_window, next_session(S))[0]
     wrong_link = replace(
         reversed_row,
         explanation_json=json.dumps(
@@ -141,7 +171,7 @@ def test_reversed_activity_is_unseen_until_rebooked_and_column_stays_unique(
         ),
     )
     with pytest.raises(ValueError, match="opposite reversal"):
-        reconcile_run._seen_activities([booked, wrong_link], base, frozen_window)
+        reconcile_run._seen_activities([booked, wrong_link], base, frozen_window, S)
     fake_reverse = replace(
         booked,
         adjustment_id=83,
@@ -151,7 +181,8 @@ def test_reversed_activity_is_unseen_until_rebooked_and_column_stays_unique(
         ingested_at=stamp + timedelta(seconds=2),
     )
     assert (
-        "cash-1" in reconcile_run._seen_activities([booked, fake_reverse], base, frozen_window)[0]
+        "cash-1"
+        in reconcile_run._seen_activities([booked, fake_reverse], base, frozen_window, S)[0]
     )
     event = ReconcileBreakRow(
         break_id="1:SEC_SPY:1",
@@ -182,7 +213,9 @@ def test_reversed_activity_is_unseen_until_rebooked_and_column_stays_unique(
     assert json.loads(rows[0].explanation_json or "")["rebooked_after_adjustment_id"] == 82
     assert (
         "cash-1"
-        in reconcile_run._seen_activities([booked, reversed_row, rows[0]], base, frozen_window)[0]
+        in reconcile_run._seen_activities([booked, reversed_row, rows[0]], base, frozen_window, S)[
+            0
+        ]
     )
     auto = reconcile_run._AutoAccept(
         size=7,
@@ -560,8 +593,8 @@ def _hold(
     return run_id
 
 
-def _sell_spy(settings: Settings, run_id: int, at: datetime) -> None:
-    """Journal a filled sale of the ten SPY shares held by `_hold`."""
+def _sell_spy(settings: Settings, run_id: int, at: datetime, quantity: float = 10.0) -> None:
+    """Journal a filled sale of `quantity` SPY shares (the ten `_hold` holds)."""
     (decision_id,) = _append(
         settings,
         DecisionRow(
@@ -569,7 +602,7 @@ def _sell_spy(settings: Settings, run_id: int, at: datetime) -> None:
             rebalance_session=at.date(),
             security_id=SPY,
             side="sell",
-            planned_quantity=10.0,
+            planned_quantity=quantity,
             whole_share=False,
             decision="trade",
             known_at=at,
@@ -590,7 +623,7 @@ def _sell_spy(settings: Settings, run_id: int, at: datetime) -> None:
             security_id=SPY,
             symbol="SPY",
             side="sell",
-            quantity=10.0,
+            quantity=quantity,
             sells_in_flight_at_submit=False,
             known_at=at,
             ingested_at=at,
@@ -602,7 +635,7 @@ def _sell_spy(settings: Settings, run_id: int, at: datetime) -> None:
         FillRow(
             client_order_id=coid,
             filled_at=at,
-            quantity=10.0,
+            quantity=quantity,
             price=PRICE,
             price_implied=False,
             broker_fill_id=f"fill-{coid}",
@@ -1940,6 +1973,212 @@ def test_a_spinoff_of_a_chain_not_yet_known_keeps_the_stored_parent(
         )
 
     assert found.spinoffs == {}
+
+
+# --- a held chained predecessor (#3024) ---------------------------------------
+
+#: The successor's ticker in the #3024 cases: the chain's hand-over renamed it.
+SUCC_SYMBOL = "SPYN"
+
+
+def _held_chained_predecessor(
+    settings: Settings, fake: BookedFake, window: PaperWindowRow, chain_known_at: datetime
+) -> None:
+    """The book holds ten `SPY` shares; the store then learns a 1:1 chain `SPY` ->
+    `SUCC` (#821, known at `chain_known_at`) whose successor trades as `SPYN` from
+    S-1, and the predecessor's Form 25. The broker re-books the position under
+    `SPYN`. The account's funding deposit is the day before the window start."""
+    fake.activities = [FUNDING]
+    _hold(settings, fake, window, {(SPY, "SPY"): 10.0})
+    known = CUT - timedelta(minutes=1)
+    _fact(
+        settings,
+        "securities",
+        security_id=SUCC,
+        cik="CIK0009000001",
+        name="SPY Successor Inc",
+        benchmark=False,
+        known_at=known,
+        ingested_at=known,
+        source="edgar",
+        provenance="filing",
+    )
+    _fact(
+        settings,
+        "listings",
+        security_id=SUCC,
+        ticker=SUCC_SYMBOL,
+        exchange="NYSE",
+        class_title="Common Stock",
+        valid_from=previous_session(S),
+        known_at=known,
+        ingested_at=known,
+        source="edgar",
+        provenance="filing",
+    )
+    _delisting(settings, SPY, CUT - timedelta(days=5))
+    _chain(settings, SPY, SUCC, chain_known_at)
+    fake.extra_quantity = {"SPY": -10.0, SUCC_SYMBOL: 10.0}
+
+
+def _held_explanations(settings: Settings, window: PaperWindowRow) -> Explanations:
+    with open_read_only(settings) as conn:
+        return explanations_as_of(
+            conn,
+            window,
+            S,
+            as_of=STAMP,
+            settings=settings,
+            broker_symbols=(SUCC_SYMBOL,),
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+
+
+def test_a_held_chained_predecessor_reconciles_under_the_successors_symbol(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#3024: a book holding a predecessor whose chain is known at close(S-1) maps
+    it to the successor's broker symbol, so the broker's `SPYN` position is the
+    book's `SPY` holding and the reconciliation is `ok`, with nothing journaled;
+    before the fix it was a `broker_only_position` beside a missing `SPY`."""
+    _held_chained_predecessor(journal_settings, fake, open_window, CUT - timedelta(minutes=1))
+
+    assert _held_explanations(journal_settings, open_window).symbols[SPY] == SUCC_SYMBOL
+    row = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert row.status == "ok"
+    assert _adjustments(journal_settings, open_window) == []
+
+
+def test_a_held_predecessor_whose_chain_is_known_after_the_cut_is_not_remapped(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """No look-ahead (#3024): with the chain known only after close(S-1), the held
+    `SPY` keeps its own symbol and the broker's `SPYN` maps to `SUCC`, so the
+    position stays a break, never re-keyed ahead of the chain."""
+    _held_chained_predecessor(journal_settings, fake, open_window, CUT + timedelta(microseconds=1))
+
+    found = _held_explanations(journal_settings, open_window)
+
+    assert found.symbols[SPY] == "SPY"
+    assert found.symbols[SUCC] == SUCC_SYMBOL
+
+
+def test_a_held_predecessor_is_not_remapped_when_the_successor_is_journaled(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """Fail closed (#3024): when the journal also names the successor, the two ids
+    cannot share one broker position, so the predecessor keeps its own symbol and
+    the successor keeps `SPYN`; the quantities are never summed by a guess."""
+    _held_chained_predecessor(journal_settings, fake, open_window, CUT - timedelta(minutes=1))
+    run_id = _run(journal_settings, open_window)
+    _order(journal_settings, run_id, "tp-succ-1", SUCC, SUCC_SYMBOL, 1.0)
+
+    found = _held_explanations(journal_settings, open_window)
+
+    assert found.symbols[SPY] == "SPY"
+    assert found.symbols[SUCC] == SUCC_SYMBOL
+
+
+def test_a_held_chained_predecessors_mapping_is_recorded_for_the_order_path(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#3031: the reconciliation that follows a held predecessor's chain records
+    `SPY -> SPYN` on its row (never a difference), and the order path's map then
+    sends `SPY` under `SPYN`. Before that row exists the order map keeps `SPY`,
+    the broker's symbol until it re-books the position, and is not ambiguous."""
+    _held_chained_predecessor(journal_settings, fake, open_window, CUT - timedelta(minutes=1))
+
+    before = _order_symbols(journal_settings, open_window, SPY, MTUM)
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+    after = _order_symbols(journal_settings, open_window, SPY, MTUM)
+
+    assert result.status == OK
+    assert result.symbol_changes == (SymbolChangeRecord(SPY, "SPY", SUCC_SYMBOL),)
+    assert after.symbols == {SPY: SUCC_SYMBOL, MTUM: "MTUM"}
+    assert after.ambiguous == {}
+    assert after.chained == {SPY: SUCC}
+    assert before.symbols == {SPY: "SPY", MTUM: "MTUM"}
+    assert before.ambiguous == {}
+    assert before.chained == {}
+
+
+def test_the_order_map_never_follows_a_chain_the_reconciliation_did_not_record(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#3031 (fail closed): the reconciliation on S recorded `SPY -> SPYN`, but the
+    order map is asked for the successor too, so two ids would claim `SPYN` and
+    it cannot follow the chain: `SPY` is ambiguous with a note, never sent under
+    `SPY` (the broker no longer holds it) nor a guessed `SPYN`."""
+    _held_chained_predecessor(journal_settings, fake, open_window, CUT - timedelta(minutes=1))
+    _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    found = _order_symbols(journal_settings, open_window, SPY, SUCC)
+
+    assert SPY not in found.symbols
+    assert f"SPY -> {SUCC_SYMBOL}" in found.ambiguous[SPY]
+    assert found.symbols[SUCC] == SUCC_SYMBOL
+
+
+def test_a_predecessor_with_two_live_successors_maps_nothing_and_is_not_sent(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """#3031 (fail closed): two live chains from `SPY` leave which successor holds
+    the position unknown. Reconcile follows neither (the break stands) and the
+    order map leaves `SPY` out with a note; nothing is guessed."""
+    _held_chained_predecessor(journal_settings, fake, open_window, CUT - timedelta(minutes=1))
+    _chain(journal_settings, SPY, MTUM, CUT - timedelta(minutes=1))
+
+    found = _held_explanations(journal_settings, open_window)
+    mapped = _order_symbols(journal_settings, open_window, SPY)
+
+    assert found.symbols[SPY] == "SPY"
+    assert found.symbol_changes == {}
+    assert mapped.symbols == {}
+    assert "more than one live successor" in mapped.ambiguous[SPY]
+
+
+def test_a_successors_dividend_credited_under_its_symbol_is_the_held_predecessors(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#3031: the chained read keys the dividend to `SUCC`, and the broker credits
+    it under `SPYN`, the held `SPY`'s symbol now. The due is the predecessor's,
+    so the credit is explained `dividend_cash` on `SPY`, not a cash break."""
+    _held_chained_predecessor(journal_settings, fake, open_window, CUT - timedelta(minutes=1))
+    _dividend(journal_settings, SUCC, 0.5, CUT - timedelta(minutes=1))
+    fake.activities = [FUNDING, CashActivity("div-succ", "DIV", S, "executed", 5.0, SUCC_SYMBOL)]
+    fake.extra_cash = 5.0
+
+    assert _held_explanations(journal_settings, open_window).dividends == pytest.approx({SPY: 5.0})
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    assert [
+        (a.kind, a.security_id, a.cash) for a in _adjustments(journal_settings, open_window)
+    ] == [("dividend_cash", SPY, pytest.approx(5.0))]
+
+
+def test_a_successors_dividend_stays_unexplained_when_its_chain_is_known_after_the_cut(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """#3031 (no look-ahead): with the chain known only after close(S-1) nothing is
+    followed, so the successor's dividend is owed on no held name."""
+    _held_chained_predecessor(journal_settings, fake, open_window, CUT + timedelta(microseconds=1))
+    _dividend(journal_settings, SUCC, 0.5, CUT - timedelta(minutes=1))
+
+    assert _held_explanations(journal_settings, open_window).dividends == {}
 
 
 # --- a when-issued spin-off child at the broker (#2112) ------------------------

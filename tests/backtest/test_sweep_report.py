@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 import re
 import time
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ from tradepartner.backtest.metrics import (
     probabilistic_sharpe,
 )
 from tradepartner.config import Settings
+from tradepartner.execution import exam_ledger
 from tradepartner.store import lab_queries, lab_registry, registry
 from tradepartner.store.db import insert_row, utc_now
 from tradepartner.store.lab_schema import LabNotInitialised
@@ -864,8 +866,9 @@ def test_report_over_ten_thousand_trials_reads_trial_metrics_a_fixed_number_of_t
     _sweep_record, records = _complete_sweep(store, settings)
     ids = [twin.hypothesis_id] + [r.hypothesis_id for r in records]
     (start,) = conn.execute("SELECT MAX(trial_id) + 1 FROM trials").fetchone()  # type: ignore[misc]
-    # 10,000 more current `ok` trials spread over the twin and the four variants: every
-    # one counts in N, and the newest of each variant becomes its counted trial.
+    # 10,000 more current `ok` trials spread over the twin and the four variants: their
+    # Sharpes vary, so they are distinct series, and the newest of each variant becomes
+    # its counted trial.
     conn.execute(
         "INSERT INTO trials (trial_id, hypothesis_id, kind, started_at, start_session, "
         "end_session, data_cutoff, code_version, code_dirty, synthetic, holdout_repeat, "
@@ -912,12 +915,15 @@ def test_report_over_ten_thousand_trials_reads_trial_metrics_a_fixed_number_of_t
     )
     elapsed = time.perf_counter() - began
 
-    assert report.family_n == results.family_n(conn, "momentum") >= 10_000
+    # The 10,000 share pairs, vintage and code, but their Sharpes vary by i % 97, so
+    # each (hypothesis, i % 97) outcome is its own series: 5 x 97 plus the first 5 (#3127).
+    assert report.family_n == results.family_n(conn, "momentum") == 490
     assert report.complete
-    # `family_sharpes`' one query per basis, plus the report's one read of the counted
-    # trials' base-level metrics: independent of the 10,000 trials.
+    # `family_sharpes`' one query per basis, the report's one read of the counted
+    # trials' base-level metrics, and one outcome-digest read per N count (`family_n`
+    # and `family_sharpes`, #3127): independent of the 10,000 trials.
     metric_reads = [s for s in recording.statements if "trial_metrics" in s]
-    assert len(metric_reads) == 3
+    assert len(metric_reads) == 5
     assert elapsed < REPORT_SECONDS_LIMIT
 
 
@@ -967,3 +973,141 @@ def test_lab_status_lists_an_operations_book_as_not_promoted(
         f"operations books:\n  ops-book (momentum, id {record.hypothesis_id}, decision "
         f"{outcome.decision_id}): operations book of {sweep.slug} v2, not promoted\n"
     ) in text()
+    # T382 (#3118 item 2): a pre-lab parent's book has no sweep_variants row, so it is
+    # listed by its parent's slug instead of dropping out of the join
+    path = lab.file("h1-open", 0.5, cost=60.0)
+    marker = "[gap]\ncount_share_threshold = 0.05\n"
+    path.write_text(
+        path.read_text().replace(marker, marker + '\n[execution]\nfill_price = "open"\n', 1)
+    )
+    pre_lab = hypothesis.register_operations_book(
+        lab_store,
+        path,
+        "h1",
+        "the open-basis restart",
+        registered_by="owner",
+        settings=settings,
+        code_vintage=CODE,
+    )
+    assert (
+        f"  h1-open (momentum, id {pre_lab.registered.hypothesis_id}, decision "
+        f"{pre_lab.decision_id}): operations book of h1 (pre-lab), not promoted\n"
+    ) in text()
+    assert sweep_report.pre_lab_standing(lab_store, 999, code_vintage=CODE) is None
+
+
+# --- the exam diagnostics in `lab status` (plan T381a; ADR 0016 decision 1, #3146) ----
+
+_LEDGER_HEAD = 'budget = 4\nbudget_adr = "docs/decisions/0016.md#rule-5"\n'
+
+
+def _entry(seq: int, family: str, *, campaign_k: int, outcome: str = "running") -> str:
+    on = "2026-10-30" if outcome == "running" else "2029-10-31"
+    return (
+        f'\n[[exam]]\nseq = {seq}\nhypothesis = "x{seq}"\nhypothesis_fingerprint = "fp{seq}"\n'
+        f'family = "{family}"\nbook_id = "b{seq}"\nwindow_id = {seq}\nstart_date = 2026-10-30\n'
+        'kill_line = "https://github.com/x/y/issues/1#issuecomment-1"\n'
+        f'campaign_k = {campaign_k}\noutcome = "{outcome}"\noutcome_on = {on}\n'
+    )
+
+
+def _family_line(text: str, family: str) -> str:
+    (line,) = [ln for ln in text.splitlines() if ln.startswith(f"  {family}: N ")]
+    return line
+
+
+def test_lab_status_prints_campaign_k_and_the_edge_label_without_changing_n_or_dsr(
+    world: tuple[Store, registry.HypothesisRecord], settings: Settings
+) -> None:
+    """ "campaign k 7" from the family's latest entry, "not recorded" with none or -1;
+    "machine pass, edge unjudged" for every family without a `passed` entry. The
+    family's numbers are the same with or without a ledger (a diagnostic only)."""
+
+    def status(ledger: exam_ledger.ExamLedger | None) -> sweep_report.LabStatus:
+        # The caller (cli `lab status`) turns the ledger into plain data: backtest code
+        # imports no execution module. None stands for an unreadable ledger.
+        return sweep_report.lab_status(
+            world[0].conn,
+            settings,
+            now=datetime(2026, 10, 7, tzinfo=UTC),
+            system_tz=ZoneInfo("America/New_York"),
+            code_vintage=CODE,
+            exam_passed=None if ledger is None else exam_ledger.passed_families(ledger),
+            campaign_ks=None if ledger is None else exam_ledger.latest_campaign_ks(ledger),
+        )
+
+    first = "momentum"
+    without = status(None)
+    text = sweep_report.format_lab_status(without)
+    assert _family_line(text, first).endswith(
+        "; campaign k not recorded; machine pass, edge unjudged"
+    )
+    ledger = exam_ledger.load_ledger(
+        _LEDGER_HEAD + _entry(1, first, campaign_k=3) + _entry(2, first, campaign_k=7)
+    )
+    with_k = status(ledger)
+    line = _family_line(sweep_report.format_lab_status(with_k), first)
+    assert line.endswith("; campaign k 7; machine pass, edge unjudged")
+    assert line.split("; campaign k")[0] == _family_line(text, first).split("; campaign k")[0]
+    strip = [replace(f, campaign_k=None, exam_passed=False) for f in with_k.families]
+    assert strip == list(without.families)
+    minus_one = exam_ledger.load_ledger(_LEDGER_HEAD + _entry(1, first, campaign_k=-1))
+    assert "campaign k not recorded" in _family_line(
+        sweep_report.format_lab_status(status(minus_one)), first
+    )
+    passed = exam_ledger.load_ledger(
+        _LEDGER_HEAD + _entry(1, first, campaign_k=7, outcome="passed")
+    )
+    assert _family_line(sweep_report.format_lab_status(status(passed)), first).endswith(
+        "; campaign k 7; forward return exam passed"
+    )
+
+
+# --- delisting exit coverage (plan T329, #2670) ----------------------------------------
+
+
+def test_each_grid_row_shows_its_unknown_delisting_exits_and_share(
+    world: tuple[Store, registry.HypothesisRecord], settings: Settings
+) -> None:
+    """The unknown count and `unknown / exits` beside every grid row, from the shown
+    trial's coverage counts; blank at 0 exits and for a trial without them."""
+    store, _twin = world
+    conn = store.conn
+    _sweep_record, records = _sweep(conn, settings, [0.15, 0.2, 0.25, 0.3])
+    coverage = [(4, 1), (0, 0), None]
+    for record, counts in zip(records, coverage, strict=False):
+        trial_id = store.trial(
+            record.hypothesis_id, metrics=_metrics(excess_cagr=0.01, sharpe_annual_excess=0.4)
+        )
+        if counts is None:
+            continue
+        exits, unknown = counts
+        for session, name, value in (
+            (date(2019, 4, 30), "n_exit_coverage_exits", exits),
+            (date(2019, 4, 30), "n_exit_coverage_unknown", unknown),
+            (date(2019, 4, 30), "n_exit_coverage_after_read", 0),
+            (date(2019, 3, 29), "n_excluded_no_history", 7),
+        ):
+            conn.execute(
+                "INSERT INTO trial_rebalance_counts VALUES (?, ?, ?, ?)",
+                [trial_id, session, name, value],
+            )
+
+    report = sweep_report.sweep_report(conn, "mom-grid", code_vintage=CODE)
+
+    rows = report.rows
+    assert [(r.exit_coverage_unknown, r.exit_coverage_exits) for r in rows] == [
+        (1, 4),
+        (0, 0),
+        (None, None),
+        (None, None),
+    ]
+    assert [r.exit_coverage_unknown_share for r in rows] == [0.25, None, None, None]
+    lines = sweep_report.format_report(report).splitlines()
+    header = next(line for line in lines if line.startswith("idx  slug"))
+    assert header.endswith("red_flag  delisting_unknown  delisting_unknown_share")
+    by_slug = {r.slug: next(line for line in lines if f"  {r.slug}  " in line) for r in rows}
+    assert by_slug[records[0].slug].endswith("  1/4  25.00%")
+    assert by_slug[records[1].slug].endswith("  0/0  -")
+    assert by_slug[records[2].slug].endswith("  -  -")
+    assert by_slug[records[3].slug].endswith("  -  -")

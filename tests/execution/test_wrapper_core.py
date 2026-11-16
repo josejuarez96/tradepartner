@@ -50,10 +50,12 @@ from tradepartner.errors import (
     SystemFaultError,
 )
 from tradepartner.execution import alerts, switch, wrapper
+from tradepartner.execution import resume as resume_module
 from tradepartner.execution import wrapper as wrapper_module
 from tradepartner.execution.alerts import Alerter
 from tradepartner.execution.collect import WriteOffContext, collect
 from tradepartner.execution.plan import State, decision_state
+from tradepartner.execution.resume import REFUSED, resume
 from tradepartner.execution.wrapper import (
     ALLOWLISTS,
     CANCEL_ALLOWLIST,
@@ -312,6 +314,7 @@ def test_the_allowlist_constants_are_pinned() -> None:
         assert allowed == expected
     for name in (
         "GET_ORDER_ALLOWLIST",
+        "GET_ORDER_BY_BROKER_ID_ALLOWLIST",
         "OPEN_ORDERS_ALLOWLIST",
         "FILLS_ALLOWLIST",
         "POSITIONS_ALLOWLIST",
@@ -545,6 +548,100 @@ def test_each_fault_halts_in_the_req_4_order(
         "alert:halted",
         "result:halted",
     ]
+
+
+def _aaa_reference(
+    _conn: object,
+    session: date,
+    _names: object,
+    _actions: object,
+    *,
+    bar_sessions: dict[str, date] | None = None,
+) -> dict[str, float]:
+    if bar_sessions is not None:
+        bar_sessions["SEC-AAA"] = calendar.previous_session(session)
+    return {"SEC-AAA": 100.0}
+
+
+def test_halt_read_judges_the_fill_it_journals(
+    journal_settings: Settings,
+    ticking_fake: FakeBroker,
+    ticking: TickingClock,
+    open_window: PaperWindowRow,
+    alerter_conn: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _run(journal_settings, open_window, ticking())
+    _order(journal_settings, ticking_fake, ticking, run, "tp-bad")
+    ticking_fake.apply("tp-bad", FillAt(price=200.0))
+    monkeypatch.setattr(wrapper_module, "reference_prices", _aaa_reference)
+    gate = _wrapper(journal_settings, ticking_fake, ticking, alerter_conn)
+
+    with pytest.raises(ValueError, match="original fault"):
+        _halt(gate, ValueError("original fault"), run)
+
+    [(message,)] = _query(
+        journal_settings, "SELECT message FROM paper_run_results WHERE run_id = ?", [run.run_id]
+    )
+    assert "fill_price_outside_band" in message
+    assert "tp-bad" in message
+
+
+def test_halt_read_bad_fill_does_not_record_cancel_failed(
+    journal_settings: Settings,
+    ticking_fake: FakeBroker,
+    ticking: TickingClock,
+    open_window: PaperWindowRow,
+    alerter_conn: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _run(journal_settings, open_window, ticking())
+    _order(journal_settings, ticking_fake, ticking, run, "tp-bad")
+    ticking_fake.apply("tp-bad", FillAt(price=200.0))
+    monkeypatch.setattr(wrapper_module, "reference_prices", _aaa_reference)
+    gate = _wrapper(journal_settings, ticking_fake, ticking, alerter_conn)
+
+    with pytest.raises(ValueError, match="original fault"):
+        _halt(gate, ValueError("original fault"), run)
+
+    assert ("cancel_failed", HALT_REASON) not in _events(journal_settings, "tp-bad")
+
+
+def test_stale_halt_bad_fill_engages_switch_and_later_resume_refuses(
+    journal_settings: Settings,
+    ticking_fake: FakeBroker,
+    ticking: TickingClock,
+    open_window: PaperWindowRow,
+    alerter_conn: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _run(journal_settings, open_window, ticking())
+    _order(journal_settings, ticking_fake, ticking, run, "tp-stale-bad")
+    ticking_fake.apply("tp-stale-bad", FillAt(price=200.0))
+    monkeypatch.setattr(wrapper_module, "reference_prices", _aaa_reference)
+    gate = _wrapper(journal_settings, ticking_fake, ticking, alerter_conn)
+
+    with pytest.raises(StaleDataError):
+        _halt(gate, StaleDataError("prices end at S-2"), run)
+
+    [(reason,)] = _query(
+        journal_settings,
+        "SELECT reason FROM kill_switch WHERE run_id = ? AND source = 'fault'",
+        [run.run_id],
+    )
+    assert reason.startswith("fill_price_outside_band:")
+    monkeypatch.setattr(resume_module, "frozen_risk", lambda _window: FROZEN)
+    outcome = resume(
+        journal_settings,
+        lambda: open_for_write(journal_settings),
+        ticking_fake,
+        ticking,
+        "owner checked",
+        False,
+        accept_rejections=False,
+    )
+    assert outcome.status == REFUSED
+    assert any("fill_price_outside_band" in item for item in outcome.reasons)
 
 
 def test_the_alert_row_exists_before_the_fault_propagates(

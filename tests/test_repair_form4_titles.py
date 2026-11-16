@@ -14,6 +14,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from conftest import open_paper_window
 from typer.testing import CliRunner
 
 from tradepartner import cli
@@ -337,3 +338,15 @@ def test_update_count_mismatch_rolls_back(
     with pytest.raises(TitleRepairRefused, match="rolled back"):
         repair_form4_titles(settings, manifest, "titles-2708", 1)
     assert _row(settings)[16] == QUOTED
+
+
+def test_refuses_rows_known_inside_an_open_paper_window(settings: Settings, tmp_path: Path) -> None:
+    zip_path, manifest = _fixture(settings, tmp_path)
+    build_manifest(settings, [zip_path], manifest)
+    open_paper_window(settings, datetime(2021, 1, 4, 14, tzinfo=UTC))
+    before = _row(settings)
+    with pytest.raises(TitleRepairRefused, match="open paper window"):
+        repair_form4_titles(settings, manifest, "titles-2708", 1, clock=lambda: NOW)
+    assert _row(settings) == before
+    with open_for_write(settings) as conn:
+        assert conn.execute("SELECT count(*) FROM ingestion_runs").fetchone() == (0,)

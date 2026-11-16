@@ -60,7 +60,9 @@ _ALLOWED = frozenset({"health.py", "store/index_members.py"})
 #: backtest, paper or research path. `store/registry.py` names it only in its
 #: trial data-vintage classification comment (the table is excluded there by
 #: construction), so it is allowed by name, not as a reader.
-_FIGI_ALLOWED = frozenset({"health.py", "ingest.py", "store/schema.py", "store/registry.py"})
+_FIGI_ALLOWED = frozenset(
+    {"health.py", "ingest.py", "store/schema.py", "store/registry.py", "store/figi_identity.py"}
+)
 #: A text naming the key's module or file: an import path, a file name or a
 #: `from tradepartner.store import ..., index_members` list.
 _NAMING = (
@@ -157,6 +159,53 @@ def test_the_figi_source_scan_finds_no_reader_outside_the_check_and_its_writer()
     assert offences == []
     # The allowed reader really reads it: the scan is not vacuous.
     assert "openfigi_types" in (_SRC / "health.py").read_text("utf-8")
+
+
+#: Only `health.py` may import the OpenFIGI identity cross-check (plan T399,
+#: #3437): not `backtest/`, `research/`, `universe.py`, the signals, `repair.py`
+#: or `ingest.py`, nor any other module.
+_IDENTITY_NAMING = re.compile(r"figi_identity\b")
+_IDENTITY_ALLOWED = frozenset({"health.py", "store/figi_identity.py"})
+
+
+def _identity_offences(relative: str, text: str) -> list[str]:
+    if relative in _IDENTITY_ALLOWED:
+        return []
+    found = []
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.ImportFrom) and node.module is not None:
+            names = {alias.name for alias in node.names}
+            if "figi_identity" in node.module or (
+                node.module == "tradepartner.store" and "figi_identity" in names
+            ):
+                found.append(f"{relative}: imports the identity check (line {node.lineno})")
+        elif isinstance(node, ast.Import) and any(
+            "figi_identity" in alias.name for alias in node.names
+        ):
+            found.append(f"{relative}: imports the identity check (line {node.lineno})")
+    return found
+
+
+def test_no_module_but_health_imports_the_figi_identity_check() -> None:
+    offences = [
+        offence
+        for path in sorted(_SRC.rglob("*.py"))
+        for offence in _identity_offences(
+            path.relative_to(_SRC).as_posix(), path.read_text("utf-8")
+        )
+    ]
+    assert offences == []
+    assert _IDENTITY_NAMING.search((_SRC / "health.py").read_text("utf-8"))
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ["backtest/run.py", "research/exposures.py", "universe.py", "repair.py", "ingest.py"],
+)
+def test_the_figi_identity_scan_has_teeth(relative: str) -> None:
+    assert _identity_offences(relative, "from tradepartner.store.figi_identity import KINDS\n")
+    assert _identity_offences(relative, "from tradepartner.store import figi_identity\n")
+    assert _identity_offences("health.py", "from tradepartner.store import figi_identity\n") == []
 
 
 def test_the_figi_source_scan_has_teeth() -> None:
@@ -330,3 +379,154 @@ def test_the_run_is_byte_identical_with_the_figi_table_populated_and_empty(
         outputs[variant] = RUNS[name](store, work)
     assert outputs["empty"] == outputs["populated"]
     assert len(outputs["empty"]) > 100  # the run produced something to compare
+
+
+#: The `retracted_rows` side table (ADR 0029, #3281, T389): rows a repair moved out of
+#: a fact table. Only repairs, the release coverage check and the schema may name it;
+#: a universe, as-of, signal, backtest, paper or research path never reads it, so a
+#: retracted row can reach no number. (Signals live under `backtest/`.)
+_RETRACTED_BARRED = (
+    "backtest/",
+    "research/",
+    "execution/",
+    "universe.py",
+    "store/asof.py",
+    "store/research.py",
+)
+
+
+def _retracted_offences(relative: str, text: str) -> list[str]:
+    """Why the module at `relative` (under `src/tradepartner/`) names `retracted_rows`
+    on a path that must not read it."""
+    if not relative.startswith(_RETRACTED_BARRED):
+        return []
+    found = []
+    if re.search(r"retracted_rows", text):
+        found.append(f"{relative}: names the retracted_rows table or module")
+    return found
+
+
+def test_the_retracted_rows_source_scan_finds_no_reader_on_a_barred_path() -> None:
+    offences = [
+        offence
+        for path in sorted(_SRC.rglob("*.py"))
+        for offence in _retracted_offences(
+            path.relative_to(_SRC).as_posix(), path.read_text("utf-8")
+        )
+    ]
+    assert offences == []
+    # The scan sees the tree: the barred prefixes exist and the module is where it should be.
+    assert (_SRC / "backtest").is_dir() and (_SRC / "research").is_dir()
+    assert (_SRC / "universe.py").is_file()
+    assert "retracted_rows" in (_SRC / "store" / "retracted_rows.py").read_text("utf-8")
+
+
+def test_the_retracted_rows_source_scan_has_teeth() -> None:
+    sql = "SELECT * FROM retracted_rows"
+    assert _retracted_offences("universe.py", sql)
+    assert _retracted_offences("backtest/signals.py", sql)
+    assert _retracted_offences(
+        "research/experiment.py", "from tradepartner.store import retracted_rows"
+    )
+    assert _retracted_offences("store/asof.py", sql)
+    assert _retracted_offences("execution/check.py", sql)
+    assert _retracted_offences("store/retracted_rows.py", sql) == []
+    assert _retracted_offences("repair.py", sql) == []
+
+
+# `store.reproduce` (ADR 0029, #3428, T398) reads `retracted_rows` to rebuild a trial's
+# store on a copy. No universe, signal, backtest or research module may import it, except
+# `backtest/run.py`'s `replay_trial`, the one seam that runs a trial on such a copy.
+_REPRODUCE_BARRED = ("backtest/", "research/", "universe.py", "signals/", "signal.py")
+_REPRODUCE_SEAM = "backtest/run.py"
+_REPRODUCE_NAMING = re.compile(
+    r"store\.reproduce\b|from tradepartner\.store import [^\n(]*\breproduce\b"
+    r"|from tradepartner\.store import \([^)]*\breproduce\b"
+)
+
+
+def _reproduce_offences(relative: str, text: str) -> list[str]:
+    """Why the module at `relative` imports `store.reproduce` on a path that must not."""
+    if not relative.startswith(_REPRODUCE_BARRED) or relative == _REPRODUCE_SEAM:
+        return []
+    if _REPRODUCE_NAMING.search(text):
+        return [f"{relative}: imports store.reproduce"]
+    return []
+
+
+def test_the_reproduce_source_scan_finds_no_importer_on_a_barred_path() -> None:
+    offences = [
+        offence
+        for path in sorted(_SRC.rglob("*.py"))
+        for offence in _reproduce_offences(
+            path.relative_to(_SRC).as_posix(), path.read_text("utf-8")
+        )
+    ]
+    assert offences == []
+    # The seam exists and is the one importer in `backtest/`.
+    assert _REPRODUCE_NAMING.search((_SRC / _REPRODUCE_SEAM).read_text("utf-8"))
+    assert (_SRC / "store" / "reproduce.py").is_file()
+
+
+def test_the_reproduce_source_scan_has_teeth() -> None:
+    plain = "from tradepartner.store import reproduce"
+    assert _reproduce_offences("backtest/engine.py", plain)
+    assert _reproduce_offences("backtest/results.py", "import tradepartner.store.reproduce")
+    assert _reproduce_offences("research/experiment.py", plain)
+    assert _reproduce_offences("universe.py", "from tradepartner.store import registry, reproduce")
+    assert _reproduce_offences(
+        "backtest/signals.py", "from tradepartner.store import (\n    reproduce,\n)"
+    )
+    assert _reproduce_offences("backtest/run.py", plain) == []
+    assert _reproduce_offences("cli.py", plain) == []
+
+
+# The identity answer key (#3275, ADR 0029, T394): judges the resolver, is never
+# read by a universe, signal, backtest or research module.
+_ID_KEY_SOURCES = ("backtest/", "research/", "universe.py", "signals/", "signal.py")
+_ID_KEY_NAMING = (
+    re.compile(r"identity_answer_key"),
+    re.compile(r"store\.identity_answer_key\b"),
+)
+
+
+def _id_key_offences(relative: str, text: str) -> list[str]:
+    """Why the module at `relative` imports or names the identity answer key,
+    when it sits on a universe, signal, backtest or research path."""
+    if not relative.startswith(_ID_KEY_SOURCES):
+        return []
+    return [f"{relative}: names the identity answer key" for p in _ID_KEY_NAMING if p.search(text)][
+        :1
+    ]
+
+
+def test_no_universe_signal_backtest_or_research_module_names_the_identity_key() -> None:
+    scanned = [
+        path
+        for path in sorted(_SRC.rglob("*.py"))
+        if path.relative_to(_SRC).as_posix().startswith(_ID_KEY_SOURCES)
+    ]
+    assert scanned  # the scan is not vacuous
+    offences = [
+        offence
+        for path in scanned
+        for offence in _id_key_offences(path.relative_to(_SRC).as_posix(), path.read_text("utf-8"))
+    ]
+    assert offences == []
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ["universe.py", "backtest/run.py", "research/foo.py", "signals/momentum.py"],
+)
+@pytest.mark.parametrize(
+    "text",
+    [
+        "from tradepartner.store.identity_answer_key import load_answer_key\n",
+        "from tradepartner.store import identity_answer_key\n",
+        'PATH = "store/identity_answer_key.toml"\n',
+    ],
+)
+def test_the_identity_key_scan_fails_on_a_planted_import(relative: str, text: str) -> None:
+    assert _id_key_offences(relative, text)
+    assert _id_key_offences("store/identity_check.py", text) == []

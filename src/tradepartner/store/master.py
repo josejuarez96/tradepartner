@@ -68,6 +68,13 @@ and no return spans the gap. A Form 15 (15-12B or 15-12G) within
 it: the old class was exchanged in a reorganisation or merger, so the
 8-A12B registers the same holders' shares (WSC's merger, #834; every
 reorganisation above filed one, no bankruptcy did). `MasterBuild.successions` records each pair.
+New equity listed only on **another exchange** than the Form 25's
+(#3056, GPOR: 25-NSE on NASDAQ, 8-A12B at emergence three months after
+it took effect, the next cover page on NYSE) is a successor too when the
+8-A12B was accepted from the session after the delisting took effect,
+with the same Form 15 veto. An exchange transfer registers its new
+exchange before the old listing ends, so its earlier 8-A12B never
+qualifies and the page still settles it as a transfer (CTO).
 The id has no `<cik>:` prefix on purpose: the price resolver treats it as
 its own company, so its listing takes the ticker from the old holder,
 which has left by then. Limit: an 8-A12B for another class (new notes) in
@@ -187,6 +194,7 @@ from tradepartner.store.filename_listings import (
     normalize_ticker,
 )
 from tradepartner.store.journal import CLOSING_STOP_STATES
+from tradepartner.store.listing_reviews import ReviewedListing, reviewed_listings
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 _EDGAR = "edgar"
@@ -233,6 +241,15 @@ class MasterBuild:
     #: entries (#821), and the entries that derive none with their reason.
     chains: tuple[Chain, ...] = ()
     chain_refusals: tuple[ChainRefusal, ...] = ()
+    #: Name changes (`symbol_changes`) judged for a missing new-ticker
+    #: listing row (#3057): the refusals with their reasons; the rows that
+    #: passed are in `listings` (`provenance = 'snapshot'`).
+    rename_refusals: tuple[RenameRefusal, ...] = ()
+    #: Reviewed listing rows (`store.listing_reviews`, #3293) the build left
+    #: out, as `(entry, reason)`: `not_yet_known` (the cited filing was
+    #: accepted after `ingested_at`) or `no_security` (the build holds no
+    #: such security). A row the build derives itself is left out silently.
+    reviewed_skipped: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -346,6 +363,9 @@ class _Stop:
     effective_on: date  # the day the delisting took effect
     reorg_start: date  # sessions of an 8-K12B or Form 15 that belong to it
     reorg_end: date
+    form: str = (
+        ""  # the Form 25's form (#3056: only an exchange's 25-NSE ends new equity elsewhere)
+    )
 
 
 #: Acceptances per marker form (`_MARKER_FORMS`) of one CIK.
@@ -373,6 +393,24 @@ def _deregistered(stop: _Stop, until: datetime, marks: _Marks, *, windowed: bool
     )
 
 
+def _new_equity_elsewhere(stop: _Stop, until: datetime, marks: _Marks) -> bool:
+    """True when shares a cover page accepted at `until` lists only on
+    another exchange than `stop`'s are new equity, not a transfer (#3056,
+    GPOR): an 8-A12B accepted from the session after the delisting took
+    effect (`stop.effective_after`) to `until`, no Form 15 in the
+    reorganisation window, and the stop an exchange's `25-NSE` (a strike:
+    GPOR's), never an issuer's own `25` (a voluntary withdrawal, how an
+    exchange transfer is filed), so an issuer's later 8-A12B (its own new
+    listing, a note registration) after a transfer never splits it."""
+    if not stop.form.startswith("25-NSE"):
+        return False
+    return any(
+        stop.effective_after <= session_of(at) and at <= until
+        for form in _NEW_REGISTRATION_FORMS
+        for at in marks.get(form, ())
+    ) and not _deregistered(stop, until, marks)
+
+
 def _new_equity(stop: _Stop, until: datetime, marks: _Marks) -> bool:
     """True when the shares listed again after `stop` (evidence accepted at
     `until`) are new equity: an 8-A12B from `stop.window_start` to `until`
@@ -380,7 +418,41 @@ def _new_equity(stop: _Stop, until: datetime, marks: _Marks) -> bool:
     return _registered(stop, until, marks) and not _deregistered(stop, until, marks)
 
 
+def _registration_start(floor: date, until: datetime, marks: _Marks) -> date | None:
+    """The session after the earliest 8-A12B accepted from `floor` to `until`:
+    the first session the new equity can trade, which the relisting's own
+    registration shows before any cover page does (#3362: HTZ, GPOR, GTX).
+    Uses only filings accepted by `until`, the cover page that settles it."""
+    days = [
+        at.astimezone(_EXCHANGE_TZ).date()
+        for form in _NEW_REGISTRATION_FORMS
+        for at in marks.get(form, ())
+        if floor <= session_of(at) and at <= until
+    ]
+    return next_session(min(days)) if days else None
+
+
 _Pairs = frozenset[tuple[str, str]]
+
+
+def _moved_new_equity(
+    cls: _Class, item: CoverListing, page: CoverPage, marks: _Marks
+) -> tuple[str, _Stop] | None:
+    """`(exchange, stop)` of `cls`'s pending Form 25 on another exchange
+    when `item` lists new equity in its place (#3056): the page shows none
+    of the class's tickers on that exchange, `item` is on another one, the
+    page is from the session after the delisting took effect, and
+    `_new_equity_elsewhere` holds. `None` otherwise (a transfer)."""
+    valid_from = session_of(page.accepted_at)
+    for exchange, stop in sorted(cls.ended.items()):
+        if exchange == item.exchange or valid_from < stop.effective_after:
+            continue
+        tickers = {ticker for ticker, ex in cls.pairs if ex == exchange}
+        if any(i.exchange == exchange and i.ticker in tickers for i in page.listings):
+            continue  # the class is relisted on its own exchange: that item decides
+        if _new_equity_elsewhere(stop, page.accepted_at, marks):
+            return exchange, stop
+    return None
 
 
 @dataclass
@@ -476,6 +548,16 @@ def _is_common(title: str, *, whole_words: bool = False) -> bool:
     return whole_words and _FALLBACK_COMMON.search(norm) is not None
 
 
+_NOTE_CLASS = re.compile(r"\b(?:notes?|debentures?)\b")
+
+
+def _is_note_class(title: str) -> bool:
+    """True when the title names a debt class (notes, debentures) and no
+    common equity. Such a class never takes the main id (#3390)."""
+    norm = _norm_title(title)
+    return _NOTE_CLASS.search(norm) is not None and not _is_common(title, whole_words=True)
+
+
 def _session_on_or_after(day: date) -> date:
     return day if is_session(day) else next_session(day)
 
@@ -535,6 +617,75 @@ def _named_common_titles(title: str) -> tuple[str, ...]:
     return tuple(names)
 
 
+#: A listing title's tail naming the units (or SAIL securities) a class also
+#: trades inside: "Class A common stock included as part of the units" is a
+#: SPAC's common class, the shares themselves (#3084).
+_UNIT_COMPONENT = re.compile(
+    r"[\s,]*\b(?:included|includes)\s+(?:as\s+(?:a\s+)?part\s+of|in)\s+"
+    r"(?:the\s+|each\s+)?(?:units?\b|sail\S*\s+securities\b).*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+#: `_NOT_COMMON_WORDS` at a word start ("Community Bancorp" names no unit),
+#: plus the words of other classes that describe themselves against common
+#: stock ("Preference Shares, convertible into Common Stock", "Subscription
+#: Receipts, each exchangeable for one common share", EDGAR's "Depository").
+#: Read by `_form25_title` only; `_NOT_COMMON_WORDS` is unchanged.
+_OTHER_CLASS_WORD = re.compile(
+    r"\b(?:"
+    + "|".join(
+        (
+            *_NOT_COMMON_WORDS,
+            "preference",
+            "depository",
+            "exchangeable",
+            "convertible",
+            "receipt",
+            "subscription",
+            "option",
+            "bond",
+            "trust",
+            "interest",
+        )
+    )
+    + ")",
+    re.IGNORECASE,
+)
+#: A title that is a company name or par value, then a class name:
+#: "HD Supply Holdings, Inc. common stock, par value ...", "ShockWave Medical
+#: Inc., common stock ...", "$.01 Par Value, Common Stock". The head holds at
+#: most one comma and ends in a legal suffix or a par value; `rest` starts
+#: with the class name itself.
+_NAME_THEN_CLASS = re.compile(
+    r"\A(?P<head>[^,]*?(?:,[^,]*?)?\b(?:inc|incorporated|corp|corporation|co|company|"
+    r"ltd|limited|llc|plc|holdings|group|bancorp|par\s+value|no\s+par)\.?)\s*,?\s+"
+    r"(?P<rest>(?:(?:class|series)\s+[a-z0-9]{1,2}\s+)?(?:common|ordinary|capital\s+stock)"
+    r"\b.*)\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _form25_title(title: str) -> str:
+    """`title` as Form 25 class matching reads it (#3084), never as a
+    class's identity (`_norm_title`, which names ids, is unchanged):
+
+    - a unit-component tail is dropped ("Class A common stock included as
+      part of the units" reads "Class A common stock");
+    - a title naming no other class (`_OTHER_CLASS_WORD`) whose head before
+      the first comma names no common equity reads from its class name only
+      when the head is a company name or a par value (`_NAME_THEN_CLASS`).
+      A description after a comma ("Shares, convertible into Common Stock")
+      is never read as the class.
+
+    Anything else is returned as it is."""
+    cut = _UNIT_COMPONENT.sub("", title)
+    if _is_common(cut) or _OTHER_CLASS_WORD.search(cut):
+        return cut
+    match = _NAME_THEN_CLASS.match(cut.strip())
+    return match.group("rest") if match else cut
+
+
 def _form25_classes[K](title: str, classes: Mapping[K, Collection[str | None]]) -> tuple[K, ...]:
     """The keys of `classes` (each class listed on the Form 25's exchange,
     with its titles there; `None` is an untitled row) that a Form 25
@@ -554,7 +705,27 @@ def _form25_classes[K](title: str, classes: Mapping[K, Collection[str | None]]) 
        exact title match gives, never a guessed class); failing that, for a
        plain-common title naming at most one class, the one class whose
        titles are all plain common.
-    Anything else is `()`: never a guess."""
+    Anything else is `()`: never a guess.
+
+    4. Only when 1-3 resolve nothing, 1-3 again with every title, the
+       filing's and the classes', read through `_form25_title` (#3084), so
+       a filing resolved today keeps exactly its classes."""
+    found = _form25_classes_read(title, classes)
+    if found:
+        return found
+    return _form25_classes_read(
+        _form25_title(title),
+        {
+            key: [None if t is None else _form25_title(t) for t in titles]
+            for key, titles in classes.items()
+        },
+    )
+
+
+def _form25_classes_read[K](
+    title: str, classes: Mapping[K, Collection[str | None]]
+) -> tuple[K, ...]:
+    """`_form25_classes`' rules 1-3 over the titles as given."""
 
     def by_title(name: str) -> list[K]:
         return [
@@ -624,6 +795,7 @@ def _stop(filing: DelistingFiling, settings: Settings, since: datetime | None) -
         effective,
         reorg_start,
         reorg_end,
+        filing.form,
     )
 
 
@@ -656,6 +828,12 @@ class _Builder:
         self.successions: list[Succession] = []
         self.class_titles: dict[tuple[str, str], ClassTitle] = {}  # first per (id, title)
         self.shown: list[ShownSpan] = []
+        #: Each CIK's cover-page acceptances, in the order built (#3363).
+        self.pages: dict[str, list[datetime]] = defaultdict(list)
+        #: `listings` by class id, and the `filing` ones by (ticker, exchange),
+        #: kept as rows are made so `_split_offs` never walks them all (#3363).
+        self.class_rows: dict[str, list[Row]] = defaultdict(list)
+        self.filed_pairs: dict[tuple[str, str], list[Row]] = defaultdict(list)
 
     def security(
         self,
@@ -693,6 +871,9 @@ class _Builder:
             "valid_from": valid_from,
         } | _row(known_at, self.ingested_at, source, provenance)
         self.listings.append(row)
+        self.class_rows[security_id].append(row)
+        if provenance == "filing":
+            self.filed_pairs[(ticker, exchange)].append(row)
         self._listings_by_cik[security_cik(security_id)].append(row)
 
     def cik_listings(self, cik: str) -> Sequence[Row]:
@@ -725,6 +906,7 @@ class _Builder:
         for page in sorted(pages, key=lambda p: (p.accepted_at, p.accession)):
             while events and events[0][0] < page.accepted_at:
                 self._event(first, classes, events.pop(0), marks)
+            self.pages[cik].append(page.accepted_at)
             known_at = max(page.accepted_at, first.accepted_at)
             valid_from = session_of(page.accepted_at)
             shown: dict[str, set[tuple[str, str]]] = defaultdict(set)
@@ -741,7 +923,26 @@ class _Builder:
                     cls = self._new_class(first, item, classes, known_at)
                 relisted = False
                 stop = cls.ended.get(item.exchange)
-                if stop is not None and (cls.security_id, item.exchange) not in starts:
+                elsewhere = (
+                    _moved_new_equity(cls, item, page, marks)
+                    if stop is None and (cls.security_id, item.exchange) not in starts
+                    else None
+                )
+                if elsewhere is not None:  # new equity listed on another exchange (#3056)
+                    relisted = True
+                    old_exchange, old_stop = elsewhere
+                    del cls.ended[old_exchange]
+                    registered = _registration_start(
+                        old_stop.effective_after, page.accepted_at, marks
+                    )
+                    start = max(
+                        min(valid_from, registered or valid_from),
+                        old_stop.after,
+                        old_stop.effective_after,
+                    )
+                    cls = self._successor(first, cls, start, classes, known_at)
+                    starts[(cls.security_id, item.exchange)] = start
+                elif stop is not None and (cls.security_id, item.exchange) not in starts:
                     new_equity = _new_equity(stop, page.accepted_at, marks)
                     # Before the delisting takes effect the old shares still
                     # trade, so the page relists only new equity (whose row
@@ -751,7 +952,14 @@ class _Builder:
                         del cls.ended[item.exchange]
                         start = max(valid_from, stop.after)
                         if new_equity:
-                            start = max(start, stop.effective_after)
+                            registered = _registration_start(
+                                stop.window_start, page.accepted_at, marks
+                            )
+                            start = max(
+                                min(valid_from, registered or valid_from),
+                                stop.after,
+                                stop.effective_after,
+                            )
                             cls = self._successor(first, cls, start, classes, known_at)
                         starts[(cls.security_id, item.exchange)] = start
                 start = starts.get((cls.security_id, item.exchange), valid_from)
@@ -916,7 +1124,10 @@ class _Builder:
     def _new_class(
         self, first: FilingIndexEntry, item: CoverListing, classes: list[_Class], known_at: datetime
     ) -> _Class:
-        if not classes:
+        # A notes-only issuer's first note takes a suffixed id, not the main
+        # id, so a master-retract of the main id's rows is not re-derived by
+        # the next write (#3390). The main id keeps its `securities` row.
+        if not classes and not _is_note_class(item.title):
             cls = _Class(primary_security_id(first.cik), first.accepted_at)
         else:
             slug = re.sub(r"[^a-z0-9]+", "-", _norm_title(item.title).replace("%", "pct"))
@@ -940,7 +1151,14 @@ class _Builder:
             cls = next((c for c in listed if entry.ticker in {k for k, _ in c.pairs_at(t)}), None)
             same_fetch = sum(1 for e in entries if e.fetched_at == t)
             if cls is None and not listed and same_fetch == 1:
-                cls = classes[0]  # a CIK with no cover page yet and one ticker
+                # A CIK with no cover page yet and one ticker. A note class
+                # (a suffixed id, #3390) not yet known at `t` is no home for it.
+                first_cls = classes[0]
+                if (
+                    first_cls.security_id == primary_security_id(entry.cik)
+                    or first_cls.known_at <= t
+                ):
+                    cls = first_cls
             if cls is None:
                 self.unmatched.append(entry)
                 continue
@@ -1056,6 +1274,207 @@ def _first_per_line(entries: Iterable[CompanySnapshotEntry]) -> tuple[CompanySna
     return tuple(first.values())
 
 
+@dataclass(frozen=True)
+class RenameChange:
+    """One stored `symbol_changes` revision, as the master judges it (#3057).
+
+    `held_by` are the `(security_id, exchange)` of every *other* security whose
+    listing in force on the change's session was already the new ticker."""
+
+    security_id: str
+    old_symbol: str
+    new_symbol: str
+    process_date: date
+    known_at: datetime
+    held_by: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class RenameListing:
+    """A listing row `derive_rename_listings` adds: the new ticker from the
+    change's session, known when the evidence for it was."""
+
+    security_id: str
+    ticker: str
+    exchange: str
+    valid_from: date
+    known_at: datetime
+
+
+@dataclass(frozen=True)
+class RenameRefusal:
+    """A name change that adds no row, and why (`RENAME_*`)."""
+
+    security_id: str
+    old_symbol: str
+    new_symbol: str
+    reason: str
+
+
+RENAME_OLD_NOT_CURRENT = "old_ticker_not_current"  # the class showed another ticker that day
+RENAME_NO_EVIDENCE = "no_evidence"  # no ticker-file fetch or listing row shows the new ticker
+RENAME_EXCHANGE_DIFFERS = "exchange_differs"  # the evidence is on another exchange
+RENAME_HELD = "new_ticker_held"  # another security held the new ticker that day
+
+
+def derive_rename_listings(
+    listings: Iterable[Mapping[str, Any]],
+    fetches: Iterable[CompanySnapshotEntry],
+    renames: Iterable[RenameChange],
+    *,
+    ingested_at: datetime,
+) -> tuple[tuple[RenameListing, ...], tuple[RenameRefusal, ...]]:
+    """The new-ticker listing rows a name change implies (#3057). Pure.
+
+    A cover page names a rename only when the filing carries its 12(b) block;
+    Revvity's (PKI -> RVTY, 2023-05) and Expand Energy's (CHK -> EXE, 2024-10)
+    10-Ks and 10-Qs carry none, so the class kept its old ticker for years
+    and a ticker-keyed read saw no bars. A change adds a row when: the class's
+    listing in force on the change's session (`process_date`, rolled to a
+    session) shows the old ticker; no row of the class already shows the new
+    ticker by then; the new ticker is evidenced, by a SEC ticker-file fetch
+    (`fetches`) taken after the change was known or by a later listing row of
+    the class; that evidence is on the old listing's exchange; and no other
+    security held the new ticker there (`RenameChange.held_by`). The row
+    starts on the change's session and is known at the evidence (never
+    before the change was known), so a read before it sees the old ticker.
+    A change that was not yet known at `ingested_at` is skipped. Each other
+    case is returned as a `RenameRefusal`."""
+    rows_by_id: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in listings:
+        rows_by_id[row["security_id"]].append(row)
+    seen_fetches: dict[tuple[str, str], list[CompanySnapshotEntry]] = defaultdict(list)
+    for fetch in fetches:
+        seen_fetches[(fetch.cik, fetch.ticker)].append(fetch)
+    added: dict[tuple[str, str, str, date], RenameListing] = {}
+    refused: list[RenameRefusal] = []
+    for change in sorted(renames, key=lambda c: (c.security_id, c.process_date, c.new_symbol)):
+        old, new, sid = change.old_symbol, change.new_symbol, change.security_id
+        if old == new or change.known_at > ingested_at:
+            continue
+        start = _session_on_or_after(change.process_date)
+        rows = rows_by_id.get(sid, [])
+        if any(r["ticker"] == new and r["valid_from"] <= start for r in rows):
+            continue  # a cover page or an earlier run already starts it
+        in_force = [r for r in rows if r["valid_from"] <= start]
+        current = max(in_force, key=lambda r: (r["valid_from"], r["known_at"]), default=None)
+        if current is None or current["ticker"] != old:
+            refused.append(RenameRefusal(sid, old, new, RENAME_OLD_NOT_CURRENT))
+            continue
+        evidence: list[tuple[datetime, str]] = [
+            (fetch.fetched_at, fetch.exchange)
+            for fetch in seen_fetches.get((security_cik(sid), new), ())
+            if fetch.fetched_at >= change.known_at
+        ]
+        evidence += [(r["known_at"], r["exchange"]) for r in rows if r["ticker"] == new]
+        if not evidence:
+            refused.append(RenameRefusal(sid, old, new, RENAME_NO_EVIDENCE))
+            continue
+        on_exchange = [item for item in evidence if item[1] == current["exchange"]]
+        if not on_exchange:
+            refused.append(RenameRefusal(sid, old, new, RENAME_EXCHANGE_DIFFERS))
+            continue
+        if any(holder != sid for holder, _ex in change.held_by):  # on any exchange
+            refused.append(RenameRefusal(sid, old, new, RENAME_HELD))
+            continue
+        known_at = max(min(at for at, _ in on_exchange), change.known_at)
+        if known_at > ingested_at:
+            continue
+        key = (sid, new, current["exchange"], start)
+        added[key] = RenameListing(sid, new, current["exchange"], start, known_at)
+    return tuple(added.values()), tuple(refused)
+
+
+_STORED_RENAMES_SQL = """
+    SELECT security_id, old_symbol, new_symbol, process_date, known_at
+    FROM (
+        SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY security_id, source_action_id,
+                CASE WHEN source_action_id = '' THEN old_symbol ELSE '' END,
+                CASE WHEN source_action_id = '' THEN new_symbol ELSE '' END,
+                CASE WHEN source_action_id = '' THEN process_date ELSE NULL END
+            ORDER BY known_at DESC
+        ) AS _rn
+        FROM symbol_changes WHERE known_at <= ?
+    ) WHERE _rn = 1
+    ORDER BY security_id, process_date, new_symbol
+"""
+
+
+def stored_rename_changes(
+    conn: duckdb.DuckDBPyConnection, at: datetime, ciks: Collection[str] | None = None
+) -> tuple[RenameChange, ...]:
+    """The store's `symbol_changes` known at `at` as `RenameChange`s (#3057),
+    each with the other securities that held its new ticker on its session.
+    `ciks` limits them to those CIKs' securities. None on a store without the
+    table."""
+    at = _validate_t(at)
+    tables = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
+    if "symbol_changes" not in tables:
+        return ()
+    changes = [
+        row
+        for row in conn.execute(_STORED_RENAMES_SQL, [at]).fetchall()
+        if ciks is None or security_cik(row[0]) in ciks
+    ]
+    news = sorted({row[2] for row in changes})
+    holders: dict[str, set[str]] = defaultdict(set)  # new ticker -> securities ever showing it
+    if news:
+        for sid, ticker in conn.execute(
+            "SELECT DISTINCT security_id, ticker FROM listings "
+            "WHERE known_at <= ? AND ticker IN (SELECT unnest(?))",
+            [at, news],
+        ).fetchall():
+            holders[ticker].add(sid)
+    latest = _latest_listing_rows(conn, at, {sid for ids in holders.values() for sid in ids})
+    out: list[RenameChange] = []
+    for sid, old, new, process_date, known_at in changes:
+        start = _session_on_or_after(process_date)
+        held = tuple(
+            sorted(
+                {
+                    (other, held[1])
+                    for other in holders.get(new, ())
+                    if other != sid
+                    and (held := latest_in_force(latest.get(other, ()), start)) is not None
+                    and held[0] == new
+                }
+            )
+        )
+        out.append(RenameChange(sid, old, new, process_date, known_at, held))
+    return tuple(out)
+
+
+def _latest_listing_rows(
+    conn: duckdb.DuckDBPyConnection, at: datetime, security_ids: Collection[str]
+) -> dict[str, list[tuple[date, datetime, str, str]]]:
+    """`(valid_from, known_at, ticker, exchange)` of each live listing row of `security_ids`
+    known at `at`, by security."""
+    out: dict[str, list[tuple[date, datetime, str, str]]] = defaultdict(list)
+    if not security_ids:
+        return out
+    for sid, valid_from, known_at, ticker, exchange in conn.execute(
+        "SELECT security_id, valid_from, known_at, ticker, exchange FROM listings "
+        "WHERE known_at <= ? AND security_id IN (SELECT unnest(?)) "
+        "QUALIFY NOT retracted AND row_number() OVER (PARTITION BY security_id, ticker, "
+        "exchange, valid_from ORDER BY known_at DESC) = 1",
+        [at, sorted(security_ids)],
+    ).fetchall():
+        out[sid].append((valid_from, known_at, ticker, exchange))
+    return out
+
+
+def latest_in_force(
+    rows: Sequence[tuple[date, datetime, str, str]], session: date
+) -> tuple[str, str] | None:
+    """The `(ticker, exchange)` of the latest row starting on or before `session`."""
+    in_force = [r for r in rows if r[0] <= session]
+    if not in_force:
+        return None
+    *_, ticker, exchange = max(in_force, key=lambda r: (r[0], r[1]))
+    return ticker, exchange
+
+
 def _filing_index_for_cik(source: FilingSource, cik: str) -> list[FilingIndexEntry]:
     """Use a store-backed CIK query when the source offers one."""
     reader = getattr(source, "filing_index_for_cik", None)
@@ -1090,14 +1509,145 @@ def _filing_index_for_forms(source: FilingSource, forms: Collection[str]) -> lis
     return [entry for entry in source.filing_index() if entry.form in forms]
 
 
+#: The ticker of a row that ends a class's span (#3363): a placeholder, which
+#: holds nothing and "still ends the security's previous span"
+#: (`adapters.alpaca_prices`), exactly as a cover page naming no ticker does.
+SPLIT_OFF_END_TICKER = "N/A"
+
+
+def _split_offs(builder: _Builder, delistings: Mapping[str, Sequence[DelistingFiling]]) -> None:
+    """Tracking stock split off into another issuer (#3363, #3288 G6).
+
+    When a class's ticker on an exchange is listed by a **different** CIK
+    from a cover page (or filing) of its own, two shapes follow, and both
+    are rules, not reviewed rows:
+
+    1. *Stale relisting.* The old issuer's Form 25 ended the class, then a
+       later cover page of the old issuer lists the same pair again, which
+       the #820 rule read as new equity (a repair successor, with an 8-A12B
+       in the window: Liberty Media's BATRA and BATRK on 2023-08-04). The
+       other issuer's row starts on or before that page, so the old issuer's
+       row is dropped, and with it a successor left with no row (its
+       `securities` row, its `Succession`, its class titles and shown
+       spans). Rows the other issuer starts later are not touched.
+    2. *Dropped class.* The old issuer has no Form 25 on the exchange, the
+       other issuer's row starts after the class's last listing row, and the
+       old issuer has since filed a cover page that no longer shows the class
+       (Liberty Media's LLYVA and LLYVK, 2025-12-16). The class's span ends
+       where the other issuer's row starts: an end row (`SPLIT_OFF_END_TICKER`)
+       on the class, `known_at` the later of the other issuer's row and that
+       first page without the class. With no such page the old issuer may
+       still list it, and nothing ends.
+
+    Only rows of provenance `filing` count, on either side: a companies
+    snapshot's first-seen date is not when a ticker changed hands.
+    """
+    successors = {s.security_id for s in builder.successions}
+    drop: set[int] = set()
+    for sid in successors:
+        cik = security_cik(sid)
+        for row in builder.class_rows.get(sid, ()):
+            if row["provenance"] != "filing":
+                continue
+            pair_rows = builder.filed_pairs[(row["ticker"], row["exchange"])]
+            # The session of the page that listed the pair again, not the row's
+            # own start: a successor's row starts at its 8-A12B (#3362), before
+            # that page.
+            page_session = session_of(row["known_at"])
+            held = [
+                o["valid_from"]
+                for o in pair_rows
+                if security_cik(o["security_id"]) == cik
+                and o["security_id"] not in successors
+                and o["valid_from"] < row["valid_from"]
+            ]
+            # The other issuer took the pair after the old issuer last held it
+            # (an unrelated holder years before is no split-off), on a fact
+            # known by the old issuer's page (the instant: a later-known row never
+            # deletes an earlier-known one).
+            taken = bool(held) and any(
+                security_cik(o["security_id"]) != cik
+                and max(held) < o["valid_from"] <= page_session
+                and o["known_at"] <= row["known_at"]
+                for o in pair_rows
+            )
+            had_it = bool(held)
+            if had_it and taken:
+                drop.add(id(row))
+    if drop:
+        dropped = {r["security_id"] for r in builder.listings if id(r) in drop}
+        builder.listings = [r for r in builder.listings if id(r) not in drop]
+        for sid in dropped:
+            builder.class_rows[sid] = [r for r in builder.class_rows[sid] if id(r) not in drop]
+        for pair, rows in builder.filed_pairs.items():
+            builder.filed_pairs[pair] = [r for r in rows if id(r) not in drop]
+        gone = {sid for sid in dropped if not builder.class_rows[sid]}
+        builder.securities = [r for r in builder.securities if r["security_id"] not in gone]
+        builder.successions = [s for s in builder.successions if s.security_id not in gone]
+        builder.shown = [s for s in builder.shown if s.security_id not in gone]
+        builder.class_titles = {k: v for k, v in builder.class_titles.items() if k[0] not in gone}
+        builder._listings_by_cik.clear()
+        for r in builder.listings:
+            builder._listings_by_cik[security_cik(r["security_id"])].append(r)
+
+    last_shown: dict[str, datetime] = {}
+    for span in builder.shown:
+        last_shown[span.security_id] = max(
+            span.last_at, last_shown.get(span.security_id, span.last_at)
+        )
+    for sid, shown_at in last_shown.items():
+        rows = sorted(builder.class_rows[sid], key=lambda r: (r["valid_from"], r["known_at"]))
+        if not rows:
+            continue
+        last = rows[-1]
+        cik = security_cik(sid)
+        if last["provenance"] != "filing" or any(
+            f.exchange == last["exchange"] and session_of(f.accepted_at) >= last["valid_from"]
+            for f in delistings.get(cik, ())
+        ):
+            continue
+        later = [
+            q
+            for q in builder.filed_pairs[(last["ticker"], last["exchange"])]
+            if security_cik(q["security_id"]) != cik
+            and q["valid_from"] > last["valid_from"]
+            and q["known_at"] > shown_at
+        ]
+        after = [at for at in builder.pages.get(cik, ()) if at > shown_at]
+        if not later or not after:
+            continue
+        q = min(later, key=lambda r: (r["valid_from"], r["known_at"]))
+        end = {
+            "security_id": sid,
+            "ticker": SPLIT_OFF_END_TICKER,
+            "exchange": last["exchange"],
+            "class_title": None,
+            "valid_from": q["valid_from"],
+        } | _row(max(q["known_at"], min(after)), builder.ingested_at, _EDGAR, "filing")
+        builder.listings.append(end)
+        builder.class_rows[sid].append(end)
+        builder._listings_by_cik[cik].append(end)
+
+
 def build_master(
     source: FilingSource,
     settings: Settings,
     *,
     ingested_at: datetime,
     earlier_fetches: Sequence[CompanySnapshotEntry] = (),
+    renames: Sequence[RenameChange] = (),
+    reviewed: Sequence[ReviewedListing] | None = None,
 ) -> MasterBuild:
     """`securities` and `listings` rows for every issuer CIK and benchmark.
+
+    `reviewed` are the reviewed listing rows (`store.listing_reviews`, #3293;
+    the packaged file when `None`): each is written as a `filing` listing
+    known at its cited filing's acceptance, once the build holds its
+    security and `ingested_at` has reached that acceptance.
+
+    `renames` are the stored `symbol_changes` (`stored_rename_changes`,
+    #3057): a change whose new ticker no cover page or fetch row starts by
+    its date gets a `snapshot` listing row (`derive_rename_listings`).
 
     `earlier_fetches` are companies-snapshot entries from earlier runs
     (`stored_snapshot_fetches`, #2291): judged with `source`'s fetches in
@@ -1194,6 +1744,28 @@ def build_master(
         else:
             missing.append(ticker)
 
+    _split_offs(builder, delistings)
+
+    # One walk of every listing, only when a name change is to be judged.
+    rename_rows, rename_refusals = (
+        derive_rename_listings(builder.listings, every, renames, ingested_at=ingested_at)
+        if renames
+        else ((), ())
+    )
+    for rename in rename_rows:
+        builder.listing(
+            rename.security_id,
+            rename.ticker,
+            rename.exchange,
+            None,
+            rename.valid_from,
+            rename.known_at,
+            provenance="snapshot",
+        )
+
+    reviewed_skipped = _reviewed_listings(
+        builder, reviewed_listings() if reviewed is None else reviewed, ingested_at
+    )
     listed = {row["security_id"] for row in builder.listings}
     return MasterBuild(
         securities=tuple(builder.securities),
@@ -1210,7 +1782,35 @@ def build_master(
         filename_form25_accessions=tuple(filename_form25_accessions),
         filename_enabled=settings.edgar.filename_listings,
         filename_conflict_ciks=tuple(filename_conflict_ciks),
+        rename_refusals=rename_refusals,
+        reviewed_skipped=reviewed_skipped,
     )
+
+
+def _reviewed_listings(
+    builder: _Builder, rows: Iterable[ReviewedListing], ingested_at: datetime
+) -> tuple[tuple[str, str], ...]:
+    """Write each reviewed row the build can hold; return the ones it cannot."""
+    held = {row["security_id"] for row in builder.securities}
+    skipped: list[tuple[str, str]] = []
+    for review in rows:
+        if review.known_at > ingested_at:
+            skipped.append((review.entry, "not_yet_known"))
+        elif review.security_id not in held:
+            skipped.append((review.entry, "no_security"))
+        elif not any(
+            (row["security_id"], row["ticker"], row["exchange"], row["valid_from"]) == review.key
+            for row in builder.cik_listings(security_cik(review.security_id))
+        ):
+            builder.listing(
+                review.security_id,
+                review.ticker,
+                review.exchange,
+                review.class_title,
+                review.valid_from,
+                review.known_at,
+            )
+    return tuple(skipped)
 
 
 def build_chains(
@@ -1594,23 +2194,23 @@ def _filename_rows(
 #: "A held position" paragraph): an order in flight counts as held.
 _HELD_SQL = """
     SELECT security_id FROM orders
-        WHERE list_contains(?, security_id) AND run_id IN (
+        WHERE security_id IN (SELECT unnest(?)) AND run_id IN (
             SELECT run_id FROM paper_runs WHERE window_id IN (
                 SELECT window_id FROM paper_windows WHERE window_id NOT IN (
-                    SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))))
+                    SELECT window_id FROM paper_window_stops WHERE state IN (SELECT unnest(?)))))
     UNION SELECT security_id FROM positions_daily
-        WHERE list_contains(?, security_id) AND run_id IN (
+        WHERE security_id IN (SELECT unnest(?)) AND run_id IN (
             SELECT run_id FROM paper_runs WHERE window_id IN (
                 SELECT window_id FROM paper_windows WHERE window_id NOT IN (
-                    SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))))
+                    SELECT window_id FROM paper_window_stops WHERE state IN (SELECT unnest(?)))))
     UNION SELECT security_id FROM adjustments
-        WHERE list_contains(?, security_id) AND window_id IN (
+        WHERE security_id IN (SELECT unnest(?)) AND window_id IN (
             SELECT window_id FROM paper_windows WHERE window_id NOT IN (
-                SELECT window_id FROM paper_window_stops WHERE list_contains(?, state)))
+                SELECT window_id FROM paper_window_stops WHERE state IN (SELECT unnest(?))))
     UNION SELECT security_id FROM lots
-        WHERE list_contains(?, security_id) AND book_id IN (
+        WHERE security_id IN (SELECT unnest(?)) AND book_id IN (
             SELECT book_id FROM paper_windows WHERE window_id NOT IN (
-                SELECT window_id FROM paper_window_stops WHERE list_contains(?, state)))
+                SELECT window_id FROM paper_window_stops WHERE state IN (SELECT unnest(?))))
 """
 
 

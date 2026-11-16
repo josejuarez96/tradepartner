@@ -19,7 +19,7 @@ reproducible.
 The range is read through `get_settings()`, which parses the environment and
 `.env` afresh on every call (~5 ms; deliberately uncached, see `config.py`).
 The session helpers run thousands of times per backtest, so the range is
-cached per **config state** instead (#154): a fingerprint of everything
+cached per **config state** instead (#154): a token for everything
 `Settings` can read for `calendar`, namely the whole environment (`.env` lines
 may expand `${VAR}` from it) and the `.env` file's path, inode, size, mtime and
 ctime (ctime cannot be reset by `utime`, and an atomic replace changes the
@@ -28,6 +28,7 @@ inode). Changing any of them re-reads the range.
 
 from __future__ import annotations
 
+import itertools
 import os
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Hashable
@@ -50,20 +51,64 @@ def _calendar(start: date, end: date) -> xcals.ExchangeCalendar:
     return xcals.get_calendar(_CALENDAR_NAME, start=pd.Timestamp(start), end=pd.Timestamp(end))
 
 
-def _config_fingerprint() -> tuple[object, ...]:
-    """What `Settings` can read for `calendar`, cheaply: the whole environment
-    and the `.env` file's state (a scan of `os.environ` and one `stat`)."""
-    env = frozenset(os.environ.items())
-    path = _default_env_file()
+_FingerprintState = tuple[dict[bytes, bytes] | dict[str, str], tuple[object, ...], int]
+_fingerprint_state: _FingerprintState | None = None
+_fingerprint_counter = itertools.count(1)
+
+
+def _env_view() -> dict[bytes, bytes] | dict[str, str]:
+    """The live environment mapping without a per-item decode (`os.environ._data`
+    on CPython; a copy on any other implementation)."""
+    data = getattr(os.environ, "_data", None)
+    if isinstance(data, dict):
+        return data
+    return dict(os.environ)
+
+
+_env_file_memo: tuple[str | None, str] | None = None
+
+
+def _env_file_state() -> tuple[object, ...]:
+    """The `.env` file's path, inode, size, mtime and ctime (one `stat`).
+
+    `_default_env_file()` resolves symlinks (several syscalls) on every call, so
+    its answer is memoised per `TRADEPARTNER_ENV_FILE` value; the path it names
+    is still `stat`-ed every time."""
+    global _env_file_memo
+    override = os.environ.get("TRADEPARTNER_ENV_FILE")
+    memo = _env_file_memo
+    if memo is None or memo[0] != override:
+        memo = (override, str(_default_env_file()))
+        _env_file_memo = memo
+    path = memo[1]
     try:
-        stat = path.stat()
+        stat = os.stat(path)
     except OSError:
-        return env, str(path), None
-    return env, str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+        return (path, None)
+    return (path, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _config_fingerprint() -> int:
+    """A token that changes whenever what `Settings` can read for `calendar`
+    changes: the whole environment and the `.env` file's state.
+
+    The previous environment is kept as a snapshot; an unchanged environment is
+    one C-speed dict comparison plus one `stat` (~3 us) instead of hashing every
+    variable into a frozenset (~90 us). Any difference mints a new token, so
+    `_calendar_bounds` re-reads the config exactly as before."""
+    global _fingerprint_state
+    env = _env_view()
+    file_state = _env_file_state()
+    state = _fingerprint_state
+    if state is not None and state[0] == env and state[1] == file_state:
+        return state[2]
+    token = next(_fingerprint_counter)
+    _fingerprint_state = (dict(env), file_state, token)
+    return token
 
 
 @lru_cache(maxsize=8)
-def _calendar_bounds(fingerprint: tuple[object, ...]) -> tuple[date, date]:
+def _calendar_bounds(fingerprint: int) -> tuple[date, date]:
     """`(calendar.start, calendar.end)` for one config state (`fingerprint` is
     the cache key only)."""
     cfg = get_settings().calendar

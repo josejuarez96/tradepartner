@@ -163,6 +163,10 @@ class EdgarConfig(BaseModel):
     # `submissions.zip` instead of per-CIK submissions.
     index_first_year: int = Field(default=1993, ge=1993)
     index_settle_days: int = Field(default=3, ge=0)
+    # #2865: an accession a fetch after its quarter settled still lacks is asked
+    # again on every run until a fetch this many days past the settle lacks it
+    # too; only then is it cached as unstampable and no longer fetched.
+    unstampable_retry_days: int = Field(default=30, ge=0)
     # T319b (#2629, #2659): every Saturday (US/Eastern) the nightly re-reads and
     # reconciles this many of the latest settled quarters, beside the HEAD-ETag test.
     reconcile_recent_quarters: int = Field(default=8, ge=1)
@@ -341,6 +345,9 @@ class EdgarConfig(BaseModel):
     # read stops at the table or here, whichever comes first (#1597), so a
     # filing whose table is never written costs one bounded read.
     filename_document_max_bytes: int = Field(default=4_000_000, gt=0)
+    # #3106: maximum bytes in an issuer's HTML Form 25. A larger document,
+    # including one found in the raw filing cache, is counted as unreadable.
+    form25_html_max_bytes: int = Field(default=2_000_000, gt=0)
     # #2932: how many of one CIK's filing-name fetches are in flight at once.
     # Every request still goes through `edgar_raw`'s one process-wide limiter,
     # so the total stays at or under `requests_per_second`; the answer and the
@@ -351,6 +358,11 @@ class EdgarConfig(BaseModel):
     # nothing cached for the failed filing, and the run goes on; past this
     # share of the CIKs asked, `check_failures` fails the run (an outage).
     filename_fetch_max_failed_share: float = Field(default=0.02, ge=0, lt=1)
+    # #2934: this many CIKs in a row whose filing-name fetch failed past the
+    # retries (each CIK sent a fetch; a fully cached one is no evidence) is an
+    # SEC outage: the pass stops and fails the run there, instead of retrying
+    # every remaining CIK before `check_failures` fails it at the end.
+    filename_fetch_outage_ciks: int = Field(default=20, ge=1)
     # (CIK, ticker) spans whose `filing_name` rows the run derives no more
     # and `master-retract --release` withdraws: the amendment's rule for a
     # collision the Alpaca backfill counted. Default empty. A malformed

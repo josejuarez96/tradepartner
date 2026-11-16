@@ -705,6 +705,13 @@ class FakeBroker(Broker):
         self._log("get_order", client_order_id)
         return self._require_order(client_order_id)
 
+    def get_order_by_broker_id(self, broker_order_id: str) -> Order:
+        self._log("get_order_by_broker_id", broker_order_id)
+        for order in self._orders.values():
+            if order.broker_order_id == broker_order_id:
+                return order
+        raise UnknownOrderError(f"unknown broker_order_id: {broker_order_id!r}")
+
     def open_orders(self) -> list[Order]:
         self._log("open_orders")
         return [o for o in self._orders.values() if o.status not in TERMINAL_STATUSES]

@@ -13,6 +13,7 @@ with no jump at the compare level. The literal check on `reconcile.py` is T50's.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -25,6 +26,7 @@ from tradepartner.config import RiskConfig
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.reconcile import (
     Explanations,
+    FilledOrder,
     JournalOpenOrder,
     Reconciliation,
     SymbolChangeRecord,
@@ -127,6 +129,7 @@ def _run(
     explanations: Explanations | None = None,
     account_id: str = "acct-1",
     frozen: RiskConfig = FROZEN,
+    filled_orders: Sequence[FilledOrder] = (),
 ) -> Reconciliation:
     return compare(
         ledger,
@@ -138,6 +141,7 @@ def _run(
         WINDOW,
         frozen,
         order_id_prefix=PREFIX,
+        filled_orders=filled_orders,
     )
 
 
@@ -1173,6 +1177,62 @@ def test_a_lagging_sell_allows_more_cash_and_fewer_shares() -> None:
     assert sorted(_kinds(wrong_way)) == ["cash", "quantity"]
 
 
+def _lagging_sells(count: int) -> list[JournalOpenOrder]:
+    """`count` uncollected sells of 1 SEC_A share each, filled at 100."""
+    items = []
+    for n in range(1, count + 1):
+        row = _order_row(f"tp-20261007-SEC_A-sell-{n}", "SEC_A", "sell", quantity=1.0)
+        items.append(
+            JournalOpenOrder(
+                row,
+                pending=False,
+                journaled_quantity=0.0,
+                journaled_notional=0.0,
+                reading=_reading(row, OrderStatus.FILLED, filled=1.0, avg=100.0),
+            )
+        )
+    return items
+
+
+@pytest.mark.parametrize(
+    ("lagging", "fills", "excess", "status"),
+    [
+        (3, 0, 0.025, "fills_lagging"),  # 0.01 x (1 + 3/2), inclusive
+        (3, 0, 0.026, "mismatch"),
+        (0, 3, 0.025, "ok"),  # the same bound as three journaled fills
+        (3, 2, 0.035, "fills_lagging"),  # 0.01 x (1 + (2 + 3)/2)
+        (3, 2, 0.036, "mismatch"),
+        (1, 0, 1.0, "mismatch"),  # a real cash gap beside a lagging order still halts
+    ],
+)
+def test_each_lagging_order_counts_as_a_fill_in_the_cash_bound(
+    lagging: int, fills: int, excess: float, status: str
+) -> None:
+    """#2996: the broker books each uncollected sell's cash to the cent, so a
+    lagging order widens the cash bound by one fill, as a journaled fill does;
+    a bare `paper reconcile` before collection otherwise held every uncollected
+    fill's rounding to the zero-fill bound and halted the book on cash."""
+    held = 10.0
+    sold = float(lagging)
+    proceeds = 100.0 * lagging
+    if lagging:
+        result = _run(
+            _ledger(1_000.0, fills_since_base=fills, SEC_A=held),
+            _positions(AAA=held - sold),
+            round(1_000.0 + proceeds + excess, 6),
+            journal_open=_lagging_sells(lagging),
+        )
+    else:
+        result = _run(
+            _ledger(1_000.0, fills_since_base=fills, SEC_A=held),
+            _positions(AAA=held),
+            round(1_000.0 + excess, 6),
+        )
+
+    assert result.status == status
+    assert _kinds(result) == (["cash"] if status == "mismatch" else [])
+
+
 @pytest.mark.parametrize(
     ("filled", "avg"),
     [(5.0, None), (5.0, 0.0), (5.0, float("inf")), (float("inf"), 100.0), (50.0, 100.0)],
@@ -1390,6 +1450,92 @@ def test_a_notional_reading_past_its_buffered_notional_is_a_bad_reading() -> Non
     )
 
     assert "bad_reading" in _kinds(result)
+
+
+def _excess_sell(journaled: float, status: OrderStatus, filled: float | None) -> JournalOpenOrder:
+    row = _order_row("tp-20261007-SEC_A-sell-1", "SEC_A", "sell", quantity=10.0)
+    return JournalOpenOrder(
+        row,
+        pending=False,
+        journaled_quantity=journaled,
+        journaled_notional=journaled * 50.0,
+        reading=_reading(row, status, filled=filled, avg=50.0 if filled else None),
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "filled"), [(OrderStatus.EXPIRED, None), (OrderStatus.CANCELLED, 4.0)]
+)
+def test_an_excess_reading_is_a_bad_reading_naming_the_order(
+    status: OrderStatus, filled: float | None
+) -> None:
+    """#3152: the journal holds 10 shares sold; the broker's terminal reading says
+    fewer (none, or 4) filled. Collect withholds the terminal event, so the order
+    stays in flight; with positions agreeing nothing else would name it."""
+    result = _run(
+        _ledger(1_500.0, SEC_A=0.0),
+        {},
+        1_500.0,
+        journal_open=[_excess_sell(10.0, status, filled)],
+    )
+
+    assert result.status == "mismatch"
+    (mismatch,) = [m for m in result.mismatches if m.kind == "bad_reading"]
+    assert mismatch.client_order_id == "tp-20261007-SEC_A-sell-1"
+    assert mismatch.security_id == "SEC_A"
+    assert "journaled 10.0" in mismatch.detail
+    assert result.lagging_ids == ()
+
+
+def test_an_excess_within_the_quantity_tolerance_is_not_a_mismatch() -> None:
+    """#3152: a journaled surplus inside `risk.reconcile_quantity_tolerance` is noise."""
+    result = _run(
+        _ledger(1_500.0, SEC_A=0.0),
+        {},
+        1_500.0,
+        journal_open=[_excess_sell(10.0, OrderStatus.FILLED, 10.0 - 1e-9)],
+    )
+
+    assert "bad_reading" not in _kinds(result)
+
+
+@pytest.mark.parametrize(
+    ("journaled", "bad"),
+    [(0.0, float("nan")), (10.0, float("nan")), (0.0, float("-inf")), (0.0, float("inf"))],
+)
+def test_a_non_finite_filled_quantity_is_a_bad_reading(journaled: float, bad: float) -> None:
+    """#3162: `Order` refuses a non-finite `filled_quantity`, but a reading that
+    slips past it (NaN compares false both ways) must not pass as "not lagging"."""
+    item = _excess_sell(journaled, OrderStatus.FILLED, 10.0)
+    assert item.reading is not None
+    object.__setattr__(item.reading, "filled_quantity", bad)  # bypass Order's validator
+    result = _run(_ledger(1_500.0, SEC_A=0.0), {}, 1_500.0, journal_open=[item])
+
+    assert result.status == "mismatch"
+    (mismatch,) = [m for m in result.mismatches if m.kind == "bad_reading"]
+    assert mismatch.client_order_id == "tp-20261007-SEC_A-sell-1"
+    assert "not a finite" in mismatch.detail
+    assert result.lagging_ids == ()
+
+
+@pytest.mark.parametrize(
+    ("journaled", "bad"),
+    [(10.0, float("nan")), (10.0, float("inf")), (10.0, float("-inf")), (0.0, float("nan"))],
+)
+def test_a_non_finite_filled_avg_price_is_a_bad_reading(journaled: float, bad: float) -> None:
+    """#3169: `Order` refuses a non-finite `filled_avg_price`, but a reading that
+    slips past it must be `bad_reading` even when every share is journaled (no
+    lag to bound), since collect withholds its terminal event."""
+    item = _excess_sell(journaled, OrderStatus.FILLED, 10.0)
+    assert item.reading is not None
+    object.__setattr__(item.reading, "filled_avg_price", bad)  # bypass Order's validator
+    result = _run(_ledger(1_500.0, SEC_A=0.0), {}, 1_500.0, journal_open=[item])
+
+    assert result.status == "mismatch"
+    (mismatch,) = [m for m in result.mismatches if m.kind == "bad_reading"]
+    assert mismatch.client_order_id == "tp-20261007-SEC_A-sell-1"
+    assert "filled_avg_price" in mismatch.detail and "not a finite" in mismatch.detail
+    assert result.lagging_ids == ()
 
 
 def test_a_credited_dividend_while_a_buy_lags_is_allowed_and_deferred() -> None:
@@ -2362,3 +2508,107 @@ def test_a_repeated_activity_id_in_one_read_is_refused() -> None:
             1_000.0,
             explanations=_explanations(activities=duplicated),
         )
+
+
+def _size_run(
+    row_kwargs: dict[str, float], broker_kwargs: dict[str, float | None]
+) -> Reconciliation:
+    row = _order_row("tp-20261007-SEC_A-buy-1", "SEC_A", "buy", **row_kwargs)
+    reading = _reading(row, OrderStatus.ACCEPTED)
+    return _run(
+        _ledger(SEC_A=1.0),
+        _positions(AAA=1.0),
+        1_000.0,
+        open_orders=[replace(reading, **broker_kwargs)],  # type: ignore[arg-type]
+        journal_open=[
+            JournalOpenOrder(
+                row,
+                pending=False,
+                journaled_quantity=0.0,
+                journaled_notional=0.0,
+                reading=reading,
+            )
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("row_kwargs", "broker_kwargs"),
+    [
+        ({"quantity": 100.0}, {"quantity": 200.0}),
+        ({"notional": 100.0}, {"notional": 200.0}),
+        ({"quantity": 100.0}, {"quantity": None, "notional": 100.0}),
+        ({"notional": 100.0}, {"notional": None, "quantity": 100.0}),
+    ],
+    ids=["qty-double", "notional-double", "qty-to-notional", "notional-to-qty"],
+)
+def test_an_own_open_order_of_another_size_differs_from_its_row(
+    row_kwargs: dict[str, float], broker_kwargs: dict[str, float | None]
+) -> None:
+    """#3336: a broker open order whose quantity or notional is not its journal
+    row's (beyond the config tolerance, or unreadable) is `open_order_differs`."""
+    result = _size_run(row_kwargs, broker_kwargs)
+    assert _kinds(result) == ["open_order_differs"]
+    (mismatch,) = result.mismatches
+    assert "quantity" in mismatch.detail or "notional" in mismatch.detail
+
+
+def test_an_own_open_order_of_the_same_size_within_tolerance_passes() -> None:
+    assert _kinds(_size_run({"quantity": 100.0}, {})) == []
+    assert _kinds(_size_run({"notional": 100.0}, {"notional": 100.004})) == []
+
+
+# --- T400: an order whose live fills exceed its size ----------------------------
+
+
+def test_a_terminal_overfilled_order_reconciles_as_overfilled_not_ok() -> None:
+    """The broker agrees with the journal (both hold 20), the order is terminal, so
+    `_order_mismatches` never sees it: the new pass names it."""
+    row = _order_row("tp-a", "SEC_A", "buy", quantity=10.0)
+    result = _run(
+        _ledger(1_000.0, SEC_A=20.0),
+        _positions(AAA=20.0),
+        1_000.0,
+        filled_orders=[FilledOrder(row, 20.0, 2_000.0)],
+    )
+
+    assert result.status == "mismatch"
+    assert [(m.kind, m.client_order_id) for m in result.mismatches] == [("overfilled", "tp-a")]
+
+
+def test_an_order_filled_at_its_size_or_within_tolerance_is_not_overfilled() -> None:
+    row = _order_row("tp-a", "SEC_A", "buy", quantity=10.0)
+    tol = FROZEN.reconcile_quantity_tolerance
+    for filled in (4.0, 10.0, 10.0 + tol / 2):
+        result = _run(
+            _ledger(1_000.0, SEC_A=filled),
+            _positions(AAA=filled),
+            1_000.0,
+            filled_orders=[FilledOrder(row, filled, filled * 100.0)],
+        )
+        assert "overfilled" not in _kinds(result)
+
+
+def test_a_notional_order_is_overfilled_past_its_buffer_only() -> None:
+    row = _order_row("tp-a", "SEC_A", "buy", notional=500.0)
+    inside = 500.0 * (1 + FROZEN.whole_share_price_buffer)
+    for notional, expected in ((inside, []), (inside + 1.0, ["overfilled"])):
+        result = _run(
+            _ledger(1_000.0, SEC_A=5.0),
+            _positions(AAA=5.0),
+            1_000.0,
+            filled_orders=[FilledOrder(row, 5.0, notional)],
+        )
+        assert [k for k in _kinds(result) if k == "overfilled"] == expected
+
+
+def test_a_size_that_cannot_be_read_is_overfilled_never_a_pass() -> None:
+    row = _order_row("tp-a", "SEC_A", "buy", quantity=10.0)
+    for quantity, notional in ((math.nan, 100.0), (5.0, math.inf)):
+        result = _run(
+            _ledger(1_000.0, SEC_A=5.0),
+            _positions(AAA=5.0),
+            1_000.0,
+            filled_orders=[FilledOrder(row, quantity, notional)],
+        )
+        assert "overfilled" in _kinds(result)

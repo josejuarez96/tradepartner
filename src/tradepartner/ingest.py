@@ -326,6 +326,7 @@ from tradepartner.adapters.form4_route import (
 from tradepartner.adapters.openfigi import FigiType, parse_mapping
 from tradepartner.adapters.openfigi_raw import map_tickers
 from tradepartner.adapters.prices import (
+    ActionType,
     Bar,
     CorporateAction,
     Merger,
@@ -372,9 +373,11 @@ from tradepartner.store.delistings import (
     listing_ends_as_of,
 )
 from tradepartner.store.filing_index import snapshot_id as index_snapshot_id
+from tradepartner.store.listing_selection import prefer_current_listing
 from tradepartner.store.master import (
     ChainCandidate,
     MasterBuild,
+    RenameChange,
     build_chains,
     build_master,
     chain_candidates,
@@ -383,6 +386,7 @@ from tradepartner.store.master import (
     securities_as_of,
     security_cik,
     session_of,
+    stored_rename_changes,
     stored_snapshot_history,
 )
 from tradepartner.store.master import (
@@ -488,7 +492,7 @@ def ingest_openfigi(
                 if row["valid_from"] > session:
                     continue
                 old = current.get(sid)
-                if old is None or row["valid_from"] > old["valid_from"]:
+                if prefer_current_listing(row, old, session):
                     current[sid] = row
             for sid, row in sorted(current.items()):
                 status, end = row["status"], row["end_session"]
@@ -504,7 +508,14 @@ def ingest_openfigi(
                     # `BF/B`.
                     undotted = class_symbols.get(ticker, ticker).replace(".", "/")
                     prepared.append((sid, ticker, undotted))
-        responses.extend(mapping([job[2] for job in prepared], settings.openfigi, clock=clock))
+        responses.extend(
+            mapping(
+                [job[2] for job in prepared],
+                settings.openfigi,
+                api_key=settings.openfigi_api_key,
+                clock=clock,
+            )
+        )
 
     def write(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
         count = unmapped = errors = 0
@@ -589,7 +600,8 @@ _TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ("security_id", "ticker", "exchange", "valid_from"),
         ("class_title", "retracted"),
     ),
-    "classifications": (("security_id",), ("sic", "security_type", "rule")),
+    # `issuer_class` (#3076, schema 48): a tag change alone is a new row.
+    "classifications": (("security_id",), ("sic", "security_type", "rule", "issuer_class")),
     "delistings": (
         ("security_id", "form", "class_title", "exchange", "filed_at"),
         ("effective_on",),
@@ -601,7 +613,7 @@ _TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 #: What makes an action row a new revision of its identity (`CorporateAction.same_values`).
 #: A value column a builder row may leave out, and what it means then: a
 #: master row is live unless a retraction says otherwise (#859).
-_VALUE_DEFAULTS: dict[str, Any] = {"retracted": False}
+_VALUE_DEFAULTS: dict[str, Any] = {"retracted": False, "issuer_class": None}
 
 _ACTION_VALUES: tuple[str, ...] = ("action_type", "ex_date", "ratio_or_amount", "cancelled")
 
@@ -1086,12 +1098,19 @@ def ingest_actions_backfill(
     clock: Callable[[], datetime] = utc_now,
     dry_run: bool = False,
     scan: Callable[[Sequence[Any], date, date], Mapping[str, Any]] | None = None,
+    name_changes_only: bool = False,
 ) -> IngestResult:
     """Scan spin-offs and name changes by process-date month, without symbols.
 
     Each month is an independent source chunk in mode ``actions``. A dry run
     fetches and reports each month while rolling its fact writes and run row
     back. The ordinary backfill resume cursor ignores this mode and status.
+
+    With `name_changes_only` (#3054) only name changes are asked, from
+    `alpaca.name_change_backfill_floor`: the stored changes are what lets a
+    renamed security's pre-rename symbol carry its splits and dividends
+    (`ListingResolver.action_alias`), and the spin-off and merger floor
+    (`alpaca.actions_backfill_floor`) stays where it is.
     """
     from alpaca.data.enums import CorporateActionsType
 
@@ -1102,10 +1121,14 @@ def ingest_actions_backfill(
 
     if isinstance(since, datetime) or not isinstance(since, date):
         raise TypeError("since must be a date")
-    if since < settings.alpaca.actions_backfill_floor:
+    floor = (
+        settings.alpaca.name_change_backfill_floor
+        if name_changes_only
+        else settings.alpaca.actions_backfill_floor
+    )
+    if since < floor:
         raise ValueError(
-            f"actions backfill starts at {settings.alpaca.actions_backfill_floor}; "
-            "earlier symbol-less coverage is unknown"
+            f"actions backfill starts at {floor}; earlier symbol-less coverage is unknown"
         )
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     through = through or now.astimezone(_NEW_YORK).date()
@@ -1113,11 +1136,15 @@ def ingest_actions_backfill(
         raise ValueError("through must be a date on or after since")
     fetch = scan or partial(alpaca_raw.corporate_actions_scan, settings=settings)
     types = (
-        CorporateActionsType.SPIN_OFF,
-        CorporateActionsType.NAME_CHANGE,
-        CorporateActionsType.CASH_MERGER,
-        CorporateActionsType.STOCK_MERGER,
-        CorporateActionsType.STOCK_AND_CASH_MERGER,
+        (CorporateActionsType.NAME_CHANGE,)
+        if name_changes_only
+        else (
+            CorporateActionsType.SPIN_OFF,
+            CorporateActionsType.NAME_CHANGE,
+            CorporateActionsType.CASH_MERGER,
+            CorporateActionsType.STOCK_MERGER,
+            CorporateActionsType.STOCK_AND_CASH_MERGER,
+        )
     )
 
     def run_month(first: date, last: date) -> SourceRun:
@@ -1135,6 +1162,7 @@ def ingest_actions_backfill(
                 process_end=last,
                 lag_days=settings.alpaca.actions_process_lag_days,
                 stock_rules=settings.alpaca,
+                backdated=resolver.backdated,  # #3054
             )
 
         def write(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
@@ -1154,6 +1182,7 @@ def ingest_actions_backfill(
             counts["actions_spinoff_revisions"] = parsed.spinoff_revisions
             counts["actions_spinoff_unordered"] = len(parsed.spinoff_unordered)
             counts["symbol_change_reused"] = parsed.symbol_change_reused
+            counts["symbol_change_backdated"] = parsed.symbol_change_backdated
             counts["symbol_change_conflict"] = parsed.symbol_change_conflict
             message = "; ".join(f"{key}={value}" for key, value in sorted(counts.items()))
             return (
@@ -1183,6 +1212,159 @@ def ingest_actions_backfill(
         if run.status != ACTIONS_FILLED:
             break
     return IngestResult(tuple(runs))
+
+
+def ingest_spinoff_backfill(
+    settings: Settings,
+    *,
+    since: date,
+    through: date | None = None,
+    release: str | None = None,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+    fetch: Callable[[list[str], date, date], Mapping[str, Any]] | None = None,
+) -> IngestResult:
+    """Ask Alpaca for `spin_offs` per symbol, by calendar month (#3058).
+
+    The symbol-less scan (`ingest_actions_backfill`) finds nothing before
+    `alpaca.actions_backfill_floor` (the 2026-10-11 corpact probe), but the
+    per-symbol request does (#101: GE -> WAB on 2019-02-25), and the bar
+    backfill that asked per symbol for 2016 to 2020 ran before `spin_offs`
+    was read (#1506). So each month asks the request the bar backfill makes
+    (`backfill._window_names`: every security a bar of the month could land
+    on) for the `spin_off` type alone, through `AlpacaPriceSource`
+    (resolution, the child's `.WI` root, the kept-if-parent-or-child rule),
+    and writes the spin-offs by `_add_actions`' rules (the #1712 floor, the
+    revision rule; a row first seen is stamped at its own `known_at`, a
+    replacement at the run). It asks for no split or dividend, so no other
+    row is touched.
+
+    `through` defaults to the day before the floor. A real run writes only
+    inside the open data release `release` (it adds history before every
+    registered trial's cutoff, so it moves the data vintage): checked before
+    the first month and again under each month's write lock. A dry run
+    fetches and reports each month while rolling its writes and run row back.
+    Each month is an independent chunk in mode `actions` (status `filled`),
+    which the ordinary backfill cursor ignores; a month that does not fill
+    stops the run."""
+    from alpaca.data.enums import CorporateActionsType
+
+    from tradepartner.adapters import alpaca_raw
+    from tradepartner.adapters.alpaca_prices import AlpacaPriceSource
+    from tradepartner.backfill import _window_names, month_windows
+    from tradepartner.repair import release_refusal, store_resolver
+
+    if isinstance(since, datetime) or not isinstance(since, date):
+        raise TypeError("since must be a date")
+    floor = settings.alpaca.actions_backfill_floor
+    through = through or floor - timedelta(days=1)
+    if isinstance(through, datetime) or not isinstance(through, date) or through < since:
+        raise ValueError("through must be a date on or after since")
+    if not dry_run and (release is None or not release.strip()):
+        raise ValueError("a spin-off backfill writes only inside a named data release")
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    if not dry_run:
+        assert release is not None
+        with _read(settings) as conn:
+            if (why := release_refusal(conn, release)) is not None:
+                raise ValueError(f"{why}; nothing written")
+    ask = fetch or partial(
+        alpaca_raw.corporate_actions, types=[CorporateActionsType.SPIN_OFF], settings=settings
+    )
+
+    def run_month(first: date, last: date) -> SourceRun:
+        prepared: dict[str, Any] = {}
+
+        def prepare() -> None:
+            with _read(settings) as conn:
+                resolver = store_resolver(conn, now, settings)
+                ids = _window_names(conn, now, (first, last), settings, resolver)[0]
+            source = AlpacaPriceSource(resolver, fetch_actions=ask, settings=settings)
+            prepared["actions"] = [
+                a
+                for a in source.corporate_actions(ids, first, last)
+                if a.action_type is ActionType.SPINOFF
+            ]
+            prepared["report"] = source.last_actions_report
+            prepared["asked"] = len(ids)
+
+        def write(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
+            if not dry_run and release is not None and (why := release_refusal(conn, release)):
+                raise ValueError(f"{why}; nothing written")
+            actions = prepared["actions"]
+            report = prepared["report"]
+            stamp = ensure_tz_aware_utc(clock(), field_name="clock()")
+            # A live split of a spin-off's parent on its ex-date is a spin-off
+            # stored as a split that the reviewed list does not name (#3058,
+            # quant-auditor): with spin-offs on, a trial would apply both. A dry
+            # run names them; a real run writes nothing for the month.
+            collisions = _split_spinoff_collisions(conn, actions)
+            if collisions and not dry_run:
+                raise ValueError(
+                    f"{len(collisions)} live split row(s) on a spin-off's parent and ex-date, "
+                    f"not on store/spinoff_splits.csv: {', '.join(collisions)}; review them first"
+                )
+            counts: dict[str, int] = {"split_spinoff_collisions": len(collisions)}
+            added = _add_actions(conn, actions, (first, last), ingested_at=stamp, stats=counts)
+            if report is not None:
+                counts["actions_unresolved"] = len(report.unresolved)
+                counts["actions_self_spinoff"] = report.self_spinoff
+                counts["actions_spinoff_revisions"] = report.spinoff_revisions
+                counts["actions_spinoff_unordered"] = len(report.spinoff_unordered)
+                counts["spinoffs_unrequested"] = report.spinoffs_unrequested
+                if report.malformed_categories:
+                    raise ValueError(f"malformed {', '.join(report.malformed_categories)}")
+            message = "; ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+            named = f"; collisions: {', '.join(collisions)}" if collisions else ""
+            return (
+                added,
+                f"{first}..{last}: {len(actions)} spin-off action(s) of "
+                f"{prepared['asked']} securities asked; {message}{named}",
+            )
+
+        return _run_source(
+            "alpaca",
+            write,
+            settings,
+            now,
+            clock,
+            f"spinoffs;since={since};through={last}",
+            dry_run,
+            mode=ACTIONS_MODE,
+            prepare=prepare,
+            success_status=ACTIONS_FILLED,
+        )
+
+    runs: list[SourceRun] = []
+    for first, last in month_windows(since, through):
+        run = run_month(first, last)
+        runs.append(run)
+        if run.status != ACTIONS_FILLED:
+            break
+    return IngestResult(tuple(runs))
+
+
+def _split_spinoff_collisions(
+    conn: duckdb.DuckDBPyConnection, actions: Sequence[CorporateAction]
+) -> list[str]:
+    """`"parent ex_date ratio"` of every live stored `split` (latest revision,
+    not cancelled) of a spin-off's parent on the spin-off's ex-date (#3058)."""
+    keys = sorted(
+        {(a.source_action_id, a.ex_date) for a in actions if a.source_action_id is not None}
+    )
+    if not keys:
+        return []
+    found = conn.execute(
+        "SELECT security_id, ex_date, ratio_or_amount FROM ("
+        "  SELECT *, row_number() OVER (PARTITION BY security_id, source_action_id, "
+        "    CASE WHEN source_action_id = '' THEN ex_date END ORDER BY known_at DESC) AS rn "
+        "  FROM corporate_actions WHERE action_type = 'split' "
+        "    AND security_id IN (SELECT unnest(?))) "
+        "WHERE rn = 1 AND NOT cancelled ORDER BY security_id, ex_date",
+        [sorted({parent for parent, _ in keys})],
+    ).fetchall()
+    wanted = set(keys)
+    return [f"{sid} {ex} {ratio!r}" for sid, ex, ratio in found if (sid, ex) in wanted]
 
 
 _FORM4_BACKFILL: ContextVar[bool] = ContextVar("form4_backfill", default=False)
@@ -1880,27 +2062,15 @@ def _index_state(
         ).fetchall()
     else:
         # The adapter needs the history of listed accessions and the rows of a
-        # new issuer's walk, not the store's entire 15M-row index.
-        raw_rows = []
-        accessions = sorted(candidate_accessions)
-        for start in range(0, len(accessions), 500):
-            chunk = accessions[start : start + 500]
-            marks = ", ".join("?" for _ in chunk)
-            raw_rows.extend(
-                conn.execute(
-                    f"SELECT {columns} FROM filing_index WHERE accession IN ({marks}) "
-                    "AND known_at <= ?",
-                    [*chunk, now],
-                ).fetchall()
-            )
-        for cik in sorted(candidate_ciks):
-            raw_rows.extend(
-                conn.execute(
-                    f"SELECT {columns} FROM filing_index WHERE cik = ? AND known_at <= ?",
-                    [cik, now],
-                ).fetchall()
-            )
-        raw_rows = list({(row[0], row[1], row[7]): row for row in raw_rows}.values())
+        # new issuer's walk, not the store's entire 15M-row index. #2921: one
+        # scan for both sets, not one per 500-accession chunk and per CIK.
+        # The table is unique on (cik, accession, known_at), so no row repeats.
+        raw_rows = conn.execute(
+            f"SELECT {columns} FROM filing_index WHERE known_at <= ? AND ("
+            "accession IN (SELECT unnest(?::VARCHAR[])) "
+            "OR cik IN (SELECT unnest(?::VARCHAR[])))",
+            [now, sorted(candidate_accessions), sorted(candidate_ciks)],
+        ).fetchall()
     rows = tuple(stored_index.FilingRow(*row) for row in raw_rows)
     pending = tuple(
         PendingIndexRow(*row)
@@ -2192,13 +2362,19 @@ def _propose_index(
             for row in proposal.rows
             if row.cik not in state.issuer_ciks and row.form in issuer_forms
         }
+        # #2921: each file's quarter parsed once and membership a set lookup,
+        # not a list scan per new issuer and file.
+        file_quarters = []
+        for file in state.daily_files:
+            day = date.fromisoformat(file.name.split(".")[1])
+            file_quarters.append((file, (day.year, (day.month - 1) // 3 + 1)))
+        already_read = set(daily_read)
         for cik in new_issuers:
             first, last = proposal.filers[cik]
-            for file in state.daily_files:
-                day = date.fromisoformat(file.name.split(".")[1])
-                quarter = (day.year, (day.month - 1) // 3 + 1)
-                if first <= quarter <= last and file not in daily_read:
+            for file, quarter in file_quarters:
+                if first <= quarter <= last and file not in already_read:
                     daily_read.append(file)
+                    already_read.add(file)
             for year, number in _index_quarters(settings.edgar.index_first_year, now):
                 quarter = (year, number)
                 if not first <= quarter <= last or quarter not in settled_days:
@@ -2445,6 +2621,23 @@ def _cache_completeness(
     return facts, statements
 
 
+def _stored_ciks_of(
+    conn: duckdb.DuckDBPyConnection, accessions: Collection[str]
+) -> dict[str, set[str]]:
+    """Every CIK any stored revision lists under each of ``accessions``, read in
+    one scan (#2921), not one per accession. Each accession is a key, with an
+    empty set when no row has it."""
+    found: dict[str, set[str]] = {accession: set() for accession in accessions}
+    if found:
+        for accession, cik in conn.execute(
+            "SELECT DISTINCT accession, cik FROM filing_index "
+            "WHERE accession IN (SELECT unnest(?::VARCHAR[]))",
+            [sorted(found)],
+        ).fetchall():
+            found[accession].add(cik)
+    return found
+
+
 def _index_touch_state(
     settings: Settings,
     source: FilingSource,
@@ -2485,13 +2678,8 @@ def _index_touch_state(
         accession_ciks[row.accession].add(row.cik)
     relevant = set(failures) | set(previous.get("failures", {})) | new_accessions
     with open_read_only(settings, retry=True) as conn:
-        for accession in sorted(relevant):
-            accession_ciks[accession].update(
-                cik
-                for (cik,) in conn.execute(
-                    "SELECT DISTINCT cik FROM filing_index WHERE accession = ?", [accession]
-                ).fetchall()
-            )
+        for accession, ciks in _stored_ciks_of(conn, relevant).items():
+            accession_ciks[accession].update(ciks)
         settled: set[str] = set()
         if previous_at is not None:
             for year, number in _index_quarters(settings.edgar.index_first_year, now):
@@ -2524,6 +2712,16 @@ def _index_touch_state(
                 for (cik,) in conn.execute(
                     "SELECT DISTINCT cik FROM filing_index WHERE accepted_at > ? "
                     "AND accepted_at <= ?",
+                    [previous_at, now],
+                ).fetchall()
+            )
+            # A name change (#3057) that became known since the last run: its
+            # CIK's new-ticker listing row is derived from it, so rebuild it.
+            newly_known.update(
+                security_cik(security_id)
+                for (security_id,) in conn.execute(
+                    "SELECT DISTINCT security_id FROM symbol_changes "
+                    "WHERE known_at > ? AND known_at <= ?",
                     [previous_at, now],
                 ).fetchall()
             )
@@ -2767,7 +2965,11 @@ def _rotation_report(
         if entry.cik in batch.rotation or entry.ticker in settings.benchmarks
     )
     master, delistings, classes, facts, _unmatched = _build_filings(
-        batch.rotation_recorded, settings, now, earlier_fetches=earlier
+        batch.rotation_recorded,
+        settings,
+        now,
+        earlier_fetches=earlier,
+        renames=stored_rename_changes(conn, now, batch.rotation),
     )
     products: dict[str, Sequence[Row]] = {
         "securities": master.securities,
@@ -3092,6 +3294,7 @@ def _statement_backfill_start(
     resume point from this digest's `partial` rows written after it."""
     from tradepartner.store.build_fingerprint import (
         PER_NAME_KEYS,
+        REVIEWED_LISTINGS_KEY,
         additive_statement_change,
         build_fingerprint,
     )
@@ -3120,7 +3323,10 @@ def _statement_backfill_start(
         return _BackfillStart(change.refusal)
     stored = cursor.get("per_name") or {}
     current = build_fingerprint(settings).per_name
-    if any(stored.get(key) != current[key] for key in PER_NAME_KEYS):
+    if any(
+        stored.get(key, [] if key == REVIEWED_LISTINGS_KEY else None) != current[key]
+        for key in (*PER_NAME_KEYS, REVIEWED_LISTINGS_KEY)
+    ):
         # Outside the hash, so T365a lets it through; the final row would absorb
         # it and the next nightly would never touch its CIKs.
         return _BackfillStart(
@@ -3832,6 +4038,18 @@ def _write_form4_bulk(
             "events.form4_compare_threshold needs the raw archive: its review markers "
             "live in the writer's provenance manifest"
         )
+    bulk_trusted = sorted(
+        name for name, src in settings.events.form4_compare_trusted.items() if src == "bulk"
+    )
+    if settings.events.form4_compare_threshold is not None and bulk_trusted:
+        # #2994: such a row would be stored as `sec_form4_xml` under the XML body's hash,
+        # which no re-derive from the kept XML reproduces. `EventsConfig` refuses the pair
+        # at load; this backstops settings built without validation (`model_copy`).
+        raise ValueError(
+            f"events.form4_compare_trusted has fields trusted to the bulk set {bulk_trusted}; "
+            "with events.form4_compare_threshold set their rows would be stored under the "
+            "XML's provenance (#2994), so the Form 4 step refuses them"
+        )
     previous = getattr(source, "form4_xml_keeper", None)
     source.form4_xml_keeper = None if provenance is None else provenance.keep_xml
     try:
@@ -4327,6 +4545,17 @@ def _form4_bulk(
             provenance.set_markers(
                 {accession}, marker_entries(accession, label, digests.get(quarter), found)
             )
+        # A marked accession compared again this run that now agrees is resolved
+        # (#2994); one never compared again keeps its carried marker.
+        resolved = sorted((marked & rule5.compared) - rule5.found.keys())
+        for accession in resolved:
+            quarter = accession_quarters[accession]
+            label = f"{quarter.year}q{quarter.number}"
+            provenance.set_markers(
+                {accession}, marker_entries(accession, label, digests.get(quarter), ())
+            )
+        if resolved:
+            counts["sec_forms_compare_marker_resolved"] = len(resolved)
     if rule5.tally.outcome(rule5.declaration.threshold) is Outcome.AT_OR_ABOVE and rule5.enforcing:
         link = ""
         unresolved = 0
@@ -4586,7 +4815,11 @@ def _ingest_filings(
             if entry.cik in touched_ciks or entry.ticker in settings.benchmarks
         )
     master, delistings, classes, facts, unmatched = _build_filings(
-        recorded, settings, now, earlier_fetches=earlier
+        recorded,
+        settings,
+        now,
+        earlier_fetches=earlier,
+        renames=stored_rename_changes(conn, now, touched_ciks),
     )
     record_snapshot_sightings(conn, recorded.companies_snapshot(), now, master.listings)
     restamped = ""
@@ -4706,10 +4939,19 @@ def _ingest_filings(
         f"unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
         f"{statements}{events}{sec_forms}{rebuilt}{restamped}{_source_counts(filings)}"
-        f"{_filename_counts(master, delistings, filings)}{chains}{candidates}; "
+        f"{_filename_counts(master, delistings, filings)}{chains}{candidates}"
+        f"{_rename_clause(master)}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
     return added, message
+
+
+def _rename_clause(master: MasterBuild) -> str:
+    """The #3057 name-change clause: refused changes by reason, empty when none."""
+    if not master.rename_refusals:
+        return ""
+    reasons = Counter(refusal.reason for refusal in master.rename_refusals)
+    return "; rename_refused: " + ", ".join(f"{why} {n}" for why, n in sorted(reasons.items()))
 
 
 def _chain_candidate_clause(candidates: Sequence[ChainCandidate]) -> str:
@@ -4827,7 +5069,7 @@ def _delete_classifications(
     if not ids:
         return 0
     deleted = conn.execute(
-        "DELETE FROM classifications WHERE list_contains(?, security_id)", [ids]
+        "DELETE FROM classifications WHERE security_id IN (SELECT unnest(?))", [ids]
     ).fetchone()
     return int(deleted[0]) if deleted else 0
 
@@ -4873,6 +5115,7 @@ def _source_counts(filings: FilingSource) -> str:
         ("cover_exchange_axis_mismatch", "cover exchange-axis mismatches"),
         ("fsn_missing", "FSN missing"),  # T11d: older cover-form accessions not in FSN
         ("pre_xml_delistings", "pre-XML delistings"),
+        ("unread_html_delistings", "unread HTML delistings"),  # #3084
         ("unstamped_delistings", "unstamped delistings"),  # T11f
         ("failed_filings", "failed filings"),  # T11h: the failure policy
         ("quarantined", "quarantined"),
@@ -4905,6 +5148,7 @@ def _build_filings(
     *,
     fetch: bool = False,
     earlier_fetches: Sequence[CompanySnapshotEntry] = (),
+    renames: Sequence[RenameChange] = (),
 ) -> tuple[MasterBuild, Any, ClassificationBuild, tuple[Row, ...], tuple[FactRecord, ...]]:
     """The builds over `filings`, the master also over `earlier_fetches`
     (the store's snapshot rows as fetches, #2291). The fetch pass (`fetch`) also asks
@@ -4914,7 +5158,11 @@ def _build_filings(
     `filing_events` for every issuer CIK while that switch is on (#1358),
     the same way."""
     master = build_master(
-        filings, settings, ingested_at=ingested_at, earlier_fetches=earlier_fetches
+        filings,
+        settings,
+        ingested_at=ingested_at,
+        earlier_fetches=earlier_fetches,
+        renames=renames,
     )
     delistings = build_delistings(filings.delistings(), master, ingested_at=ingested_at)
     classes = build_classifications(filings, master, settings, ingested_at=ingested_at)
@@ -5119,7 +5367,8 @@ class RestampResult:
     def message(self) -> str:
         """The run message's restamp part."""
         moved = ", ".join(
-            f"{t} {self.moved.get(t, 0)}" for t in (*RESTAMP_TABLES, *RESTAMP_ACCESSION_TABLES)
+            f"{t} {self.moved.get(t, 0)}"
+            for t in (*RESTAMP_TABLES, "delisting_reasons", *RESTAMP_ACCESSION_TABLES)
         )
         refused = ", ".join(f"{cik} ({why})" for cik, why in sorted(self.refused.items()))
         return (
@@ -5192,6 +5441,13 @@ def restamp_from_manifest(
     delisting's stamp) and `ingested_at` as its `ingested_at`; nothing else
     changes. A moved `facts` row with a later stored ingest of its accession (or a revision at
     its own) keeps its `ingested_at` (#2970), so a restamp never changes a read after it.
+
+    Every reason revision keyed to a moved delisting follows its `filed_at` to
+    the new stamp. A Form 25 reason known at the old stamp moves to the new
+    stamp; independent evidence keeps its acceptance time, and an as-of read
+    cannot attach it before the corrected filing.
+    A move is refused when independent evidence falls between the old and
+    corrected filing times, since its classification would need a rebuild.
 
     **`filing_index`** (T318b, #2703) has its own match path, on
     `(cik, accession)` with `accepted_at` equal to the old stamp (EDGAR
@@ -5341,6 +5597,24 @@ def restamp_from_manifest(
         "AND m.class_title = t.class_title AND m.exchange = t.exchange "
         f"AND m.old = t.known_at AND m.old = t.filed_at WHERE {_RESTAMPABLE} AND {keep}"
     )
+    # The Form 25's own reason moves with its corrected acceptance. Independent
+    # evidence never moves earlier, and no reason precedes the corrected filing.
+    reason_new_known = (
+        "CASE WHEN r.reason_source IN ('form25_provision', 'form25_text') "
+        "AND r.known_at = m.old THEN m.new "
+        "WHEN r.reason_source = 'eightk_item' THEN r.known_at "
+        "ELSE greatest(r.known_at, m.new) END"
+    )
+    matched_reasons = (
+        "FROM delisting_reasons r JOIN delistings t ON "
+        "r.security_id = t.security_id AND r.delisting_form = t.form "
+        "AND r.delisting_class_title = t.class_title "
+        "AND r.delisting_exchange = t.exchange AND r.delisting_filed_at = t.filed_at "
+        "JOIN _restamp_sids s ON s.security_id = t.security_id "
+        "JOIN _restamp_delisting m ON m.subject = s.cik AND m.form = t.form "
+        "AND m.class_title = t.class_title AND m.exchange = t.exchange "
+        f"AND m.old = t.known_at AND m.old = t.filed_at WHERE {_RESTAMPABLE} AND {keep}"
+    )
     refused: dict[str, str] = {}
     derived: dict[str, str] = {
         "securities": "m.session_moves AND t.security_id LIKE '%@%'",  # a successor's id
@@ -5367,6 +5641,31 @@ def restamp_from_manifest(
             f"(SELECT 1 FROM {table} o WHERE {same_key} AND {target})"
         ).fetchall():
             refused.setdefault(cik, f"{table}: a row is already stored at the new stamp")
+    for (cik,) in conn.execute(
+        "SELECT DISTINCT s.cik "
+        f"{matched_reasons} AND EXISTS (SELECT 1 FROM delisting_reasons o "
+        "WHERE o.security_id = r.security_id AND o.delisting_form = r.delisting_form "
+        "AND o.delisting_class_title = r.delisting_class_title "
+        "AND o.delisting_exchange = r.delisting_exchange "
+        f"AND o.delisting_filed_at = m.new AND o.known_at = {reason_new_known})"
+    ).fetchall():
+        refused.setdefault(cik, "delisting_reasons: a revision is already stored at the new key")
+    for (cik,) in conn.execute(
+        f"SELECT DISTINCT s.cik {matched_reasons} "
+        "AND r.reason_source NOT IN ('form25_provision', 'form25_text') "
+        "AND ((m.new < m.old AND r.known_at >= m.new AND r.known_at <= m.old) "
+        "OR (m.new > m.old AND r.known_at > m.old AND r.known_at < m.new))"
+    ).fetchall():
+        refused.setdefault(cik, "delisting_reasons: evidence between the corrected stamps")
+    for (cik,) in conn.execute(
+        "SELECT any_value(cik) FROM (SELECT DISTINCT s.cik, r.rowid, r.security_id, "
+        "r.delisting_form, "
+        "r.delisting_class_title, r.delisting_exchange, m.new, "
+        f"{reason_new_known} AS new_known {matched_reasons}) "
+        "GROUP BY security_id, delisting_form, delisting_class_title, "
+        "delisting_exchange, new, new_known HAVING count(*) > 1"
+    ).fetchall():
+        refused.setdefault(cik, "delisting_reasons: revisions would share a new key")
     _stage_filing_index_changes(conn, moving, filed)
     for cik, why in _filing_index_refusals(conn, filed).items():
         refused.setdefault(cik, why)
@@ -5375,12 +5674,28 @@ def restamp_from_manifest(
     refused_ids = frozenset(
         r[0]
         for r in conn.execute(
-            "SELECT security_id FROM _restamp_sids WHERE list_contains(?, cik)", [sorted(refused)]
+            "SELECT security_id FROM _restamp_sids WHERE cik IN (SELECT unnest(?))",
+            [sorted(refused)],
         ).fetchall()
     )
 
     before = {t: _security_ids(conn, t) for t in RESTAMP_TABLES}
     moved: dict[str, int] = {}
+    (reason_count,) = conn.execute(
+        f"SELECT count(DISTINCT r.rowid) {matched_reasons}"
+    ).fetchone() or (0,)
+    moved["delisting_reasons"] = int(reason_count)
+    if reason_count:
+        # The episode key is a stored revision too, even when an 8-K's own
+        # evidence acceptance stays fixed; record this ingest of the new key.
+        conn.execute(
+            "UPDATE delisting_reasons SET delisting_filed_at = u.new, "
+            "known_at = u.new_known, reason_known_at = u.new_known, ingested_at = ? "
+            "FROM (SELECT DISTINCT r.rowid AS rid, m.new AS new, "
+            f"{reason_new_known} AS new_known "
+            f"{matched_reasons}) u WHERE delisting_reasons.rowid = u.rid",
+            [ingested_at],
+        )
     for table in RESTAMP_TABLES:
         (count,) = conn.execute(f"SELECT count(DISTINCT t.rowid) {matched[table]}").fetchone() or (
             0,
@@ -6131,10 +6446,11 @@ def fact_rows(
     a listed preferred, warrant or note never takes shares. A fact whose
     member names a class letter (`us-gaap:CommonClassBMember`) goes to the
     one common class whose listing title names that letter ("Class B Common
-    Stock", "Series B common stock"), or whose cover-page title known at the
-    fact's acceptance does (`MasterBuild.class_titles`: a class first listed
-    as "Common Stock" and retitled "Class A Common Stock" later, #1166), and
-    is unmatched if none does (an unlisted class). Any other
+    Stock", "Series B common stock") and was known by the fact's acceptance
+    (a retracted listing row is skipped, #3405), or whose cover-page title
+    known at the fact's acceptance does (`MasterBuild.class_titles`: a class
+    first listed as "Common Stock" and retitled "Class A Common Stock" later,
+    #1166), and is unmatched if none does (an unlisted class). Any other
     fact (undimensioned, or a member with no letter) goes to the sole common
     class, and is unmatched when there are several: a total is no one
     class's shares. `class_member_overrides` (`edgar.class_member_overrides`,
@@ -6238,11 +6554,13 @@ def fact_rows(
             alive = [sid for sid in alive if sid not in gone]
         return alive
 
-    letters: dict[str, set[str]] = defaultdict(set)
+    letters: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
     for row in master.listings:
+        if row.get("retracted", False):
+            continue
         letter = _title_letter(row["class_title"] or "")
         if letter:
-            letters[row["security_id"]].add(letter)
+            letters[row["security_id"]].append((row["known_at"], letter))
     titled: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
     for title in master.class_titles:
         letter = _title_letter(title.title)
@@ -6250,9 +6568,8 @@ def fact_rows(
             titled[title.security_id].append((title.known_at, letter))
 
     def letters_at(sid: str, t: datetime) -> set[str]:
-        """The letters `sid`'s listing titles name, plus those its cover-page
-        titles known at `t` name (no later page names an earlier fact's class)."""
-        return letters[sid] | {letter for at, letter in titled[sid] if at <= t}
+        """Letters named by live listing and cover-page titles known at `t`."""
+        return {letter for at, letter in (*letters[sid], *titled[sid]) if at <= t}
 
     linker = _ClassLinker(master) if class_member_link else None
     largest = (
@@ -6386,6 +6703,8 @@ class _ClassLinker:
         self._titles: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
         self._listed: dict[str, datetime] = {}
         for row in master.listings:
+            if row.get("retracted", False):
+                continue
             sid, at = row["security_id"], row["known_at"]
             if row["class_title"]:
                 self._titles[sid].append((at, row["class_title"]))
@@ -6480,7 +6799,7 @@ def _fetch_prices(
             fetch, listed, static_only, may_count, reference = _price_names(
                 conn, read_at, session, settings
             )
-            missed = _missed_sessions(conn, settings, session)
+            missed = _missed_sessions(conn, settings, session, reference, fetch)
             if missed:
                 # #1572: a name delisted inside the gap is fetched for the missed
                 # sessions it still traded on (its last bars), never for `session`.
@@ -6670,34 +6989,94 @@ _PLAIN_INGEST_STEP = (
 )
 
 
-def _stored_sessions(conn: duckdb.DuckDBPyConnection, session: date) -> set[date]:
-    """The `prices_daily` sessions at or before `session` holding a bar of any
-    security (#1572)."""
-    return {
+def _stored_sessions(
+    conn: duckdb.DuckDBPyConnection,
+    session: date,
+    reference: str | None = None,
+    names: Collection[str] = (),
+    limit: float = 1.0,
+    recent: int = 0,
+) -> set[date]:
+    """The `prices_daily` sessions at or before `session` the store holds
+    whole (#1572, #3329). Without `reference` that is every session holding a
+    bar of any security. With it, a session counts as stored only when the
+    reference symbol has a bar and no more than `limit`
+    (`ingest.max_missing_share`) of `names` (those with a bar on or before
+    that session, so a later listing is not missing earlier) lack one: a stray
+    bar must not hide a missed session. Only the `recent` sessions before
+    `session` are held to that (the window a daily run can re-fetch, from
+    `alpaca.max_catchup_sessions`); an older session with any bar stays stored,
+    so history thinner than today's share is not re-fetched."""
+    stored = {
         row[0]
         for row in conn.execute(
             "SELECT DISTINCT session FROM prices_daily WHERE session <= ?", [session]
         ).fetchall()
     }
+    if reference is None:
+        return stored
+    wanted = set(names)
+    sessions = all_sessions()
+    oldest = sessions[max(0, bisect_left(sessions, session) - recent)]
+    # Name lists are read only for the window, never the whole history.
+    rows = conn.execute(
+        "SELECT session, list(DISTINCT security_id) FROM prices_daily "
+        "WHERE session >= ? AND session <= ? GROUP BY session",
+        [oldest, session],
+    ).fetchall()
+    # The names still trading: those with a bar inside the window. A name dark
+    # since before it is not "missing" from a session (the daily check leaves
+    # dark names out of its share too, #784).
+    active: set[str] = set().union(*(wanted.intersection(held) for _, held in rows))
+    firsts = conn.execute(
+        "SELECT min(session) FROM prices_daily WHERE session <= ? "
+        "AND security_id IN (SELECT unnest(?)) GROUP BY security_id",
+        [session, sorted(active)],
+    ).fetchall()
+    starts = sorted(row[0] for row in firsts)
+    whole = {day for day in stored if day < oldest}
+    for day, held in rows:
+        if reference not in held:
+            continue
+        base = bisect_right(starts, day)
+        present = len(active.intersection(held))
+        if base and (base - present) / base > limit:
+            continue
+        whole.add(day)
+    return whole
 
 
 def _missed_sessions(
-    conn: duckdb.DuckDBPyConnection, settings: Settings, session: date
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    session: date,
+    reference: str | None = None,
+    names: Collection[str] = (),
 ) -> list[date]:
     """The XNYS sessions after the store's first stored bar and before
     `session` that the store lacks, oldest first (#1572): what a daily run
     must leave stored to report `ok`. Empty on a store with no prices at
     all and on one complete through the previous session. The expected
-    session is not here: every run fetches it.
+    session is not here: every run fetches it. With `reference` and the
+    fetched `names`, a session counts as stored only when it is whole
+    (`_stored_sessions`, #3329); a first bar alone starts the span.
 
     More than `alpaca.max_catchup_sessions` of them is a lapse this path
     must not paper over: `_Stale` names them and the `--backfill --since`
     command that clears them (`backfill.backfill`)."""
-    stored = _stored_sessions(conn, session)
-    if not stored:
+    anything = _stored_sessions(conn, session)
+    if not anything:
         return []
+    stored = _stored_sessions(
+        conn,
+        session,
+        reference,
+        names,
+        settings.ingest.max_missing_share,
+        settings.alpaca.max_catchup_sessions,
+    )
     sessions = all_sessions()
-    span = sessions[bisect_right(sessions, min(stored)) : bisect_left(sessions, session)]
+    span = sessions[bisect_right(sessions, min(anything)) : bisect_left(sessions, session)]
     missed = [day for day in span if day not in stored]
     bound = settings.alpaca.max_catchup_sessions
     if len(missed) > bound:
@@ -7096,9 +7475,7 @@ def _price_names(
         sid = row["security_id"]
         _first_listed(earliest, row, settings)
         held = current.get(sid)
-        if row["valid_from"] <= session and (
-            held is None or row["valid_from"] > held["valid_from"]
-        ):
+        if row["valid_from"] <= session and prefer_current_listing(row, held, session):
             current[sid] = row
     kinds = {
         row["security_id"]: row["security_type"]
@@ -7190,8 +7567,8 @@ def _stored_actions(
     ids = sorted({row["security_id"] for row in rows})
     source_ids = sorted({row["source_action_id"] for row in rows if row["source_action_id"]})
     cursor = conn.execute(
-        "SELECT * FROM corporate_actions WHERE list_contains(?, security_id) "
-        "AND (ex_date BETWEEN ? AND ? OR list_contains(?, source_action_id))",
+        "SELECT * FROM corporate_actions WHERE security_id IN (SELECT unnest(?)) "
+        "AND (ex_date BETWEEN ? AND ? OR source_action_id IN (SELECT unnest(?)))",
         [ids, *window, source_ids],
     )
     names = [d[0] for d in cursor.description]
@@ -7480,7 +7857,9 @@ def _add_symbol_changes(
     ids = sorted({change.security_id for change in changes})
     if not ids:
         return 0
-    cursor = conn.execute("SELECT * FROM symbol_changes WHERE list_contains(?, security_id)", [ids])
+    cursor = conn.execute(
+        "SELECT * FROM symbol_changes WHERE security_id IN (SELECT unnest(?))", [ids]
+    )
     names = [column[0] for column in cursor.description]
     history: dict[_Identity, list[Row]] = defaultdict(list)
     for values in cursor.fetchall():
@@ -7575,7 +7954,7 @@ def _add_mergers(
     ids = sorted({merger.security_id for merger in mergers})
     if not ids:
         return 0
-    cursor = conn.execute("SELECT * FROM mergers WHERE list_contains(?, security_id)", [ids])
+    cursor = conn.execute("SELECT * FROM mergers WHERE security_id IN (SELECT unnest(?))", [ids])
     names = [column[0] for column in cursor.description]
     history: dict[_Identity, list[Row]] = defaultdict(list)
     for values in cursor.fetchall():
@@ -7610,7 +7989,7 @@ def _add_mergers(
             SELECT count(*) FROM (
                 SELECT security_id, effective_date FROM (
                     SELECT security_id, source_action_id, effective_date FROM mergers
-                    WHERE list_contains(?, security_id)
+                    WHERE security_id IN (SELECT unnest(?))
                     QUALIFY row_number() OVER (
                         PARTITION BY security_id, source_action_id ORDER BY known_at DESC
                     ) = 1
@@ -7670,7 +8049,7 @@ def _add_rows(
 
     ids = sorted({row["security_id"] for row in rows})
     cursor = conn.execute(
-        f"SELECT * FROM {table} WHERE list_contains(?, security_id) {where}", [ids, *params]
+        f"SELECT * FROM {table} WHERE security_id IN (SELECT unnest(?)) {where}", [ids, *params]
     )
     names = [d[0] for d in cursor.description]
     history: dict[tuple[Any, ...], list[Row]] = defaultdict(list)

@@ -7,15 +7,21 @@ from __future__ import annotations
 
 import ast
 import re
-from datetime import timedelta
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
 import pytest
 
-from lookahead.harness import TruncatedStore, probe_timestamps
+from lookahead.harness import PROBE_EPSILON, TruncatedStore, probe_timestamps
+from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import next_session, session_close
+from tradepartner.config import Settings
+from tradepartner.store import registry
 from tradepartner.store.asof import mergers_as_of
+from tradepartner.store.db import insert_row
 
 _SRC = Path(__file__).resolve().parents[2] / "src" / "tradepartner"
 _FIXTURE_MERGERS = {
@@ -199,3 +205,110 @@ def test_guard_catches_second_reader(extra: str, path: Path) -> None:
 @pytest.mark.parametrize("path", sorted(_T328B_READERS))
 def test_guard_allows_real_provider_method(path: Path) -> None:
     assert _mergers_reader_violations((_SRC / path).read_text(), path) == []
+
+
+# --- #2949: the acquirer close through the successor chain known at the cut ---------
+
+#: The chain overlay's 0001000010 -> 0001000011 pair (#821): its chain row's `known_at`.
+_CHAIN_KNOWN_AT = datetime(2020, 2, 7, 20, 30, tzinfo=UTC)
+#: A session only the successor has a bar on (the predecessor's bars end before it).
+_CHAIN_EFFECTIVE = date(2020, 2, 6)
+
+
+def _lend(
+    conn: duckdb.DuckDBPyConnection,
+) -> Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]:
+    @contextmanager
+    def connect() -> Iterator[duckdb.DuckDBPyConnection]:
+        yield conn
+
+    return connect
+
+
+def _chain_merger_handle(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> registry.TrialHandle:
+    """A stock merger whose acquirer is the chained predecessor, known before the chain,
+    and a synthetic trial whose cutoff covers both probes."""
+    stamp = datetime(2020, 2, 7, 20, tzinfo=UTC)
+    insert_row(
+        conn,
+        "mergers",
+        {
+            "security_id": "TGT_CHAIN",
+            "kind": "stock",
+            "acquirer_security_id": "0001000010",
+            "acquiree_symbol": "TGT_CHAIN",
+            "acquiree_cusip": "",
+            "acquirer_symbol": "CHNA",
+            "acquirer_cusip": "",
+            "share_ratio": 0.5,
+            "cash_per_share": None,
+            "effective_date": _CHAIN_EFFECTIVE,
+            "process_date": _CHAIN_EFFECTIVE,
+            "payable_date": None,
+            "source_action_id": "m-chain",
+            "known_at": stamp,
+            "ingested_at": stamp,
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    )
+    hypothesis = registry.register_hypothesis(
+        conn,
+        slug="h-merger-chain",
+        family="momentum",
+        title="merger chain look-ahead",
+        doc_path="docs/hypotheses/h-merger-chain.md",
+        doc_sha256="0" * 64,
+        params={"costs.per_side_bps": 15.0},
+        in_sample_start=date(2019, 10, 31),
+        holdout_start=date(2023, 1, 1),
+        holdout_end=date(2025, 12, 31),
+        registered_by="test",
+        settings=settings,
+    )
+    return registry.open_trial(
+        conn,
+        hypothesis_id=hypothesis.hypothesis_id,
+        kind="in_sample",
+        start_session=date(2019, 10, 31),
+        end_session=date(2020, 6, 30),
+        data_cutoff=datetime(2020, 6, 30, 20, tzinfo=UTC),
+        synthetic=True,
+        run_by="test",
+        settings=settings,
+    )
+
+
+def test_merger_exits_resolve_the_acquirer_through_the_chain_known_at_the_cut(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """#2949: the acquirer close follows only the chain known at `t`. One microsecond
+    before the chain row's `known_at` the predecessor has no bar on the effective date
+    and the close is null (the successor's bar is not reached through a chain not yet
+    known); from the stamp it is the successor's bar. Both answers equal those of the
+    store truncated to `t` (the truncated set includes `successor_chains`)."""
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
+    settings = Settings(_env_file=None)
+    conn = chain_fixture_store
+    handle = _chain_merger_handle(conn, settings)
+    cut = TruncatedStore(conn)
+    try:
+        assert {"mergers", "successor_chains", "prices_daily"} <= set(cut.tables)
+        expected = {_CHAIN_KNOWN_AT - PROBE_EPSILON: None, _CHAIN_KNOWN_AT: 19.74}
+        for t, close in expected.items():
+            with StoreProvider(_lend(conn), handle, settings) as provider:
+                full = provider.merger_exits(t, ["TGT_CHAIN"])
+            with StoreProvider(
+                _lend(cut.at(t)), handle, settings, registry_connect=_lend(conn)
+            ) as provider:
+                truncated = provider.merger_exits(t, ["TGT_CHAIN"])
+            assert full.select("acquirer_security_id", "acquirer_raw_close").rows() == [
+                ("0001000010", close)
+            ], t
+            assert full.equals(truncated), t
+    finally:
+        cut.close()

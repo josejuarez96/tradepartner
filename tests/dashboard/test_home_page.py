@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from dashboard_nav import nav_calls_fixture  # noqa: F401
+from dashboard_nav import app_test, nav_calls_fixture  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.config import Settings
@@ -124,7 +124,7 @@ def _app(
     monkeypatch.setattr(
         ops, "performance_data", lambda conn, settings, book_id=None, *, now: _perf()
     )
-    at = AppTest.from_file(_APP_PATH, default_timeout=30)
+    at = app_test(_APP_PATH)
     at.run()
     assert not at.exception
     return at
@@ -163,7 +163,7 @@ def test_version_37_store_shows_journal_outdated(
         raise AssertionError("expected outdated journal")
 
     monkeypatch.setattr(home_view, "build", outdated)
-    at.run(timeout=30)
+    at.run()
     assert not at.exception
     assert "journal outdated" in _text(at).lower()
     assert "paper plans require schema version" in _text(at)

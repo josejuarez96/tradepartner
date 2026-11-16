@@ -118,6 +118,7 @@ from tradepartner.store.journal import (
     RebalanceEventRow,
     SignalRow,
 )
+from tradepartner.store.listing_selection import prefer_current_listing
 from tradepartner.store.schema import (
     DELISTED_REASON,
     EXCLUDE_NAME_REASON,
@@ -829,6 +830,41 @@ def rebalance_state(
     if mine and all(state.state in (State.CLOSED, State.SETTLED) for state in mine):
         return RebalanceState.EXECUTED
     return RebalanceState.PENDING
+
+
+_FILLED_STATUS = "filled"
+
+
+def traded_at_lapse(
+    states: Sequence[tuple[DecisionRow, DecisionState]],
+    orders: Sequence[OrderRow],
+    order_events: Sequence[OrderEventRow],
+    fills: Sequence[OrderedFill],
+) -> bool:
+    """Whether a pending rebalance whose catch-up has run out traded (#3141): it has
+    decisions, none is in flight, and every one is closed, settled, or open with
+    orders of its own that **all** ended `filled` with a live fill (the remainder a
+    notional cap or rounding left, never written off because a sell was in flight
+    at submit). Such a rebalance is journaled `executed` at its lapse, not `missed`.
+    A decision never sent (open with no order, as after a halt before the buys), or
+    with an order that expired, was cancelled or was rejected, even after a partial
+    fill, keeps the lapse `missed`. No size threshold: what is left is named by the
+    caller."""
+    if not states:
+        return False
+    filled = {item.fill.client_order_id for item in fills}
+    ended_filled = {e.client_order_id for e in order_events if e.status == _FILLED_STATUS}
+    for decision, state in states:
+        if state.state in (State.CLOSED, State.SETTLED):
+            continue
+        if state.state is not State.OPEN:
+            return False
+        mine = _orders_of(decision, orders)
+        if not mine or not all(
+            o.client_order_id in filled and o.client_order_id in ended_filled for o in mine
+        ):
+            return False
+    return True
 
 
 def stop_session(requested_at: datetime) -> date:
@@ -1667,9 +1703,10 @@ def decisions_from(
 
 def current_listings(listings: pl.DataFrame, day: date) -> dict[str, dict[str, Any]]:
     """Per security, its listing row with the latest `valid_from` on or before `day`
-    (the first in frame order on a tie, as `universe_as_of` reads it). The one
-    tie rule planning, the wrapper, the run, reconcile_run and the window's
-    flatness check share (#534, #705). A row with no `valid_from` is always
+    (a delisted row first on a tie, otherwise a live row before a withdrawn
+    line). This rule is shared by planning, the wrapper, the run,
+    reconcile_run and the window's flatness check (#534, #705); universe
+    additionally prefers a configured venue on equal-rank ties. A row with no `valid_from` is always
     current but never beats a dated row."""
     current: dict[str, dict[str, Any]] = {}
     for row in listings.iter_rows(named=True):
@@ -1677,9 +1714,6 @@ def current_listings(listings: pl.DataFrame, day: date) -> dict[str, dict[str, A
         if valid_from is not None and valid_from > day:
             continue
         held = current.get(row["security_id"])
-        if held is None or (
-            valid_from is not None
-            and (held["valid_from"] is None or valid_from > held["valid_from"])
-        ):
+        if prefer_current_listing(row, held, day):
             current[row["security_id"]] = row
     return current

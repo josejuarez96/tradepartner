@@ -4,7 +4,9 @@ delisted security), in one recorded transaction."""
 
 from __future__ import annotations
 
+import csv
 import dataclasses
+import inspect
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,7 @@ from typing import Any
 import duckdb
 import polars as pl
 import pytest
+from conftest import open_paper_window
 from typer.testing import CliRunner
 
 from tradepartner import cli, repair
@@ -31,6 +34,7 @@ from tradepartner.store import registry
 from tradepartner.store.asof import adjusted_prices_as_of, prices_as_of
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.dividend_reviews import ReviewedGroup
+from tradepartner.store.retracted_rows import restore
 from tradepartner.store.retraction import retraction
 from tradepartner.store.schema import init_schema
 
@@ -111,15 +115,20 @@ def _dividend(sid: str, ex_date: date) -> dict[str, Any]:
     }
 
 
-@pytest.fixture
-def store(settings: Settings) -> Settings:
+HEIR = "0000000077"
+
+
+def _build(settings: Settings, *, heir: bool) -> Settings:
     """DEAD lists GONE from 2019 and is delisted from 2021-05-31; another
-    equity's GONE bars and dividend sit on it after that day. LIVE trades."""
+    equity's GONE bars and dividend sit on it after that day. LIVE trades.
+    With `heir`, HEIR lists GONE from 2021-06-01, so the stale bars have a
+    receiver (moved); without it no id receives them (orphans, #3265)."""
     with open_for_write(settings) as conn:
         init_schema(conn)
         for row in (
             _listing(DEAD, "GONE", date(2019, 1, 2)),
             _listing(LIVE, "LIVE", date(2019, 1, 2)),
+            *([_listing(HEIR, "GONE", date(2021, 6, 1))] if heir else []),
         ):
             insert_row(conn, "listings", row)
         insert_row(
@@ -153,6 +162,18 @@ def store(settings: Settings) -> Settings:
     return settings
 
 
+@pytest.fixture
+def store(settings: Settings) -> Settings:
+    """The store whose stale bars are received by HEIR (moved, not orphans)."""
+    return _build(settings, heir=True)
+
+
+@pytest.fixture
+def orphan_store(settings: Settings) -> Settings:
+    """The same store with no heir: no id receives the stale bars."""
+    return _build(settings, heir=False)
+
+
 def _rows(settings: Settings, sql: str) -> list[tuple[Any, ...]]:
     with duckdb.connect(settings.store.path, read_only=True) as conn:
         return conn.execute(sql).fetchall()
@@ -172,7 +193,7 @@ def test_a_dry_run_counts_and_changes_nothing(store: Settings) -> None:
     assert (result.bar_rows, result.action_rows) == (3, 1)
     assert sorted(result.found.bars) == [(DEAD, date(2021, 6, 1)), (DEAD, date(2021, 6, 2))]
     assert (result.bar_keys_checked, result.action_keys_checked) == (4, 2)
-    assert result.summary().startswith("would delete 3 bar rows (2 of 4 keys) and 1 action rows")
+    assert result.summary().startswith("would retract 3 bar rows (2 of 4 keys) and 1 action rows")
     assert _bars(store) == before
     assert _rows(store, "SELECT count(*) FROM ingestion_runs") == [(0,)]
 
@@ -227,7 +248,7 @@ def test_the_command_dry_run_and_repair(store: Settings) -> None:
     runner = CliRunner()
     dry = runner.invoke(app, ["repair-resolution", "--dry-run"])
     assert dry.exit_code == 0, dry.output
-    assert dry.output.startswith("would delete 3 bar rows")
+    assert dry.output.startswith("would retract 3 bar rows")
     assert f"  {DEAD}: 3 bar rows 2021-06-01..2021-06-02, 1 action rows" in dry.output
     unguarded = runner.invoke(app, ["repair-resolution"])
     assert unguarded.exit_code != 0
@@ -250,7 +271,7 @@ def test_the_command_dry_run_and_repair(store: Settings) -> None:
     assert len(_bars(store)) == 6
     done = runner.invoke(app, ["repair-resolution", *expect, "--release", REL])
     assert done.exit_code == 0, done.output
-    assert done.output.startswith("deleted 3 bar rows")
+    assert done.output.startswith("retracted 3 bar rows")
     assert len(_bars(store)) == 3
 
 
@@ -331,7 +352,7 @@ def test_delete_bars_dry_run_counts_every_revision_and_changes_nothing(store: Se
     assert result.bar_sessions == (date(2021, 6, 1), date(2021, 6, 2))
     assert result.ex_dates == (date(2021, 6, 15),)
     assert result.summary() == (
-        f"would delete 3 bar rows on 2 sessions 2021-06-01..2021-06-02 and 1 action rows "
+        f"would retract 3 bar rows on 2 sessions 2021-06-01..2021-06-02 and 1 action rows "
         f"(ex-dates 2021-06-15) of {DEAD} in 2021-06-01..2021-06-15"
     )
     assert _bars(store) == before
@@ -355,7 +376,7 @@ def test_delete_bars_deletes_the_range_every_revision_and_records_the_run(
     )
     assert (source, status, mode, rows) == ("alpaca", REPAIRED, REPAIR, 0)
     assert message == f"{result.summary()}; release {REL}"
-    assert message.startswith("deleted 3 bar rows")
+    assert message.startswith("retracted 3 bar rows")
 
 
 def test_delete_bars_refuses_and_deletes_nothing(store: Settings) -> None:
@@ -425,7 +446,7 @@ def test_the_repair_bars_command(store: Settings) -> None:
     base = ["repair-bars", "--security", DEAD, "--from", "2021-06-01", "--to", "2021-06-15"]
     dry = runner.invoke(app, [*base, "--release", REL, "--dry-run"])
     assert dry.exit_code == 0, dry.output
-    assert dry.output.startswith("would delete 3 bar rows on 2 sessions")
+    assert dry.output.startswith("would retract 3 bar rows on 2 sessions")
     assert runner.invoke(app, [*base, "--dry-run"]).exit_code == cli.USAGE_ERROR  # no release
     expect = ["--expect-bar-rows", "3", "--expect-action-rows", "1"]
     assert runner.invoke(app, [*base, "--release", REL]).exit_code == cli.USAGE_ERROR
@@ -438,7 +459,7 @@ def test_the_repair_bars_command(store: Settings) -> None:
     assert len(_bars(store)) == 6
     done = runner.invoke(app, [*base, "--release", REL, *expect])
     assert done.exit_code == 0, done.output
-    assert done.output.startswith("deleted 3 bar rows")
+    assert done.output.startswith("retracted 3 bar rows")
     assert len(_bars(store)) == 3
 
 
@@ -924,7 +945,7 @@ def test_a_dividend_dry_run_counts_and_changes_nothing(dividends: Settings) -> N
     assert (result.deferred, result.already_repaired, result.stale) == (1, 0, ())
     assert result.ex_dates == (EX,)
     assert result.summary() == (
-        "would delete 1 duplicate dividend rows of 1 identities on 1 ex-dates "
+        "would retract 1 duplicate dividend rows of 1 identities on 1 ex-dates "
         f"{EX}..{EX}; entries 2 through {EX}, deferred 1, already repaired 0, stale 0"
     )
     assert _actions(dividends) == ALL_ACTIONS
@@ -939,7 +960,7 @@ def test_the_dividend_repair_deletes_the_retract_identity_only(dividends: Settin
     )
     assert (source, status, mode, rows) == ("alpaca", REPAIRED, REPAIR, 0)
     assert message == f"{result.summary()}; release {REL}"
-    assert message.startswith("deleted 1 duplicate dividend rows")
+    assert message.startswith("retracted 1 duplicate dividend rows")
     with duckdb.connect(dividends.store.path, read_only=True) as conn:
         [ingest] = [i for i in last_ingests(conn, RUN) if i.source == "alpaca"]
     # A repair row is never an ingest (#2125): it is not the latest run at all,
@@ -1077,7 +1098,7 @@ def test_the_repair_dividends_command(dividends: Settings, monkeypatch: pytest.M
     base = ["repair-dividends", "--release", REL, "--to", str(EX)]
     dry = runner.invoke(app, [*base, "--dry-run"])
     assert dry.exit_code == 0, dry.output
-    assert dry.output.startswith("would delete 1 duplicate dividend rows")
+    assert dry.output.startswith("would retract 1 duplicate dividend rows")
     assert runner.invoke(app, ["repair-dividends", "--dry-run"]).exit_code == cli.USAGE_ERROR
     assert runner.invoke(app, base).exit_code == cli.USAGE_ERROR  # no count
     bad = runner.invoke(app, [*base[:-1], "2021-06-12", "--dry-run"])
@@ -1091,7 +1112,7 @@ def test_the_repair_dividends_command(dividends: Settings, monkeypatch: pytest.M
     assert _actions(dividends) == ALL_ACTIONS
     done = runner.invoke(app, [*base, "--expect-action-rows", "1"])
     assert done.exit_code == 0, done.output
-    assert done.output.startswith("deleted 1 duplicate dividend rows")
+    assert done.output.startswith("retracted 1 duplicate dividend rows")
     assert len(_actions(dividends)) == len(ALL_ACTIONS) - 1
 
 
@@ -1238,6 +1259,21 @@ def test_repair_deletes_only_the_bad_parents_spinoff_of_a_shared_child(
         store,
         "SELECT source_action_id FROM corporate_actions WHERE action_type = 'spinoff'",
     ) == [(LIVE,)]
+    # The bad parent's row is kept, with the parent named in its rule (T390).
+    assert (
+        _rows(
+            store,
+            "SELECT row_values['source_action_id'], rule FROM retracted_rows "
+            "WHERE row_values['action_type'] = 'spinoff'",
+        )[0][0]
+        == DEAD
+    )
+    assert (
+        f"parent {DEAD}"
+        in _rows(
+            store, "SELECT rule FROM retracted_rows WHERE row_values['action_type'] = 'spinoff'"
+        )[0][0]
+    )
 
 
 def _symbol_change(sid: str, old: str, new: str, process: date, known: datetime) -> dict[str, Any]:
@@ -1428,7 +1464,7 @@ def test_a_master_dry_run_lists_every_row_and_changes_nothing(vz: Settings) -> N
     result = _delete_master(vz, dry_run=True)
     assert (result.listings, result.delistings, result.refused) == (2, 1, ())
     assert result.summary() == (
-        f"would delete 2 listings and 1 delistings rows of 3 manifest rows; refused 0; "
+        f"would retract 2 listings and 1 delistings rows of 3 manifest rows; refused 0; "
         f"release {REL}"
     )
     assert [line.split(" known_at")[0] for line in result.found] == [
@@ -1442,7 +1478,7 @@ def test_a_master_dry_run_lists_every_row_and_changes_nothing(vz: Settings) -> N
 
 def test_the_delete_removes_only_the_manifest_rows_and_records_the_run(vz: Settings) -> None:
     result = _delete_master(vz)
-    assert not result.dry_run and result.summary().startswith("deleted 2 listings and 1 ")
+    assert not result.dry_run and result.summary().startswith("retracted 2 listings and 1 ")
     assert _master_rows(vz) == [
         ("listings", "VZ", COMMON_KNOWN),
         ("listings", "VZ", RETRACTED_AT),
@@ -1498,7 +1534,7 @@ def test_a_refused_row_is_listed_and_the_real_run_deletes_nothing(
     before = _master_rows(vz)
     dry = _delete_master(vz, manifest, dry_run=True, headers=headers)
     assert dry.refused and all(reason in line for line in dry.refused), dry.refused
-    with pytest.raises(RepairRefused, match="nothing deleted"):
+    with pytest.raises(RepairRefused, match="nothing retracted"):
         _delete_master(vz, manifest, headers=headers)
     assert _master_rows(vz) == before
     assert _rows(vz, "SELECT count(*) FROM ingestion_runs") == [(0,)]
@@ -1514,6 +1550,37 @@ def test_a_master_delete_writes_only_inside_the_open_release_of_its_name(vz: Set
         _delete_master(vz)
     assert len(_master_rows(vz)) == 5
     assert _delete_master(vz, dry_run=True).refused == ()  # a dry run needs no open release
+
+
+def test_a_deleted_master_row_is_retracted_with_its_manifest_line_as_the_rule(
+    vz: Settings,
+) -> None:
+    _delete_master(vz)
+    moved = _rows(
+        vz,
+        "SELECT table_name, row_values['ticker'], row_values['known_at'], reason, release, rule, "
+        "restored_at FROM retracted_rows ORDER BY retraction_id",
+    )
+    assert len(moved) == 3
+    assert {m[0] for m in moved} == {"listings", "delistings"}
+    assert all(m[3].startswith("delete-master-rows") and m[4] == REL for m in moved)
+    assert all(m[6] is None for m in moved)
+    labels = {r.label() for r in _note_manifest()}
+    for m in moved:  # the rule names the manifest line (a key's revisions share one rule)
+        assert any(label in m[5] for label in labels)
+    assert {label for label in labels if any(label in m[5] for m in moved)} == labels
+    # Restoring puts the never-true rows back with their original stamps.
+    with open_for_write(vz) as conn:
+        assert restore(conn, release=REL) == 3
+    assert len(_master_rows(vz)) == 5
+    assert COMMON_KNOWN in {r[2] for r in _master_rows(vz)}
+
+
+def test_the_master_delete_issues_no_delete_on_the_fact_tables() -> None:
+    source = inspect.getsource(repair.delete_master_rows) + inspect.getsource(
+        repair._retract_master_rows
+    )
+    assert "DELETE FROM" not in source
 
 
 def _open_paper_window(settings: Settings, started_at: datetime) -> None:
@@ -1559,10 +1626,10 @@ def test_a_row_known_inside_an_open_window_is_refused(vz: Settings) -> None:
     assert "known inside the open paper window (first session 2026-10-12)" in retraction[0]
 
 
-def test_a_delete_that_misses_its_count_rolls_the_master_back(
+def test_a_retraction_that_misses_its_count_rolls_the_master_back(
     vz: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(repair, "_delete_master_row", lambda conn, row: 0)
+    monkeypatch.setattr(repair, "retract", lambda *args, **kwargs: 0)
     with pytest.raises(RuntimeError, match="rolled back"):
         _delete_master(vz)
     assert len(_master_rows(vz)) == 5
@@ -1707,3 +1774,784 @@ def test_a_retract_id_alone_in_the_feed_is_kept() -> None:
     source._fetch_actions = lambda symbols, start, end: only_b
     got = source.corporate_actions([DUP], date(2021, 6, 1), date(2021, 6, 30))
     assert [a.source_action_id for a in got] == ["b"]
+
+
+WW_OLD, WW_NEW = "0000105319", "0000105319@2025-08-11"
+WW_FILED = datetime(2025, 7, 3, 16, 29, tzinfo=UTC)
+
+
+@pytest.fixture
+def ww(settings: Settings) -> Settings:
+    """#3056, the owner's store's facts: WW's old common lists WW from
+    2019-08-07 and last prints 2025-05-15 (it trades OTC as WGHTQ after
+    that); the 25-NSE for the cancelled shares is filed 2025-07-03,
+    effective 07-13. The new equity prints under WW from 07-07 and those
+    prints sat on the old id; its own id lists WW from 2025-08-11."""
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        for row in (
+            _listing(WW_OLD, "WW", date(2019, 8, 7)),
+            _listing(WW_NEW, "WW", date(2025, 8, 11)),
+        ):
+            insert_row(conn, "listings", row)
+        insert_row(
+            conn,
+            "delistings",
+            {
+                "security_id": WW_OLD,
+                "form": "25-NSE",
+                "class_title": "Common Stock",
+                "exchange": "NYSE",
+                "filed_at": WW_FILED,
+                "effective_on": date(2025, 7, 13),
+                "known_at": WW_FILED,
+                "ingested_at": RUN,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+        for sid, session, close in (
+            (WW_OLD, date(2025, 5, 14), 0.28),
+            (WW_OLD, date(2025, 5, 15), 0.25),
+            (WW_OLD, date(2025, 7, 7), 40.0),
+            (WW_OLD, date(2025, 7, 11), 39.05),
+            (WW_NEW, date(2025, 8, 11), 33.54),
+        ):
+            insert_row(conn, "prices_daily", _bar(sid, session, close=close))
+    return settings
+
+
+def test_new_equity_prints_before_the_old_form_25_takes_effect_leave_the_old_id(
+    ww: Settings,
+) -> None:
+    # #3056: the old line stopped 05-15, more than the window before its
+    # Form 25 was filed, so its span ends 05-16 and the 40.00 prints are
+    # no one's (the successor's own row starts 08-11): the dry run lists them.
+    result = repair_resolution(ww, clock=lambda: RUN, dry_run=True)
+    assert sorted(result.found.bars) == [(WW_OLD, date(2025, 7, 7)), (WW_OLD, date(2025, 7, 11))]
+    with duckdb.connect(ww.store.path, read_only=True) as conn:
+        resolver = store_resolver(conn, RUN, ww)
+    assert resolver.resolve("WW", date(2025, 5, 15)) == WW_OLD
+    assert resolver.resolve("WW", date(2025, 7, 7)) is None
+    assert resolver.resolve("WW", date(2025, 8, 11)) == WW_NEW
+
+
+def test_a_line_trading_up_to_its_form_25_keeps_the_effective_day_cut(ww: Settings) -> None:
+    # A merger's shape: bars until the day before the filing, so the cut
+    # stays on the effective day and nothing moves.
+    with open_for_write(ww) as conn:
+        insert_row(conn, "prices_daily", _bar(WW_OLD, date(2025, 7, 2), close=0.3))
+    with duckdb.connect(ww.store.path, read_only=True) as conn:
+        resolver = store_resolver(conn, RUN, ww)
+    assert resolver.resolve("WW", date(2025, 7, 11)) == WW_OLD
+    assert resolver.resolve("WW", date(2025, 7, 14)) is None
+
+
+def test_the_stopped_before_filing_cut_reads_only_what_was_known(ww: Settings) -> None:
+    # No look-ahead (#3056): nothing is cut before the Form 25 is known, nor
+    # before the successor's row is (07-10: the old line keeps the prints);
+    # `filed_bars` reads only bars known at `at`, so a late-arriving bar
+    # (known after `at`) never decides an earlier run's cut.
+    late = datetime(2025, 9, 1, 21, tzinfo=UTC)
+    with open_for_write(ww) as conn:
+        insert_row(conn, "prices_daily", _bar(WW_OLD, date(2025, 7, 2), close=0.3, known=late))
+    with duckdb.connect(ww.store.path, read_only=True) as conn:
+        before = store_resolver(conn, WW_FILED - timedelta(seconds=1), ww)
+        assert before.holds(WW_OLD, date(2025, 6, 2))
+        assert store_resolver(conn, datetime(2025, 7, 10, 21, tzinfo=UTC), ww).holds(
+            WW_OLD, date(2025, 7, 7)
+        )
+        at = datetime(2025, 8, 12, 21, tzinfo=UTC)
+        assert repair.filed_bars(conn, at) == {(WW_OLD, date(2025, 7, 3)): date(2025, 5, 15)}
+        assert repair.filed_bars(conn, RUN) == {(WW_OLD, date(2025, 7, 3)): date(2025, 7, 2)}
+        assert not store_resolver(conn, at, ww).holds(WW_OLD, date(2025, 7, 7))
+        assert store_resolver(conn, RUN, ww).holds(WW_OLD, date(2025, 7, 7))
+
+
+# --- #3265: bars no id receives are refused without the owner's count ---
+
+
+def test_moved_keys_are_not_orphans(store: Settings) -> None:
+    result = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert result.orphan_keys == 0
+    assert not any("ORPHAN" in line for line in result.lines())
+    assert " 0 orphan bar keys" in result.summary()
+
+
+def test_an_owner_holding_its_own_bar_is_no_receiver(store: Settings) -> None:
+    """#3455: HEIR already holds a bar of its own on 06-01, so no refetch lands
+    DEAD's bar there: an orphan. 06-02 (HEIR has none) stays moved."""
+    with open_for_write(store) as conn:
+        insert_row(conn, "prices_daily", _bar(HEIR, date(2021, 6, 1)))
+    result = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert dict(result.orphans) == {(DEAD, date(2021, 6, 1)): 1}
+
+
+def test_a_stale_owner_bar_does_not_count_as_held(store: Settings) -> None:
+    """#3455: an owner's bar that this run retracts is not one that stays."""
+    from tradepartner.repair import _holds_bar
+
+    with open_for_write(store) as conn:
+        insert_row(conn, "prices_daily", _bar(HEIR, date(2021, 6, 1)))
+        day = date(2021, 6, 1)
+        assert _holds_bar(conn, ["alpaca_sip"], {})(HEIR, day)
+        assert not _holds_bar(conn, ["alpaca_sip"], {(HEIR, day): 1})(HEIR, day)
+        assert not _holds_bar(conn, ["alpaca_sip"], {})(HEIR, date(2021, 6, 2))
+
+
+def test_an_owner_without_a_bar_stays_a_receiver(store: Settings) -> None:
+    """#3455: HEIR holds a bar on another session only."""
+    with open_for_write(store) as conn:
+        insert_row(conn, "prices_daily", _bar(HEIR, date(2021, 6, 4)))
+    result = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert result.orphan_keys == 0
+
+
+def test_an_owner_holding_the_same_bar_covers_the_key(store: Settings) -> None:
+    """#3463: HEIR holds DEAD's 06-01 bar itself (the latest revision, close
+    26.0, same volume): retracting DEAD's copy loses nothing, so it is no
+    orphan; the dry run lists it as a duplicate of HEIR."""
+    with open_for_write(store) as conn:
+        insert_row(conn, "prices_daily", _bar(HEIR, date(2021, 6, 1), close=26.0))
+    result = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert result.orphan_keys == 0
+    assert dict(result.duplicates) == {(DEAD, date(2021, 6, 1)): HEIR}
+    [line] = [x for x in result.lines() if "DUPLICATE" in x]
+    assert line == (
+        f"  DUPLICATE {DEAD} (?): 1 bar keys 2021-06-01..2021-06-01 duplicate of {HEIR}"
+    )
+    assert "1 duplicate bar keys an owner already holds" in result.summary()
+
+
+def test_a_duplicate_needs_no_orphan_count_to_apply(store: Settings) -> None:
+    with open_for_write(store) as conn:
+        insert_row(conn, "prices_daily", _bar(HEIR, date(2021, 6, 1), close=26.0))
+    result = repair_resolution(store, clock=lambda: RUN, expect=(3, 1), release=REL)
+    assert (result.bar_rows, result.orphan_keys, len(result.duplicates)) == (3, 0, 1)
+    with open_for_write(store) as conn:
+        assert registry.approved_orphans(conn, REL)[0] == 0
+
+
+def test_a_duplicate_within_the_tolerance_covers_the_key(store: Settings) -> None:
+    with open_for_write(store) as conn:
+        insert_row(conn, "prices_daily", _bar(HEIR, date(2021, 6, 1), close=26.0 + 1e-6))
+    assert repair_resolution(store, clock=lambda: RUN, dry_run=True).orphan_keys == 0
+    strict = store.model_copy(
+        update={"store": store.store.model_copy(update={"release_move_price_tolerance": 0.0})}
+    )
+    result = repair_resolution(strict, clock=lambda: RUN, dry_run=True)
+    assert dict(result.orphans) == {(DEAD, date(2021, 6, 1)): 1}
+    assert not result.duplicates
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"close": 25.0},  # DEAD's earlier revision, not its latest
+        {"volume": 999},
+        {"open": 27.0},
+        {"high": 27.0},
+        {"low": 25.0},
+    ],
+)
+def test_a_different_bar_stays_an_orphan(store: Settings, change: dict[str, float]) -> None:
+    """#3457's rule holds for any other bar: the owner's refetch lands its own."""
+    row = {**_bar(HEIR, date(2021, 6, 1), close=26.0), **change}
+    with open_for_write(store) as conn:
+        insert_row(conn, "prices_daily", row)
+    result = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert dict(result.orphans) == {(DEAD, date(2021, 6, 1)): 1}
+    assert not result.duplicates
+
+
+def test_a_dry_run_lists_the_orphans_per_security(orphan_store: Settings) -> None:
+    before = _bars(orphan_store)
+    result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
+    assert result.orphan_keys == 2
+    assert dict(result.orphans) == {(DEAD, date(2021, 6, 1)): 1, (DEAD, date(2021, 6, 2)): 1}
+    [line] = [x for x in result.lines() if "ORPHAN" in x]
+    assert line == f"  ORPHAN {DEAD} (?): 2 bar keys 2021-06-01..2021-06-02 that no id receives"
+    assert "2 orphan bar keys no id receives on 1 securities" in result.summary()
+    assert _bars(orphan_store) == before
+
+
+def test_an_orphan_makes_the_apply_refuse(orphan_store: Settings) -> None:
+    before = _bars(orphan_store)
+    with pytest.raises(RepairRefused, match="2 bar keys on 1 securities are received by no id"):
+        repair_resolution(orphan_store, clock=lambda: RUN, expect=(3, 1), release=REL)
+    assert _bars(orphan_store) == before
+    assert _rows(orphan_store, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+@pytest.mark.parametrize("count", [0, 1, 3])
+def test_a_wrong_orphan_count_refuses(orphan_store: Settings, count: int) -> None:
+    before = _bars(orphan_store)
+    with pytest.raises(RepairRefused, match="--allow-orphans"):
+        repair_resolution(
+            orphan_store, clock=lambda: RUN, expect=(3, 1), release=REL, allow_orphans=count
+        )
+    assert _bars(orphan_store) == before
+
+
+def test_the_exact_orphan_count_lets_the_apply_through(orphan_store: Settings) -> None:
+    result = repair_resolution(
+        orphan_store, clock=lambda: RUN, expect=(3, 1), release=REL, allow_orphans=2
+    )
+    assert (result.bar_rows, result.orphan_keys) == (3, 2)
+    assert (DEAD, date(2021, 6, 1)) not in {(r[0], r[1]) for r in _bars(orphan_store)}
+
+
+def test_the_apply_records_the_approved_orphan_keys_against_the_release(
+    orphan_store: Settings,
+) -> None:
+    from tradepartner.store import registry
+
+    repair_resolution(orphan_store, clock=lambda: RUN, expect=(3, 1), release=REL, allow_orphans=2)
+    with open_for_write(orphan_store) as conn:
+        count, keys = registry.approved_orphans(conn, REL)
+    assert count == 2 and {sid for sid, _ in keys} == {DEAD} and len(keys) == 2
+
+
+def test_an_orphan_count_with_no_orphans_refuses(store: Settings) -> None:
+    before = _bars(store)
+    with pytest.raises(RepairRefused, match="--allow-orphans"):
+        repair_resolution(store, clock=lambda: RUN, expect=(3, 1), release=REL, allow_orphans=2)
+    assert _bars(store) == before
+
+
+def test_orphans_are_judged_as_of_the_run_not_later_listings(orphan_store: Settings) -> None:
+    # No look-ahead: a listing known after the run (HEIR, known 2021-06-01 21:00)
+    # does not turn an earlier run's orphans into moved keys.
+    early = datetime(2021, 5, 31, 22, tzinfo=UTC)
+    with open_for_write(orphan_store) as conn:
+        insert_row(conn, "listings", _listing(HEIR, "GONE", date(2021, 6, 1)))
+    result = repair_resolution(orphan_store, clock=lambda: early, dry_run=True)
+    assert result.bar_rows == 3
+    assert result.orphan_keys == 2
+
+
+def test_the_orphan_line_reads_the_latest_name_known_at_the_run(orphan_store: Settings) -> None:
+    # #3270 (1): the display-name query is as-of the run, not the newest row.
+    with open_for_write(orphan_store) as conn:
+        insert_row(
+            conn, "securities", _security(DEAD, datetime(2019, 1, 2, 21, tzinfo=UTC), "Old Name")
+        )
+        insert_row(
+            conn,
+            "securities",
+            _security(DEAD, datetime(2027, 1, 4, 21, tzinfo=UTC), "Later Name")
+            | {"ingested_at": datetime(2027, 1, 5, tzinfo=UTC)},
+        )
+    result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
+    [line] = [x for x in result.lines() if "ORPHAN" in x]
+    assert line == (
+        f"  ORPHAN {DEAD} (Old Name): 2 bar keys 2021-06-01..2021-06-02 that no id receives"
+    )
+
+
+def test_the_orphan_line_ignores_a_retracted_securities_name(orphan_store: Settings) -> None:
+    # #3270 (1): a retracted row's name is not the id's display name.
+    with open_for_write(orphan_store) as conn:
+        insert_row(
+            conn, "securities", _security(DEAD, datetime(2019, 1, 2, 21, tzinfo=UTC), "Old Name")
+        )
+        insert_row(
+            conn,
+            "securities",
+            {
+                **_security(DEAD, datetime(2021, 5, 1, 21, tzinfo=UTC), "Withdrawn Name"),
+                "retracted": True,
+            },
+        )
+    result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
+    [line] = [x for x in result.lines() if "ORPHAN" in x]
+    assert line == (
+        f"  ORPHAN {DEAD} (Old Name): 2 bar keys 2021-06-01..2021-06-02 that no id receives"
+    )
+
+
+def test_the_command_refuses_allow_orphans_with_a_dry_run(orphan_store: Settings) -> None:
+    # #3270 (2): a dry run must not silently accept the count it never checks.
+    app = cli.make_app(settings=lambda: orphan_store, clock=lambda: RUN)
+    before = _bars(orphan_store)
+    result = CliRunner().invoke(app, ["repair-resolution", "--dry-run", "--allow-orphans", "2"])
+    assert result.exit_code == cli.USAGE_ERROR
+    assert "--allow-orphans" in result.output and "--dry-run" in result.output
+    assert _bars(orphan_store) == before
+
+
+def test_the_command_refuses_a_negative_allow_orphans(orphan_store: Settings) -> None:
+    # #3270 (3): a negative count is a usage error, not a refusal after the read.
+    app = cli.make_app(settings=lambda: orphan_store, clock=lambda: RUN)
+    before = _bars(orphan_store)
+    expect = ["--expect-bar-rows", "3", "--expect-action-rows", "1", "--release", REL]
+    result = CliRunner().invoke(app, ["repair-resolution", *expect, "--allow-orphans=-1"])
+    assert result.exit_code == cli.USAGE_ERROR
+    assert "--allow-orphans" in result.output
+    assert _bars(orphan_store) == before
+
+
+def test_the_command_refuses_orphans_until_the_count_is_passed(orphan_store: Settings) -> None:
+    app = cli.make_app(settings=lambda: orphan_store, clock=lambda: RUN)
+    runner = CliRunner()
+    dry = runner.invoke(app, ["repair-resolution", "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert f"  ORPHAN {DEAD} (?): 2 bar keys" in dry.output
+    expect = ["--expect-bar-rows", "3", "--expect-action-rows", "1", "--release", REL]
+    refused = runner.invoke(app, ["repair-resolution", *expect])
+    assert refused.exit_code == 1
+    assert "received by no id" in refused.output
+    assert len(_bars(orphan_store)) == 6
+    done = runner.invoke(app, ["repair-resolution", *expect, "--allow-orphans", "2"])
+    assert done.exit_code == 0, done.output
+    assert len(_bars(orphan_store)) == 3
+
+
+def test_a_retracted_class_id_is_moved_only_by_its_own_ticker(orphan_store: Settings) -> None:
+    # quant-auditor on #3266: the id's own retracted listing row names its ticker;
+    # a live sibling class on another ticker must not make it "moved".
+    base, cls, sib = "0000000088", "0000000088:class-a", "0000000088:class-b"
+    with open_for_write(orphan_store) as conn:
+        insert_row(conn, "listings", _listing(base, "GONE", date(2021, 6, 1)))
+        insert_row(conn, "listings", _listing(sib, "SIBL", date(2019, 1, 2)))
+        insert_row(conn, "listings", _listing(cls, "ZZZZ", date(2019, 1, 2)))
+        insert_row(conn, "listings", _listing("0000000089:class-a", "GONE", date(2019, 1, 2)))
+        insert_row(conn, "prices_daily", _bar(cls, date(2021, 6, 1)))
+        insert_row(conn, "prices_daily", _bar("0000000089:class-a", date(2021, 6, 1)))
+    with open_for_write(orphan_store) as conn:
+        conn.execute("UPDATE listings SET retracted = true WHERE security_id = ?", [cls])
+        conn.execute(
+            "UPDATE listings SET retracted = true WHERE security_id = ?", ["0000000089:class-a"]
+        )
+    result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
+    assert ("0000000089:class-a", date(2021, 6, 1)) in result.found.bars
+    assert (cls, date(2021, 6, 1)) in result.orphans  # ZZZZ: nobody receives it
+    assert ("0000000089:class-a", date(2021, 6, 1)) not in result.orphans  # GONE: base/heir
+
+
+def test_a_retracted_class_id_whose_same_cik_lists_its_ticker_is_moved(
+    orphan_store: Settings,
+) -> None:
+    # quant-auditor on #3266 (follow-up #3270): the P&G shape on its own CIK --
+    # a retracted `:common-stock` id whose plain-CIK base still lists its ticker.
+    base, cls = "0000000088", "0000000088:common-stock"
+    with open_for_write(orphan_store) as conn:
+        insert_row(conn, "listings", _listing(base, "PG", date(2019, 1, 2)))
+        insert_row(conn, "listings", _listing(cls, "PG", date(2019, 1, 2)))
+        insert_row(conn, "prices_daily", _bar(cls, date(2021, 6, 1)))
+    with open_for_write(orphan_store) as conn:
+        conn.execute("UPDATE listings SET retracted = true WHERE security_id = ?", [cls])
+    result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
+    assert (cls, date(2021, 6, 1)) in result.found.bars
+    assert (cls, date(2021, 6, 1)) not in result.orphans  # PG: the same CIK's base id
+
+
+# --- #3290: the orphan test reads the id's own former ticker ---
+
+
+def _swap_common_row(settings: Settings, ticker: str, valid_from: date) -> None:
+    """Retract DEAD's GONE row and leave only a live `ticker` row, the shape
+    master-retract plus an EDGAR write leaves (a warrant row, a lowercase
+    ticker): the id's common ticker is now a retracted row."""
+    with open_for_write(settings) as conn:
+        common = _listing(DEAD, "GONE", date(2019, 1, 2))
+        insert_row(conn, "listings", retraction(common, datetime(2021, 5, 1, 22, tzinfo=UTC)))
+        insert_row(
+            conn,
+            "listings",
+            {**_listing(DEAD, ticker, valid_from), "class_title": "Warrants"}
+            if ticker.endswith("WW")
+            else _listing(DEAD, ticker, valid_from),
+        )
+
+
+@pytest.mark.parametrize(("ticker", "valid_from"), [("GONEWW", date(2020, 1, 2)), ("gone", None)])
+def test_a_leftover_warrant_or_lowercase_row_does_not_hide_the_receiver(
+    store: Settings, ticker: str, valid_from: date | None
+) -> None:
+    # The common row is retracted and the live row is a warrant or a raw
+    # lowercase ticker: the bars' receiver (HEIR, under GONE) is still found.
+    _swap_common_row(store, ticker, valid_from or date(2021, 5, 1))
+    result = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    # HEIR lists GONE from 06-01: those keys are moved; a warrant row's class
+    # leaves the 05-27 bar (before HEIR) with no receiver.
+    assert (DEAD, date(2021, 6, 1)) not in result.orphans
+    assert (DEAD, date(2021, 6, 2)) not in result.orphans
+
+
+def test_held_tickers_normalise_case_and_include_the_ids_retracted_rows(store: Settings) -> None:
+    _swap_common_row(store, "gone", date(2021, 5, 1))
+    with duckdb.connect(store.store.path, read_only=True) as conn:
+        held = repair._held_tickers(conn, RUN)
+    assert held(DEAD, date(2021, 6, 1)) == ["GONE"]
+
+
+def test_a_retracted_row_still_leaves_a_genuine_orphan(orphan_store: Settings) -> None:
+    # No id lists GONE from the bars' days: retracting DEAD's own row and
+    # adding a warrant row must not make its bars look received.
+    _swap_common_row(orphan_store, "GONEWW", date(2020, 1, 2))
+    result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
+    assert {(DEAD, date(2021, 6, 1)), (DEAD, date(2021, 6, 2))} <= set(result.orphans)
+
+
+def test_a_renamed_away_ticker_does_not_hide_a_genuine_orphan(orphan_store: Settings) -> None:
+    # DEAD's GONE row was retracted and its own class later lists NEW; another
+    # id reusing GONE does not receive DEAD's bars (quant-auditor, #3295).
+    with open_for_write(orphan_store) as conn:
+        common = _listing(DEAD, "GONE", date(2019, 1, 2))
+        insert_row(conn, "listings", retraction(common, datetime(2021, 5, 1, 22, tzinfo=UTC)))
+        insert_row(conn, "listings", _listing(DEAD, "NEWT", date(2020, 1, 2)))
+        insert_row(conn, "listings", _listing(HEIR, "GONE", date(2021, 6, 1)))
+    result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
+    assert result.orphan_keys == 2
+
+
+# --- T390 (#3275, ADR 0029): the four repairs retract instead of delete ---
+
+
+def _retracted(settings: Settings) -> list[tuple[Any, ...]]:
+    return _rows(
+        settings,
+        "SELECT table_name, row_values['security_id'], reason, release, rule, restored_at "
+        "FROM retracted_rows ORDER BY retraction_id",
+    )
+
+
+def test_repair_resolution_retracts_what_it_would_have_deleted(store: Settings) -> None:
+    repair_resolution(store, clock=lambda: RUN, expect=(3, 1), release=REL)
+    # The fact tables hold what a delete would have left.
+    assert _bars(store) == [
+        (DEAD, date(2021, 5, 27), 10.0, "alpaca_sip"),
+        (DEAD, date(2021, 6, 3), 10.0, "fixture"),
+        (LIVE, date(2021, 6, 1), 10.0, "alpaca_sip"),
+    ]
+    assert _rows(store, "SELECT ex_date FROM corporate_actions ORDER BY 1") == [
+        (date(2021, 5, 20),)
+    ]
+    rows = _retracted(store)
+    assert [r[0] for r in rows].count("prices_daily") == 3
+    assert [r[0] for r in rows].count("corporate_actions") == 1
+    for _, sid, reason, release, rule, restored in rows:
+        assert (sid, release, restored) == (DEAD, REL, None)
+        assert reason.startswith("repair-resolution")
+        # The end that judged the key is recorded: GONE's listing, ended by the Form 25.
+        assert "GONE NYSE" in rule and "delisted end 2021-06-03 (25-NSE)" in rule
+
+
+def test_a_dry_run_retracts_nothing_and_says_would_retract(store: Settings) -> None:
+    result = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert result.summary().startswith("would retract 3 bar rows")
+    assert _retracted(store) == []
+
+
+def test_a_real_run_summary_says_retracted(store: Settings) -> None:
+    result = repair_resolution(store, clock=lambda: RUN, expect=(3, 1), release=REL)
+    assert result.summary().startswith("retracted 3 bar rows")
+
+
+def test_a_key_that_holds_another_sources_revision_is_listed_and_refused(
+    store: Settings,
+) -> None:
+    """`retract` moves every revision of a key; the old delete spared other sources.
+    The dry run lists the extra row; the real run refuses before moving anything."""
+    with open_for_write(store) as conn:
+        insert_row(
+            conn,
+            "prices_daily",
+            _bar(DEAD, date(2021, 6, 2), source="fixture", known=datetime(2021, 6, 4, tzinfo=UTC)),
+        )
+    before = _bars(store)
+    dry = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert len(dry.wider) == 1 and "fixture revision" in dry.wider[0]
+    assert "2021-06-02" in dry.wider[0] and any("WIDER" in line for line in dry.lines())
+    assert "1 extra rows held by the same keys" in dry.summary()
+    with pytest.raises(RepairRefused, match="extra rows would be retracted"):
+        repair_resolution(store, clock=lambda: RUN, expect=(3, 1), release=REL)
+    assert _bars(store) == before
+    assert _retracted(store) == []
+
+
+def test_a_bar_key_that_holds_another_sources_revision_is_listed_and_refused(
+    store: Settings,
+) -> None:
+    """`retract` moves every revision of a key; the old delete spared other sources.
+    The dry run lists the extra row; the real run refuses before moving anything."""
+    with open_for_write(store) as conn:
+        insert_row(
+            conn,
+            "prices_daily",
+            _bar(DEAD, date(2021, 6, 2), source="fixture", known=datetime(2021, 6, 4, tzinfo=UTC)),
+        )
+    before = _bars(store)
+    dry = _delete_bars(store, dry_run=True)
+    assert len(dry.wider) == 1 and "fixture revision" in dry.wider[0]
+    assert "2021-06-02" in dry.wider[0] and dry.lines() == [f"  WIDER {dry.wider[0]}"]
+    assert "1 extra rows held by the same keys" in dry.summary()
+    app = cli.make_app(settings=lambda: store, clock=lambda: RUN)
+    shown = CliRunner().invoke(
+        app,
+        [
+            "repair-bars",
+            "--security",
+            DEAD,
+            "--from",
+            "2021-06-01",
+            "--to",
+            "2021-06-15",
+            "--release",
+            REL,
+            "--dry-run",
+        ],
+    )
+    assert shown.exit_code == 0, shown.output
+    assert f"  WIDER {dry.wider[0]}" in shown.output
+    with pytest.raises(RepairRefused, match="extra rows would be retracted"):
+        _delete_bars(store, expect=(3, 1), release=REL)
+    assert _bars(store) == before
+    assert _retracted(store) == []
+
+
+def test_a_dividend_dry_run_lists_the_extra_rows_held_by_its_keys(
+    dividends: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dry run lists each extra row a retraction would also move, as
+    `repair-resolution` does; a real run refuses on any. No stored dividend
+    identity reaches the detector today (a second row of the identity makes
+    the entry stale first), so the detector's line is stubbed."""
+    line = (
+        "corporate_actions key ('0000000001', 'b', 'dividend', 2021-06-15) also holds a "
+        "fixture revision known 2026-10-04 18:00:00+00:00 (ex-date 2021-06-15)"
+    )
+    monkeypatch.setattr(repair, "_wider_identities", lambda *a, **k: [line])
+    dry = _retract(dividends, dry_run=True)
+    assert dry.wider == (line,)
+    assert dry.lines() == [f"  WIDER {line}"]
+    assert "1 extra rows held by the same keys" in dry.summary()
+    monkeypatch.setattr(repair, "reviewed_groups", lambda: LIST)
+    app = cli.make_app(settings=lambda: dividends, clock=lambda: RUN)
+    shown = CliRunner().invoke(
+        app, ["repair-dividends", "--release", REL, "--to", str(EX), "--dry-run"]
+    )
+    assert shown.exit_code == 0, shown.output
+    assert f"  WIDER {line}" in shown.output
+    with pytest.raises(RepairRefused, match="extra rows would be retracted"):
+        _retract(dividends, expect=1, release=REL)
+    assert _actions(dividends) == ALL_ACTIONS
+    assert _retracted(dividends) == []
+
+
+def test_a_redated_spinoff_identity_retracts_in_one_call(store: Settings) -> None:
+    child, ex = "0000000003", date(2021, 6, 15)
+    with open_for_write(store) as conn:
+        insert_row(conn, "listings", _listing(child, "CHILD", date(2021, 6, 1)))
+        for day in (ex, ex + timedelta(days=1)):
+            insert_row(
+                conn,
+                "corporate_actions",
+                {
+                    **_dividend(child, day),
+                    "action_type": "spinoff",
+                    "ratio_or_amount": 0.25,
+                    "source_action_id": DEAD,
+                    "known_at": session_close(day),
+                },
+            )
+    dry = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    repair_resolution(store, clock=lambda: RUN, expect=(dry.bar_rows, dry.action_rows), release=REL)
+    spin = [r for r in _retracted(store) if "parent" in r[4]]
+    assert len(spin) == 2
+
+
+def _load_apa(settings: Settings) -> None:
+    """T388's fixture (`tests/fixtures/form25_withdrawals`) into the store."""
+    folder = Path(__file__).parent / "fixtures" / "form25_withdrawals"
+
+    def rows(name: str) -> list[dict[str, str]]:
+        with (folder / name).open(newline="") as handle:
+            return list(csv.DictReader(handle))
+
+    def utc(text: str) -> datetime:
+        return datetime.fromisoformat(text.replace("+0000", "+00:00"))
+
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        for r in rows("listings.csv"):
+            insert_row(
+                conn,
+                "listings",
+                {
+                    **{k: r[k] for k in ("security_id", "ticker", "exchange")},
+                    **{k: r[k] for k in ("source", "provenance")},
+                    "class_title": r["class_title"] or None,
+                    "valid_from": date.fromisoformat(r["valid_from"]),
+                    "known_at": utc(r["known_at"]),
+                    "ingested_at": utc(r["ingested_at"]),
+                    "retracted": r["retracted"] == "True",
+                },
+            )
+        for r in rows("delistings.csv"):
+            insert_row(
+                conn,
+                "delistings",
+                {
+                    **{k: r[k] for k in ("security_id", "form", "class_title", "exchange")},
+                    **{k: r[k] for k in ("source", "provenance")},
+                    "filed_at": utc(r["filed_at"]),
+                    "effective_on": date.fromisoformat(r["effective_on"]),
+                    "known_at": utc(r["known_at"]),
+                    "ingested_at": utc(r["ingested_at"]),
+                },
+            )
+        for r in rows("bars.csv"):
+            insert_row(
+                conn,
+                "prices_daily",
+                _bar(r["security_id"], date.fromisoformat(r["session"]), close=float(r["close"])),
+            )
+    _open_release(settings)
+
+
+APA_ID = "0000006769"
+
+
+def test_the_apa_fixture_retracts_no_apa_bar_once_the_rule_is_right(settings: Settings) -> None:
+    """T388's fixture (the sitting copy's Apache rows): its NYSE and NYSE Chicago
+    Form 25s are line withdrawals, so a real run retracts none of APA's bars."""
+    _load_apa(settings)
+    dry = repair_resolution(settings, clock=lambda: RUN, dry_run=True)
+    assert APA_ID not in dry.found.securities
+    repair_resolution(
+        settings,
+        clock=lambda: RUN,
+        expect=(dry.bar_rows, dry.action_rows),
+        release=REL,
+        allow_orphans=dry.orphan_keys,
+    )
+    assert APA_ID not in {r[1] for r in _retracted(settings)}
+
+
+def test_the_pre_t388_verdict_retracts_apas_bars_with_the_end_recorded(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store import delistings
+
+    _load_apa(settings)
+    monkeypatch.setattr(delistings, "_withdrawn", lambda *a, **k: None)  # the old reading
+    dry = repair_resolution(settings, clock=lambda: RUN, dry_run=True)
+    assert APA_ID in dry.found.securities
+    repair_resolution(
+        settings,
+        clock=lambda: RUN,
+        expect=(dry.bar_rows, dry.action_rows),
+        release=REL,
+        allow_orphans=dry.orphan_keys,
+    )
+    rules = {r[4] for r in _retracted(settings) if r[1] == APA_ID and r[0] == "prices_daily"}
+    assert rules
+    for rule in rules:
+        assert "delisted end" in rule and "(25" in rule and "Chicago" in rule.title()
+
+
+def test_delete_bars_retracts_with_the_range_as_its_rule(store: Settings) -> None:
+    _delete_bars(store, expect=(3, 1), release=REL)
+    rows = _retracted(store)
+    assert len(rows) == 4
+    for _table, sid, reason, release, rule, _ in rows:
+        assert (sid, release) == (DEAD, REL)
+        assert reason.startswith("repair-bars")
+        assert "--from 2021-06-01 --to 2021-06-15" in rule
+    assert {r[0] for r in rows} == {"prices_daily", "corporate_actions"}
+
+
+def test_dividend_repair_retracts_with_the_review_entry_as_its_rule(dividends: Settings) -> None:
+    _retract(dividends, expect=1, release=REL)
+    [(table, sid, reason, release, rule, restored)] = _retracted(dividends)
+    assert (table, sid, release, restored) == ("corporate_actions", DUP, REL, None)
+    assert reason.startswith("repair-dividends")
+    assert "b" in rule and str(EX) in rule
+
+
+def test_the_four_repairs_issue_no_delete_on_the_fact_tables() -> None:
+    import inspect
+    import re
+
+    pattern = re.compile(r"DELETE\s+FROM\s+(prices_daily|corporate_actions|listings|delistings)")
+    pattern_fstring = re.compile(r"DELETE\s+FROM\s+\{table\}")
+    for fn in (
+        repair._delete,
+        repair._delete_spinoffs,
+        repair.delete_bars,
+        repair.retract_dividends,
+        repair._delete_identities,
+        repair.retract_spinoff_splits,
+        repair._delete_split_identities,
+        repair.repair_resolution,
+    ):
+        source = inspect.getsource(fn)
+        assert not pattern.search(source), fn.__name__
+        assert not pattern_fstring.search(source), fn.__name__
+
+
+def test_a_repair_without_an_open_release_still_refuses_and_retracts_nothing(
+    store: Settings,
+) -> None:
+    _close_release(store)
+    with pytest.raises(RepairRefused, match="no release is open"):
+        repair_resolution(store, clock=lambda: RUN, expect=(3, 1), release=REL)
+    with pytest.raises(RepairRefused, match="no release is open"):
+        _delete_bars(store, expect=(3, 1), release=REL)
+    assert _retracted(store) == []
+
+
+# --- #3330: a repair that changes past reads refuses inside an open paper window ---
+
+WINDOW_START = datetime(2021, 5, 28, 14, tzinfo=UTC)  # first session 2021-05-28
+
+
+def test_resolution_repair_refuses_inside_an_open_paper_window(store: Settings) -> None:
+    open_paper_window(store, WINDOW_START)
+    before = _bars(store)
+    with pytest.raises(RepairRefused, match="open paper window"):
+        repair_resolution(store, clock=lambda: RUN, expect=(3, 1), release=REL)
+    assert _bars(store) == before
+    assert _rows(store, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+    assert repair_resolution(store, clock=lambda: RUN, dry_run=True).bar_rows == 3
+
+
+def test_delete_bars_refuses_inside_an_open_paper_window(store: Settings) -> None:
+    open_paper_window(store, WINDOW_START)
+    before = _bars(store)
+    with pytest.raises(RepairRefused, match="open paper window"):
+        _delete_bars(store, expect=(3, 1), release=REL)
+    assert _bars(store) == before
+    assert _rows(store, "SELECT count(*) FROM corporate_actions") == [(2,)]
+    assert _rows(store, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+def test_delete_bars_dated_before_the_window_is_refused_too(store: Settings) -> None:
+    # The window's runs read these bars: a past read must not move under it.
+    open_paper_window(store, datetime(2021, 6, 16, 14, tzinfo=UTC))
+    with pytest.raises(RepairRefused, match="open paper window"):
+        _delete_bars(store, expect=(3, 1), release=REL)
+    assert _rows(store, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+def test_dividend_repair_refuses_inside_an_open_paper_window(dividends: Settings) -> None:
+    open_paper_window(dividends, datetime(2021, 6, 14, 14, tzinfo=UTC))
+    with pytest.raises(RepairRefused, match="open paper window"):
+        _retract(dividends, expect=1, release=REL)
+    assert _actions(dividends) == ALL_ACTIONS
+    assert _rows(dividends, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+def test_the_helper_passes_with_no_window_or_nothing_affected(
+    store: Settings,
+) -> None:
+    with duckdb.connect(store.store.path, read_only=True) as conn:
+        repair.refuse_inside_open_window(conn, [date(2030, 1, 2)])  # no window open
+    open_paper_window(store, WINDOW_START)
+    with duckdb.connect(store.store.path, read_only=True) as conn:
+        repair.refuse_inside_open_window(conn, [])
+        for day in (date(2021, 5, 27), date(2021, 5, 28)):  # before it, on it
+            with pytest.raises(RepairRefused, match="first session 2021-05-28"):
+                repair.refuse_inside_open_window(conn, [day])

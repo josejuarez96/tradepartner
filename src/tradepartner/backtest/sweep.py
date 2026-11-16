@@ -1033,6 +1033,17 @@ def register(
                     f"between in_sample_start {parsed.in_sample_start} and the development "
                     f"boundary {boundary}"
                 )
+    if (
+        boundary is not None
+        and parsed.family != registry.ORACLE_FAMILY
+        and parsed.holdout_start <= boundary
+    ):
+        # ADR 0016 points 3 and 8 (#3151): every exam starts after the boundary, the
+        # line `write_development_boundary` holds for a boundary move.
+        raise DevelopmentBoundaryError(
+            f"{file}: holdout.start {parsed.holdout_start} is on or before the development "
+            f"boundary {boundary}: exam months never become development months"
+        )
 
     rules = lab_registry.family_rules(conn, parsed.family)
     new_family: tuple[str | None, float | None] | None = None

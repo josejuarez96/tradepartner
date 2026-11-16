@@ -373,6 +373,12 @@ def test_report_appends_a_paper_reports_row_naming_the_trial_and_through_session
     stored_window_id, stored_trial_id, stored_through = rows[0]
     assert (stored_window_id, stored_through) == (window_id, TRACKING_END)
     assert stored_trial_id == outcome.paper_report.trial_id
+    # #3180: the report-only fidelity line reads the live config keys and covers every
+    # compared period; `paper_reports` stores nothing of it (the three columns above).
+    assert outcome.fidelity is not None
+    assert outcome.fidelity.max_gap_bps == report_settings.paper.fidelity_max_gap_bps
+    assert outcome.fidelity.min_periods == report_settings.paper.fidelity_min_periods
+    assert outcome.fidelity.periods == len(outcome.comparison.periods)
 
 
 def test_report_still_writes_its_row_when_the_slippage_line_cannot_be_computed(

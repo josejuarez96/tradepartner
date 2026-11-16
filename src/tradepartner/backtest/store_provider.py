@@ -32,6 +32,16 @@ must be in that store and have no result row yet. T40
 passes a truncated data store as `connect` and the untruncated fixture
 store as `registry_connect`.
 
+**Duplicate dividends (#3015).** Every dividend-including `adjusted_prices` read and
+every `dropped_dividends` read passes the packaged reviewed list
+(`store.dividend_reviews.reviewed_groups`, read once at construction) as
+`dividend_reviews`, so a payment the vendor stored twice is never summed twice whether
+or not `health` ran first: a listed `duplicate` not yet repaired applies once, and an
+equal-amount group the list does not explain, on a name the read asks for, is left
+unapplied and reported by `dropped_dividends` as `unexplained_duplicate`, which the
+engine counts in the trial's `n_dropped_dividends` like any other dropped dividend
+(per record, so a held unexplained pair adds 2).
+
 **Frames** are the as-of functions' own frames, read with `traded_only=True`
 (#787): a zero-volume bar is missing, not a price, so it can be neither a
 fill, a mark nor a signal anchor. Two reads have no
@@ -41,6 +51,12 @@ single as-of function and are built from `store.asof` reads:
   `t_prev`, with an ex-date on or before `t_prev`'s session, at their latest
   revision as of `t` (`security_id`, `ex_date`, `ratio_or_amount`,
   `known_at`). A revision of a dividend already known at `t_prev` is not late.
+- `late_splits(t_prev, t, ids)` (#3096): per `(security_id, ex_date)` with an
+  ex-date on or before `t_prev`'s session, the live split factor at `t` over the
+  one at `t_prev` (`universe._split_factors` on each side, the list the marking
+  frame applies), kept when it is not 1: a split first known late, or one a
+  re-date or cancellation moved off that ex-date. A predecessor's splits at
+  `t_prev` are keyed by the successor known at `t`.
 - `late_spin_offs(t_prev, t, ids)`: the same rule for `spinoff` rows, selected
   and reported by their **parent** (`source_action_id`, #1894 item 2), so a
   `spinoff` whose `known_at` lands after the rebalance that owned its ex-date
@@ -74,7 +90,11 @@ at the data cutoff and only under a delisting failure-return policy other than
 `DELISTING_REASON_COLUMNS`; `merger_exits(t, ids)` is `store.asof.mergers_as_of`
 kept to rows whose acquiree is in `ids`, left-joined to the acquirer's raw
 `prices_as_of(traded_only=True)` bar on `effective_date` (null when that bar is
-absent: no earlier-close fallback, and a zero-volume bar is missing, as above).
+absent: no earlier-close fallback, and a zero-volume bar is missing, as above). An
+acquirer that is a chained predecessor in a chain known at `t` is read under its
+successor's id, where `prices_as_of` keys its bars (#821, #2949);
+`acquirer_security_id` stays the stored id, and a chain known only after `t` is not
+followed.
 
 `turnover_inputs(t, ids, sessions_from)` (backtest spec amendment #1358,
 plan T165b) is three reads on the step's connection with the frozen
@@ -92,6 +112,7 @@ so the static count agrees with the universe.
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack
@@ -105,6 +126,7 @@ import polars as pl
 from tradepartner import gap as gap_module
 from tradepartner.backtest.provider import (
     DELISTING_REASON_COLUMNS,
+    LATE_SPLIT_COLUMNS,
     MERGER_EXIT_COLUMNS,
     STATEMENT_FACT_NAMES,
     TURNOVER_BAR_COLUMNS,
@@ -123,6 +145,7 @@ from tradepartner.store.asof import (
     adjusted_prices_as_of,
     dropped_dividends_as_of,
     listings_as_of,
+    live_actions_as_of,
     live_chains,
     marking_changed_ids_as_of,
     mergers_as_of,
@@ -131,17 +154,68 @@ from tradepartner.store.asof import (
     statement_facts_as_of,
     unvalued_spin_offs_as_of,
 )
+from tradepartner.store.asof import (
+    refuse_forked_chains as refuse_forks_at,
+)
 from tradepartner.store.benchmarks import benchmark_security_ids
 from tradepartner.store.classify import classifications_as_of
 from tradepartner.store.db import StoreLockedError
 from tradepartner.store.delisting_reasons import delisting_reasons_as_of
 from tradepartner.store.delistings import listing_ends_as_of
+from tradepartner.store.dividend_reviews import reviewed_groups
 from tradepartner.universe import Universe, _split_factors, shares_as_of, universe_as_of
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 
 _ACTION_KEY: Final = ("security_id", "action_type", "ex_date")
 _LATE_COLUMNS: Final = ("security_id", "ex_date", "ratio_or_amount", "known_at")
+#: `late_splits`' frame (`LATE_SPLIT_COLUMNS`, #3096).
+_LATE_SPLIT_SCHEMA: Final = dict(
+    zip(LATE_SPLIT_COLUMNS, (pl.Utf8, pl.Date, pl.Float64), strict=True)
+)
+#: Two split factors this close are one: `r1 * r2 / r1 / r2` on one ex-date is 1 up to
+#: rounding, never a re-base.
+_SAME_FACTOR: Final = 1e-12
+
+
+def _rekeyed_splits(
+    actions: pl.DataFrame, successor: Mapping[str, str], session: date
+) -> list[tuple[tuple[str, date], float]]:
+    """`((security_id, ex_date), ratio)` of the live splits in `actions` with an ex-date
+    on or before `session`, each re-keyed to its successor, one per action identity
+    (#108: the source's id, else the ex-date): when a predecessor and its successor
+    both carry one identity, the successor's own row is kept, the rule
+    `live_actions_as_of` applies under a chain (#821)."""
+    kept: dict[tuple[str, str, date | None], tuple[bool, date, float]] = {}
+    for row in actions.iter_rows(named=True):
+        if row["action_type"] != "split" or row["ex_date"] > session:
+            continue
+        sid = row["security_id"]
+        key = successor.get(sid, sid)
+        source_id = row["source_action_id"] or ""
+        identity = (key, source_id, None if source_id else row["ex_date"])
+        own = key == sid
+        if identity not in kept or (own and not kept[identity][0]):
+            kept[identity] = (own, row["ex_date"], row["ratio_or_amount"])
+    return [((key, ex_date), ratio) for (key, _, _), (_, ex_date, ratio) in kept.items()]
+
+
+def _successors(chains: Sequence[tuple[str, str]]) -> dict[str, str]:
+    """Each chained predecessor's last live successor, stopping before a cycle."""
+    step = dict(chains)
+    out: dict[str, str] = {}
+    for pred in step:
+        seen, current = {pred}, step[pred]
+        while current in step and step[current] not in seen:
+            seen.add(current)
+            current = step[current]
+        out[pred] = current
+    return out
+
+
+#: `merger_exits`' join key: the acquirer's id mapped through the chains known at `t`.
+_ACQUIRER_KEY: Final = "_acquirer_key"
+
 #: `late_spin_offs`'s frame while it is read: the child in `security_id` (the action's
 #: own key), the parent re-keyed, so the two children of one parent on one ex-date stay
 #: two rows and a late second one is not swallowed by the first.
@@ -202,6 +276,8 @@ class StoreProvider:
         handle: registry.TrialHandle,
         frozen_settings: Settings,
         registry_connect: Connect | None = None,
+        *,
+        refuse_forked_chains: bool = False,
     ) -> None:
         if not isinstance(handle, registry.TrialHandle):
             raise TypeError(
@@ -215,8 +291,12 @@ class StoreProvider:
                 "ones, so this run would not use its frozen calendar"
             )
         self._connect = connect
+        #: A backtest run refuses a read through a forked chain (#3323); paper
+        #: planning keeps its own per-name handling and leaves this off.
+        self._refuse_forks = refuse_forked_chains
         self.handle = handle
         self.settings = frozen_settings
+        self._dividend_reviews = reviewed_groups()
         stack, conn = self._open(registry_connect or connect)
         with stack:
             registry._check_open(conn, handle)
@@ -276,7 +356,15 @@ class StoreProvider:
 
     def universe(self, t: datetime) -> Universe:
         t = check_t(t)
-        return self._step_universe(t)
+        universe = self._step_universe(t)
+        self._refuse_forks_at(t, universe.members["security_id"].to_list())
+        return universe
+
+    def _refuse_forks_at(self, t: datetime, ids: Sequence[str]) -> None:
+        """`ForkedChainError` for a forked chain among `ids` when this provider was
+        opened to refuse them (a backtest run, #3323)."""
+        if self._refuse_forks:
+            refuse_forks_at(self._at(t), t, ids)
 
     def chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
         """The live successor chains known at `t` (#821, T187b): the
@@ -294,6 +382,7 @@ class StoreProvider:
         sessions_from: date | None = None,
     ) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
+        self._refuse_forks_at(t, wanted)
         return adjusted_prices_as_of(
             self._at(t),
             t,
@@ -306,6 +395,7 @@ class StoreProvider:
             settings=self.settings,
             traded_only=True,
             sessions_from=sessions_from,
+            dividend_reviews=self._dividend_reviews if include_dividends else None,
         )
 
     def marking_changed_ids(
@@ -317,6 +407,7 @@ class StoreProvider:
 
     def raw_prices(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
+        self._refuse_forks_at(t, wanted)
         return prices_as_of(self._at(t), t, wanted, traded_only=True)
 
     def listing_ends(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
@@ -338,7 +429,9 @@ class StoreProvider:
 
     def dropped_dividends(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
-        return dropped_dividends_as_of(self._at(t), t, wanted, settings=self.settings)
+        return dropped_dividends_as_of(
+            self._at(t), t, wanted, settings=self.settings, dividend_reviews=self._dividend_reviews
+        )
 
     def late_dividends(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t, t_prev, wanted = check_t(t), check_t(t_prev, name="t_prev"), _ids(ids)
@@ -361,6 +454,38 @@ class StoreProvider:
             .filter(pl.col("ex_date") <= prev_session)
         )
         return late.select(_LATE_COLUMNS).sort("security_id", "ex_date")
+
+    def late_splits(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        """The split factors on ex-dates at or before `t_prev`'s session that `t` knows
+        differently from `t_prev` (#3096), each side `universe._split_factors`' live
+        splits (latest revision per identity, a cancelled one dropped, #108), the list
+        the marking frame's adjustment applies. A predecessor's splits read at `t_prev`
+        are keyed by its successor in the chains known at `t` (#821), as `t`'s read
+        keys them, one row per action identity with the successor's own row winning a
+        shared one (`_rekeyed_splits`), so a chain first known in the window moves no
+        factor, even for a split the vendor stored on both ids."""
+        t, t_prev, wanted = check_t(t), check_t(t_prev, name="t_prev"), _ids(ids)
+        if t_prev >= t:
+            raise ValueError(f"t_prev {t_prev.isoformat()} is not before t {t.isoformat()}")
+        conn = self._at(t)
+        prev_session = last_completed_session(t_prev)
+        successor = _successors(live_chains(conn, t))
+        asked = set(wanted)
+        before_ids = sorted(asked | {pred for pred, succ in successor.items() if succ in asked})
+        factors: dict[tuple[str, date], float] = {}
+        for sid, splits in _split_factors(conn, t, wanted, prev_session).items():
+            for ex_date, ratio in splits:
+                factors[(sid, ex_date)] = factors.get((sid, ex_date), 1.0) * ratio
+        for (sid, ex_date), ratio in _rekeyed_splits(
+            live_actions_as_of(conn, t_prev, before_ids), successor, prev_session
+        ):
+            factors[(sid, ex_date)] = factors.get((sid, ex_date), 1.0) / ratio
+        rows = [
+            (sid, ex_date, factor)
+            for (sid, ex_date), factor in sorted(factors.items())
+            if sid in asked and not math.isclose(factor, 1.0, rel_tol=_SAME_FACTOR, abs_tol=0.0)
+        ]
+        return pl.DataFrame(rows, schema=_LATE_SPLIT_SCHEMA, orient="row")
 
     def unvalued_spin_offs(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         """`unvalued_spin_offs_as_of` with the parent in `security_id` (it returns
@@ -415,22 +540,30 @@ class StoreProvider:
 
     def merger_exits(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
+        self._refuse_forks_at(t, wanted)
         conn = self._at(t)
         # `mergers_as_of` also keeps rows matched only by their acquirer; drop them.
         mergers = mergers_as_of(conn, t, wanted).filter(pl.col("security_id").is_in(wanted))
-        acquirers = sorted(set(mergers["acquirer_security_id"].drop_nulls().to_list()))
+        # `prices_as_of` keys a chained predecessor's bars under its successor (#821), so
+        # read the acquirer's close under the id the chains known at `t` map it to (#2949).
+        chains = dict(live_chains(conn, t))
+        mergers = mergers.with_columns(
+            pl.col("acquirer_security_id").replace(chains).alias(_ACQUIRER_KEY)
+        )
+        acquirers = sorted(set(mergers[_ACQUIRER_KEY].drop_nulls().to_list()))
+        self._refuse_forks_at(t, [*acquirers, *mergers["acquirer_security_id"].drop_nulls()])
         # Bound the acquirers' bars to the earliest effective date: only those dates join.
         first = mergers["effective_date"].min()
         sessions_from = first if isinstance(first, date) else None
         closes = prices_as_of(
             conn, t, acquirers, traded_only=True, sessions_from=sessions_from
         ).select(
-            pl.col("security_id").alias("acquirer_security_id"),
+            pl.col("security_id").alias(_ACQUIRER_KEY),
             pl.col("session").alias("effective_date"),
             pl.col("close").alias("acquirer_raw_close"),
         )
         return (
-            mergers.join(closes, on=["acquirer_security_id", "effective_date"], how="left")
+            mergers.join(closes, on=[_ACQUIRER_KEY, "effective_date"], how="left")
             .select(MERGER_EXIT_COLUMNS)
             .sort("security_id", "effective_date", "source_action_id")
         )

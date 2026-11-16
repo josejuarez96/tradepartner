@@ -44,6 +44,26 @@ def test_truncation_invariance_and_benchmark(tmp_path: Path) -> None:
     )
 
 
+def test_bars_are_gated_on_the_reviewed_dividend_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3015: the total-return bars pass the packaged reviewed list, so a duplicate
+    dividend is never summed twice whether or not `health` ran first."""
+    from tradepartner.store.dividend_reviews import reviewed_groups
+
+    seen: list[object] = []
+    real = reader_module.adjusted_prices_as_of
+
+    def spy(*args: object, **kwargs: object) -> object:
+        seen.append(kwargs.get("dividend_reviews"))
+        return real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(reader_module, "adjusted_prices_as_of", spy)
+    reader = EventStudyReader(build_event_study_store(tmp_path / "s.duckdb"), END)
+    reader.bars(["ISSUER"], sessions_from=date(2018, 6, 1))
+    assert seen == [reviewed_groups()]
+
+
 def test_benchmark_resolves_snapshot_static_identity_stamped_after_the_window(
     tmp_path: Path,
 ) -> None:

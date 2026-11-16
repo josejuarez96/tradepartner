@@ -600,6 +600,38 @@ def test_incremental_pending_and_acceptance_time(
     assert not later.pending
 
 
+def test_incremental_unstampable_quarter_is_the_first_filed_on_quarter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#3041: the quarter that decides an unstampable accession is its first
+    listing's filed_on quarter (T323a), fresh or pending, never the quarter of
+    a pending row's listed_on, which a settled form.idx's Last-Modified puts a
+    quarter late. A rebuild and an incremental store then decide alike."""
+    from tradepartner.adapters.filings import PendingIndexRow
+
+    source = EdgarFilingSource(edgar_settings(tmp_path), clock=lambda: CLOCK)
+    # Pending from 2025 Q4's form.idx, listed at its Last-Modified in 2026 Q1.
+    late = PendingIndexRow(
+        APPLE, "0000320193-25-000009", "8-K", "Company", date(2025, 12, 23), date(2026, 1, 12)
+    )
+    # A fresh first listing in a 2026 Q2 daily file, filed in Q1.
+    file = _incremental_file(date(2026, 4, 1))
+    fresh = _incremental_row(APPLE, "0000320193-26-000009", "10-K", date(2026, 3, 31))
+    monkeypatch.setattr(source, "_incremental_daily_rows", lambda _file: (fresh,))
+    asked: dict[str, tuple[int, int]] = {}
+
+    def stamps(
+        rows: dict[str, dict[str, tuple[UnstampedFiling, tuple[int, int]]]],
+    ) -> dict[tuple[str, str], datetime | None]:
+        asked.update({a: q for by_cik in rows.values() for a, (_, q) in by_cik.items()})
+        return {}
+
+    monkeypatch.setattr(source, "_incremental_stamps", stamps)
+    result = source.incremental_index(_incremental_state(pending=(late,), files=(file,)))
+    assert asked == {late.accession: (2025, 4), fresh.accession: (2026, 1)}
+    assert {r.accession for r in result.pending} == {late.accession, fresh.accession}
+
+
 def test_incremental_keeps_exchange_only_and_filer_13d(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -925,6 +957,26 @@ def test_completed_index_seed_routes_full_rebuild_to_table(
     )
     with pytest.raises(RuntimeError, match="stored filing index is stale"):
         stale_repair.filing_index()
+
+
+def test_statement_backfill_row_does_not_freshen_index_seed(tmp_path: Path) -> None:
+    """#2924: a statement backfill's `ok` row reads no index, so it is not a seed."""
+    base = edgar_settings(tmp_path)
+    settings = base.model_copy(
+        update={"store": base.store.model_copy(update={"path": str(tmp_path / "store.duckdb")})}
+    )
+    conn = duckdb.connect(settings.store.path)
+    schema.init_schema(conn)
+    conn.execute(
+        "INSERT INTO ingestion_runs (run_id, source, started_at, status, mode) VALUES "
+        "('seed', 'edgar_index', ?, 'ok', 'rebuild'), "
+        "('backfill', 'edgar_index', ?, 'ok', 'statement_backfill')",
+        [CLOCK - timedelta(days=1), CLOCK],
+    )
+    conn.close()
+    repair = EdgarFilingSource(settings, clock=lambda: CLOCK, prefer_stored_index=True)
+    with pytest.raises(RuntimeError, match="stored filing index is stale"):
+        repair.filing_index()
 
 
 def test_table_delisting_fetches_missing_stamp_metadata(
@@ -2224,6 +2276,70 @@ def test_an_accession_missing_after_its_quarter_settled_is_cached_as_unstampable
     again.filing_index()
     assert [u.accession for u in again.unstamped_filings] == [MISSING]
     assert _submission_urls(router) == []
+
+
+#: 2026 Q3 ends 2026-10-01 ET and settles three days later, 2026-10-04 ET.
+_Q3_SETTLED = datetime(2026, 10, 10, tzinfo=UTC)
+_MISSING_AT = datetime(2026, 9, 24, 20, tzinfo=UTC)
+
+
+def _late_router(*, stamped: bool) -> EdgarRouter:
+    """`_router` through 2026 Q4 (still open, 404); with `stamped`, Apple's
+    submissions list `MISSING` with its acceptance, as SEC serves it late."""
+    router = _router(last=(2026, 4), overrides={(2026, 4): 404})
+    if stamped:
+        payload = load(SUBMISSIONS[APPLE][0])
+        recent = payload["filings"]["recent"]
+        for column, values in recent.items():
+            values.insert(0, values[0])
+            if column == "accessionNumber":
+                values[0] = MISSING
+            elif column == "form":
+                values[0] = "8-K"
+            elif column == "acceptanceDateTime":
+                values[0] = _MISSING_AT.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            elif column == "filingDate":
+                values[0] = "2026-09-24"
+        router.add(f"{SUBMISSIONS_URL}CIK{APPLE}.json", payload)
+    return router
+
+
+def test_a_stamp_that_arrives_inside_the_retry_window_after_settle_is_kept(
+    tmp_path: Path,
+) -> None:
+    """#2865: a fetch after the quarter settled that lacks the accession does
+    not end the asking while `edgar.unstampable_retry_days` runs, so a stamp
+    SEC serves later is kept at its acceptance."""
+    cache = tmp_path / "cache"
+    first = _source(edgar_settings(cache), _late_router(stamped=False), clock=_Q3_SETTLED)
+    assert MISSING not in {e.accession for e in first.filing_index()}
+    assert [u.accession for u in first.unstamped_filings] == [MISSING]
+    router = _late_router(stamped=True)
+    later = _source(edgar_settings(cache), router, clock=_Q3_SETTLED + timedelta(days=10))
+    entries = {e.accession: e for e in later.filing_index()}
+    assert f"CIK{APPLE}.json" in _submission_urls(router)
+    assert entries[MISSING].accepted_at == _MISSING_AT
+    assert later.unstamped_filings == []
+
+
+def test_an_accession_still_missing_past_the_retry_window_is_cached_unstampable(
+    tmp_path: Path,
+) -> None:
+    """#2865: once a fetch made `edgar.unstampable_retry_days` after the settle
+    still lacks the accession, it is cached as unstampable and never asked again."""
+    settings = edgar_settings(tmp_path / "cache")
+    window = timedelta(days=settings.edgar.unstampable_retry_days)
+    settle = datetime(2026, 10, 4, tzinfo=edgar_source_module._EASTERN)
+    inside = _source(settings, _late_router(stamped=False), clock=settle + window - timedelta(1))
+    inside.filing_index()
+    past = _source(settings, _late_router(stamped=False), clock=settle + window)
+    past.filing_index()
+    assert [u.accession for u in past.unstamped_filings] == [MISSING]
+    router = _late_router(stamped=True)
+    again = _source(settings, router, clock=settle + window + timedelta(days=1))
+    assert MISSING not in {e.accession for e in again.filing_index()}
+    assert [u.accession for u in again.unstamped_filings] == [MISSING]
+    assert f"CIK{APPLE}.json" not in _submission_urls(router)
 
 
 def test_a_truncated_cache_file_is_not_served(settings: Settings) -> None:
@@ -3573,6 +3689,7 @@ def test_filename_fetch_workers_defaults_to_four_and_refuses_zero() -> None:
         Settings(_env_file=None, edgar={"filename_fetch_workers": 0})
 
 
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize("workers", [2, 4, 8])
 def test_filename_pool_answer_is_byte_identical_to_the_sequential_fetch(
     tmp_path: Path, workers: int
@@ -3588,6 +3705,44 @@ def test_filename_pool_answer_is_byte_identical_to_the_sequential_fetch(
     seq_router = _fn_router()
     _fn_run(tmp_path / "again", seq_router, 1)
     assert sorted(router.urls) == sorted(seq_router.urls)
+
+
+@pytest.mark.timeout(60)
+def test_filename_pool_finishes_after_a_leaked_limiter_stamp(tmp_path: Path) -> None:
+    """#3039: the CI hang. Another test's fake clock left the process-wide
+    limiter's stamp far ahead of the real `time.monotonic()`; the pool's
+    first request slept the whole gap under the limiter lock and every
+    worker queued behind it. Each wait is now at most one interval."""
+    edgar_raw._LIMITER._last_request_monotonic = time.monotonic() + 100_000.0
+    started = time.monotonic()
+    result = _fn_run(tmp_path, _fn_router(), 2)
+    assert time.monotonic() - started < 30.0
+    assert [e.accession for e in result["listings"]] == [_FN_A, _FN_B, _FN_25_NASDAQ, _FN_COVER]
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("workers", [2, 4])
+def test_filename_pool_job_started_after_its_turn_still_answers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workers: int
+) -> None:
+    """#3039: the second CI hang. The caller takes each prefetched future in
+    order, removing it from the dict it was handed; a job a worker picked up
+    only after its turn came found no future, died in the pool unseen, and
+    the caller waited on that future forever. Here every job starts late, so
+    every turn comes first: the answer is still the sequential one."""
+    real_pool = edgar_source_module.ThreadPoolExecutor
+
+    class LateStart(real_pool):  # type: ignore[misc, valid-type]
+        def map(self, fn: Any, *iterables: Any, **kwargs: Any) -> Any:
+            def late(*args: Any) -> Any:
+                time.sleep(0.2)  # the caller reaches its turn first
+                return fn(*args)
+
+            return super().map(late, *iterables, **kwargs)
+
+    sequential = _fn_run(tmp_path / "one", _fn_router(), 1)
+    monkeypatch.setattr(edgar_source_module, "ThreadPoolExecutor", LateStart)
+    assert _fn_run(tmp_path / "pool", _fn_router(), workers) == sequential
 
 
 def test_filename_pool_of_one_is_todays_sequential_path(
@@ -3834,6 +3989,64 @@ def test_filename_fetch_share_counts_only_ciks_that_sent_a_fetch(tmp_path: Path)
     cached = _fn_source(tmp_path, router)
     cached.filename_listings(_FN_CIK)
     assert cached._filename_ciks_asked == set()
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_filename_fetch_stops_after_consecutive_failed_ciks(tmp_path: Path, workers: int) -> None:
+    """#2934: in a full SEC outage the pass stops once
+    `edgar.filename_fetch_outage_ciks` CIKs in a row failed past the
+    retries, instead of retrying every remaining CIK; the raise fails the
+    run closed, naming the outage. Each call here is one more failed CIK."""
+    router = _fn_router()
+    router.add(_fn_url(_FN_C, "index.json"), 503)
+    source = _fn_source(
+        tmp_path,
+        router,
+        filename_fetch_workers=workers,
+        retry_max_attempts=1,
+        filename_fetch_outage_ciks=3,
+    )
+    assert source.filename_listings(_FN_CIK) == []
+    assert source.filename_listings(_FN_CIK) == []
+    with pytest.raises(
+        edgar_source_module.FilenameFetchOutageError,
+        match=r"3 CIKs in a row.*edgar\.filename_fetch_outage_ciks.*HTTPStatusError",
+    ):
+        source.filename_listings(_FN_CIK)
+    assert source.filename_incomplete_ciks == {_FN_CIK}
+    stored = json.loads((tmp_path / "cache" / "filename" / "v1" / f"{_FN_CIK}.json").read_text())
+    assert _FN_C not in stored["records"]  # the failed filing stays uncached
+
+
+def test_filename_fetch_outage_streak_resets_on_an_answer(tmp_path: Path) -> None:
+    """A CIK whose fetch answers ends the streak; a fully cached CIK sends
+    nothing and leaves it as it is (it is no evidence either way)."""
+    down = [True]
+    router = _fn_router()
+    url = _fn_url(_FN_C, "index.json")
+    healthy = router._routes[url]
+
+    def flaky(request: httpx.Request) -> httpx.Response:
+        if down[0]:
+            return httpx.Response(503, request=request)
+        return cast(httpx.Response, healthy(request))
+
+    router.add(url, flaky)
+    source = _fn_source(tmp_path, router, retry_max_attempts=1, filename_fetch_outage_ciks=2)
+    source.filename_listings(_FN_CIK)
+    assert source._filename_failed_streak == 1
+    down[0] = False
+    source.filename_listings(_FN_CIK)
+    assert source._filename_failed_streak == 0
+    source._filename_failed_streak = 1
+    source.filename_listings(_FN_CIK)  # fully cached now: nothing sent
+    assert source._filename_failed_streak == 1
+
+
+def test_filename_fetch_outage_ciks_defaults_and_refuses_zero() -> None:
+    assert Settings(_env_file=None).edgar.filename_fetch_outage_ciks == 20
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, edgar={"filename_fetch_outage_ciks": 0})
 
 
 def _done(result: Any = None, error: BaseException | None = None) -> Any:
@@ -4258,6 +4471,59 @@ def test_a_touched_binding_reads_its_touched_issuers_in_one_scan(tmp_path: Path)
     assert source._stored.loaded >= touched & source._stored_issuer_ciks()
     assert ciks[30] not in source._stored.loaded
     assert counting.queries > after_touched  # the untouched CIK was read alone
+
+
+@pytest.mark.parametrize("ciks", [50, 500])
+def test_stored_form_reads_order_shared_accessions_in_one_scan(
+    tmp_path: Path, ciks: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2921: `filing_index_for_forms` and the delisting read ordered each
+    accession shared by more than one CIK (every exchange 25-NSE pair) with
+    its own `accession_listing_order` scan. Now one scan per read, same rows."""
+    settings = edgar_settings(tmp_path)
+    conn, _names = _stored_index_fixture(ciks)
+    fresh = stored_index.Listing(
+        _EXCHANGE,
+        f"{_EXCHANGE}-26-000003",
+        "25-NSE",
+        "Exchange",
+        CLOCK.date(),
+        CLOCK,
+        CLOCK.date(),
+        True,
+        9,
+    )  # an uncommitted copy of a stored shared accession
+    forms = {"25-NSE", "10-K", "SC 13D"}
+
+    def answers(source: EdgarFilingSource) -> list[Any]:
+        return [
+            source.filing_index_for_forms(forms),
+            source._stored_form_rows(forms, first=False),
+            source._stored_form_rows({"25", "25-NSE"}, first=True),
+        ]
+
+    old = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    old.use_index(conn, [fresh])
+    with monkeypatch.context() as patched:  # the pre-#2921 read: one scan per accession
+        patched.setattr(
+            stored_index,
+            "accession_listing_orders",
+            lambda c, accessions, t: {
+                a: rows
+                for a in accessions
+                if (rows := stored_index.accession_listing_order(c, a, t))
+            },
+        )
+        expected = answers(old)
+    counting = _CountingConn(conn)
+    source = EdgarFilingSource(settings, clock=lambda: CLOCK)
+    source.use_index(cast(duckdb.DuckDBPyConnection, counting), [fresh])
+    assert answers(source) == expected
+    shared = {r.accession for r in expected[1] if r.form == "25-NSE"}
+    assert len(shared) >= ciks // 7
+    # 17 at either size: a form scan per form, one order scan per read. It was
+    # those plus one scan per shared accession per read (about ciks / 7 each).
+    assert counting.queries <= 20, counting.queries
 
 
 @pytest.mark.parametrize("ciks", [50, 500])

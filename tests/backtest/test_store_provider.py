@@ -14,6 +14,7 @@ from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import duckdb
@@ -27,6 +28,7 @@ from tradepartner import gap as gap_module
 from tradepartner.backtest import store_provider as store_provider_module
 from tradepartner.backtest.provider import (
     DELISTING_REASON_COLUMNS,
+    LATE_SPLIT_COLUMNS,
     MERGER_EXIT_COLUMNS,
     STATEMENT_FACT_NAMES,
     DataProvider,
@@ -55,6 +57,7 @@ from tradepartner.store.db import (
 )
 from tradepartner.store.delisting_reasons import delisting_reasons_as_of
 from tradepartner.store.delistings import listing_ends_as_of
+from tradepartner.store.dividend_reviews import reviewed_groups
 from tradepartner.universe import shares_as_of, universe_as_of
 
 UNIVERSE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
@@ -459,6 +462,30 @@ def test_dropped_dividends_equal_the_as_of_read(store: Store) -> None:
     assert got.equals(want)
 
 
+@pytest.mark.parametrize("include_dividends", [False, True])
+def test_dividend_reads_pass_the_reviewed_list(
+    store: Store, monkeypatch: pytest.MonkeyPatch, include_dividends: bool
+) -> None:
+    """#3015: every dividend-including read is gated on the packaged reviewed list, so a
+    duplicate payment is not summed whether or not `health` ran first; a splits-only
+    read passes nothing (it reads no dividend)."""
+    seen = _spy_on_adjusted(monkeypatch)
+    dropped_calls: list[dict[str, Any]] = []
+
+    def spy_dropped(*args: Any, **kwargs: Any) -> pl.DataFrame:
+        dropped_calls.append(kwargs)
+        return dropped_dividends_as_of(*args, **kwargs)
+
+    monkeypatch.setattr(store_provider_module, "dropped_dividends_as_of", spy_dropped)
+    ids = ["SEC_DIV_REVISED", "SEC_SPY"]
+    with store.provider() as provider:
+        provider.adjusted_prices(T_MAR, ids, include_dividends)
+        provider.dropped_dividends(T_MAR, ids)
+    want = reviewed_groups()
+    assert [call.get("dividend_reviews") for call in seen] == [want if include_dividends else None]
+    assert [call.get("dividend_reviews") for call in dropped_calls] == [want]
+
+
 def test_late_dividends(store: Store) -> None:
     ids = ["SEC_DUAL_A", "SEC_DUAL_B", "SEC_DIV_REVISED"]
     with store.provider() as provider:
@@ -521,6 +548,94 @@ def test_unvalued_spin_offs_select_by_the_parent(store: Store) -> None:
     assert got.columns == ["security_id", "child", "ex_date", "reason"]
     assert got.equals(want.rename({"parent": "security_id"}))
     assert child_alone.is_empty()
+
+
+def test_late_splits_report_a_re_date_and_a_split_first_known_late(store: Store) -> None:
+    """#3096 on the fixture's splits. `SEC_SPLIT_REDATED` (2:1 ex 2019-06-10, known
+    06-07) is re-dated to 06-17 at 2019-06-12 21:00: a window opening at close(06-11)
+    undoes the 06-10 factor (0.5) and leaves 06-17, after that session, to the frame.
+    `SEC_SPLIT_REDATED_NOID`'s 2:1 ex 2019-10-14 is first known 10-18 22:00: late (2.0)
+    in the window after close(10-18), while the cancelled 10-21 row is past that
+    session. An on-time split and a window that sees no change report nothing."""
+    with store.provider() as provider:
+        redated = provider.late_splits(
+            session_close(date(2019, 6, 11)),
+            session_close(date(2019, 6, 14)),
+            ["SEC_SPLIT_REDATED"],
+        )
+        quiet = provider.late_splits(
+            session_close(date(2019, 6, 13)),
+            session_close(date(2019, 6, 14)),
+            ["SEC_SPLIT_REDATED"],
+        )
+        first_late = provider.late_splits(
+            session_close(date(2019, 10, 18)),
+            session_close(date(2019, 10, 21)),
+            ["SEC_SPLIT_REDATED_NOID", "SEC_SPLIT_REDATED"],
+        )
+        on_time = provider.late_splits(
+            session_close(date(2018, 12, 12)),
+            session_close(date(2018, 12, 14)),
+            ["SEC_SPLIT_PLAIN"],
+        )
+        not_asked = provider.late_splits(
+            session_close(date(2019, 6, 11)), session_close(date(2019, 6, 14)), ["SEC_SPLIT_PLAIN"]
+        )
+    assert redated.columns == list(LATE_SPLIT_COLUMNS)
+    assert redated.rows() == [("SEC_SPLIT_REDATED", date(2019, 6, 10), 0.5)]
+    assert first_late.rows() == [("SEC_SPLIT_REDATED_NOID", date(2019, 10, 14), 2.0)]
+    assert quiet.is_empty() and on_time.is_empty() and not_asked.is_empty()
+
+
+@pytest.mark.parametrize("on_both", [False, True])
+def test_late_splits_move_no_factor_when_a_chain_is_first_known_in_the_window(
+    tmp_path: Path, on_both: bool
+) -> None:
+    """#3096 on the chain overlay (0001000010 -> 0001000011, known 2020-02-07): a 2:1
+    split ex 2020-01-10, known in time on the predecessor (and, `on_both`, stored again
+    on the successor with no source id, one identity after the re-key), is the same
+    split at `t_prev` (before the chain) and at `t` (after it), so nothing is late. The
+    successor's own row wins a shared identity on both sides, never a 1/r."""
+    path = tmp_path / "chain_splits.duckdb"
+    settings = _settings(path)
+    conn = duckdb.connect(str(path))
+    try:
+        configure_connection(conn)
+        schema.init_schema(conn)
+        load_universe_fixtures(conn, UNIVERSE_DIR)
+        load_chain_overlay(conn)
+        known = datetime(2020, 1, 9, 21, 30, tzinfo=UTC)
+        for sid in ["0001000010", "0001000011"] if on_both else ["0001000010"]:
+            insert_row(
+                conn,
+                "corporate_actions",
+                {
+                    "security_id": sid,
+                    "action_type": "split",
+                    "ex_date": date(2020, 1, 10),
+                    "ratio_or_amount": 2.0,
+                    "announced_at": None,
+                    "source_action_id": "",
+                    "cancelled": False,
+                    "known_at": known,
+                    "ingested_at": known,
+                    "source": "alpaca",
+                    "provenance": "action",
+                },
+            )
+    finally:
+        conn.close()
+    handle = _open_trial(settings, tmp_path)
+    with StoreProvider(_connect_to(settings), handle, settings) as provider:
+        late = provider.late_splits(
+            session_close(date(2020, 1, 31)), session_close(date(2020, 2, 28)), ["0001000011"]
+        )
+    assert late.is_empty()
+
+
+def test_late_splits_refuse_a_window_that_does_not_move_forward(store: Store) -> None:
+    with store.provider() as provider, pytest.raises(ValueError, match="not before"):
+        provider.late_splits(T_MAR, T_FEB, ["SEC_SPLIT_REDATED"])
 
 
 def test_late_spin_offs_are_keyed_by_parent_and_the_window(store: Store) -> None:
@@ -1215,6 +1330,75 @@ def test_chains_reads_the_live_successor_chains(tmp_path: Path, store: Store) ->
         assert provider.chains(_CHAIN_KNOWN_AT) == (("0001000010", "0001000011"),)
 
 
+def test_a_forked_predecessor_is_refused_by_the_research_reads(
+    tmp_path: Path, store: Store
+) -> None:
+    """#3323: a predecessor with two live successors at `t` refuses the reads that
+    name it (or a successor) with `ForkedChainError`; before the second chain is
+    known, and for unrelated ids, the reads go through."""
+    from lookahead.harness import PROBE_EPSILON
+
+    from tradepartner.store.asof import ForkedChainError, forked_chains
+
+    path = tmp_path / "fork.duckdb"
+    settings = _settings(path)
+    fork_at = datetime(2020, 6, 1, 20, 30, tzinfo=UTC)
+    conn = duckdb.connect(str(path))
+    try:
+        configure_connection(conn)
+        schema.init_schema(conn)
+        load_universe_fixtures(conn, UNIVERSE_DIR)
+        load_chain_overlay(conn)
+        insert_row(
+            conn,
+            "successor_chains",
+            {
+                "predecessor_id": "0001000010",
+                "successor_id": "0001000099",
+                "evidence_accession": "0001000099-24-000001",
+                "evidence_form": "8-K12B",
+                "retracted": False,
+                "withdrawn_known_at": None,
+                "known_at": fork_at,
+                "ingested_at": fork_at,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+        assert forked_chains(conn, fork_at - PROBE_EPSILON) == {}
+        assert forked_chains(conn, fork_at) == {"0001000010": ("0001000011", "0001000099")}
+        assert forked_chains(conn, fork_at, ["0001000013"]) == {}
+        assert forked_chains(conn, fork_at, ["0001000099"]) != {}
+    finally:
+        conn.close()
+    handle = _open_trial(settings, tmp_path)
+
+    @contextmanager
+    def connect() -> Iterator[duckdb.DuckDBPyConnection]:
+        with open_read_only(settings) as conn:
+            yield conn
+
+    # Paper planning builds its provider without the flag: nothing is refused.
+    with StoreProvider(connect, handle, settings) as provider:
+        assert not provider.raw_prices(fork_at, ["0001000011"]).is_empty()
+    with StoreProvider(connect, handle, settings, refuse_forked_chains=True) as provider:
+        provider.raw_prices(fork_at - PROBE_EPSILON, ["0001000011"])
+        provider.raw_prices(fork_at, ["0001000013"])
+        with pytest.raises(ForkedChainError, match="0001000010"):
+            provider.raw_prices(fork_at, ["0001000011"])
+        with pytest.raises(ForkedChainError, match="0001000099"):
+            provider.adjusted_prices(fork_at, ["0001000010"], include_dividends=False)
+        # The universe check reads the step's members (a fork member among them).
+        provider._at(fork_at)  # opens the step; a new `t` would drop the stub universe
+        provider._universe = SimpleNamespace(  # type: ignore[assignment]
+            members=pl.DataFrame({"security_id": ["0001000011"]})
+        )
+        with pytest.raises(ForkedChainError, match="0001000010"):
+            provider.universe(fork_at)
+        with pytest.raises(ForkedChainError, match="0001000010"):
+            provider.merger_exits(fork_at, ["0001000011"])
+
+
 def _open_trial(settings: Settings, tmp_path: Path) -> registry.TrialHandle:
     """A real `TrialHandle` recorded in `settings`'s store."""
     with open_for_write(settings) as conn:
@@ -1516,6 +1700,54 @@ def test_a_missing_effective_date_bar_gives_null(
     closes = dict(frame.select("security_id", "acquirer_raw_close").iter_rows())
     assert closes["TGT_NOBAR"] is None
     assert closes["TGT_CASH"] is None
+
+
+#: The chain overlay's 0001000010 -> 0001000011 pair (#821): its chain is known from
+#: `_CHAIN_KNOWN_AT`; only the successor has a bar on `_CHAIN_EFFECTIVE`.
+_CHAIN_EFFECTIVE = date(2020, 2, 6)
+
+
+def test_a_chained_predecessor_acquirer_reads_its_successors_close(
+    tmp_path: Path,
+) -> None:
+    """#2949: a merger naming a predecessor as its acquirer reads the close through the
+    chain known at `t` (the bar `prices_as_of` re-keys to the successor), keeping the
+    stored `acquirer_security_id`; before the chain is known the close is null."""
+    from lookahead.harness import PROBE_EPSILON
+
+    path = tmp_path / "chain_exits.duckdb"
+    settings = _settings(path)
+    conn = duckdb.connect(str(path))
+    try:
+        configure_connection(conn)
+        schema.init_schema(conn)
+        load_universe_fixtures(conn, UNIVERSE_DIR)
+        load_chain_overlay(conn)
+        insert_row(
+            conn,
+            "mergers",
+            _merger_row(
+                "TGT_CHAIN",
+                "m-chain",
+                datetime(2020, 2, 7, 20, tzinfo=UTC),
+                acquirer="0001000010",
+                effective_date=_CHAIN_EFFECTIVE,
+                process_date=_CHAIN_EFFECTIVE,
+            ),
+        )
+    finally:
+        conn.close()
+    handle = _open_trial(settings, tmp_path)
+    with StoreProvider(_connect_to(settings), handle, settings) as provider:
+        before = provider.merger_exits(_CHAIN_KNOWN_AT - PROBE_EPSILON, ["TGT_CHAIN"])
+        known = provider.merger_exits(_CHAIN_KNOWN_AT, ["TGT_CHAIN"])
+    assert before.select("acquirer_security_id", "acquirer_raw_close").rows() == [
+        ("0001000010", None)
+    ]
+    assert known.select("acquirer_security_id", "acquirer_raw_close").rows() == [
+        ("0001000010", 19.74)
+    ]
+    assert known.columns == list(MERGER_EXIT_COLUMNS)
 
 
 def test_the_fake_answers_the_exit_reads_as_the_store(

@@ -20,7 +20,7 @@ from typing import Any
 
 import duckdb
 import pytest
-from dashboard_nav import NavCall, nav_calls_fixture, nav_titles  # noqa: F401
+from dashboard_nav import NavCall, app_test, nav_calls_fixture, nav_titles  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.backtest.metrics import LONG_SHORT_KEYS, METRIC_KEYS, deflated_sharpe
@@ -256,7 +256,7 @@ def _seed(store_path: Path, tmp_path: Path) -> Seeded:
 def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> AppTest:
     monkeypatch.setenv("STORE__PATH", str(store_path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
-    at = AppTest.from_file(_APP_PATH)
+    at = app_test(_APP_PATH)
     at.run()
     monkeypatch.setenv("DASHBOARD_TEST_PAGE", "Backtest")
     at.run()

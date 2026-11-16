@@ -480,6 +480,18 @@ class AlpacaBroker(Broker):
             raise
         return _mapped("order", _order, payload)
 
+    def get_order_by_broker_id(self, broker_order_id: str) -> Order:
+        """The broker's order with its own id `broker_order_id`, in any state, or
+        `UnknownOrderError`. Read-only (`GET /v2/orders/{id}`)."""
+        self._now()
+        try:
+            payload = self._raw.get_order_by_id(broker_order_id)
+        except AlpacaTradingError as error:
+            if error.status_code == _NOT_FOUND:
+                raise UnknownOrderError(f"the broker has no order id {broker_order_id!r}") from None
+            raise
+        return _mapped("order", _order, payload)
+
     def open_orders(self) -> list[Order]:
         """Every order Alpaca lists as open."""
         self._now()

@@ -184,20 +184,18 @@ def _last_bars(
     security_filter = _security_filter(ids, params)
     sql = f"""
         WITH latest AS (
-            SELECT security_id, session, close, volume, ROW_NUMBER() OVER (
-                PARTITION BY security_id, session ORDER BY known_at DESC
-            ) AS _revision
+            SELECT security_id, session,
+                   arg_max(close, known_at) AS close,
+                   arg_max(volume, known_at) AS volume
             FROM prices_daily
             WHERE known_at <= ? AND session <= ?
             {security_filter}
-        ), traded AS (
-            SELECT security_id, session, close, ROW_NUMBER() OVER (
-                PARTITION BY security_id ORDER BY session DESC
-            ) AS _rn
-            FROM latest
-            WHERE _revision = 1 AND volume > 0
+            GROUP BY security_id, session
         )
-        SELECT security_id, session, close FROM traded WHERE _rn = 1
+        SELECT security_id, max(session), arg_max(close, session)
+        FROM latest
+        WHERE volume > 0
+        GROUP BY security_id
     """
     return {sid: (day, close) for sid, day, close in conn.execute(sql, params).fetchall()}
 

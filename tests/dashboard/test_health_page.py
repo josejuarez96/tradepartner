@@ -20,7 +20,7 @@ import duckdb
 import polars as pl
 import pytest
 from conftest import load_universe_fixtures
-from dashboard_nav import nav_calls_fixture  # noqa: F401
+from dashboard_nav import app_test, nav_calls_fixture  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner import health
@@ -89,7 +89,7 @@ def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path, now: datetime = T) -
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
     monkeypatch.setattr(health_page, "_now", lambda: now)
     monkeypatch.setenv("DASHBOARD_TEST_PAGE", "Data health")
-    at = AppTest.from_file(_APP_PATH, default_timeout=60)
+    at = app_test(_APP_PATH)
     at.run()
     return at
 
@@ -353,6 +353,23 @@ def test_render_shows_every_metric(monkeypatch: pytest.MonkeyPatch, store_path: 
     assert tuple(report.delisted.frame.columns) in frames
     assert tuple(report.listed_without_bars.frame.columns) in frames
     assert tuple(report.gaps.rows.columns) in frames
+
+
+def test_render_shows_the_delisting_reasons_card(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    """#3215: the report-only delisting-reasons block (T329) gets its own card."""
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    text = _text(at)
+    assert "Delisting reasons" in text
+    with _connect(store_path) as conn:
+        block = health_report(conn, T, _settings(store_path)).delisting_reasons
+    assert block is not None
+    for line in block.lines():
+        assert line.strip() in text, line
+    frames = {tuple(df.value.columns) for df in at.dataframe}
+    assert block.unknown.is_empty() or tuple(block.unknown.columns) in frames
 
 
 def test_render_marks_a_stale_store(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> None:

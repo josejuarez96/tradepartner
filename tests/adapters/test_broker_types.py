@@ -645,6 +645,7 @@ def test_broker_declares_every_method_abstract() -> None:
             "submit",
             "cancel",
             "get_order",
+            "get_order_by_broker_id",
             "open_orders",
             "fills",
             "cash_activities",

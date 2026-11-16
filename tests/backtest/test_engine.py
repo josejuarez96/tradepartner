@@ -6,6 +6,7 @@ import ast
 import dataclasses
 import itertools
 import math
+import pickle
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
@@ -127,6 +128,98 @@ def _rows(result: BacktestResult, session: date) -> Any:
 
 
 class TestReads:
+    def test_marking_bound_is_computed_once_per_step(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        original_bound = engine._marking_bound
+        original_anchor = engine.anchor_sessions
+        bounds = 0
+        anchors = 0
+        held_months_by_step: list[set[tuple[int, int]]] = []
+
+        def counted_anchor(*args: Any, **kwargs: Any) -> tuple[date, date]:
+            nonlocal anchors
+            anchors += 1
+            return original_anchor(*args, **kwargs)
+
+        def counted_bound(*args: Any, **kwargs: Any) -> date:
+            nonlocal bounds
+            bounds += 1
+            variant = cast(engine._Variant, args[0])
+            held_months_by_step.append(
+                {
+                    (since.year, since.month)
+                    for book in variant.books
+                    for since in book.held_since.values()
+                }
+            )
+            return original_bound(*args, **kwargs)
+
+        monkeypatch.setattr(engine, "anchor_sessions", counted_anchor)
+        monkeypatch.setattr(engine, "_marking_bound", counted_bound)
+        _run(_provider(), levels=(0.0, 15.0, 30.0, 100.0))
+        steps = len(rebalance_sessions(T0, T3)) - 1
+        assert bounds == steps
+        assert any(len(months) >= 2 for months in held_months_by_step)
+        # The plan and each distinct earliest held date need at most one anchor
+        # per step, regardless of names or cost levels.
+        assert anchors <= 2 * steps
+
+    def test_marking_bound_change_keeps_fixture_result_bytes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        optimized = _run(_provider(), levels=(0.0, 15.0, 30.0))
+        original_bound = engine._marking_bound
+
+        # Keep this pre-fix algorithm independent of the production helper: it is
+        # the reference for the fixture's byte-for-byte result comparison.
+        def per_name_bound(
+            variant: engine._Variant,
+            step_end: date,
+            family: HypothesisFamily,
+            marked: Sequence[str],
+        ) -> date:
+            plan = cast(engine.Plan, variant.plan)
+            settings = variant.settings
+            sessions = all_sessions()
+            at = engine.bisect.bisect_right(sessions, step_end) - 1
+            stale = sessions[max(0, at - settings.backtest.stale_exit_sessions)]
+            bounds = [stale, plan.session]
+            bounds.extend(
+                variant.last_stitched[sid] for sid in marked if sid in variant.last_stitched
+            )
+            if family in ("momentum", "combined"):
+                bounds.append(
+                    engine.anchor_sessions(
+                        plan.session,
+                        settings.strategy.formation_months,
+                        settings.strategy.skip_months,
+                        settings.schedule.signal_anchor,
+                    )[0]
+                )
+            for book in variant.books:
+                bounds.extend(book.marked_at.values())
+                bounds.extend(book.held_since.values())
+                bounds.extend(
+                    holding.marked_at
+                    for holding in book.benchmarks.values()
+                    if holding.marked_at is not None
+                )
+                if family in ("momentum", "combined"):
+                    bounds.extend(
+                        engine.anchor_sessions(
+                            since,
+                            settings.strategy.formation_months,
+                            settings.strategy.skip_months,
+                            settings.schedule.signal_anchor,
+                        )[0]
+                        for since in book.held_since.values()
+                    )
+            return min(bounds)
+
+        monkeypatch.setattr(engine, "_marking_bound", per_name_bound)
+        reference = _run(_provider(), levels=(0.0, 15.0, 30.0))
+        monkeypatch.setattr(engine, "_marking_bound", original_bound)
+        assert pickle.dumps(optimized) == pickle.dumps(reference)
+
     def test_only_rebalance_closes_are_read(self) -> None:
         provider = _provider()
         _run(provider)
@@ -1764,6 +1857,54 @@ def test_h1_twin_run_on_the_fake_provider_is_pinned() -> None:
     assert finals == pytest.approx(TWIN_FINAL_EQUITY, rel=1e-12)
 
 
+def test_the_twin_pin_carries_no_delisting_exit_record() -> None:
+    """Plan T328c: the `none` twin (no listing ends) records no delisting exit in memory;
+    the record is outside the digest either way."""
+    settings = _twin_settings()
+    assert settings.backtest.delisting_failure_return == "none"
+    results = run(settings, _provider(), T0, T4, _handle(), (0.0,), family="momentum")
+    assert results[0.0].delisting_exits == ()
+    assert _run_digest(results[0.0]) == TWIN_RUN_DIGESTS[0.0]
+
+
+@pytest.mark.parametrize("policy", ["failure_v1", "severe_v1"])
+def test_a_policy_twin_without_exits_reads_nothing_new_and_adds_only_zero_counts(
+    policy: str,
+) -> None:
+    """Plan T328c: with no delisting exit a policy run makes no evidence read (its call
+    log is the pinned one) and its rows differ from the pin only by the policy counts,
+    all zero, which a policy other than `none` writes on every row."""
+    import hashlib
+    import json
+
+    settings = _twin_settings().model_copy(
+        update={
+            "backtest": _twin_settings().backtest.model_copy(
+                update={"delisting_failure_return": policy}
+            )
+        }
+    )
+    provider = _provider()
+    levels = tuple(settings.costs.sensitivity_per_side_bps)
+    results = run(settings, provider, T0, T4, _handle(), levels, family="momentum")
+    log = _call_log(provider)
+    assert hashlib.sha256(json.dumps(log).encode()).hexdigest() == TWIN_CALL_LOG_SHA256
+    policy_counts = set(engine.POLICY_COUNT_NAMES)
+    stripped = {}
+    for level, result in results.items():
+        for row in result.rebalances:
+            assert {k: row.counts[k] for k in policy_counts} == dict.fromkeys(policy_counts, 0)
+        rows = tuple(
+            dataclasses.replace(
+                row, counts={k: v for k, v in row.counts.items() if k not in policy_counts}
+            )
+            for row in result.rebalances
+        )
+        stripped[level] = _run_digest(dataclasses.replace(result, rebalances=rows))
+    assert stripped == TWIN_RUN_DIGESTS
+    assert _run_digest(results[0.0]) != TWIN_RUN_DIGESTS[0.0]
+
+
 def test_the_twin_pin_fails_if_the_screen_reads_or_runs_at_the_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1788,7 +1929,8 @@ def test_the_twin_pin_fails_if_the_screen_reads_or_runs_at_the_default(
 
 #: The provider methods the twin's run calls: no turnover read. `chains` (#821,
 #: T187b) is the engine's once-per-step live successor-chain read; it is empty on
-#: the fake and changes no run digest, only the call log.
+#: the fake and changes no run digest, only the call log. `late_splits` (#3096) is the
+#: once-per-step late-split read; the twin has none, so it too moved only the log.
 TWIN_CALL_METHODS = {
     "universe",
     "chains",
@@ -1800,9 +1942,10 @@ TWIN_CALL_METHODS = {
     "listing_ends",
     "dropped_dividends",
     "late_dividends",
+    "late_splits",
 }
-TWIN_N_CALLS = 41
-TWIN_CALL_LOG_SHA256 = "84941e2098cbff6122a610b8b2a0b2b63f13a7a8c6a23378fb25116ac867f25a"
+TWIN_N_CALLS = 45
+TWIN_CALL_LOG_SHA256 = "a2cf056104ff5167b445aaecd8d36d719b1b1fc845f2ad5aac260116df76d56c"
 #: Per cost level: a SHA-256 over the equity, rebalance (counts included), weight and
 #: target rows, floats rounded to nine places.
 TWIN_RUN_DIGESTS = {

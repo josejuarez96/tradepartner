@@ -81,6 +81,7 @@ from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.holdout import Frozen, Window, default_in_sample_window
 from tradepartner.backtest.sweep import READ_GROUP_FREE_KEYS
 from tradepartner.config import Cadence
+from tradepartner.config_backtest import DelistingFailureReturn
 from tradepartner.store import lab_registry
 from tradepartner.store.lab_registry import (
     CADENCE_KEY,
@@ -90,7 +91,6 @@ from tradepartner.store.lab_registry import (
 )
 from tradepartner.store.lab_schema import require_lab
 from tradepartner.store.registry import (
-    SPIN_OFFS_KEY,
     STORE_CHANGED_MESSAGE,
     UNREAD,
     Unread,
@@ -99,6 +99,7 @@ from tradepartner.store.registry import (
     code_tree_sha256,
     data_vintage,
     get_hypothesis_by_id,
+    vintage_gates,
 )
 
 #: The message a `failed` trial carries when the group's shared read failed
@@ -108,11 +109,13 @@ SHARED_READ_FAILED: Final = "shared read failed"
 #: `sweep_state`'s overall value (spec, Definitions "Complete sweep").
 SweepStateName = Literal["complete", "incomplete (stale)", "incomplete (unrun)"]
 
-#: The data-vintage memo the planning reads share, keyed by `(cutoff, spin_offs)`: a
-#: trial's frozen `adjust.apply_spin_offs` decides whether its vintage counts the
-#: stored `spinoff` rows (`registry.data_vintage`; backtest spec amendment #1894,
-#: item 6; T211d), so a `False` variant's cut does not stand in for a `True` one's.
-Vintages = dict[tuple[datetime, bool], datetime | None]
+#: The data-vintage memo the planning reads share, keyed by `(cutoff, spin_offs,
+#: delisting_policy)`: a trial's frozen `adjust.apply_spin_offs` decides whether its
+#: vintage counts the stored `spinoff` rows (`registry.data_vintage`; backtest spec
+#: amendment #1894, item 6; T211d) and its frozen `backtest.delisting_failure_return`
+#: whether it counts `delisting_reasons` and `mergers` (#2670, T328d), so one
+#: variant's cut does not stand in for another's.
+Vintages = dict[tuple[datetime, bool, DelistingFailureReturn], datetime | None]
 
 
 class SweepNotCompleteError(LabRegistryError):
@@ -288,6 +291,25 @@ def counted_trial(
     return _counted_trial(conn, hypothesis_id, window, code_tree_sha256(), {})
 
 
+def latest_ok_trial(
+    conn: duckdb.DuckDBPyConnection, hypothesis_id: int, *, code_vintage: str | None
+) -> tuple[TrialRow, bool] | None:
+    """A pre-lab hypothesis's latest `ok`, non-synthetic, `in_sample` trial, over any
+    window (each such trial is counted in N), with whether it is current at
+    `code_vintage`; or None. What an operations file of a pre-lab parent reads in place
+    of a variant's counted trial (paper spec amendment 2026-11-07 #3118 item 2)."""
+    require_lab(conn)
+    row = conn.execute(
+        _TRIAL_SELECT + "WHERE t.hypothesis_id = ? AND t.kind = 'in_sample' "
+        "AND NOT t.synthetic AND r.status = 'ok' ORDER BY t.trial_id DESC LIMIT 1",
+        [hypothesis_id],
+    ).fetchone()
+    if row is None:
+        return None
+    trial = TrialRow(*row)
+    return trial, _is_current(conn, trial, code_vintage, {})
+
+
 def is_current(conn: duckdb.DuckDBPyConnection, trial: TrialRow) -> bool:
     """Whether `trial` is current (spec, Definitions "Vintage"): its data vintage
     equals the data vintage computed now at its own cutoff, and its code vintage
@@ -304,7 +326,7 @@ def _is_current(
     vintages: Vintages,
 ) -> bool:
     """`is_current` with a pre-computed checkout code vintage and a memo of the
-    data vintage per `(cutoff, spin_offs)` (`vintages`), so a caller walking many
+    data vintage per `(cutoff, spin_offs, delisting_policy)` (`vintages`), so a caller walking many
     trials at one cutoff computes the store's vintage once. The trial's frozen
     `adjust.apply_spin_offs` decides whether its vintage counts the `spinoff` rows
     it reads (backtest spec amendment #1894, item 6; T211d), so a `False` variant's
@@ -313,10 +335,15 @@ def _is_current(
         return False
     if trial.code_tree_sha256 is None or trial.code_tree_sha256 != code_vintage:
         return False
-    spin_offs = bool(frozen_values(get_hypothesis_by_id(conn, trial.hypothesis_id))[SPIN_OFFS_KEY])
-    key = (trial.data_cutoff, spin_offs)
+    gates = vintage_gates(get_hypothesis_by_id(conn, trial.hypothesis_id))
+    key = (trial.data_cutoff, gates.spin_offs, gates.delisting_policy)
     if key not in vintages:
-        vintages[key] = data_vintage(conn, trial.data_cutoff, spin_offs=spin_offs)
+        vintages[key] = data_vintage(
+            conn,
+            trial.data_cutoff,
+            spin_offs=gates.spin_offs,
+            delisting_policy=gates.delisting_policy,
+        )
     return vintages[key] == trial.data_vintage
 
 

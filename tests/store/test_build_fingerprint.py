@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -49,12 +50,33 @@ def test_every_listed_setting_changes_hash(key: str) -> None:
 # Pinned from main (before #2826 added `edgar.statement_fact_units`), then
 # re-pinned for #2929's `BUILD_RULES_VERSION` 3, then #2941's 4, then T198's
 # flip of `edgar.cover_split_contexts` and `edgar.class_member_link` with
-# `FSN_VERSION` and `COVER_VERSION` 7.
-MAIN_DEFAULT_HASH = "da136ce753e445c2f92f4c2985958d7e221df0624fa74cf15fb10a2682785df1"
+# `FSN_VERSION` and `COVER_VERSION` 7, then #2490's `CURRENT_SCHEMA_VERSION` 47
+# (`resume_invocations.book_id`; at 46 the hash is still da136ce7...785df1), then
+# #3012's move of the two Form 4 routing keys out of the hash (before T324 seeds
+# the real store), then #3056's `BUILD_RULES_VERSION` 5, then #3084's
+# `BUILD_RULES_VERSION` 6 with `DELISTING_HTML_VERSION` in the cache names, then
+# #3076's `BUILD_RULES_VERSION` 7 and `CURRENT_SCHEMA_VERSION` 48 (`classifications.issuer_class`),
+# then #3106's Form 25 cap (hashed setting only; no rules or cache version bump),
+# then #3190's `BUILD_RULES_VERSION` 8 (at 7 the hash is d55d7410...dec8145), then
+# T389's `CURRENT_SCHEMA_VERSION` 49 (`retracted_rows`; at 48 the hash is 5c00edf7...e07e1b),
+# then #3363's `BUILD_RULES_VERSION` 9 (at 8 the hash is 9e881b83...f56932).
+# then #3362's `BUILD_RULES_VERSION` 10 (at 9 the hash is 0512a8aa...996a855).
+# then #3390's `BUILD_RULES_VERSION` 11 (at 10 the hash is c5591bf7...12cfe).
+# then #3325's `BUILD_RULES_VERSION` 12 (at 11 the hash is 0b36a3c6...b69452).
+MAIN_DEFAULT_HASH = "12d62e301d2eb3b01b74e30e447c6fd3d85d381a47a0939a61865f0b82bb4437"
 
 
 def test_hash_at_defaults_equals_the_hex_pinned_from_main() -> None:
     assert module.build_fingerprint(Settings(_env_file=None)).hash == MAIN_DEFAULT_HASH
+
+
+def test_form25_html_cap_is_hashed() -> None:
+    settings = Settings(_env_file=None)
+    assert "edgar.form25_html_max_bytes" in module.HASHED_SETTINGS_KEYS
+    changed = settings.model_copy(
+        update={"edgar": settings.edgar.model_copy(update={"form25_html_max_bytes": 1_000_000})}
+    )
+    assert module.build_fingerprint(changed).hash != module.build_fingerprint(settings).hash
 
 
 def test_statement_fact_units_is_classified_and_hashed_only_when_non_empty() -> None:
@@ -143,7 +165,38 @@ def test_every_master_and_edgar_key_is_classified() -> None:
         "events.sec_forms_backfill_start",
         "events.form4_xml_price_below",
         "events.form4_zero_price_xml_codes",
+        "events.form4_multi_owner_xml",
+        "events.form4_compare_trusted",
+        "events.form4_compare_decimals",
+        "events.form4_compare_tolerance",
+        "events.form4_compare_threshold",
     }
+
+
+@pytest.mark.parametrize(
+    "update",
+    (
+        {"form4_compare_threshold": Decimal("0.5"), "form4_multi_owner_xml": False},
+        {"form4_xml_price_below": Decimal("2.00")},
+        {"form4_zero_price_xml_codes": ["TEST"]},
+    ),
+)
+def test_form4_keys_do_not_move_the_build_hash(update: dict[str, Any]) -> None:
+    """#2994, #3012: every Form 4 writer key is classified as excluded, so setting one
+    leaves the incremental EDGAR build's hash (and so its gate) as it was."""
+    base = Settings(_env_file=None)
+    changed = base.model_copy(update={"events": base.events.model_copy(update=update)})
+    assert module.build_fingerprint(changed).hash == module.build_fingerprint(base).hash
+
+
+def test_no_form4_key_is_hashed() -> None:
+    form4 = {
+        k
+        for k in (*module.HASHED_SETTINGS_KEYS, *module.EXCLUDED_SETTINGS_KEYS)
+        if k.startswith("events.form4_")
+    }
+    assert form4
+    assert form4 <= set(module.EXCLUDED_SETTINGS_KEYS)
 
 
 # --- additive_statement_change (T365a, #2826) ---------------------------------

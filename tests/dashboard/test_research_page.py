@@ -19,7 +19,7 @@ from typing import Any
 
 import duckdb
 import pytest
-from dashboard_nav import NavCall, nav_calls_fixture, nav_titles  # noqa: F401
+from dashboard_nav import NavCall, app_test, nav_calls_fixture, nav_titles  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.backtest.results import family_n_split
@@ -415,7 +415,7 @@ def seeded_store(tmp_path: Path) -> tuple[Path, Seeded]:
 def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> AppTest:
     monkeypatch.setenv("STORE__PATH", str(store_path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
-    at = AppTest.from_file(_APP_PATH)
+    at = app_test(_APP_PATH)
     at.run()
     monkeypatch.setenv("DASHBOARD_TEST_PAGE", "Research")
     at.run()
@@ -590,7 +590,12 @@ def test_render_exposures_and_family_configurations(
     assert families.iloc[0]["exposure configurations"] == 2
     checkbox = next(box for box in at.checkbox if box.label == "Show synthetic exposures")
     checkbox.check().run()
-    assert "candidate-3" in set(_frame(at, "candidate")["candidate"])
+    shown = _frame(at, "candidate").set_index("candidate")
+    assert "candidate-3" in shown.index
+    assert [bool(shown.loc[c, "synthetic"]) for c in ("candidate-1", "candidate-3")] == [
+        False,
+        True,
+    ]
 
 
 def test_pre_exposure_store_renders_not_initialised(

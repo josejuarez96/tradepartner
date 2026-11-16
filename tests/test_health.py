@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import duckdb
@@ -45,6 +46,7 @@ from tradepartner.health import (
     CHAIN_IDS_DISTINCT_CIKS,
     CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS,
     CHAIN_KNOWN_AT_LE_INGESTED_AT,
+    CHAIN_NOT_REVIEWED,
     CHAIN_PREDECESSOR_NO_BAR_AFTER_HANDOVER,
     CHAIN_PRICE_BREAK,
     CHAIN_SUCCESSOR_LISTED_UNDER_PREDECESSOR_TICKER,
@@ -63,6 +65,7 @@ from tradepartner.health import (
     NO_BARS_AFTER_DELISTING,
     NO_DUPLICATE_BARS,
     NON_OVERLAPPING_LISTINGS,
+    OLD_ID_BARS_AFTER_SUCCESSOR,
     PROVENANCE_ALLOWED,
     RATE_KNOWN_AT,
     RATE_UNIQUE,
@@ -1478,6 +1481,120 @@ def test_finra_temporary_d_symbol_beside_its_base_is_not_an_overlap(
     assert check.passed, check.violations
 
 
+def test_same_day_pair_with_a_dot_space_spelling_is_one_line(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #3243: `DSAQ. WS` / `DSAQ.WS` (one warrant line, a stray space after the
+    # dot on one cover page) is one Alpaca symbol under two filer spellings.
+    for ticker in ("DSAQ. WS", "DSAQ.WS"):
+        insert_row(
+            fixture_store,
+            "listings",
+            _listing_row(
+                "SEC_DOT_SPACE",
+                ticker,
+                "NYSE",
+                date(2019, 11, 15),
+                "Redeemable warrants, each warrant exercisable for one share",
+            ),
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert check.passed, check.violations
+
+
+def test_same_day_warrant_suffix_pair_is_one_line_for_a_late_form25_too(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #3243: TMPM held NASDAQ, then TMPM and TMPMW both start one day (the
+    # warrant symbol on the common line's cover page). The pair is one line,
+    # so the later Form 25 on TMPM is not tested against TMPMW as "the next
+    # exchange line", which started before the filing.
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row("SEC_WARRANT_SUFFIX", "TMPM", "NASDAQ", date(2018, 11, 30)),
+    )
+    for ticker in ("TMPM", "TMPMW"):
+        insert_row(
+            fixture_store,
+            "listings",
+            _listing_row("SEC_WARRANT_SUFFIX", ticker, "NASDAQ", date(2019, 3, 18)),
+        )
+    insert_row(
+        fixture_store,
+        "delistings",
+        _form25_row("SEC_WARRANT_SUFFIX", "NASDAQ", date(2019, 10, 18), date(2019, 10, 28)),
+    )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert "SEC_WARRANT_SUFFIX" not in check.violations["security_id"].to_list()
+
+
+def test_same_day_warrant_suffix_pair_with_no_held_ticker_is_one_line(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row("SEC_WARRANT_FIRST", "TMPM", "NASDAQ", date(2019, 3, 18)),
+    )
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row(
+            "SEC_WARRANT_FIRST",
+            "TMPMW",
+            "NASDAQ",
+            date(2019, 3, 18),
+            "Redeemable warrants, each exercisable for one share",
+        ),
+    )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert check.passed, check.violations
+
+
+def test_same_day_equity_pair_with_a_suffix_and_no_held_ticker_still_fails(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Control: both rows equity and no ticker held before: the resolver
+    # assigns the security nothing, so health keeps failing it.
+    for ticker in ("TMPM", "TMPMW"):
+        insert_row(
+            fixture_store,
+            "listings",
+            _listing_row("SEC_EQUITY_SUFFIX", ticker, "NASDAQ", date(2019, 3, 18)),
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
+
+
+def test_same_day_pair_with_another_suffix_or_exchange_still_fails(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Control: only the warrant, unit and right letters excuse a pair, and
+    # only on one exchange.
+    for ticker in ("EXCH", "EXCHX"):
+        insert_row(
+            fixture_store,
+            "listings",
+            _listing_row("SEC_SUFFIX_X", ticker, "NASDAQ", date(2019, 6, 3)),
+        )
+    for ticker, exchange in (("OTHR", "NASDAQ"), ("OTHRW", "NYSE")):
+        insert_row(
+            fixture_store,
+            "listings",
+            _listing_row("SEC_SUFFIX_EXCHANGES", ticker, exchange, date(2019, 6, 3)),
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert set(check.violations["security_id"].to_list()) == {
+        "SEC_SUFFIX_X",
+        "SEC_SUFFIX_EXCHANGES",
+    }
+
+
 def test_finra_d_suffix_on_an_exchange_is_still_a_second_listing(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
@@ -1523,6 +1640,15 @@ def test_an_otc_pair_on_a_base_longer_than_four_letters_is_not_temporary(
     assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
 
 
+def _stopped_after(conn: duckdb.DuckDBPyConnection, security_id: str, day: date) -> None:
+    """The security's bars end on `day`: a Form 25 effective then is a real stop.
+    With bars after its effective day a Form 25 is a transfer (#3242) and the
+    late-Form-25 test is not run."""
+    conn.execute(
+        "DELETE FROM prices_daily WHERE security_id = ? AND session > ?", [security_id, day]
+    )
+
+
 def test_listing_live_after_the_next_one_started_fails_its_rule(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
@@ -1537,7 +1663,7 @@ def test_listing_live_after_the_next_one_started_fails_its_rule(
         "listings",
         {
             "security_id": "SEC_SPLIT_BACKFILLED",
-            "ticker": "BKFL",
+            "ticker": "BKFN",
             "exchange": "NASDAQ",
             "class_title": "Common Stock",
             "valid_from": date(2018, 6, 1),
@@ -1564,6 +1690,7 @@ def test_listing_live_after_the_next_one_started_fails_its_rule(
             "provenance": "filing",
         },
     )
+    _stopped_after(fixture_store, "SEC_SPLIT_BACKFILLED", date(2019, 1, 20))
     checks = integrity_checks(fixture_store, T_END, _settings())
     assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
     check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
@@ -1649,13 +1776,14 @@ def test_late_form25_is_checked_against_the_next_exchange_line_past_an_otc_row(
     insert_row(
         fixture_store,
         "listings",
-        _listing_row("SEC_SPLIT_BACKFILLED", "BKFL", "NASDAQ", date(2018, 6, 1)),
+        _listing_row("SEC_SPLIT_BACKFILLED", "BKFN", "NASDAQ", date(2018, 6, 1)),
     )
     insert_row(
         fixture_store,
         "delistings",
         _form25_row("SEC_SPLIT_BACKFILLED", "NYSE", date(2019, 1, 10), date(2019, 1, 20)),
     )
+    _stopped_after(fixture_store, "SEC_SPLIT_BACKFILLED", date(2019, 1, 20))
     checks = integrity_checks(fixture_store, T_END, _settings())
     check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
     [row] = check.violations.to_dicts()
@@ -2166,11 +2294,14 @@ def test_an_accepted_pair_does_not_excuse_a_late_form25_on_its_row(
         "delistings",
         _form25_row(FIRST_PAIR_SID, "NASDAQ", date(2020, 1, 10), date(2020, 1, 20)),
     )
+    _stopped_after(fixture_store, FIRST_PAIR_SID, date(2020, 1, 20))
     report = health_report(fixture_store, T_END, _accepting(FIRST_PAIR_ENTRY))
     check = next(c for c in report.integrity if c.rule == NON_OVERLAPPING_LISTINGS)
     assert not check.passed
     assert set(check.violations["next_valid_from"].to_list()) == {date(2019, 7, 1)}
-    assert report.accepted_same_day_pairs.frame.height == 1
+    # The Form 25 ended both rows of the pair, so they are one line without the
+    # owner's entry (#3242); the late filing still fails against the NYSE line.
+    assert report.accepted_same_day_pairs.frame.height == 0
 
 
 @pytest.mark.parametrize("bad", ["SEC_A", "@2019-06-03", "SEC_A@2019-13-01", "SEC_A@"])
@@ -3323,6 +3454,27 @@ def test_a_repaired_duplicate_is_neither_shown_nor_failed(
     assert report.duplicate_dividends.groups == ()
 
 
+def test_a_re_sent_retract_id_with_a_noisy_amount_fails(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#2980: dd-b, deleted by the release, comes back with a noisy amount;
+    its exact key misses the reviewed one, but beside the kept dd-a it is one
+    payment stored twice, so the rule fails on both ids."""
+    later = DIV_KNOWN + timedelta(days=2)
+    _cash(fixture_store, "dd-a")
+    _cash(fixture_store, "dd-b", known=later, amount=0.37 + 1e-12)
+    failed, violations, report = _dividend_check(fixture_store, [_review("duplicate")])
+    assert failed == {DUPLICATE_DIVIDENDS}
+    assert not report.ok
+    assert violations.select("amount", "source_action_id", "verdict").to_dicts() == [
+        {"amount": 0.37, "source_action_id": "dd-a", "verdict": "duplicate"},
+        {"amount": 0.37 + 1e-12, "source_action_id": "dd-b", "verdict": "duplicate"},
+    ]
+    # Before the re-send is known the store is the repaired one: it passes.
+    early = health_report(fixture_store, DIV_KNOWN, _settings(), reviewed=[_review("duplicate")])
+    assert DUPLICATE_DIVIDENDS not in early.failures
+
+
 def test_the_fixture_store_passes_under_the_packaged_list(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
@@ -3971,6 +4123,59 @@ def test_the_figi_block_reads_the_latest_observation_known_at_t(
 
 
 CHAIN_IDS = ("0001000010", "0001000011")
+
+
+def test_empty_successor_chain_table_passes_review_rule(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    assert _chain_rule(fixture_store, CHAIN_NOT_REVIEWED) == []
+
+
+def test_missing_successor_chain_table_fails_closed(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    fixture_store.execute("DROP TABLE successor_chains")
+    assert "missing table" in _chain_rule(fixture_store, CHAIN_NOT_REVIEWED)[0]["predecessor_id"]
+
+
+def test_unlisted_successor_chain_fails_and_names_row(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    report = health_report(chain_fixture_store, T_END, _settings())
+    assert CHAIN_NOT_REVIEWED in report.failures
+    rows = next(c.violations.to_dicts() for c in report.integrity if c.rule == CHAIN_NOT_REVIEWED)
+    assert any(
+        row["predecessor_id"] == CHAIN_IDS[0] and row["successor_id"] == CHAIN_IDS[1]
+        for row in rows
+    )
+
+
+def test_listed_successor_chain_passes_review_rule(
+    chain_fixture_store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store import successor_reviews
+
+    rows = health.successor_chains(chain_fixture_store, T_END, _settings()).frame.to_dicts()
+    reviewed = "predecessor_id,successor_id,effective_session,reason,issue\n" + "".join(
+        f"{row['predecessor_id']},{row['successor_id']},{row['handover']},fixture,#3142\n"
+        for row in rows
+    )
+    monkeypatch.setattr(
+        health, "reviewed_chains", lambda: successor_reviews.parse_reviews(reviewed)
+    )
+    assert _chain_rule(chain_fixture_store, CHAIN_NOT_REVIEWED) == []
+
+
+def test_malformed_successor_allowlist_fails_closed(
+    fixture_store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store import successor_reviews
+
+    monkeypatch.setattr(
+        health, "reviewed_chains", lambda: successor_reviews.parse_reviews("wrong,header\n")
+    )
+    with pytest.raises(ValueError, match=r"successor_reviews\.csv"):
+        health_report(fixture_store, T_END, _settings())
 
 
 def _live_chain(
@@ -5002,3 +5207,586 @@ def test_filing_index_naive_timestamp_fails(
     insert_row(loose_store, "filing_index", _fi_first())
     failed = _fi_failed(loose_store, settings)
     assert failed["filing_index_timestamps_aware"]["column"].to_list() == [column]
+
+
+# --- spliced_series (#3056) ---------------------------------------------------
+
+_SPLICED_RUN = datetime(2026, 10, 4, 18, tzinfo=UTC)
+
+
+def _splice_bar(sid: str, session: date, close: float) -> dict[str, Any]:
+    from tradepartner.calendar import session_close
+
+    return {
+        "security_id": sid,
+        "session": session,
+        "open": close,
+        "high": close,
+        "low": close,
+        "close": close,
+        "volume": 1_000,
+        "known_at": session_close(session),
+        "ingested_at": _SPLICED_RUN,
+        "source": "alpaca_sip",
+        "provenance": "bar",
+    }
+
+
+@pytest.fixture
+def splice_settings(tmp_path: Path) -> Settings:
+    """`_settings()` on a fresh tmp store file."""
+    return _settings().model_copy(
+        update={"store": _settings().store.model_copy(update={"path": str(tmp_path / "s.duckdb")})}
+    )
+
+
+@pytest.fixture
+def spliced_store(splice_settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
+    """GPOR's shape: the old common's last prints 2020-11-24/25, then the
+    new equity's 72.95 on 2021-05-18 under the same id; a quiet name with a
+    long gap and a small move; a big one-day move with no gap."""
+    from tradepartner.store.schema import init_schema
+
+    conn = duckdb.connect(splice_settings.store.path)
+    configure_connection(conn)
+    init_schema(conn)
+    for row in (
+        _splice_bar("GPOR", date(2020, 11, 24), 0.145),
+        _splice_bar("GPOR", date(2020, 11, 25), 0.1383),
+        _splice_bar("GPOR", date(2021, 5, 18), 72.95),
+        _splice_bar("GPOR", date(2021, 5, 19), 68.01),
+        _splice_bar("QUIET", date(2021, 1, 4), 10.0),
+        _splice_bar("QUIET", date(2021, 3, 1), 12.0),
+        _splice_bar("JUMP", date(2021, 1, 4), 1.0),
+        _splice_bar("JUMP", date(2021, 1, 5), 9.0),
+    ):
+        insert_row(conn, "prices_daily", row)
+    yield conn
+    conn.close()
+
+
+def test_a_jump_across_a_bar_gap_is_listed_as_spliced(
+    spliced_store: duckdb.DuckDBPyConnection, splice_settings: Settings
+) -> None:
+    found = health.spliced_series(spliced_store, _SPLICED_RUN, splice_settings)
+    assert found.frame.select("security_id", "prev_session", "session").rows() == [
+        ("GPOR", date(2020, 11, 25), date(2021, 5, 18))
+    ]
+    row = found.frame.row(0, named=True)
+    assert row["ratio"] == pytest.approx(72.95 / 0.1383)
+    assert row["gap_sessions"] > splice_settings.master.transfer_window_sessions
+
+
+def test_the_splice_bound_comes_from_config(
+    spliced_store: duckdb.DuckDBPyConnection, splice_settings: Settings
+) -> None:
+    loose = splice_settings.model_copy(
+        update={"health": splice_settings.health.model_copy(update={"splice_max_price_ratio": 1.1})}
+    )
+    found = health.spliced_series(spliced_store, _SPLICED_RUN, loose)
+    assert found.frame["security_id"].to_list() == ["GPOR", "QUIET"]
+
+
+def test_spliced_series_reads_only_bars_known_at_t(
+    spliced_store: duckdb.DuckDBPyConnection, splice_settings: Settings
+) -> None:
+    # No look-ahead: before the new equity's first bar is known, no gap.
+    from tradepartner.calendar import session_close
+
+    before = session_close(date(2021, 5, 18)) - PROBE_EPSILON
+    assert health.spliced_series(spliced_store, before, splice_settings).count == 0
+    assert (
+        health.spliced_series(
+            spliced_store, session_close(date(2021, 5, 18)), splice_settings
+        ).count
+        == 1
+    )
+
+
+def test_the_health_report_carries_the_spliced_block(
+    spliced_store: duckdb.DuckDBPyConnection, splice_settings: Settings
+) -> None:
+    report = health.health_report(spliced_store, _SPLICED_RUN, splice_settings)
+    assert report.spliced.count == 1
+    assert report.ok or "spliced_series" not in report.failures
+
+
+# --- Delisting reasons (plan T329, #2670) -----------------------------------------
+
+_REASON_RULE = "delisting_reasons_known_at_from_acceptance"
+_MERGER_FILED = datetime(2018, 7, 25, 20, 30, tzinfo=UTC)
+_TRANSFER_FILED = datetime(2018, 10, 23, 20, 30, tzinfo=UTC)
+
+
+def _reason_row(
+    security_id: str,
+    filed_at: datetime,
+    reason: str,
+    known_at: datetime,
+    *,
+    source: str = "eightk_item",
+    accession: str | None = "acc-reason",
+    class_title: str = "Common Stock",
+) -> dict[str, Any]:
+    return {
+        "security_id": security_id,
+        "delisting_form": "25",
+        "delisting_class_title": class_title,
+        "delisting_exchange": "NYSE",
+        "delisting_filed_at": filed_at,
+        "reason": reason,
+        "reason_evidence_form": "8-K" if source == "eightk_item" else "25",
+        "reason_evidence_accession": accession,
+        "reason_source": source,
+        "reason_known_at": known_at,
+        "known_at": known_at,
+        "ingested_at": known_at,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+
+
+def _eightk(cik: str, accession: str, items: str, accepted_at: datetime) -> dict[str, Any]:
+    return {
+        "cik": cik,
+        "accession": accession,
+        "form": "8-K",
+        "items": items,
+        "accepted_at": accepted_at,
+        "known_at": accepted_at,
+        "ingested_at": accepted_at,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+
+
+def test_the_delisting_reason_rule_is_an_integrity_rule_and_the_fixture_block_is_empty(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    assert _REASON_RULE in INTEGRITY_RULES
+    report = health_report(fixture_store, T_END, settings)
+    assert report.ok, report.failures
+    block = report.delisting_reasons
+    assert block is not None
+    assert block.by_reason_source == {}
+    assert block.unknown.height == 8  # every fixture episode has no reason row
+    assert block.conflicted.is_empty() and block.missing_consideration.is_empty()
+    assert block.unmatched_items == {"1.03": 0, "2.01": 0, "3.01": 0}
+    assert block.lines()[0] == "delisting reasons: none"
+
+
+def test_reasons_are_counted_by_reason_and_source_with_unknown_and_conflicted_episodes(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    merger_known = datetime(2018, 7, 26, 20, 0, tzinfo=UTC)
+    transfer_known = datetime(2018, 10, 24, 20, 0, tzinfo=UTC)
+    for row in (
+        _reason_row(
+            "SEC_CLEAN_MERGER",
+            _MERGER_FILED,
+            "merger_acquisition",
+            merger_known,
+            source="form25_text",
+            accession="acc-25-merger",
+        ),
+        _reason_row("SEC_TRANSFER", _TRANSFER_FILED, "bankruptcy", transfer_known),
+        # A second class of the same Form 25 key: the engine reads both, a conflict.
+        _reason_row(
+            "SEC_TRANSFER", _TRANSFER_FILED, "voluntary_other", transfer_known, class_title="B"
+        ),
+        _reason_row(
+            "SEC_BOUNDARY_DELIST",
+            datetime(2018, 10, 1, 20, 30, tzinfo=UTC),
+            "unknown",
+            transfer_known,
+            source="unknown",
+            accession=None,
+        ),
+        # Known after T: invisible.
+        _reason_row(
+            "SEC_REUSE_1",
+            datetime(2018, 12, 26, 20, 30, tzinfo=UTC),
+            "bankruptcy",
+            T_END + timedelta(days=1),
+        ),
+    ):
+        insert_row(fixture_store, "delisting_reasons", row)
+
+    block = health_report(fixture_store, T_END, settings).delisting_reasons
+
+    assert block is not None
+    # The second class row has no `delistings` episode, so the reason read drops it.
+    assert block.by_reason_source == {
+        ("merger_acquisition", "form25_text"): 1,
+        ("bankruptcy", "eightk_item"): 1,
+        ("unknown", "unknown"): 1,
+    }
+    assert set(block.unknown["security_id"]) == {
+        "SEC_25NSE",
+        "SEC_BOUNDARY_DELIST",
+        "SEC_DUAL_PFD",
+        "SEC_REUSE_1",
+        "SEC_TRUNC_DELIST",
+        "SEC_WINDOW_DELIST",
+    }
+    assert block.conflicted.is_empty()
+    # The merger has its cash row in the window: consideration is not missing.
+    assert block.missing_consideration.is_empty()
+    assert "merger_acquisition/form25_text 1" in block.lines()[0]
+
+
+def test_two_reasons_for_one_engine_key_are_conflicted(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """Two episodes of one security sharing form, exchange and acceptance (two class
+    titles) both answer the ended listing: the engine reads `unknown`."""
+    filed = datetime(2018, 9, 24, 20, 30, tzinfo=UTC)
+    known = datetime(2018, 9, 25, 20, 0, tzinfo=UTC)
+    fixture_store.execute(
+        "INSERT INTO delistings SELECT * REPLACE ('Common Stock' AS class_title) "
+        "FROM delistings WHERE security_id = 'SEC_DUAL_PFD'"
+    )
+    for title, reason in (("6% Preferred Stock", "bankruptcy"), ("Common Stock", "unknown")):
+        insert_row(
+            fixture_store,
+            "delisting_reasons",
+            _reason_row("SEC_DUAL_PFD", filed, reason, known, class_title=title)
+            | (
+                {"reason_source": "unknown", "reason_evidence_accession": None}
+                if reason == "unknown"
+                else {}
+            ),
+        )
+    block = health.delisting_reasons_report(
+        fixture_store, T_END, health.listing_ends_as_of(fixture_store, T_END, settings)
+    )
+    [row] = block.conflicted.to_dicts()
+    assert (row["security_id"], row["reasons"]) == ("SEC_DUAL_PFD", ["bankruptcy", "unknown"])
+
+
+def test_missing_merger_consideration_is_listed(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """A `merger_acquisition` reason with no acquiree `mergers` row in the window is
+    listed; one whose cash row is in it is not, nor one on a transferred listing (never
+    an exit)."""
+    known = datetime(2018, 10, 24, 20, 0, tzinfo=UTC)
+    insert_row(
+        fixture_store,
+        "delisting_reasons",
+        _reason_row("SEC_TRANSFER", _TRANSFER_FILED, "merger_acquisition", known),
+    )
+    insert_row(
+        fixture_store,
+        "delisting_reasons",
+        _reason_row(
+            "SEC_TRUNC_DELIST",
+            datetime(2018, 6, 14, 20, 30, tzinfo=UTC),
+            "merger_acquisition",
+            datetime(2018, 6, 15, 20, 0, tzinfo=UTC),
+        ),
+    )
+    insert_row(
+        fixture_store,
+        "delisting_reasons",
+        _reason_row(
+            "SEC_CLEAN_MERGER",
+            _MERGER_FILED,
+            "merger_acquisition",
+            datetime(2018, 7, 26, 20, 0, tzinfo=UTC),
+        ),
+    )
+    block = health_report(fixture_store, T_END, settings).delisting_reasons
+    assert block is not None
+    [row] = block.missing_consideration.to_dicts()
+    assert (row["security_id"], row["detail"]) == (
+        "SEC_TRUNC_DELIST",
+        "0 merger rows in the window",
+    )
+
+
+def test_missing_eightk_reason_evidence_is_reported_only(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    known = datetime(2018, 10, 24, 20, tzinfo=UTC)
+    insert_row(
+        fixture_store,
+        "delisting_reasons",
+        _reason_row("SEC_TRANSFER", _TRANSFER_FILED, "bankruptcy", known, accession="missing-8k"),
+    )
+    block = health_report(fixture_store, T_END, settings).delisting_reasons
+    assert block is not None
+    assert block.missing_eightk_evidence.to_dicts() == [
+        {"security_id": "SEC_TRANSFER", "reason_evidence_accession": "missing-8k"}
+    ]
+    assert "  missing 8-K evidence: 1" in block.lines()
+    assert "SEC_TRANSFER (missing-8k)" in "\n".join(block.lines())
+
+    insert_row(
+        fixture_store, "filing_events", _eightk("CIK0001000007", "missing-8k", "1.03", known)
+    )
+    block = health_report(fixture_store, T_END, settings).delisting_reasons
+    assert block is not None
+    assert block.missing_eightk_evidence.is_empty()
+    assert "  missing 8-K evidence: 0" in block.lines()
+
+
+def test_future_filing_event_does_not_resolve_missing_eightk_evidence(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    insert_row(
+        fixture_store,
+        "delisting_reasons",
+        _reason_row(
+            "SEC_TRANSFER",
+            _TRANSFER_FILED,
+            "bankruptcy",
+            datetime(2018, 10, 24, 20, tzinfo=UTC),
+            accession="future-8k",
+        ),
+    )
+    future = T_END + timedelta(days=1)
+    insert_row(
+        fixture_store, "filing_events", _eightk("CIK0001000007", "future-8k", "1.03", future)
+    )
+    at_t = health_report(fixture_store, T_END, settings).delisting_reasons
+    after = health_report(fixture_store, future + timedelta(days=1), settings).delisting_reasons
+    assert at_t is not None and after is not None
+    assert at_t.missing_eightk_evidence.height == 1
+    assert after.missing_eightk_evidence.is_empty()
+
+
+def test_stock_merger_close_lookup_is_batched_with_same_report(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    episodes = (
+        ("SEC_TRUNC_DELIST", datetime(2018, 6, 14, 20, 30, tzinfo=UTC)),
+        ("SEC_BOUNDARY_DELIST", datetime(2018, 10, 1, 20, 30, tzinfo=UTC)),
+        ("SEC_WINDOW_DELIST", datetime(2019, 6, 28, 20, 30, tzinfo=UTC)),
+    )
+    ends = {
+        row["security_id"]: row["end_session"]
+        for row in health.listing_ends_as_of(fixture_store, T_END, settings).iter_rows(named=True)
+        if row["delisting_form"] is not None
+    }
+    seed = fixture_store.execute("SELECT * FROM mergers WHERE security_id = 'SEC_DIV_CANCELLED'")
+    merger = dict(zip([column[0] for column in seed.description], seed.fetchone(), strict=True))
+    for sid, filed in episodes:
+        effective = ends[sid]
+        insert_row(
+            fixture_store,
+            "delisting_reasons",
+            _reason_row(sid, filed, "merger_acquisition", filed + timedelta(days=1)),
+        )
+        insert_row(
+            fixture_store,
+            "mergers",
+            merger
+            | {
+                "security_id": sid,
+                "source_action_id": f"stock-{sid}",
+                "effective_date": effective,
+                "process_date": effective,
+                "known_at": filed + timedelta(days=1),
+                "ingested_at": filed + timedelta(days=1, minutes=1),
+            },
+        )
+    calls: list[tuple[datetime, tuple[str, ...], date | None]] = []
+    real = health.prices_as_of
+
+    def spy(
+        conn: duckdb.DuckDBPyConnection, at: datetime, ids: list[str], **kwargs: Any
+    ) -> pl.DataFrame:
+        calls.append((at, tuple(ids), kwargs.get("sessions_from")))
+        return real(conn, at, ids, **kwargs)
+
+    monkeypatch.setattr(health, "prices_as_of", spy)
+    block = health_report(fixture_store, T_END, settings).delisting_reasons
+    assert block is not None
+    assert block.missing_consideration.select("security_id", "detail").to_dicts() == [
+        {
+            "security_id": "SEC_TRUNC_DELIST",
+            "detail": "no acquirer raw close on the effective date",
+        },
+    ]
+    assert len(calls) == 1
+    assert calls[0][0] == T_END
+
+
+def test_reason_8k_items_outside_every_window_or_uncorroborated_are_unmatched(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    insert_row(
+        fixture_store,
+        "delisting_reasons",
+        _reason_row(
+            "SEC_TRANSFER", _TRANSFER_FILED, "bankruptcy", datetime(2018, 10, 24, 20, tzinfo=UTC)
+        ),
+    )
+    for row in (
+        # In the 1.03 window of SEC_TRANSFER's Form 25: matched.
+        _eightk("CIK0001000007", "acc-1", "1.03", datetime(2018, 10, 1, 20, tzinfo=UTC)),
+        # Two years before: outside every window.
+        _eightk("CIK0001000007", "acc-2", "1.03,3.01", datetime(2016, 10, 1, 20, tzinfo=UTC)),
+        # A 2.01 beside a bankruptcy reason: uncorroborated.
+        _eightk("CIK0001000007", "acc-3", "2.01", datetime(2018, 10, 20, 20, tzinfo=UTC)),
+        # A 2.01 beside the clean merger (no reason row): uncorroborated too.
+        _eightk("CIK0001000003", "acc-4", "2.01", datetime(2018, 7, 20, 20, tzinfo=UTC)),
+    ):
+        insert_row(fixture_store, "filing_events", row)
+    block = health_report(fixture_store, T_END, settings).delisting_reasons
+    assert block is not None
+    assert block.unmatched_items == {"1.03": 1, "2.01": 2, "3.01": 1}
+    insert_row(
+        fixture_store,
+        "delisting_reasons",
+        _reason_row(
+            "SEC_CLEAN_MERGER",
+            _MERGER_FILED,
+            "merger_acquisition",
+            datetime(2018, 7, 26, 20, tzinfo=UTC),
+        ),
+    )
+    block = health_report(fixture_store, T_END, settings).delisting_reasons
+    assert block is not None
+    assert block.unmatched_items == {"1.03": 1, "2.01": 1, "3.01": 1}
+
+
+@pytest.mark.parametrize(
+    ("source", "known_at", "fails"),
+    [
+        ("eightk_item", datetime(2018, 10, 1, 20, tzinfo=UTC), False),
+        ("eightk_item", datetime(2018, 10, 1, 19, tzinfo=UTC), True),
+        ("form25_provision", _TRANSFER_FILED, False),
+        ("form25_provision", datetime(2018, 10, 23, 20, tzinfo=UTC), True),
+    ],
+)
+def test_a_reason_stamped_before_its_supporting_acceptance_fails(
+    fixture_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    source: str,
+    known_at: datetime,
+    fails: bool,
+) -> None:
+    """An `eightk_item` reason known before its 8-K's acceptance, or a `form25_*` one
+    before the Form 25's, fails `--check`."""
+    accepted = datetime(2018, 10, 1, 20, tzinfo=UTC)
+    insert_row(fixture_store, "filing_events", _eightk("CIK0001000007", "acc-8k", "1.03", accepted))
+    accession = "acc-8k" if source == "eightk_item" else "acc-25"
+    insert_row(
+        fixture_store,
+        "delisting_reasons",
+        _reason_row(
+            "SEC_TRANSFER",
+            _TRANSFER_FILED,
+            "bankruptcy",
+            known_at,
+            source=source,
+            accession=accession,
+        ),
+    )
+    report = health_report(fixture_store, T_END, settings)
+    assert (_REASON_RULE in _failed(report.integrity)) == fails
+
+
+# --- Bars left under an old id after its successor starts (#3251) ----------
+
+_OLD = "0001825079:common-stock"
+_NEW = "0001825079@2019-03-01"
+
+
+def _old_id_check(conn: duckdb.DuckDBPyConnection, t: datetime = T_END) -> Any:
+    return next(
+        c for c in integrity_checks(conn, t, _settings()) if c.rule == OLD_ID_BARS_AFTER_SUCCESSOR
+    )
+
+
+def _vld_to_velo(conn: duckdb.DuckDBPyConnection) -> None:
+    """VLD's old id and the successor id VELO, with old-id bars across the
+    hand-over: two before, three on or after the successor's first session."""
+    insert_row(conn, "listings", _listing_row(_OLD, "VLD", "NYSE", date(2018, 1, 2)))
+    insert_row(conn, "listings", _listing_row(_NEW, "VELO", "NASDAQ", date(2019, 3, 1)))
+    for day in (date(2019, 2, 27), date(2019, 2, 28), date(2019, 3, 1), date(2019, 3, 4)):
+        insert_row(conn, "prices_daily", _bar(_OLD, day))
+    insert_row(conn, "prices_daily", _bar(_OLD, date(2019, 3, 5)))
+
+
+def test_old_id_bars_from_the_successors_first_session_fail_the_rule(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    _vld_to_velo(fixture_store)
+    check = _old_id_check(fixture_store)
+    assert not check.passed
+    assert check.violations["session"].to_list() == [
+        date(2019, 3, 1),
+        date(2019, 3, 4),
+        date(2019, 3, 5),
+    ]
+    assert set(check.violations["security_id"]) == {_OLD}
+    assert set(check.violations["successor_id"]) == {_NEW}
+
+
+def test_old_id_bars_once_moved_pass_the_rule(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    _vld_to_velo(fixture_store)
+    fixture_store.execute(
+        "DELETE FROM prices_daily WHERE security_id = ? AND session >= ?", [_OLD, date(2019, 3, 1)]
+    )
+    assert _old_id_check(fixture_store).passed
+
+
+def test_another_classes_successor_does_not_silence_or_flag_an_old_id(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    _vld_to_velo(fixture_store)
+    pref = "0001825079:preferred"
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row(pref, "VLDP", "NYSE", date(2018, 1, 2), "Preferred Stock"),
+    )
+    # The preferred's own successor started earlier, and its old bars stay
+    # under the preferred id: the common's bars are still flagged, and only
+    # the preferred's own successor flags the preferred's bars.
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row(
+            "0001825079@2019-02-01", "VELP", "NASDAQ", date(2019, 2, 1), "Preferred Stock"
+        ),
+    )
+    insert_row(fixture_store, "prices_daily", _bar(pref, date(2019, 2, 4)))
+    check = _old_id_check(fixture_store)
+    flagged = {(r["security_id"], r["successor_id"]) for r in check.violations.to_dicts()}
+    assert flagged == {(_OLD, _NEW), (pref, "0001825079@2019-02-01")}
+    # A common-only company: the preferred's bar is not the common successor's.
+    fixture_store.execute("DELETE FROM prices_daily WHERE security_id = ?", [_OLD])
+    flagged = {
+        (r["security_id"], r["successor_id"])
+        for r in _old_id_check(fixture_store).violations.to_dicts()
+    }
+    assert flagged == {(pref, "0001825079@2019-02-01")}
+
+
+def test_old_id_rule_reads_only_rows_known_at_t(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    _vld_to_velo(fixture_store)
+    # Before the successor's listing is known (its stamp is its start's close)
+    # nothing is flagged; after it, only bars known by `t` count.
+    assert _old_id_check(fixture_store, session_close(date(2019, 2, 28))).passed
+    at_start = _old_id_check(fixture_store, session_close(date(2019, 3, 1)))
+    assert at_start.violations["session"].to_list() == [date(2019, 3, 1)]
+
+
+def test_old_id_rule_matches_reworded_titles_and_ignores_missing_ones(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # VLD's two wordings of common stock are one class; a null title names none.
+    insert_row(fixture_store, "listings", _listing_row(_OLD, "VLD", "NYSE", date(2018, 1, 2)))
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row(_NEW, "VELO", "NASDAQ", date(2019, 3, 1), "Common Stock, $0.0001 par value"),
+    )
+    insert_row(fixture_store, "prices_daily", _bar(_OLD, date(2019, 3, 4)))
+    assert not _old_id_check(fixture_store).passed
+    fixture_store.execute("UPDATE listings SET class_title = NULL")
+    assert _old_id_check(fixture_store).passed

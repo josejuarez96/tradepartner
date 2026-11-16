@@ -62,7 +62,10 @@ class FakeApi:
                 "parents": [{"sha": PARENT}],
             },
             f"repos/{REPO}/git/commits/{HEAD}": {"tree": {"sha": TREE}, "parents": []},
-            f"repos/{REPO}/compare/{PARENT}...{HEAD}": {"status": "ahead"},
+            f"repos/{REPO}/compare/{PARENT}...{HEAD}": {
+                "status": "ahead",
+                "files": [{"filename": "src/tradepartner/dashboard/app.py"}],
+            },
             f"repos/{REPO}/commits/{HEAD}/check-runs?filter=latest&per_page=100": {
                 "total_count": len(runs),
                 "check_runs": runs,
@@ -88,7 +91,8 @@ def test_a_squash_of_a_fully_tested_up_to_date_head_skips() -> None:
 
 
 def test_identical_compare_status_still_counts_as_contained() -> None:
-    assert _decide(FakeApi(**{f"repos/{REPO}/compare/{PARENT}...{HEAD}": {"status": "identical"}}))
+    identical = {"status": "identical", "files": [{"filename": "tests/dashboard/test_app.py"}]}
+    assert _decide(FakeApi(**{f"repos/{REPO}/compare/{PARENT}...{HEAD}": identical}))
 
 
 @pytest.mark.parametrize(
@@ -127,6 +131,71 @@ def test_a_tree_that_differs_from_the_head_runs() -> None:
 @pytest.mark.parametrize("status", ["behind", "diverged", None])
 def test_a_head_that_lacks_mains_parent_runs(status: str | None) -> None:
     assert not _decide(FakeApi(**{f"repos/{REPO}/compare/{PARENT}...{HEAD}": {"status": status}}))
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        ["src/tradepartner/dashboard/app.py"],
+        ["src/tradepartner/backtest/engine.py", "tests/dashboard/test_app.py"],
+        [".streamlit/config.toml"],
+    ],
+)
+def test_a_pr_that_ran_the_dashboard_tests_skips(files: list[str]) -> None:
+    compare = {"status": "ahead", "files": [{"filename": f} for f in files]}
+    assert _decide(FakeApi(**{f"repos/{REPO}/compare/{PARENT}...{HEAD}": compare}))
+
+
+def test_a_dashboard_file_renamed_away_still_counts() -> None:
+    moved = {"filename": "src/tradepartner/views/x.py"}
+    moved["previous_filename"] = "src/tradepartner/dashboard/x.py"
+    compare = {"status": "ahead", "files": [moved]}
+    assert _decide(FakeApi(**{f"repos/{REPO}/compare/{PARENT}...{HEAD}": compare}))
+
+
+@pytest.mark.parametrize(
+    "compare",
+    [
+        {"status": "ahead", "files": [{"filename": "src/tradepartner/backtest/engine.py"}]},
+        {"status": "ahead", "files": [{"filename": "src/tradepartner/dashboardx.py"}]},
+        {"status": "ahead", "files": []},
+        {"status": "ahead"},
+        {"status": "ahead", "files": None},
+        {
+            "status": "ahead",
+            "files": [{"filename": "src/tradepartner/dashboard/app.py"}] * 300,
+        },
+    ],
+    ids=["backtest-only", "dashboard-lookalike", "no-files", "missing", "null", "capped"],
+)
+def test_a_pr_whose_run_skipped_the_dashboard_tests_runs_the_full_suite(
+    compare: dict[str, Any],
+) -> None:
+    """#3221: a PR missing the dashboard ran its shards without tests/dashboard, so its
+    green run never tested the whole tree; main runs the full suite (fails closed)."""
+    assert not _decide(FakeApi(**{f"repos/{REPO}/compare/{PARENT}...{HEAD}": compare}))
+
+
+@pytest.mark.parametrize(
+    ("stdin", "answer"),
+    [
+        ("src/tradepartner/backtest/engine.py\ntests/backtest/test_engine.py\n", "no"),
+        ("docs/STATUS.md\nsrc/tradepartner/dashboard/home_page.py\n", "yes"),
+        ("tests/dashboard/dashboard_nav.py\n", "yes"),
+        (".streamlit/config.toml\n", "yes"),
+        ("src/tradepartner/cli.py\ntests/conftest.py\n", "no"),
+        ("", "no"),
+    ],
+)
+def test_cli_dashboard_tests_needed_reads_paths_from_stdin(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], stdin: str, answer: str
+) -> None:
+    """CI's scope job pipes a PR's `git diff --name-only` in; `no` drops tests/dashboard."""
+    import io
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
+    assert ci_tested_tree.main(["--dashboard-tests-needed"]) == 0
+    assert capsys.readouterr().out.strip() == answer
 
 
 def _runs_without(name: str) -> list[dict[str, Any]]:

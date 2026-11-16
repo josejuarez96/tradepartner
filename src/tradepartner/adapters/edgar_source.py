@@ -24,7 +24,12 @@ kept once per source instance. Acceptance times are cached per CIK,
 one reduced record per accession, under a directory named by
 `PARSER_VERSION`, so a parser fix re-stamps. A cache file that does not
 decode (truncated, older version) is ignored and re-fetched. Every write
-goes through a temp file and `os.replace`.
+goes through a temp file and `os.replace`. The per-CIK facts and statement
+caches each get a key sidecar `<cik>.json.key` (#3032) holding the file's
+`version`, `cik` and `key` and the size, mtime and inode it was written
+with, so the nightly completeness probe reads the key without parsing the
+payload; a sidecar that does not match the file on disk is ignored and the
+file is parsed in full (fail-closed: a truncated file never reads as keyed).
 
 **Stamps layout and `items` (T164c, #1358).** A stamps record carries the
 payload's 8-K `items` string as a fifth element under `STAMPS_LAYOUT`, a
@@ -57,7 +62,9 @@ so after a bulk pass the CIKs still unstamped get the per-CIK fetch. The
 items refresh (above) reads the zip under `reuse_cached` but writes `items`
 only, never an `accepted_at`. A row still unstamped is excluded and reported on
 `.unstamped_filings`; it is cached as unstampable (and not re-fetched) only
-when its quarter had settled before the per-CIK fetch that lacked it.
+when a per-CIK fetch made `edgar.unstampable_retry_days` or more after its
+quarter settled still lacked it (#2865: SEC can serve a stamp after the
+settle).
 With `edgar.stamp_sgml_check` on (default, #1494: from 2026-10 the per-CIK
 API has served `acceptanceDateTime` moved late by New York's UTC offset), a
 CIK's new per-CIK stamps are cached only once the newest one matches its SGML
@@ -284,6 +291,7 @@ import hashlib
 import itertools
 import json
 import math
+import os
 import re
 import shutil
 import threading
@@ -311,8 +319,13 @@ from tradepartner.adapters.accession_rows import (
     first_per_accession,
     issuer_delistings,
 )
-from tradepartner.adapters.daily_index import DailyIndexFile, daily_files_to_read
+from tradepartner.adapters.daily_index import (
+    DailyIndexFile,
+    daily_files_to_read,
+    parse_daily_body,
+)
 from tradepartner.adapters.edgar import (
+    HTML_DELISTING_FORMS,
     SEC_FORMS_PARSER_VERSION,
     CoverPageParse,
     FilingParties,
@@ -333,6 +346,7 @@ from tradepartner.adapters.edgar import (
     parse_company_tickers,
     parse_cover_page,
     parse_delisting,
+    parse_delisting_html,
     parse_filing_index,
     parse_form4,
     parse_form25_evidence,
@@ -411,7 +425,17 @@ COVER_VERSION = 7
 #: As `COVER_VERSION`, for per-document `parse_sgml_header` results (T11d).
 HEADER_VERSION = 1
 #: As `COVER_VERSION`, for per-document `parse_delisting` results (T11f).
+#: #3106 (linear script/style strip, size cap) shipped without a bump: its
+#: output differs only for a document with an unclosed script or style tag or
+#: over the cap, which EDGAR rejects or a one-page Form 25 never reaches, so
+#: parses cached before it stand. A bump would re-download every Form 25.
 DELISTING_VERSION = 1
+#: The issuer HTML Form 25s `parse_delisting_html` read and found no class or
+#: exchange in (`delisting_html_unread/v1/`, #3084): bump when that parser reads
+#: more, so they are fetched again. A successful read goes to the
+#: `DELISTING_VERSION` cache like an XML one, so only a `DELISTING_VERSION`
+#: bump re-reads those (a parser change that alters successful readings needs it).
+DELISTING_HTML_VERSION = 1
 #: The per-document `parse_form25_evidence` cache (`delisting_evidence/v1/`, T327,
 #: #2670): the provision only, beside (never inside) the `DELISTING_VERSION` cache.
 FORM25_EVIDENCE_VERSION = 1
@@ -451,6 +475,13 @@ _EXCHANGE_FORMS = frozenset({"25-NSE", "25-NSE/A"})
 Quarter = tuple[int, int]
 
 _T = TypeVar("_T")
+
+
+class FilenameFetchOutageError(RuntimeError):
+    """Raised by `filename_listings` (#2934) once
+    `edgar.filename_fetch_outage_ciks` CIKs in a row failed their
+    filing-name fetch past the retries: an SEC outage, so the pass stops
+    and the run fails closed rather than retrying every remaining CIK."""
 
 
 class FilingFailuresError(RuntimeError):
@@ -712,6 +743,8 @@ class EdgarFilingSource(FilingSource):
         # T11f: Form 25/25-NSE primary documents skipped pre-fetch (not XML).
         self.pre_xml_delistings = 0
         self.unstamped_delistings = 0
+        # #3084: issuer HTML Form 25s read (now or before) with no class or exchange.
+        self.unread_html_delistings = 0
         # T11e: the `companyfacts.zip` path and member names once downloaded,
         # False once the per-CIK API was chosen, None until decided.
         self._facts_bulk: tuple[Path, frozenset[str]] | bool | None = None
@@ -772,6 +805,9 @@ class EdgarFilingSource(FilingSource):
         # fully cached CIK sends none), `check_failures`' denominator.
         self.filename_fetch_failed_ciks: dict[str, str] = {}
         self._filename_ciks_asked: set[str] = set()
+        # #2934: CIKs in a row (of those that sent a fetch) whose filename
+        # fetch failed past the retries; an answered fetch resets it.
+        self._filename_failed_streak = 0
         # T11h: the failure policy.
         self.failed_filings = 0
         self.quarantined = 0
@@ -978,9 +1014,11 @@ class EdgarFilingSource(FilingSource):
         # fetch pass releases it (`release_index`) before any other opens.
         conn = self._open_index(path)
         try:
+            # #2924: a statement backfill's `ok` row reads no index, so it
+            # is not a seed and must not make a stale index look fresh.
             seed = conn.execute(
                 "SELECT max(started_at) FROM ingestion_runs WHERE source = 'edgar_index' "
-                "AND status = 'ok'"
+                "AND status = 'ok' AND mode <> 'statement_backfill'"
             ).fetchone()
             if seed is None or seed[0] is None:
                 conn.close()
@@ -1382,13 +1420,14 @@ class EdgarFilingSource(FilingSource):
         counts: dict[str, int] = {}
         for row in by_key.values():
             counts[row.accession] = counts.get(row.accession, 0) + 1
+        # #2921: every shared accession's listing order in one scan.
+        shared = [accession for accession, count in counts.items() if count > 1]
         order_rows = {
             (row.cik, row.accession): row
-            for accession, count in counts.items()
-            if count > 1
-            for row in stored_index.accession_listing_order(
-                self._index_conn, accession, self._now()
-            )
+            for listed in stored_index.accession_listing_orders(
+                self._index_conn, shared, self._now()
+            ).values()
+            for row in listed
         }
 
         def listing_key(
@@ -1468,14 +1507,7 @@ class EdgarFilingSource(FilingSource):
         body = path.read_bytes()
         if self.daily_index_keeper is not None:
             self.daily_index_keeper(file, path, body)  # kept before it is parsed
-        # `read_text`'s universal newlines, as before the keeper
-        text = body.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
-        text = re.sub(
-            r"\b(\d{4})(\d{2})(\d{2})(?=\s+edgar/data/)",
-            r"\1-\2-\3",
-            text,
-        )
-        return parse_filing_index(text, {}).unstamped
+        return parse_daily_body(body)  # shared with the raw re-derive (T352)
 
     def _incremental_stamps(
         self, rows: Mapping[str, Mapping[str, tuple[UnstampedFiling, tuple[int, int]]]]
@@ -1678,11 +1710,7 @@ class EdgarFilingSource(FilingSource):
                     ),
                     pending_row.listed_on,
                     True,
-                    # T318's pending table preserves listed_on, not the source
-                    # quarter. For daily files this is the index quarter. A
-                    # settled-quarter Last-Modified may put it later, which
-                    # delays an unstampable decision rather than dating it early.
-                    (pending_row.listed_on.year, (pending_row.listed_on.month - 1) // 3 + 1),
+                    (pending_row.filed_on.year, (pending_row.filed_on.month - 1) // 3 + 1),
                 ),
             )
         stamp_input: dict[str, dict[str, tuple[UnstampedFiling, tuple[int, int]]]] = {}
@@ -1691,10 +1719,16 @@ class EdgarFilingSource(FilingSource):
             listings.sort(key=lambda item: (item[1], not item[2]))
             if first_pending is not None:
                 listings.insert(0, first_pending)
-            row, _, _, index_quarter = listings[0]
+            row = listings[0][0]
+            # #3041: the unstampable decision settles by the first listing's
+            # filed_on quarter (T323a, as `sec_form_stamp` and the delisting
+            # path do), fresh or pending. Not the pending row's listed_on, which
+            # a settled form.idx's Last-Modified puts a quarter late, nor the
+            # source file's quarter, which T318's pending table does not keep:
+            # either would let a rebuild and an incremental store decide apart.
             stamp_input.setdefault(key[0], {})[key[1]] = (
                 row,
-                index_quarter,
+                (row.filed_on.year, (row.filed_on.month - 1) // 3 + 1),
             )
         stamps = self._incremental_stamps(stamp_input)
         # #2858: a pending row holds only its first listing, so a later listing of
@@ -1871,6 +1905,14 @@ class EdgarFilingSource(FilingSource):
         end = datetime(year + qtr // 4, qtr % 4 * 3 + 1, 1, tzinfo=_EASTERN)
         return at >= end + timedelta(days=self._settings.edgar.index_settle_days)
 
+    def _unstampable(self, quarter: Quarter, at: datetime) -> bool:
+        """#2865: whether a fetch at `at` that lacks an accession of `quarter`
+        settles it as unstampable: `edgar.unstampable_retry_days` past the
+        quarter's settle (`_settled`). Before that the accession stays unstamped
+        and is asked again, since SEC can serve a stamp after the settle."""
+        retry = timedelta(days=self._settings.edgar.unstampable_retry_days)
+        return self._settled(quarter, at - retry)
+
     # --- stamping -----------------------------------------------------------
 
     def _stamp(
@@ -1913,7 +1955,7 @@ class EdgarFilingSource(FilingSource):
                 if submissions.empty:
                     break  # #576: an empty answer proves nothing unstampable
                 row, quarter = kept[cik][accession]
-                if self._settled(quarter, submissions.fetched_at):
+                if self._unstampable(quarter, submissions.fetched_at):
                     new[accession] = SubmissionRecord(accession, row.form, "", False, None)
             new = self._sgml_checked(cik, new)
             if new:
@@ -2240,7 +2282,7 @@ class EdgarFilingSource(FilingSource):
             found = submissions.records.get(accession)
             if found is None:
                 quarter = (filed_date.year, (filed_date.month - 1) // 3 + 1)
-                if not submissions.empty and self._settled(quarter, submissions.fetched_at):
+                if not submissions.empty and self._unstampable(quarter, submissions.fetched_at):
                     stamps[accession] = SubmissionRecord(accession, "", "", False, None)
                     self._save_stamps(issuer_cik, stamps)
                 return None
@@ -2945,7 +2987,7 @@ class EdgarFilingSource(FilingSource):
                 _fsn_rows(
                     members["dim.tsv"],
                     ("dimhash", "segments"),
-                    where="list_contains(?, dimhash)",
+                    where="dimhash IN (SELECT unnest(?))",
                     params=[dimhashes],
                     free_text="segments",
                 )
@@ -3153,12 +3195,13 @@ class EdgarFilingSource(FilingSource):
                 continue
             cached = self._load_cover_cache(accession)
             if cached is not None:
-                self._per_document_attempted.add(accession)  # #610 policy 1: a cache hit
+                self._note_cache_hit(accession)  # #610 policy 1, #3259
                 if cached.entity_cik == cik:  # else a co-registrant's copy: not its page
                     yield record, cached
                 continue
             fsn_filing = fsn_cache.get(accession)
             if fsn_filing is not None:
+                self._succeeded_this_run.add(accession)  # #3259: an FSN row is a parse too
                 yield record, fsn_filing
                 continue
             if accession in self._fsn_extracted_accessions:
@@ -3270,13 +3313,14 @@ class EdgarFilingSource(FilingSource):
                 continue
             cached = self._load_header_cache(cik, accession)
             if cached is not None:
-                self._per_document_attempted.add(accession)  # #610 policy 1: a cache hit
+                self._note_cache_hit(accession)  # #610 policy 1, #3259
                 headers.append(
                     FilingHeader(cik, accession, record.form, cached.sic, record.accepted_at)
                 )
                 continue
             fsn_filing = fsn_cache.get(accession)
             if fsn_filing is not None and fsn_filing.sic is not None:
+                self._succeeded_this_run.add(accession)  # #3259
                 headers.append(
                     FilingHeader(cik, accession, record.form, fsn_filing.sic, record.accepted_at)
                 )
@@ -3369,16 +3413,21 @@ class EdgarFilingSource(FilingSource):
         """Every Form 25, 25/A, 25-NSE and 25-NSE/A over full history
         (`since` filters the result, never the scan), de-duplicated by
         accession as `filing_index` de-duplicates its own rows (the
-        exchange's own copy of a 25-NSE dropped). A 25 or 25-NSE whose
-        `primaryDocument` is not an `.xml` file is not downloaded: counted
-        on `.pre_xml_delistings` (`parse_delisting` reads XML only, and the
-        index runs from 1993, long before EDGAR's XML forms). A cached
-        parse, or a quarantined accession (T11h), makes no request."""
+        exchange's own copy of a 25-NSE dropped). An issuer's own Form 25
+        or 25/A filed as HTML, under one CIK, is read by
+        `parse_delisting_html` (#3084; most issuer notices since 2019 are
+        HTML, not XML); one naming no class or exchange is counted on
+        `.unread_html_delistings` and not fetched again. Any other
+        `primaryDocument` that is not an `.xml` file is not downloaded:
+        counted on `.pre_xml_delistings` (`parse_delisting` reads XML only,
+        and the index runs from 1993, long before EDGAR's XML forms). A
+        cached parse, or a quarantined accession (T11h), makes no request."""
         if since is not None:
             since = ensure_tz_aware_utc(since, field_name="since")
         self._maybe_use_stored_index()
         self.pre_xml_delistings = 0
         self.unstamped_delistings = 0
+        self.unread_html_delistings = 0
         start = (self._settings.edgar.index_first_year, 1)
         last = quarter_of(self._now())
         quarters = [(y, q) for y in range(start[0], last[0] + 1) for q in range(1, 5)]
@@ -3462,7 +3511,7 @@ class EdgarFilingSource(FilingSource):
             cik, record, accepted_at = stamped[0]
             cached = self._load_delisting_cache(accession)
             if cached is not None:
-                self._per_document_attempted.add(accession)  # #610 policy 1: a cache hit
+                self._note_cache_hit(accession)  # #610 policy 1, #3259
                 results.append(
                     DelistingFiling(
                         cik=cached.cik,
@@ -3475,15 +3524,21 @@ class EdgarFilingSource(FilingSource):
                     )
                 )
                 continue
-            if not record.primary_document.lower().endswith(".xml"):
+            html_form = _is_html_document(record.primary_document) and (
+                record.form in HTML_DELISTING_FORMS and len(options) == 1
+            )
+            if not record.primary_document.lower().endswith(".xml") and not html_form:
                 self.pre_xml_delistings += 1
+                continue
+            if html_form and self._unread_html_delisting(accession):
+                self.unread_html_delistings += 1  # #3084: read before, no class or exchange
                 continue
             if self._is_quarantined(accession):
                 self._quarantined_this_run.add(accession)
                 self.quarantined += 1
                 continue
-            delisting_fetch: Callable[[], DelistingFiling] = partial(
-                self._fetch_delisting,
+            delisting_fetch: Callable[[], DelistingFiling | None] = partial(
+                self._fetch_html_delisting if html_form else self._fetch_delisting,
                 cik,
                 accession,
                 record.form,
@@ -3514,6 +3569,84 @@ class EdgarFilingSource(FilingSource):
         self._save_delisting_cache(accession, parsed)
         return parsed
 
+    def _fetch_html_delisting(
+        self, cik: str, accession: str, form: str, primary_document: str, accepted_at: datetime
+    ) -> DelistingFiling | None:
+        """An issuer's HTML Form 25 (#3084), read by `parse_delisting_html`
+        under the one CIK the index lists it for. A document whose layout
+        names no class or no single exchange is not a malformed filing (a
+        third of the sampled issuers leave the exchange line blank): it is
+        recorded nowhere as a failure, which would trip the run's failure
+        share, but kept in `delisting_html_unread/` and counted on
+        `.unread_html_delistings`, so it is never fetched again under this
+        `DELISTING_HTML_VERSION`. A 404 or 410 still goes to the failure policy."""
+        try:
+            path = edgar_raw.download_filing_file(
+                cik,
+                accession,
+                primary_document,
+                settings=self._settings,
+                client=self._client,
+                max_bytes=self._settings.edgar.form25_html_max_bytes,
+            )
+        except edgar_raw.FilingTooLargeError as why:
+            # A pre-existing raw cache can be over the cap too.
+            edgar_raw.cached_filing_path(
+                cik, accession, primary_document, settings=self._settings
+            ).unlink(missing_ok=True)
+            self._save_unread_html_delisting(accession, str(why), over_cap=True)
+            return None
+        try:
+            text = path.read_bytes().decode("utf-8", errors="replace")
+        finally:
+            path.unlink(missing_ok=True)  # the document is deleted after parsing
+        try:
+            parsed = parse_delisting_html(
+                text, cik=cik, form=form, accession=accession, accepted_at=accepted_at
+            )
+        except ValueError as why:
+            self._save_unread_html_delisting(accession, str(why))
+            return None
+        self._save_delisting_cache(accession, parsed)
+        return parsed
+
+    def _save_unread_html_delisting(
+        self, accession: str, reason: str, *, over_cap: bool = False
+    ) -> None:
+        """Remember an unreadable issuer Form 25 without failing the run."""
+        data = {"version": DELISTING_HTML_VERSION, "accession": accession, "reason": reason}
+        if over_cap:
+            data["max_bytes"] = self._settings.edgar.form25_html_max_bytes
+        edgar_raw.write_atomic(self._unread_html_path(accession), json.dumps(data).encode("utf-8"))
+        self.unread_html_delistings += 1
+
+    def _unread_html_path(self, accession: str) -> Path:
+        edgar_raw.validate_accession(accession)
+        return (
+            self._cache
+            / "delisting_html_unread"
+            / f"v{DELISTING_HTML_VERSION}"
+            / f"{accession}.json"
+        )
+
+    def _unread_html_delisting(self, accession: str) -> bool:
+        """Whether `accession`'s HTML Form 25 was read under this
+        `DELISTING_HTML_VERSION` and named no class or exchange."""
+        path = self._unread_html_path(accession)  # validates first, outside the try
+        try:
+            data = json.loads(path.read_bytes())
+        except (OSError, ValueError):
+            return False
+        return (
+            isinstance(data, dict)
+            and data.get("version") == DELISTING_HTML_VERSION
+            and data.get("accession") == accession
+            and (
+                "max_bytes" not in data
+                or data["max_bytes"] == self._settings.edgar.form25_html_max_bytes
+            )
+        )
+
     def form25_evidence(
         self,
         cik: str,
@@ -3529,7 +3662,7 @@ class EdgarFilingSource(FilingSource):
         fetched here: `notice_text` stays `None` until a caller reads one."""
         cached = self._load_form25_evidence_cache(accession, accepted_at)
         if cached is not None:
-            self._per_document_attempted.add(accession)
+            self._note_cache_hit(accession)
             return cached
         if self._is_quarantined(accession):
             self._quarantined_this_run.add(accession)
@@ -3698,11 +3831,12 @@ class EdgarFilingSource(FilingSource):
         if first_cover is not None and first_cover.accepted_at is not None:
             jobs.append((first_cover, False))
         jobs.extend((record, False) for record in form25s if self._own_form25(cik, record))
-        if any(
+        asks = any(
             _filename_cache_hit(cache, record, read_document) is None
             and not self._is_quarantined(record.accession)
             for record, read_document in jobs
-        ):
+        )
+        if asks:
             self._filename_ciks_asked.add(cik)  # #2932: the share's denominator
         pool: ThreadPoolExecutor | None = None
         prefetched: dict[tuple[str, bool], Future[_FilenameExtract]] = {}
@@ -3803,15 +3937,24 @@ class EdgarFilingSource(FilingSource):
             # closed (no answer, the failed filing uncached, asked again next
             # run); `check_failures` fails the run past the share threshold.
             self.filename_incomplete_ciks.add(cik)
-            self.filename_fetch_failed_ciks.setdefault(
-                cik, self._stored_message(f"{type(error).__name__}: {error}")
-            )
+            message = self._stored_message(f"{type(error).__name__}: {error}")
+            self.filename_fetch_failed_ciks.setdefault(cik, message)
+            self._filename_failed_streak += 1
+            limit = edgar_settings.filename_fetch_outage_ciks
+            if self._filename_failed_streak >= limit:
+                raise FilenameFetchOutageError(
+                    f"filename fetch stopped: {limit} CIKs in a row failed past the retries "
+                    f"(edgar.filename_fetch_outage_ciks), an SEC outage; nothing failed is "
+                    f"cached, rerun once SEC answers; last: {cik} {message}"
+                ) from error
             return []
         finally:
             if pool is not None:
                 # A queued job is dropped unrun; its future is never asked again.
                 pool.shutdown(wait=True, cancel_futures=True)
 
+        if asks:
+            self._filename_failed_streak = 0  # #2934: SEC answered this CIK
         if cik not in self._filename_counted:
             self._filename_counted.add(cik)
             self.filename_10ks_read += counts.read
@@ -3877,30 +4020,41 @@ class EdgarFilingSource(FilingSource):
         pool = ThreadPoolExecutor(
             max_workers=min(workers, len(todo)), thread_name_prefix="edgar-filename"
         )
-        # The caller's context per job (the retry observer is a ContextVar), and
-        # one future per job, set by its worker. `map` queues every job now;
+        # One future per job, set by its worker, and the caller's context per
+        # job (the retry observer is a ContextVar). `map` queues every job now;
         # the boundary test refuses any `.submit` outside the broker wrapper.
+        # Each job carries its own future, context and record (#3039): the
+        # caller takes futures out of its copy of the dict in order, often
+        # before a worker has picked the job up, so a job must never look its
+        # future up there (a miss died unseen in the pool and the caller
+        # waited on that future forever).
         futures: dict[tuple[str, bool], Future[_FilenameExtract]] = {key: Future() for key in todo}
-        contexts = {key: contextvars.copy_context() for key in todo}
+        work = [
+            (futures[key], contextvars.copy_context(), record, read_document)
+            for key, (record, read_document) in todo.items()
+        ]
 
-        def run(key: tuple[str, bool]) -> None:
-            future = futures[key]
+        def run(
+            job: tuple[Future[_FilenameExtract], contextvars.Context, SubmissionRecord, bool],
+        ) -> None:
+            future, context, record, read_document = job
             if not future.set_running_or_notify_cancel():
                 return
-            record, read_document = todo[key]
             try:
-                extract = self._fetch_filename_extract(cik, record, read_document, on_worker=True)
+                extract = context.run(
+                    self._fetch_filename_extract, cik, record, read_document, on_worker=True
+                )
             except BaseException as error:  # handed to the caller, raised in order there
                 future.set_exception(error)
             else:
                 future.set_result(extract)
 
         try:
-            pool.map(lambda key: contexts[key].run(run, key), list(todo))
+            pool.map(run, work)
         except BaseException:
             pool.shutdown(wait=True, cancel_futures=True)
             raise
-        return pool, futures
+        return pool, dict(futures)
 
     def _first_cover_filing(
         self, cik: str, stamps: Mapping[str, SubmissionRecord]
@@ -3942,7 +4096,7 @@ class EdgarFilingSource(FilingSource):
         one request at a time as before, with the sequential wait-out."""
         cached = _filename_cache_hit(cache, record, read_document)
         if cached is not None:
-            self._per_document_attempted.add(record.accession)  # #610 policy 1: a cache hit
+            self._note_cache_hit(record.accession)  # #610 policy 1, #3259
             return cached
         if self._is_quarantined(record.accession):
             self._quarantined_this_run.add(record.accession)
@@ -4094,6 +4248,13 @@ class EdgarFilingSource(FilingSource):
         self._succeeded_this_run.add(accession)
         return result
 
+    def _note_cache_hit(self, accession: str) -> None:
+        """A per-document cache hit: attempted (#610 policy 1) and parsed this
+        run, like `_guarded`'s success, so a stored cross-day failure for it
+        is not counted (#3259)."""
+        self._per_document_attempted.add(accession)
+        self._succeeded_this_run.add(accession)
+
     def _record_failure(
         self,
         accession: str,
@@ -4197,8 +4358,11 @@ class EdgarFilingSource(FilingSource):
             # Re-read under the lock, never the copy loaded at the fetch pass:
             # an owner's hand edit (or another writer) since then is kept (#275).
             store = dict(self._load_failed_filings())
-            for accession in self._succeeded_this_run - self._pending_failures.keys():
-                store.pop(accession, None)  # it parses now: the old failure is resolved
+            resolved = self._succeeded_this_run - self._pending_failures.keys()
+            for accession in resolved - self._quarantined_this_run:
+                # It parses now: the old failure is resolved. A quarantined one
+                # stays (a header cache hit is not its cover parsing, #3259).
+                store.pop(accession, None)
             self._merge_pending_failures(store, today)
             self._save_failed_filings(store)
         self._failed_filings_cache = store
@@ -4434,6 +4598,12 @@ class EdgarFilingSource(FilingSource):
         for accession, entry in store.items():
             if accession in self._pending_failures:
                 continue  # judged below, by this run's own error
+            if (
+                accession in self._succeeded_this_run
+                and accession not in self._quarantined_this_run
+                and entry.get("kind") != "collision"
+            ):
+                continue  # re-parsed this run: a write prunes it (#3240); a collision stays
             if not entry.get("accepted", False):
                 pairs[(entry["error_class"], entry["base_form"])].add(accession)
         for accession, (error_class, base_form, message) in self._pending_failures.items():
@@ -4734,7 +4904,7 @@ class EdgarFilingSource(FilingSource):
             "records": [_statement_record_to_json(r) for r in entries.records],
             "conflicts": [_statement_conflict_to_json(c) for c in entries.conflicts],
         }
-        edgar_raw.write_atomic(self._statement_cache_path(cik), json.dumps(data).encode("utf-8"))
+        _write_keyed_cache(self._statement_cache_path(cik), data)
         self._statement_filled[cik] = key
         self._statement_requested[cik] = self._statement_key(latest)
         return entries
@@ -4898,7 +5068,7 @@ class EdgarFilingSource(FilingSource):
             if complete:  # else the payload trails the latest filing: fetch again next run
                 rows = [[n, a, d.isoformat(), v] for n, a, d, v in cached]
                 data = {"version": PARSER_VERSION, "cik": cik, "key": key, "facts": rows}
-                edgar_raw.write_atomic(path, json.dumps(data).encode("utf-8"))
+                _write_keyed_cache(path, data)
         fsn_cache = self._load_fsn_cache(cik)
         # (accession, name, capped date) -> [(value, dated after acceptance)]
         kept: dict[tuple[str, str, date], list[tuple[float, bool]]] = {}
@@ -5326,6 +5496,12 @@ class _StoredReads:
     new_by_cik: dict[str, list[stored_index.FilingRow | stored_index.Listing]] | None = None
 
 
+def _is_html_document(name: str) -> bool:
+    """Whether a `primaryDocument` is an HTML file (`form25.htm`), the
+    document an issuer's own Form 25 is filed as (#3084)."""
+    return name.lower().endswith((".htm", ".html"))
+
+
 def _filed_by(row: AccessionRow) -> bool:
     """Whether `row` is listed under the CIK that submitted it (the accession prefix)."""
     return int(row.accession[:10]) == int(row.cik)
@@ -5349,18 +5525,38 @@ def _cached_latest(path: Path, cik: str) -> str | None:
     """The latest cover-form accession a facts cache file was keyed by, or
     None when there is no usable cache (the bulk decision's staleness probe,
     which cannot know the names a later `facts` call will ask for)."""
-    try:
-        data = json.loads(path.read_bytes())
-        if data["version"] != PARSER_VERSION or data["cik"] != cik:
-            return None
-        return str(data["key"]).split("|", 1)[0]
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
+    key = _cached_key(path, cik, PARSER_VERSION)
+    return None if key is None else key.split("|", 1)[0]
 
 
 def _cached_key(path: Path, cik: str, version: int) -> str | None:
     """The key a per-CIK cache file was written under, or None when there is
-    no usable file (absent, truncated, another version or CIK)."""
+    no usable file (absent, truncated, another version or CIK).
+
+    #3032: read from the file's key sidecar (`_key_sidecar_path`) when the
+    sidecar still describes the file on disk (same size, mtime and inode),
+    else from a full parse (`_parse_cache_key`), which then writes the
+    sidecar so the next run skips the parse. Fail-closed: a sidecar that is
+    absent, unreadable, for another version or CIK, or describing another
+    file (a truncated, rewritten or restored one) is ignored."""
+    try:
+        before = path.stat()
+    except OSError:
+        return None
+    sidecar = _read_key_sidecar(path, cik, version, before)
+    if sidecar is not None:
+        return sidecar
+    key = _parse_cache_key(path, cik, version)
+    if key is not None:
+        with contextlib.suppress(OSError):
+            if _stat_identity(path.stat()) == _stat_identity(before):  # unchanged mid-parse
+                _write_key_sidecar(path, cik, version, key, before)
+    return key
+
+
+def _parse_cache_key(path: Path, cik: str, version: int) -> str | None:
+    """`_cached_key` by a full parse of the cache file: the reference answer
+    a key sidecar must agree with."""
     try:
         data = json.loads(path.read_bytes())
         if data["version"] != version or data["cik"] != cik:
@@ -5368,6 +5564,59 @@ def _cached_key(path: Path, cik: str, version: int) -> str | None:
         return str(data["key"])
     except (OSError, ValueError, KeyError, TypeError):
         return None
+
+
+def _key_sidecar_path(path: Path) -> Path:
+    """`<cik>.json.key` beside the cache file `<cik>.json` (#3032)."""
+    return path.with_name(f"{path.name}.key")
+
+
+def _stat_identity(st: os.stat_result) -> tuple[int, int, int]:
+    """What a key sidecar pins of its cache file: size, mtime (ns) and inode.
+    `write_atomic` replaces the file, so every rewrite changes the inode."""
+    return (st.st_size, st.st_mtime_ns, st.st_ino)
+
+
+def _read_key_sidecar(path: Path, cik: str, version: int, st: os.stat_result) -> str | None:
+    """The key `path`'s sidecar records, or None unless the sidecar is
+    well formed, names `version` and `cik`, and pins exactly `st`."""
+    try:
+        data = json.loads(_key_sidecar_path(path).read_bytes())
+        if (
+            data["version"] != version
+            or data["cik"] != cik
+            or [data["size"], data["mtime_ns"], data["ino"]] != list(_stat_identity(st))
+            or not isinstance(data["key"], str)
+        ):
+            return None
+        return data["key"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _write_key_sidecar(path: Path, cik: str, version: int, key: str, st: os.stat_result) -> None:
+    """Record `key` for the cache file `path` as `st` describes it."""
+    size, mtime_ns, ino = _stat_identity(st)
+    data = {
+        "version": version,
+        "cik": cik,
+        "key": key,
+        "size": size,
+        "mtime_ns": mtime_ns,
+        "ino": ino,
+    }
+    edgar_raw.write_atomic(_key_sidecar_path(path), json.dumps(data).encode("utf-8"))
+
+
+def _write_keyed_cache(path: Path, data: Mapping[str, Any]) -> None:
+    """Write a per-CIK cache file (`version`, `cik`, `key`, ...) and then its
+    key sidecar (#3032). A crash between the two leaves the old sidecar,
+    which pins the old file, so the next read falls back to a full parse."""
+    body = json.dumps(data).encode("utf-8")
+    edgar_raw.write_atomic(path, body)
+    st = path.stat()
+    if st.st_size == len(body):  # else another writer replaced it: no sidecar
+        _write_key_sidecar(path, str(data["cik"]), int(data["version"]), str(data["key"]), st)
 
 
 def _carries_a_tag(payload: Mapping[str, Any], tags: Mapping[str, Sequence[str]]) -> bool:

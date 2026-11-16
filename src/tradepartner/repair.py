@@ -1,5 +1,17 @@
 """Remove the Alpaca rows the resolver no longer assigns to their security (#819).
 
+**Retracted, not deleted (T390, #3275, ADR 0029).** `repair_resolution`,
+`delete_bars`, `retract_dividends` and `retract_spinoff_splits` move their rows
+out of `prices_daily` and `corporate_actions` into `retracted_rows`
+(`store.retracted_rows.retract`) with the command's reason, the open release and
+the rule that judged them (for `repair_resolution`, the resolver's listing ends
+with their Form 25 and the chains it read; for the others, the range or the
+reviewed entry), and none issues a `DELETE` on those tables. The fact tables hold
+exactly what a delete would have left, so no reader changes; wherever the text
+below says "delete", read "retract". `retract` moves every revision of a key from
+any source, so a key that holds another source's revision makes the count differ
+from the dry run's and the run rolls back (`RuntimeError`).
+
 A bar or corporate action from Alpaca reaches the store keyed by the
 `security_id` that `ListingResolver` mapped its symbol to at ingest. When a
 resolver rule is corrected (#819: a span ends at its own delisting, so a
@@ -29,6 +41,20 @@ What the repair is and is not:
 - **Only what a dry run showed.** A real run takes the dry run's bar and
   action row counts and refuses, deleting nothing, on any other count; the
   terminal lists every security found with its counts.
+- **No orphans without the owner's count** (#3265). A bar the resolver does
+  not assign to its security is either *moved* (some other security now owns
+  one of the symbols the security held that session, so a fill-holes refetch
+  puts the bar there) or an *orphan* (no id receives the symbol on that
+  session: the deleted bar is lost, as when a one-exchange Form 25 cut Apache
+  or Marriott while another line stayed listed). A key whose would-be owner
+  already holds the same bar as its own (equal volume, OHLC within
+  `store.release_move_price_tolerance`, as release coverage judges a move) is
+  a *duplicate*, not an orphan (#3463): retracting it loses nothing, and the
+  dry run lists it per security as `duplicate of <owner>`. The dry run lists
+  every orphan security with its first and last session and its key count. A real
+  run refuses, deleting nothing, on any orphan unless `allow_orphans` equals
+  the dry run's orphan key count exactly. Classified as the resolver at the
+  run (listings, delistings and chains known then); no look-ahead is added.
 - **Inside a named release** (#1319, data-foundation plan T140c; runbook
   `docs/runbooks/data-releases.md`). A real run takes the name of the open
   release (`store.registry.open_release`) and refuses, deleting nothing, when
@@ -84,7 +110,7 @@ from __future__ import annotations
 import csv
 import functools
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
@@ -100,6 +126,8 @@ from tradepartner.adapters.alpaca_prices import (
     ACTIONS_SOURCE,
     BAR_SOURCES,
     ListingResolver,
+    _succeeds,
+    alpaca_symbol,
     registrant_evidence,
 )
 from tradepartner.adapters.filings import FilingHeader
@@ -113,16 +141,25 @@ from tradepartner.store.asof import (
     live_chains,
     symbol_changes_as_of,
 )
-from tradepartner.store.db import open_for_write, utc_now
-from tradepartner.store.delistings import listing_ends_as_of
+from tradepartner.store.db import insert_row, open_for_write, utc_now
+from tradepartner.store.delistings import delistings_as_of, listing_ends_as_of
 from tradepartner.store.dividend_reviews import DUPLICATE, ReviewedGroup, reviewed_groups
-from tradepartner.store.master import first_session, session_of
-from tradepartner.store.registry import open_release
+from tradepartner.store.master import (
+    RenameRefusal,
+    derive_rename_listings,
+    first_session,
+    session_of,
+    stored_rename_changes,
+    stored_snapshot_history,
+)
+from tradepartner.store.registry import open_release, record_approved_orphans
 from tradepartner.store.restamp_precheck import (
     crossed_instants,
     read_instants,
     window_first_session,
 )
+from tradepartner.store.retracted_rows import retract
+from tradepartner.store.spinoff_splits import SpinoffSplit, spinoff_splits
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 REPAIR = "repair"
@@ -155,6 +192,7 @@ def store_resolver(
         quiet_after_days=settings.alpaca.registrant_quiet_days,
         transfer_window_sessions=settings.master.transfer_window_sessions,
         class_symbols=settings.alpaca.class_symbols,
+        filed_bars=filed_bars(conn, at),
     )
     return ListingResolver(
         listings_as_of(conn, at).iter_rows(named=True),
@@ -170,6 +208,45 @@ def store_resolver(
         symbol_changes=_symbol_changes(conn, at),
         chains=live_chains(conn, at),
     )
+
+
+def filed_bars(conn: duckdb.DuckDBPyConnection, at: datetime) -> dict[tuple[str, date], date]:
+    """Per `(security_id, New York day of a Form 25 acceptance)` of the
+    `delistings` known at `at`, the session of that security's last traded
+    Alpaca bar on or before that day known at `at` (#3056, rule 7's
+    stopped-before-filing cut): per session the latest revision known at
+    `at`, from an Alpaca source, with volume above zero, as `last_bar`
+    reads one. One query for every Form 25; a security with no such bar
+    is left out."""
+    at = ensure_tz_aware_utc(at, field_name="at")
+    filed = delistings_as_of(conn, at)
+    if filed.is_empty():
+        return {}
+    days = (
+        filed.select(
+            pl.col("security_id"),
+            pl.col("filed_at").dt.convert_time_zone("America/New_York").dt.date().alias("filed_on"),
+        )
+        .unique()
+        .sort("security_id", "filed_on")
+    )
+    conn.register("_filed_days", days)
+    try:
+        rows = conn.execute(
+            "SELECT d.security_id, d.filed_on, max(b.session) FROM _filed_days d"
+            " JOIN ("
+            "  SELECT security_id, session, volume FROM prices_daily"
+            "  WHERE known_at <= ? AND source IN (SELECT unnest(?))"
+            "  AND security_id IN (SELECT security_id FROM _filed_days)"
+            "  QUALIFY row_number() OVER"
+            "    (PARTITION BY security_id, session ORDER BY known_at DESC) = 1"
+            " ) b ON b.security_id = d.security_id AND b.session <= d.filed_on"
+            " WHERE b.volume > 0 GROUP BY 1, 2",
+            [at, sorted(BAR_SOURCES)],
+        ).fetchall()
+    finally:
+        conn.unregister("_filed_days")
+    return {(str(sid), day): last for sid, day, last in rows}
 
 
 def _symbol_changes(conn: duckdb.DuckDBPyConnection, at: datetime) -> list[dict[str, Any]]:
@@ -192,7 +269,7 @@ def last_bar(
         "SELECT max(session) FROM ("
         "  SELECT session, volume FROM prices_daily"
         "  WHERE security_id = ? AND session >= ? AND session < ? AND known_at <= ?"
-        "  AND list_contains(?, source)"
+        "  AND source IN (SELECT unnest(?))"
         "  QUALIFY row_number() OVER (PARTITION BY session ORDER BY known_at DESC) = 1"
         ") WHERE volume > 0",
         [security_id, start, before, at, sorted(BAR_SOURCES)],
@@ -258,6 +335,307 @@ def misattributed(
     return Misattributed(bars, actions)
 
 
+def _base_id(security_id: str) -> str:
+    """The CIK of a `<cik>:<class>` or `<cik>@<date>` security id."""
+    return security_id.split(":")[0].split("@")[0]
+
+
+def orphan_bars(
+    resolver: ListingResolver,
+    bar_keys: Iterable[Key],
+    tickers: Callable[[str, date], Sequence[str]],
+    holds_bar: Callable[[str, date], bool] = lambda _sid, _day: False,
+    same_bar: Callable[[str, str, date], bool] = lambda _sid, _owner, _day: False,
+) -> dict[Key, int]:
+    """The bar keys among `bar_keys` (each one the resolver does not assign
+    to its security) that no id receives (#3265): no ticker the security held
+    on the session resolves, for a fill or a bar, to another security. A
+    *moved* key has such an owner. An owner that already holds a stored bar
+    of its own on the session (`holds_bar`) is no receiver (#3455): a refetch
+    lands that owner's bar, never this one (Barrick under Gold.com's AMRK
+    bars). A key whose holding owner's bar is this very bar (`same_bar`) is
+    no orphan either (#3463, `duplicate_bars`): retracting it loses nothing.
+    Returns `{key: 1}` per orphan key. Pure."""
+    out: dict[Key, int] = {}
+    for sid, day in bar_keys:
+        held = tickers(sid, day)
+        if not (bar_owners(resolver, held, day, holds_bar) - {sid}) and (
+            _duplicate_owner(resolver, sid, day, held, holds_bar, same_bar) is None
+        ):
+            out[(sid, day)] = 1
+    return out
+
+
+def duplicate_bars(
+    resolver: ListingResolver,
+    bar_keys: Iterable[Key],
+    tickers: Callable[[str, date], Sequence[str]],
+    holds_bar: Callable[[str, date], bool],
+    same_bar: Callable[[str, str, date], bool],
+) -> dict[Key, str]:
+    """The bar keys among `bar_keys` that no id receives but that an owner
+    already holds as its own bar (#3463): one of the security's tickers on the
+    session resolves to that owner (as in `bar_owners`), the owner keeps a
+    stored bar there (`holds_bar`), and that bar is this one (`same_bar`: the
+    rule release coverage uses to call a bar moved). Retracting such a key
+    loses nothing, so it is no orphan. Returns `{key: owner}` (the smallest
+    such owner id). Pure."""
+    out: dict[Key, str] = {}
+    for sid, day in bar_keys:
+        held = tickers(sid, day)
+        if bar_owners(resolver, held, day, holds_bar) - {sid}:
+            continue  # moved: a receiver exists
+        owner = _duplicate_owner(resolver, sid, day, held, holds_bar, same_bar)
+        if owner is not None:
+            out[(sid, day)] = owner
+    return out
+
+
+def successor_moves(
+    resolver: ListingResolver,
+    bar_keys: Iterable[Key],
+    tickers: Callable[[str, date], Sequence[str]],
+    holds_bar: Callable[[str, date], bool],
+) -> dict[Key, str]:
+    """The moved bar keys among `bar_keys` whose one receiver is a repair
+    successor of the key's own company (`<cik>@<date>`, #3056) that holds no
+    bar of its own there (#3474): the old id's bar from the successor's
+    start, which the successor lacks (VELO's and REED's recent sessions). A
+    real run copies every revision of such a key to the successor before it
+    retracts it, so the company loses no session; a refetch could put the
+    same bar there, this does it in the same transaction. Returns `{key:
+    successor}`. Pure."""
+    out: dict[Key, str] = {}
+    for sid, day in bar_keys:
+        owners = bar_owners(resolver, tickers(sid, day), day, holds_bar) - {sid}
+        if len(owners) == 1 and _succeeds(owner := next(iter(owners)), sid):
+            out[(sid, day)] = owner
+    return out
+
+
+def _move_bars(
+    conn: duckdb.DuckDBPyConnection, sources: list[str], moves: Mapping[Key, str], at: datetime
+) -> int:
+    """Copy every revision (`sources` only) of each `moves` key to its
+    successor id, the row unchanged but for `security_id` and `ingested_at`
+    (`at`): its `known_at` stays the session close a refetch would stamp.
+    Returns the rows written. Runs on the caller's transaction."""
+    if not moves:
+        return 0
+    conn.execute(
+        "CREATE OR REPLACE TEMP TABLE _move_keys "
+        "(security_id VARCHAR, session DATE, successor VARCHAR)"
+    )
+    try:
+        conn.executemany(
+            "INSERT INTO _move_keys VALUES (?, ?, ?)",
+            [(sid, day, owner) for (sid, day), owner in sorted(moves.items())],
+        )
+        [before] = conn.execute("SELECT count(*) FROM prices_daily").fetchone() or (0,)
+        conn.execute(
+            "INSERT INTO prices_daily (security_id, session, open, high, low, close, volume, "
+            "known_at, ingested_at, source, provenance) "
+            "SELECT k.successor, p.session, p.open, p.high, p.low, p.close, p.volume, "
+            "p.known_at, ?, p.source, p.provenance FROM prices_daily p JOIN _move_keys k "
+            "ON p.security_id = k.security_id AND p.session = k.session "
+            "WHERE p.source IN (SELECT unnest(?))",
+            [at, sources],
+        )
+        [after] = conn.execute("SELECT count(*) FROM prices_daily").fetchone() or (0,)
+    finally:
+        conn.execute("DROP TABLE IF EXISTS _move_keys")
+    return int(after) - int(before)
+
+
+def _duplicate_owner(
+    resolver: ListingResolver,
+    sid: str,
+    day: date,
+    tickers: Sequence[str],
+    holds_bar: Callable[[str, date], bool],
+    same_bar: Callable[[str, str, date], bool],
+) -> str | None:
+    """The smallest owner of `day` under `tickers`, other than `sid`, that
+    holds a bar of its own there equal to `sid`'s (#3463), else `None`."""
+    owners = bar_owners(resolver, tickers, day) - {sid}
+    return min((o for o in owners if holds_bar(o, day) and same_bar(sid, o, day)), default=None)
+
+
+def bar_owners(
+    resolver: ListingResolver,
+    tickers: Iterable[str],
+    day: date,
+    holds_bar: Callable[[str, date], bool] = lambda _sid, _day: False,
+) -> set[str]:
+    """The securities that receive a bar of `day` under any of `tickers`, for a
+    fill or a bar (`fill_resolve`, then a rename or first-span `lead`), less
+    any that already hold a bar of their own there (`holds_bar`, #3455). Pure."""
+    owners = {resolver.fill_resolve(t, day) for t in tickers}
+    owners |= {resolver.lead(t, day) for t in tickers}
+    return {o for o in owners if o is not None and not holds_bar(o, day)}
+
+
+def _holds_bar(
+    conn: duckdb.DuckDBPyConnection, sources: list[str], stale: Mapping[Key, int]
+) -> Callable[[str, date], bool]:
+    """`(security_id, session)` to whether the store holds a bar of that
+    security there that stays: not one of the `stale` keys this run retracts.
+    Reads every stored bar, like `_Counted` (the same view as `found_bars`)."""
+    cache: dict[Key, bool] = {}
+
+    def holds(sid: str, day: date) -> bool:
+        key = (sid, day)
+        if key not in cache:
+            cache[key] = key not in stale and bool(
+                conn.execute(
+                    "SELECT 1 FROM prices_daily WHERE security_id = ? AND session = ? "
+                    "AND source IN (SELECT unnest(?)) LIMIT 1",
+                    [sid, day, sources],
+                ).fetchone()
+            )
+        return cache[key]
+
+    return holds
+
+
+def _same_bar(
+    conn: duckdb.DuckDBPyConnection, sources: list[str], tolerance: float
+) -> Callable[[str, str, date], bool]:
+    """`(stale_id, owner, session)` to whether the two ids' stored bars there
+    are the same bar (#3463): each id's latest revision (by `known_at`, over
+    `sources`), equal volume and every one of open, high, low and close within
+    `tolerance` relative to the stale bar's, with an absolute floor at price 1:
+    the rule `release_coverage` uses to call a lost bar moved
+    (`store.release_move_price_tolerance`)."""
+
+    def latest(sid: str, day: date) -> tuple[float, float, float, float, int] | None:
+        row = conn.execute(
+            "SELECT arg_max(open, known_at), arg_max(high, known_at), arg_max(low, known_at), "
+            "arg_max(close, known_at), arg_max(volume, known_at) FROM prices_daily "
+            "WHERE security_id = ? AND session = ? AND source IN (SELECT unnest(?))",
+            [sid, day, sources],
+        ).fetchone()
+        if row is None or any(v is None for v in row):
+            return None
+        return float(row[0]), float(row[1]), float(row[2]), float(row[3]), int(row[4])
+
+    def same(stale: str, owner: str, day: date) -> bool:
+        a, b = latest(stale, day), latest(owner, day)
+        if a is None or b is None or a[4] != b[4]:
+            return False
+        return all(
+            abs(y - x) <= tolerance * max(1.0, abs(x)) for x, y in zip(a[:4], b[:4], strict=True)
+        )
+
+    return same
+
+
+def _norm(ticker: str) -> str:
+    """A listing ticker in the form the resolver reads (upper case, Alpaca's
+    class suffix), else the raw ticker."""
+    return alpaca_symbol(ticker) or ticker
+
+
+def _held_tickers(
+    conn: duckdb.DuckDBPyConnection, at: datetime
+) -> Callable[[str, date], Sequence[str]]:
+    """`(security_id, session)` to the tickers the security's listings known
+    at `at` carry on that session: those of its latest listing starting on or
+    before it, else all of its listings (a bar before its first row); plus the
+    new symbol of each of its own `symbol_changes` known at `at` on or before
+    that session from a ticker it then carried (#3466: a lost id's bars after
+    `ATLN -> CIRC` were Alpaca's `CIRC`)."""
+    listed: dict[str, list[tuple[date, str]]] = defaultdict(list)
+    live_classes: dict[str, list[tuple[date, str, Any]]] = defaultdict(list)
+    for row in listings_as_of(conn, at).iter_rows(named=True):
+        listed[row["security_id"]].append((row["valid_from"], _norm(row["ticker"])))
+        live_classes[row["security_id"]].append(
+            (row["valid_from"], _norm(row["ticker"]), row["class_title"])
+        )
+
+    own_tickers: dict[str, set[str]] = defaultdict(set)  # the id's own rows, retracted too
+    for sid, ticker in conn.execute(
+        "SELECT security_id, ticker FROM listings WHERE known_at <= ?", [at]
+    ).fetchall():
+        own_tickers[str(sid)].add(_norm(str(ticker)))
+
+    # The id's own withdrawn rows (#3290): master-retract moves an id's common
+    # ticker to a class or successor id, and a leftover warrant row or a raw
+    # lowercase ticker is then all that is live. The bars' receiver sits under
+    # the withdrawn ticker.
+    withdrawn: dict[str, list[tuple[date, str]]] = defaultdict(list)
+    for sid, ticker, valid_from, class_title in conn.execute(
+        "SELECT security_id, ticker, valid_from, class_title FROM listings WHERE known_at <= ? "
+        "QUALIFY row_number() OVER (PARTITION BY security_id, ticker, exchange, valid_from "
+        "ORDER BY known_at DESC, ingested_at DESC) = 1 AND retracted",
+        [at],
+    ).fetchall():
+        norm = _norm(str(ticker))
+        # A ticker its own class later replaced is a rename, not a withdrawn
+        # common ticker: another id reusing it must not receive this id's bars.
+        if any(
+            d >= valid_from and t != norm and c == class_title
+            for d, t, c in live_classes.get(str(sid), ())
+        ):
+            continue
+        withdrawn[str(sid)].append((valid_from, norm))
+
+    renames: dict[str, list[tuple[date, str, str]]] = defaultdict(list)
+    for change in _symbol_changes(conn, at):
+        renames[str(change["security_id"])].append(
+            (
+                change["process_date"],
+                _norm(str(change["old_symbol"])),
+                _norm(str(change["new_symbol"])),
+            )
+        )
+    for listed_changes in renames.values():
+        listed_changes.sort()
+
+    def listed_on(security_id: str, day: date) -> set[str]:
+        rows = listed.get(security_id, [])
+        if not rows:  # a retracted id: its own retracted listing rows (#3265 review)
+            return set(own_tickers.get(security_id, ()))
+        started = [r for r in rows if r[0] <= day]
+        if not started:
+            return {t for _, t in rows}
+        latest = max(r[0] for r in started)
+        out = {t for d, t in started if d == latest}
+        own = [r for r in withdrawn.get(security_id, ()) if r[0] <= day]
+        if own:
+            last = max(r[0] for r in own)
+            out |= {t for d, t in own if d == last}
+        return out
+
+    def held(security_id: str, day: date) -> Sequence[str]:
+        out = listed_on(security_id, day)
+        for process_date, old, new in renames.get(security_id, ()):
+            if process_date <= day and old in out:
+                out.add(new)
+        return sorted(out)
+
+    return held
+
+
+def _with_successor_tickers(
+    resolver: ListingResolver, held: Callable[[str, date], Sequence[str]]
+) -> Callable[[str, date], Sequence[str]]:
+    """`held`, plus on a session from an old id's repair successor's start
+    (`ListingResolver.successor_from`, #3474) the tickers that successor
+    trades under that day: the bar is the successor's, so it is the receiver
+    even when the old id carries none of its tickers (its rows withdrawn to
+    the successor, or only a symbol-change ticker such as VLDXD left)."""
+
+    def tickers(security_id: str, day: date) -> Sequence[str]:
+        out = list(held(security_id, day))
+        successor = resolver.successor_from(security_id, day)
+        if successor is not None:
+            out += [t for t in resolver.symbols(successor, day, day) if t not in out]
+        return out
+
+    return tickers
+
+
 @dataclass(frozen=True)
 class ChainLine:
     """A live successor chain the run applied (#821, plan T187b): the
@@ -283,6 +661,24 @@ class RepairResult:
     unjudged_symbol_changes: int = 0
     unjudged_mergers: int = 0
     chains: tuple[ChainLine, ...] = ()
+    #: The bar keys no id receives (#3265): `(security_id, session)` to rows.
+    orphans: Mapping[Key, int] = field(default_factory=dict)
+    #: The bar keys an owner already holds as its own bar (#3463): no orphans,
+    #: `(security_id, session)` to that owner.
+    duplicates: Mapping[Key, str] = field(default_factory=dict)
+    #: Display names by base id, for the orphan and duplicate lines only.
+    names: Mapping[str, str] = field(default_factory=dict)
+    #: Rows beyond the counted ones that retracting these keys would also move
+    #: (`_wider`); a real run refuses on any.
+    wider: tuple[str, ...] = ()
+    #: The bar keys a real run copies to their company's repair successor
+    #: before retracting them (#3474, `successor_moves`): key to successor.
+    moves: Mapping[Key, str] = field(default_factory=dict)
+
+    @property
+    def orphan_keys(self) -> int:
+        """Bar keys no id receives; a real run needs this exact count passed."""
+        return len(self.orphans)
 
     @property
     def bar_rows(self) -> int:
@@ -299,7 +695,7 @@ class RepairResult:
         named = self.found.securities
         more = f" and {len(named) - _NAMED} more" if len(named) > _NAMED else ""
         shown = f": {', '.join(named[:_NAMED])}{more}" if named else ""
-        verb = "would delete" if self.dry_run else "deleted"
+        verb = "would retract" if self.dry_run else "retracted"
         return (
             f"{verb} {self.bar_rows} bar rows ({len(self.found.bars)} of "
             f"{self.bar_keys_checked} keys) and {self.action_rows} action rows "
@@ -307,7 +703,21 @@ class RepairResult:
             f"{self.action_keys_checked} keys) that the "
             f"resolver no longer assigns to their security, on {len(named)} securities{shown}; "
             f"{self.unjudged_symbol_changes} symbol_changes rows unjudged; "
-            f"{self.unjudged_mergers} mergers rows unjudged"
+            f"{self.unjudged_mergers} mergers rows unjudged; "
+            f"{self.orphan_keys} orphan bar keys no id receives on "
+            f"{len({sid for sid, _ in self.orphans})} securities"
+            + (
+                f"; {len(self.duplicates)} duplicate bar keys an owner already holds"
+                if self.duplicates
+                else ""
+            )
+            + (
+                f"; {len(self.moves)} bar keys {'to move' if self.dry_run else 'moved'} "
+                "to a repair successor that lacks them"
+                if self.moves
+                else ""
+            )
+            + (f"; {len(self.wider)} extra rows held by the same keys" if self.wider else "")
         )
 
     def lines(self) -> list[str]:
@@ -327,6 +737,37 @@ class RepairResult:
             days = bars.get(sid, [])
             span = f" {min(days)}..{max(days)}" if days else ""
             out.append(f"  {sid}: {rows[sid]} bar rows{span}, {actions[sid]} action rows")
+        by_sid: dict[str, list[date]] = defaultdict(list)
+        for sid, day in self.orphans:
+            by_sid[sid].append(day)
+        for sid in sorted(by_sid):
+            days = by_sid[sid]
+            name = self.names.get(_base_id(sid), "?")
+            out.append(
+                f"  ORPHAN {sid} ({name}): {len(days)} bar keys {min(days)}..{max(days)} "
+                "that no id receives"
+            )
+        dups: dict[tuple[str, str], list[date]] = defaultdict(list)
+        for (sid, day), owner in self.duplicates.items():
+            dups[(sid, owner)].append(day)
+        for sid, owner in sorted(dups):
+            days = dups[(sid, owner)]
+            name = self.names.get(_base_id(sid), "?")
+            out.append(
+                f"  DUPLICATE {sid} ({name}): {len(days)} bar keys {min(days)}..{max(days)} "
+                f"duplicate of {owner}"
+            )
+        moved: dict[tuple[str, str], list[date]] = defaultdict(list)
+        for (sid, day), owner in self.moves.items():
+            moved[(sid, owner)].append(day)
+        for sid, owner in sorted(moved):
+            days = moved[(sid, owner)]
+            name = self.names.get(_base_id(sid), "?")
+            out.append(
+                f"  MOVE {sid} ({name}): {len(days)} bar keys {min(days)}..{max(days)} "
+                f"to {owner}, which lacks them"
+            )
+        out += [f"  WIDER {line}" for line in self.wider]
         for chain in self.chains:
             ratio = "-" if chain.ratio is None else f"{chain.ratio:.4f}"
             out.append(
@@ -374,10 +815,10 @@ class _Counted:
         sources: list[str],
         action_types: Sequence[str] | None = None,
     ) -> None:
-        extra = " AND list_contains(?, action_type)" if action_types is not None else ""
+        extra = " AND action_type IN (SELECT unnest(?))" if action_types is not None else ""
         self._cursor = conn.execute(
             f"SELECT security_id, {day}, count(*) FROM {table} "
-            f"WHERE list_contains(?, source){extra} GROUP BY ALL",
+            f"WHERE source IN (SELECT unnest(?)){extra} GROUP BY ALL",
             [sources, *([list(action_types)] if action_types is not None else [])],
         )
         self.seen = 0
@@ -389,19 +830,200 @@ class _Counted:
                 yield str(sid), day, int(rows)
 
 
-def _delete_spinoffs(conn: duckdb.DuckDBPyConnection, keys: Sequence[tuple[str, date, str]]) -> int:
-    """Delete the `spinoff` rows from `ACTIONS_SOURCE` whose `(child, ex_date,
-    parent)` is in `keys`, never another parent's row of the same child and
-    day; the number deleted."""
-    if not keys:
-        return 0
-    before = _rows(conn, "corporate_actions")
-    conn.executemany(
-        "DELETE FROM corporate_actions WHERE source = ? AND action_type = 'spinoff' "
-        "AND security_id = ? AND ex_date = ? AND source_action_id = ?",
-        [[ACTIONS_SOURCE, *key] for key in keys],
+def _span(days: Iterable[date]) -> str:
+    """`first..last` of a non-empty set of days."""
+    ordered = sorted(days)
+    return f"{ordered[0]}..{ordered[-1]}"
+
+
+#: The columns `_select_*` return per row and `_wider` compares. The logical key
+#: (`retracted_rows.KEY_COLUMNS`) is the first 2 (bars) or first 4 (actions).
+_BAR_COLS = "security_id, session, source, known_at, ingested_at"
+_ACTION_COLS = "security_id, source_action_id, action_type, ex_date, source, known_at, ingested_at"
+
+
+def _cols(table: str) -> tuple[str, int]:
+    return (_BAR_COLS, 2) if table == "prices_daily" else (_ACTION_COLS, 4)
+
+
+def _day_of(table: str, row: tuple[Any, ...]) -> date:
+    return row[1] if table == "prices_daily" else row[3]  # type: ignore[no-any-return]
+
+
+def _select_rows(
+    conn: duckdb.DuckDBPyConnection,
+    table: str,
+    day: str,
+    sources: list[str],
+    keys: Iterable[Key],
+    action_types: Sequence[str] | None = None,
+) -> list[tuple[Any, ...]]:
+    """Every row of `table` from `sources` (and `action_types`) whose
+    `(security_id, <day>)` is in `keys`: what the old delete matched."""
+    rows = [[sid, when] for sid, when in keys]
+    if not rows:
+        return []
+    conn.execute("CREATE OR REPLACE TEMP TABLE _repair_keys (security_id VARCHAR, day DATE)")
+    conn.executemany("INSERT INTO _repair_keys VALUES (?, ?)", rows)
+    extra = " AND action_type IN (SELECT unnest(?))" if action_types is not None else ""
+    try:
+        found = conn.execute(
+            f"SELECT {_cols(table)[0]} FROM {table} WHERE source IN (SELECT unnest(?)){extra} "
+            f"AND (security_id, {day}) IN (SELECT (security_id, day) FROM _repair_keys)",
+            [sources, *([list(action_types)] if action_types is not None else [])],
+        ).fetchall()
+    finally:
+        conn.execute("DROP TABLE _repair_keys")
+    return [tuple(r) for r in found]
+
+
+def _select_actions(
+    conn: duckdb.DuckDBPyConnection, action_type: str, identities: Iterable[Sequence[Any]]
+) -> list[tuple[Any, ...]]:
+    """Every `ACTIONS_SOURCE` row of `action_type` whose `(security_id,
+    source_action_id)` is an identity, plus (for a spin-off) its ex-date as a
+    third entry of the identity, when given."""
+    out: list[tuple[Any, ...]] = []
+    for identity in identities:
+        sid, action_id, *ex = identity
+        extra = " AND ex_date = ?" if ex else ""
+        out += [
+            tuple(r)
+            for r in conn.execute(
+                f"SELECT {_ACTION_COLS} FROM corporate_actions WHERE source = ? "
+                f"AND action_type = ? AND security_id = ? AND source_action_id = ?{extra}",
+                [ACTIONS_SOURCE, action_type, sid, action_id, *ex],
+            ).fetchall()
+        ]
+    return out
+
+
+def _wider(
+    conn: duckdb.DuckDBPyConnection, table: str, selected: Sequence[tuple[Any, ...]]
+) -> list[str]:
+    """Why a retraction would move more than the old delete did (ADR 0029):
+    `retract` moves every revision of a logical key whatever its source, and an
+    action with a `source_action_id` across ex-dates. One line per extra row, key
+    first; empty when the selected rows are everything those keys hold."""
+    if not selected:
+        return []
+    cols, width = _cols(table)
+    names = cols.split(", ")[:width]
+    keys = list(dict.fromkeys(tuple(r[:width]) for r in selected))
+    conn.execute(
+        f"CREATE OR REPLACE TEMP TABLE _wider_keys AS SELECT {', '.join(names)} "
+        f"FROM {table} LIMIT 0"
     )
-    return before - _rows(conn, "corporate_actions")
+    try:
+        conn.executemany(f"INSERT INTO _wider_keys VALUES ({', '.join('?' for _ in names)})", keys)
+        if table == "prices_daily":
+            cond = "t.security_id = k.security_id AND t.session = k.session"
+        else:
+            cond = (
+                "t.security_id = k.security_id AND t.source_action_id = k.source_action_id "
+                "AND (k.source_action_id <> '' OR (t.action_type = k.action_type "
+                "AND t.ex_date = k.ex_date))"
+            )
+        matched = conn.execute(
+            f"SELECT {', '.join('t.' + c for c in cols.split(', '))} FROM {table} t "
+            f"WHERE EXISTS (SELECT 1 FROM _wider_keys k WHERE {cond})"
+        ).fetchall()
+    finally:
+        conn.execute("DROP TABLE IF EXISTS _wider_keys")
+    extra = sorted({tuple(r) for r in matched} - {tuple(r) for r in selected}, key=str)
+    return [
+        f"{table} key {tuple(map(str, r[:width]))} also holds a {r[width]} revision "
+        f"known {r[width + 1]} (ex-date {_day_of(table, r)})"
+        if table != "prices_daily"
+        else f"{table} key {tuple(map(str, r[:width]))} also holds a {r[width]} revision "
+        f"known {r[width + 1]}"
+        for r in extra
+    ]
+
+
+def _refuse_wider(wider: Sequence[str]) -> None:
+    """Raise `RepairRefused`, naming the keys, when a retraction would take more
+    than the dry run counted."""
+    if wider:
+        listed = "\n".join(f"  {line}" for line in wider[:20])
+        more = f"\n  and {len(wider) - 20} more" if len(wider) > 20 else ""
+        raise RepairRefused(
+            f"{len(wider)} extra rows would be retracted with the counted keys (a retraction "
+            f"moves every revision of a key, whatever its source or ex-date); nothing "
+            f"retracted, review them:\n{listed}{more}"
+        )
+
+
+def _retract_grouped(
+    conn: duckdb.DuckDBPyConnection,
+    table: str,
+    selected: Sequence[tuple[Any, ...]],
+    rules: Callable[[tuple[Any, ...]], str],
+    *,
+    reason: str,
+    release: str,
+) -> int:
+    """Retract (ADR 0029, `store.retracted_rows.retract`) the logical keys of the
+    `selected` rows, one call per distinct rule `rules(key)` gives, so every moved
+    row records the rule that judged it; the rows moved."""
+    width = _cols(table)[1]
+    by_rule: dict[str, list[tuple[Any, ...]]] = defaultdict(list)
+    for key in dict.fromkeys(tuple(r[:width]) for r in selected):
+        by_rule[rules(key)].append(key)
+    return sum(
+        retract(conn, table, group, reason, release, rule)
+        for rule, group in sorted(by_rule.items())
+    )
+
+
+def _wider_spinoffs(
+    conn: duckdb.DuckDBPyConnection, keys: Sequence[tuple[str, date, str]]
+) -> list[str]:
+    """`_wider` for `_delete_spinoffs`'s keys."""
+    return _wider(
+        conn, "corporate_actions", _select_actions(conn, "spinoff", [(c, p, e) for c, e, p in keys])
+    )
+
+
+def _delete_spinoffs(
+    conn: duckdb.DuckDBPyConnection,
+    keys: Sequence[tuple[str, date, str]],
+    *,
+    reason: str,
+    release: str,
+    rule: Callable[[str, date, str], str],
+) -> int:
+    """Retract the `spinoff` rows from `ACTIONS_SOURCE` whose `(child, ex_date,
+    parent)` is in `keys`, never another parent's row of the same child and
+    day, with `rule(child, ex_date, parent)` as the rule that judged them (the
+    rules of one identity's ex-dates joined: its revisions move together); the
+    number retracted."""
+    selected = _select_actions(conn, "spinoff", [(c, p, e) for c, e, p in keys])
+    if not selected:
+        return 0
+    by_identity: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for child, ex_date, parent in sorted(keys):
+        by_identity[(child, parent)].append(rule(child, ex_date, parent))
+    return _retract_grouped(
+        conn,
+        "corporate_actions",
+        selected,
+        lambda key: " | ".join(by_identity[(str(key[0]), str(key[1]))]),
+        reason=reason,
+        release=release,
+    )
+
+
+def _wider_delete(
+    conn: duckdb.DuckDBPyConnection,
+    table: str,
+    day: str,
+    sources: list[str],
+    keys: Iterable[Key],
+    action_types: Sequence[str] | None = None,
+) -> list[str]:
+    """`_wider` for `_delete`'s keys."""
+    return _wider(conn, table, _select_rows(conn, table, day, sources, keys, action_types))
 
 
 def _delete(
@@ -411,23 +1033,27 @@ def _delete(
     sources: list[str],
     keys: Iterable[Key],
     action_types: Sequence[str] | None = None,
+    *,
+    reason: str,
+    release: str,
+    rule: Callable[[str, Sequence[date]], str],
 ) -> int:
-    """Delete every row of `table` from `sources` whose `(security_id,
-    <day>)` is in `keys`; the number deleted."""
-    rows = [[sid, when] for sid, when in keys]
-    if not rows:
-        return 0
-    conn.execute("CREATE OR REPLACE TEMP TABLE _repair_keys (security_id VARCHAR, day DATE)")
-    conn.executemany("INSERT INTO _repair_keys VALUES (?, ?)", rows)
-    before = _rows(conn, table)
-    extra = " AND list_contains(?, action_type)" if action_types is not None else ""
-    conn.execute(
-        f"DELETE FROM {table} WHERE list_contains(?, source){extra} "
-        f"AND (security_id, {day}) IN (SELECT (security_id, day) FROM _repair_keys)",
-        [sources, *([list(action_types)] if action_types is not None else [])],
+    """Retract every row of `table` from `sources` whose `(security_id,
+    <day>)` is in `keys` (ADR 0029: moved to `retracted_rows`, not deleted),
+    with `rule(security_id, days)` as the rule that judged each security's
+    keys; the number retracted."""
+    selected = _select_rows(conn, table, day, sources, keys, action_types)
+    days_of: dict[str, set[date]] = defaultdict(set)
+    for row in selected:
+        days_of[str(row[0])].add(_day_of(table, row))
+    return _retract_grouped(
+        conn,
+        table,
+        selected,
+        lambda key: rule(str(key[0]), sorted(days_of[str(key[0])])),
+        reason=reason,
+        release=release,
     )
-    conn.execute("DROP TABLE _repair_keys")
-    return before - _rows(conn, table)
 
 
 def release_refusal(conn: duckdb.DuckDBPyConnection, release: str) -> str | None:
@@ -445,9 +1071,74 @@ def release_refusal(conn: duckdb.DuckDBPyConnection, release: str) -> str | None
     )
 
 
+def refuse_inside_open_window(
+    conn: duckdb.DuckDBPyConnection, affected_sessions: Iterable[date]
+) -> None:
+    """Raise `RepairRefused` when any paper window is open and
+    `affected_sessions`, the dates of the rows a repair or backfill is about
+    to rewrite or retract, is not empty (#3330, quant-auditor on #3359).
+
+    A window's runs read the store at read instants from its first session on
+    (`restamp_precheck.read_instants`). A row dated inside the window may be
+    read or not yet; a row dated before it was read by every run, so changing
+    either moves a past read. The per-row `known_at` test of
+    `delete_master_rows` therefore refuses every affected row here, and the
+    date test is moot: any open window refuses any non-empty repair. No window
+    open, or nothing affected, passes. Call it on the write connection before
+    any write."""
+    first = window_first_session(conn)
+    dates = sorted(set(affected_sessions))
+    if first is None or not dates:
+        return
+    raise RepairRefused(
+        f"an open paper window (first session {first}) reads the store and the repair "
+        f"changes {len(dates)} dates from {dates[0]}; nothing written, wait for the "
+        "window to close"
+    )
+
+
+def known_dates(instants: Iterable[datetime]) -> list[date]:
+    """The New York dates of `instants`, for `refuse_inside_open_window`."""
+    return [
+        ensure_tz_aware_utc(i, field_name="known_at").astimezone(_NEW_YORK).date() for i in instants
+    ]
+
+
 def _rows(conn: duckdb.DuckDBPyConnection, table: str) -> int:
     row = conn.execute(f"SELECT count(*) FROM {table}").fetchone()
     return 0 if row is None else int(row[0])
+
+
+def _resolution_rules(
+    conn: duckdb.DuckDBPyConnection, at: datetime, settings: Settings
+) -> Callable[[str, str, Sequence[date]], str]:
+    """`rule(what, security_id, days)`: the text `retracted_rows.rule` keeps for a
+    key the resolver at `at` does not assign (ADR 0029): the tickers the id held
+    on those days, and the listing ends (with their Form 25) and successor chains
+    the resolver read for the id, which judged the key outside its span."""
+    ends: dict[str, list[str]] = defaultdict(list)
+    for row in listing_ends_as_of(conn, at, settings).iter_rows(named=True):
+        form = f" ({row['delisting_form']})" if row.get("delisting_form") else ""
+        ends[str(row["security_id"])].append(
+            f"{row['ticker']} {row['exchange']} from {row['valid_from']} "
+            f"{row.get('status')} end {row.get('end_session')}{form}"
+        )
+    chains: dict[str, list[str]] = defaultdict(list)
+    for predecessor, successor in live_chains(conn, at):
+        for sid in (predecessor, successor):
+            chains[sid].append(f"{predecessor}->{successor}")
+    held = _held_tickers(conn, at)
+
+    def rule(what: str, security_id: str, days: Sequence[date]) -> str:
+        tickers = sorted({t for day in days for t in held(security_id, day)})
+        return (
+            f"resolver at {at.isoformat()}: no ticker of {security_id} "
+            f"({', '.join(tickers) or 'none'}) resolves to it on {what} {_span(days)}; "
+            f"listing ends: {'; '.join(ends.get(security_id, [])) or 'none'}; "
+            f"chains: {', '.join(chains.get(security_id, [])) or 'none'}"
+        )
+
+    return rule
 
 
 def repair_resolution(
@@ -457,6 +1148,7 @@ def repair_resolution(
     dry_run: bool = False,
     expect: tuple[int, int] | None = None,
     release: str | None = None,
+    allow_orphans: int | None = None,
 ) -> RepairResult:
     """Delete the Alpaca bars and actions that the resolver built as of
     `clock()` does not assign to their security, and record the run (module
@@ -466,8 +1158,11 @@ def repair_resolution(
     A real run deletes only what a dry run showed: `expect` is that dry
     run's `(bar_rows, action_rows)`, and any other count raises
     `RepairRefused` before anything is deleted. It runs only inside the open
-    data release `release` (`release_refusal`), else `RepairRefused`. Raises
-    `StoreLockedError` like ingest when the store stays locked."""
+    data release `release` (`release_refusal`), else `RepairRefused`. A bar
+    key no id receives (`orphan_bars`, #3265) is deleted only when
+    `allow_orphans` equals the orphan key count exactly, else `RepairRefused`
+    before anything is deleted. Raises `StoreLockedError` like ingest when
+    the store stays locked."""
     if not dry_run and expect is None:
         raise ValueError("a repair deletes only the counts of a dry run: pass expect")
     if not dry_run and release is None:
@@ -479,7 +1174,7 @@ def repair_resolution(
     bar_sources = sorted(BAR_SOURCES)
     with opened as conn:
         if release is not None and not dry_run and (why := release_refusal(conn, release)):
-            raise RepairRefused(f"{why}; nothing deleted")
+            raise RepairRefused(f"{why}; nothing retracted")
         resolver = store_resolver(conn, started, settings)
         bars = _Counted(conn, "prices_daily", "session", bar_sources)
         found_bars = misattributed(resolver, bars, ()).bars
@@ -507,6 +1202,41 @@ def repair_resolution(
                 bad_spins.append((child, ex_date, parent))
         spinoffs = dict(spinoffs)
         found = Misattributed(found_bars, ordinary, spinoffs)
+        wider = tuple(
+            _wider_delete(conn, "prices_daily", "session", bar_sources, found_bars)
+            + _wider_delete(
+                conn,
+                "corporate_actions",
+                "ex_date",
+                [ACTIONS_SOURCE],
+                ordinary,
+                ("split", "dividend"),
+            )
+            + _wider_spinoffs(conn, bad_spins)
+        )
+        held_tickers = _with_successor_tickers(resolver, _held_tickers(conn, started))
+        holds_bar = _holds_bar(conn, bar_sources, found_bars)
+        same_bar = _same_bar(conn, bar_sources, settings.store.release_move_price_tolerance)
+        orphans = orphan_bars(resolver, found_bars, held_tickers, holds_bar, same_bar)
+        duplicates = duplicate_bars(
+            resolver, [k for k in found_bars if k not in orphans], held_tickers, holds_bar, same_bar
+        )
+        moves = successor_moves(
+            resolver,
+            [k for k in found_bars if k not in orphans and k not in duplicates],
+            held_tickers,
+            holds_bar,
+        )
+        names = {
+            _base_id(str(sid)): str(name)
+            for sid, name in conn.execute(
+                "SELECT security_id, name FROM securities WHERE known_at <= ? AND NOT retracted "
+                "QUALIFY row_number() OVER (PARTITION BY security_id "
+                "ORDER BY known_at DESC, ingested_at DESC) = 1",
+                [started],
+            ).fetchall()
+            if name is not None
+        }
         unjudged_row = conn.execute("SELECT count(*) FROM symbol_changes").fetchone()
         assert unjudged_row is not None
         unjudged = int(unjudged_row[0])
@@ -520,15 +1250,65 @@ def repair_resolution(
             unjudged_symbol_changes=unjudged,
             unjudged_mergers=int(mergers_row[0]),
             chains=_chain_lines(conn, started),
+            orphans=orphans,
+            duplicates=duplicates,
+            names=names,
+            wider=wider,
+            moves=moves,
         )
         if not dry_run:
+            if result.orphan_keys != (allow_orphans or 0):
+                raise RepairRefused(
+                    f"{result.orphan_keys} bar keys on "
+                    f"{len({sid for sid, _ in orphans})} securities are received by no id, "
+                    f"and --allow-orphans is {allow_orphans}; the owner's exact count is "
+                    "required to retract them; nothing retracted, run --dry-run and read the "
+                    "ORPHAN lines"
+                )
             if (result.bar_rows, result.action_rows) != expect:
                 raise RepairRefused(
                     f"found {result.bar_rows} bar rows and {result.action_rows} action rows, "
-                    f"not the expected {expect}; nothing deleted, run --dry-run again"
+                    f"not the expected {expect}; nothing retracted, run --dry-run again"
                 )
-            deleted = (
-                _delete(conn, "prices_daily", "session", bar_sources, found.bars),
+            _refuse_wider(wider)
+            refuse_inside_open_window(
+                conn,
+                [d for _, d in (*found.bars, *found.actions, *found.spinoffs)],
+            )
+            assert release is not None  # checked above
+            why_rule = _resolution_rules(conn, started, settings)
+            reason = f"repair-resolution at {started.isoformat()}: the resolver no longer assigns"
+            copied = _move_bars(conn, bar_sources, moves, started)
+            if copied != sum(found.bars[key] for key in moves):  # never a partial move
+                raise RuntimeError(
+                    f"repair copied {copied} bar rows to successors where it counted "
+                    f"{sum(found.bars[key] for key in moves)}; rolled back"
+                )
+            moved_to: dict[str, set[str]] = defaultdict(set)
+            for (sid, _), owner in moves.items():
+                moved_to[sid].add(owner)
+
+            def bar_rule(sid: str, days: Sequence[date]) -> str:
+                text = why_rule("session", sid, days)
+                if sid in moved_to:
+                    count = sum(1 for key in moves if key[0] == sid)
+                    text += (
+                        f"; {count} of these sessions copied first to "
+                        f"{', '.join(sorted(moved_to[sid]))}, which lacked them (#3474)"
+                    )
+                return text
+
+            moved = (
+                _delete(
+                    conn,
+                    "prices_daily",
+                    "session",
+                    bar_sources,
+                    found.bars,
+                    reason=reason,
+                    release=release,
+                    rule=bar_rule,
+                ),
                 _delete(
                     conn,
                     "corporate_actions",
@@ -536,13 +1316,34 @@ def repair_resolution(
                     [ACTIONS_SOURCE],
                     found.actions,
                     action_types=("split", "dividend"),
+                    reason=reason,
+                    release=release,
+                    rule=lambda sid, days: why_rule(
+                        "the session before ex-date", sid, [previous_session(d) for d in days]
+                    ),
                 )
-                + _delete_spinoffs(conn, bad_spins),
+                + _delete_spinoffs(
+                    conn,
+                    bad_spins,
+                    reason=reason,
+                    release=release,
+                    rule=lambda child, ex_date, parent: (
+                        why_rule("ex-date", child, [ex_date])
+                        + f"; parent {parent}: "
+                        + why_rule(
+                            "the session before ex-date", parent, [previous_session(ex_date)]
+                        )
+                    ),
+                ),
             )
-            if deleted != (result.bar_rows, result.action_rows):  # never a partial repair
+            if moved != (result.bar_rows, result.action_rows):  # never a partial repair
                 raise RuntimeError(
-                    f"repair deleted {deleted} rows where it counted "
+                    f"repair retracted {moved} rows where it counted "
                     f"{(result.bar_rows, result.action_rows)}; rolled back"
+                )
+            if orphans:  # the owner's exact count: the coverage check accepts exactly these
+                record_approved_orphans(
+                    conn, release=release, allow_orphans=allow_orphans or 0, keys=orphans
                 )
             message = f"{result.summary()}; release {release}"
             run = SourceRun("alpaca", REPAIRED, 0, "", message)
@@ -564,10 +1365,13 @@ class BarsDeleted:
     bar_sessions: tuple[date, ...]
     ex_dates: tuple[date, ...]
     dry_run: bool
+    #: Rows beyond the counted ones that retracting these keys would also move
+    #: (`_wider`); a real run refuses on any.
+    wider: tuple[str, ...] = ()
 
     def summary(self) -> str:
         """One line for the run row and the terminal."""
-        verb = "would delete" if self.dry_run else "deleted"
+        verb = "would retract" if self.dry_run else "retracted"
         span = (
             f" on {len(self.bar_sessions)} sessions {self.bar_sessions[0]}..{self.bar_sessions[-1]}"
             if self.bar_sessions
@@ -577,7 +1381,12 @@ class BarsDeleted:
         return (
             f"{verb} {self.bar_rows} bar rows{span} and {self.action_rows} action rows{dates} "
             f"of {self.security_id} in {self.sessions_from}..{self.sessions_to}"
+            + (f"; {len(self.wider)} extra rows held by the same keys" if self.wider else "")
         )
+
+    def lines(self) -> list[str]:
+        """One line per extra row a retraction would also move, for the terminal."""
+        return [f"  WIDER {line}" for line in self.wider]
 
 
 def _bars_in_range(
@@ -585,7 +1394,7 @@ def _bars_in_range(
 ) -> tuple[int, tuple[date, ...], int, tuple[date, ...]]:
     bars = conn.execute(
         "SELECT session, count(*) FROM prices_daily WHERE security_id = ? "
-        "AND session BETWEEN ? AND ? AND list_contains(?, source) GROUP BY ALL ORDER BY 1",
+        "AND session BETWEEN ? AND ? AND source IN (SELECT unnest(?)) GROUP BY ALL ORDER BY 1",
         [security_id, first, last, sorted(BAR_SOURCES)],
     ).fetchall()
     actions = conn.execute(
@@ -639,14 +1448,14 @@ def delete_bars(
     )
     with opened as conn:
         if release is not None and not dry_run and (why := release_refusal(conn, release)):
-            raise RepairRefused(f"{why}; nothing deleted")
+            raise RepairRefused(f"{why}; nothing retracted")
         known = conn.execute(  # a typo'd id is refused, not a quiet 0-row run
             "SELECT 1 FROM securities WHERE security_id = $id "
             "UNION ALL SELECT 1 FROM listings WHERE security_id = $id LIMIT 1",
             {"id": security_id},
         ).fetchone()
         if known is None:
-            raise RepairRefused(f"the store holds no security {security_id!r}; nothing deleted")
+            raise RepairRefused(f"the store holds no security {security_id!r}; nothing retracted")
         bar_rows, sessions, action_rows, ex_dates = _bars_in_range(
             conn, security_id, sessions_from, sessions_to
         )
@@ -659,20 +1468,47 @@ def delete_bars(
             bar_sessions=sessions,
             ex_dates=ex_dates,
             dry_run=dry_run,
+            wider=tuple(
+                _wider_delete(
+                    conn,
+                    "prices_daily",
+                    "session",
+                    sorted(BAR_SOURCES),
+                    ((security_id, day) for day in sessions),
+                )
+                + _wider_delete(
+                    conn,
+                    "corporate_actions",
+                    "ex_date",
+                    [ACTIONS_SOURCE],
+                    ((security_id, day) for day in ex_dates),
+                )
+            ),
         )
         if not dry_run:
             if (bar_rows, action_rows) != expect:
                 raise RepairRefused(
                     f"found {bar_rows} bar rows and {action_rows} action rows, not the "
-                    f"expected {expect}; nothing deleted, run --dry-run again"
+                    f"expected {expect}; nothing retracted, run --dry-run again"
                 )
-            deleted = (
+            _refuse_wider(result.wider)
+            refuse_inside_open_window(conn, (*sessions, *ex_dates))
+            assert release is not None  # checked above
+            reason = f"repair-bars {security_id} {sessions_from}..{sessions_to}"
+            rule = (
+                f"repair-bars --security-id {security_id} --from {sessions_from} "
+                f"--to {sessions_to}: the owner's reviewed range (contaminated, rule 8)"
+            )
+            moved = (
                 _delete(
                     conn,
                     "prices_daily",
                     "session",
                     sorted(BAR_SOURCES),
                     ((security_id, day) for day in sessions),
+                    reason=reason,
+                    release=release,
+                    rule=lambda sid, days: rule,
                 ),
                 _delete(
                     conn,
@@ -680,11 +1516,14 @@ def delete_bars(
                     "ex_date",
                     [ACTIONS_SOURCE],
                     ((security_id, day) for day in ex_dates),
+                    reason=reason,
+                    release=release,
+                    rule=lambda sid, days: rule,
                 ),
             )
-            if deleted != (bar_rows, action_rows):  # never a partial repair
+            if moved != (bar_rows, action_rows):  # never a partial repair
                 raise RuntimeError(
-                    f"repair deleted {deleted} rows where it counted "
+                    f"repair retracted {moved} rows where it counted "
                     f"{(bar_rows, action_rows)}; rolled back"
                 )
             message = f"{result.summary()}; release {release}"
@@ -715,10 +1554,13 @@ class DividendsRetracted:
     #: The distinct ex-dates of the rows found.
     ex_dates: tuple[date, ...]
     dry_run: bool
+    #: Rows beyond the counted ones that retracting these keys would also move
+    #: (`_wider`); a real run refuses on any.
+    wider: tuple[str, ...] = ()
 
     def summary(self) -> str:
         """One line for the run row and the terminal."""
-        verb = "would delete" if self.dry_run else "deleted"
+        verb = "would retract" if self.dry_run else "retracted"
         span = (
             f" on {len(self.ex_dates)} ex-dates {self.ex_dates[0]}..{self.ex_dates[-1]}"
             if self.ex_dates
@@ -729,7 +1571,12 @@ class DividendsRetracted:
             f"{verb} {self.action_rows} duplicate dividend rows of {self.identities} identities"
             f"{span}; entries {self.entries}{bound}, deferred {self.deferred}, "
             f"already repaired {self.already_repaired}, stale {len(self.stale)}"
+            + (f"; {len(self.wider)} extra rows held by the same keys" if self.wider else "")
         )
+
+    def lines(self) -> list[str]:
+        """One line per extra row a retraction would also move, for the terminal."""
+        return [f"  WIDER {line}" for line in self.wider]
 
 
 def _stale_reason(
@@ -807,7 +1654,7 @@ def retract_dividends(
     )
     with opened as conn:
         if release is not None and not dry_run and (why := release_refusal(conn, release)):
-            raise RepairRefused(f"{why}; nothing deleted")
+            raise RepairRefused(f"{why}; nothing retracted")
         live = live_actions_as_of(conn, started, sorted({e.security_id for e in entries}))
         live = live.filter(pl.col("action_type") == "dividend")
         deferred = already = 0
@@ -860,24 +1707,42 @@ def retract_dividends(
             stale=tuple(stale),
             ex_dates=tuple(sorted({e.ex_date for e in found})),
             dry_run=dry_run,
+            wider=tuple(
+                _wider_identities(
+                    conn, [(e.security_id, e.retract_source_action_id) for e in found]
+                )
+            ),
         )
         if not dry_run:
             if stale:
                 raise RepairRefused(
-                    f"{len(stale)} stale list entries; nothing deleted, re-review them on "
+                    f"{len(stale)} stale list entries; nothing retracted, re-review them on "
                     "#1613:\n" + "\n".join(stale)
                 )
             if result.action_rows != expect:
                 raise RepairRefused(
                     f"found {result.action_rows} action rows, not the expected {expect}; "
-                    "nothing deleted, run --dry-run again"
+                    "nothing retracted, run --dry-run again"
                 )
+            _refuse_wider(result.wider)
+            refuse_inside_open_window(conn, result.ex_dates)
+            assert release is not None  # checked above
             deleted = _delete_identities(
-                conn, [(e.security_id, e.retract_source_action_id) for e in found]
+                conn,
+                [(e.security_id, e.retract_source_action_id) for e in found],
+                reason="repair-dividends: duplicate cash dividend",
+                release=release,
+                rules={
+                    (e.security_id, e.retract_source_action_id): (
+                        f"reviewed duplicate {e.security_id} {e.ex_date} amount {e.amount!r} "
+                        f"({e.ticker or 'no ticker'}): retract {e.retract_source_action_id}"
+                    )
+                    for e in found
+                },
             )
             if deleted != result.action_rows:  # never a partial repair
                 raise RuntimeError(
-                    f"repair deleted {deleted} rows where it counted {result.action_rows}; "
+                    f"repair retracted {deleted} rows where it counted {result.action_rows}; "
                     "rolled back"
                 )
             message = f"{result.summary()}; release {release}"
@@ -886,26 +1751,244 @@ def retract_dividends(
     return result
 
 
-def _delete_identities(
+def _wider_identities(
     conn: duckdb.DuckDBPyConnection, identities: Sequence[tuple[str, str]]
+) -> list[str]:
+    """`_wider` for `_delete_identities`'s identities."""
+    return _wider(conn, "corporate_actions", _select_actions(conn, "dividend", identities))
+
+
+def _delete_identities(
+    conn: duckdb.DuckDBPyConnection,
+    identities: Sequence[tuple[str, str]],
+    *,
+    reason: str,
+    release: str,
+    rules: Mapping[tuple[str, str], str],
 ) -> int:
-    """Delete every `ACTIONS_SOURCE` dividend row whose `(security_id,
-    source_action_id)` is in `identities`; the number deleted."""
-    if not identities:
+    """Retract every `ACTIONS_SOURCE` dividend row whose `(security_id,
+    source_action_id)` is in `identities` (ADR 0029: moved to `retracted_rows`,
+    not deleted), each with `rules[identity]` as the entry that judged it; the
+    number retracted."""
+    selected = _select_actions(conn, "dividend", identities)
+    if not selected:
         return 0
-    conn.execute(
-        "CREATE OR REPLACE TEMP TABLE _retract_ids (security_id VARCHAR, source_action_id VARCHAR)"
+    return _retract_grouped(
+        conn,
+        "corporate_actions",
+        selected,
+        lambda key: rules[(str(key[0]), str(key[1]))],
+        reason=reason,
+        release=release,
     )
-    conn.executemany("INSERT INTO _retract_ids VALUES (?, ?)", [list(i) for i in identities])
-    before = _rows(conn, "corporate_actions")
-    conn.execute(
-        "DELETE FROM corporate_actions WHERE source = ? AND action_type = 'dividend' "
-        "AND (security_id, source_action_id) IN (SELECT (security_id, source_action_id) "
-        "FROM _retract_ids)",
-        [ACTIONS_SOURCE],
+
+
+# --- #3058: the reviewed delete of split rows that are spin-offs ---
+
+
+@dataclass(frozen=True)
+class SpinoffSplitsRetracted:
+    """What `retract_spinoff_splits` found for the reviewed list and, unless
+    `dry_run`, deleted (`DividendsRetracted`'s shape)."""
+
+    #: The list's entries.
+    entries: int
+    #: Entries whose identity still has rows, none stale.
+    identities: int
+    #: The rows (every revision) those identities hold.
+    action_rows: int
+    #: Entries whose identity has no row at all.
+    already_repaired: int
+    #: One line per stale entry (refuses a real run).
+    stale: tuple[str, ...]
+    #: The distinct ex-dates of the identities found.
+    ex_dates: tuple[date, ...]
+    dry_run: bool
+    #: Rows beyond the counted ones that retracting these keys would also move
+    #: (`_wider`); a real run refuses on any.
+    wider: tuple[str, ...] = ()
+
+    def summary(self) -> str:
+        """One line for the run row and the terminal."""
+        verb = "would retract" if self.dry_run else "retracted"
+        span = (
+            f" on {len(self.ex_dates)} ex-dates {self.ex_dates[0]}..{self.ex_dates[-1]}"
+            if self.ex_dates
+            else ""
+        )
+        return (
+            f"{verb} {self.action_rows} spin-off split rows of {self.identities} identities"
+            f"{span}; entries {self.entries}, already repaired {self.already_repaired}, "
+            f"stale {len(self.stale)}"
+            + (f"; {len(self.wider)} extra rows held by the same keys" if self.wider else "")
+        )
+
+    def lines(self) -> list[str]:
+        """One line per extra row a retraction would also move, for the terminal."""
+        return [f"  WIDER {line}" for line in self.wider]
+
+
+def _spinoff_split_stale(rows: list[tuple[Any, ...]], entry: SpinoffSplit) -> str | None:
+    """Why one entry may not be deleted, or None. `rows` are every row of the
+    identity, oldest first, as `(source, action_type, ex_date,
+    ratio_or_amount, cancelled)`. Every row must be an `ACTIONS_SOURCE`
+    split, and the latest must hold the reviewed ex-date and ratio (exact
+    `DOUBLE` equality): a source that changed the event since the review
+    needs a new review, never a silent delete."""
+    for source, action_type, *_ in rows:
+        if source != ACTIONS_SOURCE or action_type != "split":
+            return f"the identity holds a {source} {action_type} row"
+    _, _, ex_date, ratio, _ = rows[-1]
+    if ex_date != entry.ex_date or ratio != entry.ratio:
+        return (
+            f"the latest row is {ex_date} {ratio!r}, "
+            f"not the reviewed {entry.ex_date} {entry.ratio!r}"
+        )
+    return None
+
+
+def retract_spinoff_splits(
+    settings: Settings,
+    *,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+    expect: int | None = None,
+    release: str | None = None,
+    reviewed: Sequence[SpinoffSplit] | None = None,
+) -> SpinoffSplitsRetracted:
+    """Delete every row of each reviewed spin-off split identity (`reviewed`,
+    default `store.spinoff_splits.spinoff_splits()`): every revision of
+    `(security_id, source_action_id)`, in one transaction, and record the run
+    (#3058); with `dry_run`, count them on a read-only connection and change
+    nothing.
+
+    The rows are deleted, not cancelled: the split never happened, so every
+    read at every `t` must stop applying it, and only a back-dated change does
+    that (a cancel from the clock on, `action-retract`, leaves every past read
+    as it was). That moves the data vintage, so it runs only inside a named
+    data release, like `retract_dividends`. Ingest refuses a listed identity
+    with its reviewed values from then on
+    (`AlpacaPriceSource.corporate_actions`).
+
+    An entry whose identity has no row is `already_repaired`. An entry is
+    stale (`_spinoff_split_stale`) when a row of the identity is not an
+    `ACTIONS_SOURCE` split or the latest row's ex-date or ratio differs from
+    the reviewed one; a dry run lists the stale entries, a real run refuses on
+    any. A real run deletes only the dry run's row count (`expect`) and only
+    inside the open data release `release`; anything else raises
+    `RepairRefused` before anything is deleted. Raises `StoreLockedError` like
+    ingest when the store stays locked."""
+    if not dry_run and expect is None:
+        raise ValueError("a repair deletes only the counts of a dry run: pass expect")
+    if not dry_run and release is None:
+        raise ValueError("a repair writes only inside a named data release: pass release")
+    entries = list(spinoff_splits() if reviewed is None else reviewed)
+    started = ensure_tz_aware_utc(clock(), field_name="clock()")
+    opened: AbstractContextManager[duckdb.DuckDBPyConnection] = (
+        _read(settings) if dry_run else open_for_write(settings)
     )
-    conn.execute("DROP TABLE _retract_ids")
-    return before - _rows(conn, "corporate_actions")
+    with opened as conn:
+        if release is not None and not dry_run and (why := release_refusal(conn, release)):
+            raise RepairRefused(f"{why}; nothing retracted")
+        already = rows_found = 0
+        found: list[SpinoffSplit] = []
+        stale: list[str] = []
+        for entry in entries:
+            rows = conn.execute(
+                "SELECT source, action_type, ex_date, ratio_or_amount, cancelled "
+                "FROM corporate_actions WHERE security_id = ? AND source_action_id = ? "
+                "ORDER BY known_at, ingested_at",
+                [entry.security_id, entry.source_action_id],
+            ).fetchall()
+            if not rows:
+                already += 1
+                continue
+            if (why := _spinoff_split_stale(rows, entry)) is not None:
+                stale.append(
+                    f"  {entry.security_id} {entry.ex_date} {entry.ratio!r} "
+                    f"{entry.source_action_id} ({entry.ticker or 'no ticker'}): {why}"
+                )
+                continue
+            found.append(entry)
+            rows_found += len(rows)
+        result = SpinoffSplitsRetracted(
+            entries=len(entries),
+            identities=len(found),
+            action_rows=rows_found,
+            already_repaired=already,
+            stale=tuple(stale),
+            ex_dates=tuple(sorted({e.ex_date for e in found})),
+            dry_run=dry_run,
+            wider=tuple(_wider_split_identities(conn, [e.identity for e in found])),
+        )
+        if not dry_run:
+            if stale:
+                raise RepairRefused(
+                    f"{len(stale)} stale list entries; nothing retracted, re-review them on "
+                    "#3058:\n" + "\n".join(stale)
+                )
+            if result.action_rows != expect:
+                raise RepairRefused(
+                    f"found {result.action_rows} action rows, not the expected {expect}; "
+                    "nothing retracted, run --dry-run again"
+                )
+            _refuse_wider(result.wider)
+            refuse_inside_open_window(conn, result.ex_dates)
+            assert release is not None  # checked above
+            deleted = _delete_split_identities(
+                conn,
+                [e.identity for e in found],
+                reason="repair-spinoff-splits: a spin-off recorded as a split",
+                release=release,
+                rules={
+                    e.identity: (
+                        f"reviewed spin-off split {e.security_id} {e.ex_date} ratio "
+                        f"{e.ratio!r} ({e.ticker or 'no ticker'}): {e.source_action_id}"
+                    )
+                    for e in found
+                },
+            )
+            if deleted != result.action_rows:  # never a partial repair
+                raise RuntimeError(
+                    f"repair retracted {deleted} rows where it counted {result.action_rows}; "
+                    "rolled back"
+                )
+            message = f"{result.summary()}; release {release}"
+            run = SourceRun("alpaca", REPAIRED, 0, "", message)
+            _write_run(conn, uuid.uuid4().hex, started, clock(), run, REPAIR)
+    return result
+
+
+def _wider_split_identities(
+    conn: duckdb.DuckDBPyConnection, identities: Sequence[tuple[str, str]]
+) -> list[str]:
+    """`_wider` for `_delete_split_identities`'s identities."""
+    return _wider(conn, "corporate_actions", _select_actions(conn, "split", identities))
+
+
+def _delete_split_identities(
+    conn: duckdb.DuckDBPyConnection,
+    identities: Sequence[tuple[str, str]],
+    *,
+    reason: str,
+    release: str,
+    rules: Mapping[tuple[str, str], str],
+) -> int:
+    """Retract every `ACTIONS_SOURCE` split row whose `(security_id,
+    source_action_id)` is in `identities` (ADR 0029: moved to `retracted_rows`,
+    not deleted), each with `rules[identity]` as the entry that judged it; the
+    number retracted."""
+    selected = _select_actions(conn, "split", identities)
+    if not selected:
+        return 0
+    return _retract_grouped(
+        conn,
+        "corporate_actions",
+        selected,
+        lambda key: rules[(str(key[0]), str(key[1]))],
+        reason=reason,
+        release=release,
+    )
 
 
 # --- T191 (#1682 lever B): the reviewed delete of never-true master rows ---
@@ -1056,7 +2139,7 @@ class MasterRowsDeleted:
 
     def summary(self) -> str:
         """One line for the run row and the terminal."""
-        verb = "would delete" if self.dry_run else "deleted"
+        verb = "would retract" if self.dry_run else "retracted"
         return (
             f"{verb} {self.listings} listings and {self.delistings} delistings rows of "
             f"{self.rows} manifest rows; refused {len(self.refused)}; release {self.release}"
@@ -1168,29 +2251,24 @@ def _same_key(a: MasterRowKey, b: MasterRowKey) -> bool:
     return a.table == b.table and _key(a) == _key(b)
 
 
-def _delete_master_row(conn: duckdb.DuckDBPyConnection, row: MasterRowKey) -> int:
-    """Delete the one stored row `row` names; the number deleted."""
-    before = _rows(conn, row.table)
-    if row.table == "listings":
-        conn.execute(
-            "DELETE FROM listings WHERE security_id = ? AND ticker = ? AND exchange = ? "
-            "AND valid_from = ? AND known_at = ? AND class_title IS NOT DISTINCT FROM ?",
-            [
-                row.security_id,
-                row.ticker,
-                row.exchange,
-                row.valid_from,
-                row.known_at,
-                row.class_title,
-            ],
-        )
-    else:
-        conn.execute(
-            "DELETE FROM delistings WHERE security_id = ? AND form = ? AND class_title = ? "
-            "AND exchange = ? AND filed_at = ? AND known_at = ?",
-            [row.security_id, row.form, row.class_title, row.exchange, row.filed_at, row.known_at],
-        )
-    return before - _rows(conn, row.table)
+def _retract_master_rows(
+    conn: duckdb.DuckDBPyConnection, rows: Sequence[MasterRowKey], *, reason: str, release: str
+) -> int:
+    """Retract (ADR 0029, `store.retracted_rows.retract`) the logical keys of
+    `rows`, each key once with every revision, its manifest lines (the revisions'
+    `label()`s, joined) as the rule that judged it; the rows moved."""
+    by_key: dict[tuple[str, tuple[object, ...]], list[str]] = defaultdict(list)
+    for row in rows:
+        by_key[(row.table, _key(row))].append(row.label())
+    moved = 0
+    for table in MASTER_DELETE_TABLES:
+        by_rule: dict[str, list[tuple[Any, ...]]] = defaultdict(list)
+        for (name, key), labels in by_key.items():
+            if name == table:
+                by_rule[" | ".join(sorted(labels))].append(key)
+        for rule, keys in sorted(by_rule.items()):
+            moved += retract(conn, table, keys, reason, release, rule)
+    return moved
 
 
 def delete_master_rows(
@@ -1202,16 +2280,20 @@ def delete_master_rows(
     headers: HeaderLookup,
     clock: Callable[[], datetime] = utc_now,
 ) -> MasterRowsDeleted:
-    """Delete the never-true master rows of a reviewed manifest (spec
+    """Retract the never-true master rows of a reviewed manifest (spec
     amendment 2026-10-14, item 7; #1682 lever B; data-foundation plan T191),
     on `conn`, inside the caller's transaction (`open_for_write`, so a
     refusal or failure rolls everything back); with `dry_run`, check and
-    count them and change nothing.
+    count them and change nothing. The rows move into `retracted_rows`
+    (ADR 0029, #3275, T392) with the reason, the release and the key's
+    manifest lines as the rule, and `restore` puts them back; the tables
+    hold what a delete would have left.
 
     A stored `listings` or `delistings` row that was never right at any
     instant (a note's listing, or its Form 25, on the common's id) has no
-    `known_at` at which a retraction could be stored (the #1613 rule): it is
-    deleted, the release's backup being the history. Each manifest row is
+    `known_at` at which a `retracted` revision could be stored (the #1613
+    rule): it is retracted into `retracted_rows`, every revision of its key
+    with it. Each manifest row is
     **refused** unless:
 
     - exactly one stored row has its key and `known_at`, an EDGAR `filing`
@@ -1231,10 +2313,10 @@ def delete_master_rows(
     A dry run lists every row found and refused. A real run deletes only a
     manifest with no refused row, only inside the open data release
     `release` (`release_refusal`), and raises `RepairRefused` before
-    anything is deleted otherwise; it writes one `ingestion_runs` row
+    anything is retracted otherwise; it writes one `ingestion_runs` row
     (source `edgar`, mode `repair`, status `repaired`) with the counts. A
-    delete that misses its count raises `RuntimeError`, so the caller's
-    transaction rolls back. A delete is not a revision: an as-of read at a
+    retraction that misses its count raises `RuntimeError`, so the caller's
+    transaction rolls back. A retraction is not a revision: an as-of read at a
     `t` before a row's `known_at` is unchanged, and one after it no longer
     sees the row (the delete-only rerun rule of
     `docs/runbooks/data-releases.md` applies to the sweeps that read it)."""
@@ -1242,7 +2324,7 @@ def delete_master_rows(
         raise ValueError("a master-row delete names its data release: pass release")
     started = ensure_tz_aware_utc(clock(), field_name="clock()")
     if not dry_run and (why := release_refusal(conn, release)):
-        raise RepairRefused(f"{why}; nothing deleted")
+        raise RepairRefused(f"{why}; nothing retracted")
     first = window_first_session(conn)
     window = None if first is None else (first, read_instants(conn))
     found: list[str] = []
@@ -1268,14 +2350,135 @@ def delete_master_rows(
         return result
     if refused:
         raise RepairRefused(
-            f"{len(refused)} of {len(manifest)} manifest rows refused; nothing deleted:\n"
+            f"{len(refused)} of {len(manifest)} manifest rows refused; nothing retracted:\n"
             + "\n".join(refused)
         )
-    deleted = sum(_delete_master_row(conn, row) for row in passing)
-    if deleted != len(passing):  # never a partial delete
+    moved = _retract_master_rows(
+        conn,
+        passing,
+        reason="delete-master-rows: a master row never right at any instant",
+        release=release,
+    )
+    if moved != len(passing):  # never a partial retraction
         raise RuntimeError(
-            f"delete removed {deleted} rows where the manifest names {len(passing)}; rolled back"
+            f"retraction moved {moved} rows where the manifest names {len(passing)}; rolled back"
         )
     run = SourceRun("edgar", REPAIRED, 0, "", result.summary())
     _write_run(conn, uuid.uuid4().hex, started, clock(), run, REPAIR)
+    return result
+
+
+@dataclass(frozen=True)
+class RenameListingsRepaired:
+    """What `repair_rename_listings` found and, unless `dry_run`, wrote (#3057)."""
+
+    #: Stored name changes judged.
+    changes: int
+    #: Listing rows added: `(security_id, ticker, exchange, valid_from, known_at)`.
+    rows: tuple[tuple[str, str, str, date, datetime], ...]
+    refusals: tuple[RenameRefusal, ...]
+    dry_run: bool
+
+    def summary(self) -> str:
+        """One line for the run row and the terminal."""
+        verb = "would add" if self.dry_run else "added"
+        reasons = Counter(r.reason for r in self.refusals)
+        refused = ", ".join(f"{why} {n}" for why, n in sorted(reasons.items())) or "none"
+        return (
+            f"{verb} {len(self.rows)} new-ticker listing rows of {self.changes} name changes; "
+            f"refused: {refused}"
+        )
+
+    def lines(self) -> list[str]:
+        """One line per row and per refusal, for the dry run's review."""
+        out = [
+            f"  + {sid} {ticker} {exchange} from {valid_from} known {known_at.isoformat()}"
+            for sid, ticker, exchange, valid_from, known_at in self.rows
+        ]
+        out += [
+            f"  - {r.security_id} {r.old_symbol}->{r.new_symbol}: {r.reason}" for r in self.refusals
+        ]
+        return out
+
+
+def repair_rename_listings(
+    settings: Settings,
+    *,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+    expect: int | None = None,
+    release: str | None = None,
+) -> RenameListingsRepaired:
+    """Add the new-ticker `listings` rows the stored `symbol_changes` imply
+    (`store.master.derive_rename_listings`, #3057: PKI -> RVTY, CHK -> EXE),
+    one `snapshot` row each, in one transaction, and record the run; with
+    `dry_run`, derive them on a read-only connection and change nothing.
+
+    A real run writes only the dry run's row count (`expect`) and only inside
+    the open data release `release`; anything else raises `RepairRefused`
+    before a row is written. The rows are those the nightly EDGAR master
+    derives itself, so a later run adds nothing to them."""
+    if not dry_run and expect is None:
+        raise ValueError("a repair writes only the count of a dry run: pass expect")
+    if not dry_run and release is None:
+        raise ValueError("a repair writes only inside a named data release: pass release")
+    started = ensure_tz_aware_utc(clock(), field_name="clock()")
+    opened: AbstractContextManager[duckdb.DuckDBPyConnection] = (
+        _read(settings) if dry_run else open_for_write(settings)
+    )
+    with opened as conn:
+        if release is not None and not dry_run and (why := release_refusal(conn, release)):
+            raise RepairRefused(f"{why}; nothing written")
+        changes = stored_rename_changes(conn, started)
+        live = conn.execute(
+            "SELECT security_id, ticker, exchange, valid_from, known_at FROM listings "
+            "QUALIFY NOT retracted AND row_number() OVER (PARTITION BY security_id, ticker, "
+            "exchange, valid_from ORDER BY known_at DESC) = 1"
+        ).fetchall()
+        stored = [
+            {
+                "security_id": sid,
+                "ticker": ticker,
+                "exchange": exchange,
+                "valid_from": valid_from,
+                "known_at": known_at,
+            }
+            for sid, ticker, exchange, valid_from, known_at in live
+        ]
+        derived, refusals = derive_rename_listings(
+            stored, stored_snapshot_history(conn, started), changes, ingested_at=started
+        )
+        result = RenameListingsRepaired(
+            changes=len(changes),
+            rows=tuple(
+                (r.security_id, r.ticker, r.exchange, r.valid_from, r.known_at) for r in derived
+            ),
+            refusals=refusals,
+            dry_run=dry_run,
+        )
+        if not dry_run:
+            if len(derived) != expect:
+                raise RepairRefused(
+                    f"found {len(derived)} rows, not the expected {expect}; "
+                    "nothing written, run --dry-run again"
+                )
+            for rename in derived:
+                insert_row(
+                    conn,
+                    "listings",
+                    {
+                        "security_id": rename.security_id,
+                        "ticker": rename.ticker,
+                        "exchange": rename.exchange,
+                        "class_title": None,
+                        "valid_from": rename.valid_from,
+                        "known_at": rename.known_at,
+                        "ingested_at": started,
+                        "source": "edgar",
+                        "provenance": "snapshot",
+                    },
+                )
+            message = f"{result.summary()}; release {release}"
+            run = SourceRun("edgar", REPAIRED, 0, "", message)
+            _write_run(conn, uuid.uuid4().hex, started, clock(), run, REPAIR)
     return result

@@ -101,7 +101,9 @@ def _utc(day: date, hour: int) -> datetime:
     return datetime(day.year, day.month, day.day, hour, tzinfo=UTC)
 
 
-def _frozen_settings(turnover_top_fraction: float | None = None) -> Settings:
+def _frozen_settings(
+    turnover_top_fraction: float | None = None, *, cadence: Cadence = CADENCE
+) -> Settings:
     # `profitability` and `combined` take the same top fraction from their own
     # sections (T152); a momentum registration freezes only `strategy.*`.
     strategy: dict[str, Any] = {"top_fraction": 0.5}
@@ -112,6 +114,7 @@ def _frozen_settings(turnover_top_fraction: float | None = None) -> Settings:
         strategy=strategy,
         profitability={"top_fraction": 0.5},
         combined={"top_fraction": 0.5},
+        schedule={"rebalance_cadence": cadence},
         holdout={"start": HOLDOUT_START.isoformat(), "end": HOLDOUT_END.isoformat()},
     )
 
@@ -170,6 +173,7 @@ class Env:
         assets_read: Callable[[Sequence[str]], Mapping[str, Asset]] | None = None,
         lagging: bool = False,
         journal_: planning.Journal = journal,
+        cadence: Cadence = CADENCE,
     ) -> planning.PlanOutcome:
         return plan_rebalance(
             self.conn,
@@ -182,7 +186,7 @@ class Env:
             assets_read or AssetsRead(),
             lagging,
             now=_utc(session, 12),
-            cadence=CADENCE,
+            cadence=cadence,
         )
 
     def counts(self) -> dict[str, int]:
@@ -206,6 +210,7 @@ def open_env(
     *,
     drop_keys: Sequence[str] = (),
     turnover_top_fraction: float | None = None,
+    cadence: Cadence = CADENCE,
 ) -> Iterator[Env]:
     """The module's planning environment for a hypothesis of `family` (T152), its stored
     params less `drop_keys` (a registration stored before those keys existed, T165),
@@ -217,7 +222,7 @@ def open_env(
         store={"path": str(tmp_path / "not-the-fixture.duckdb")},
         paper={"live_capital_reference": LIVE_CAPITAL},
     )
-    params = _frozen_settings(turnover_top_fraction)
+    params = _frozen_settings(turnover_top_fraction, cadence=cadence)
     hypothesis = registry.register_hypothesis(
         conn,
         slug="h-paper-plan",
@@ -941,13 +946,95 @@ def test_an_older_bar_is_divided_by_every_split_after_its_own_session(env: Env) 
     bar = date(2019, 4, 26)
     close = _copy_bar(env, "SEC_X", bar)
     splits = _splits(("SEC_X", bar, 5.0), ("SEC_X", date(2019, 4, 29), 2.0), ("SEC_X", F_I, 3.0))
-    prices = planning.reference_prices(env.conn, F_I, {"SEC_X"}, splits)
+    bar_sessions: dict[str, date] = {}
+    prices = planning.reference_prices(env.conn, F_I, {"SEC_X"}, splits, bar_sessions=bar_sessions)
     assert prices["SEC_X"] == pytest.approx(close / 6.0)
+    assert bar_sessions == {"SEC_X": bar}
 
 
 def test_a_name_with_no_bar_by_s_minus_1_raises(env: Env) -> None:
     with pytest.raises(ValueError, match="SEC_NONE"):
         planning.reference_prices(env.conn, F_I, {"SEC_NONE"}, _splits())
+
+
+# --- a held chained predecessor (#3051) --------------------------------------------------
+
+
+def _chain(env: Env, predecessor: str, successor: str, known_at: datetime) -> None:
+    """A live 1:1 successor chain (#821) `predecessor -> successor` known at `known_at`."""
+    stamp = {"known_at": known_at, "ingested_at": known_at}
+    insert_row(
+        env.conn,
+        "successor_chains",
+        {
+            "predecessor_id": predecessor,
+            "successor_id": successor,
+            "evidence_accession": f"SEC-{predecessor}-{successor}",
+            "evidence_form": "8-K12B",
+            "retracted": False,
+            "withdrawn_known_at": None,
+            "source": "edgar",
+            "provenance": "filing",
+            **stamp,
+        },
+    )
+
+
+def test_a_held_chained_predecessor_is_priced_through_its_successor(env: Env) -> None:
+    """#3051: a chain known at close(S-1) files the predecessor's bars under its
+    successor (#821); the reference price of the predecessor id is the
+    successor's latest bar (a successor split before that bar is already in it)."""
+    close = _copy_bar(env, "SEC_OLD", T_I)
+    _chain(env, "SEC_OLD", "SEC_NEW", session_close(T_I) - timedelta(minutes=1))
+    splits = _splits(("SEC_NEW", T_I, 2.0))
+
+    prices = planning.reference_prices(env.conn, F_I, {"SEC_OLD"}, splits)
+
+    assert prices == {"SEC_OLD": pytest.approx(close)}
+
+
+def test_a_successor_split_after_the_bar_refuses_the_predecessors_price(env: Env) -> None:
+    """#3051 (fail closed): a successor split ex S is keyed to the successor, so
+    the ledger's quantity of the held predecessor never counts it (#3062); a
+    price on the split's basis would halve its value, so the name is refused."""
+    _copy_bar(env, "SEC_OLD", T_I)
+    _chain(env, "SEC_OLD", "SEC_NEW", session_close(T_I) - timedelta(minutes=1))
+    splits = _splits(("SEC_NEW", F_I, 2.0))
+
+    with pytest.raises(ValueError, match=r"SEC_OLD: its chain successor SEC_NEW's split"):
+        planning.reference_prices(env.conn, F_I, {"SEC_OLD"}, splits)
+
+
+def test_a_predecessor_and_its_successor_are_both_priced(env: Env) -> None:
+    close = _copy_bar(env, "SEC_OLD", T_I)
+    _chain(env, "SEC_OLD", "SEC_NEW", session_close(T_I) - timedelta(minutes=1))
+
+    prices = planning.reference_prices(env.conn, F_I, {"SEC_OLD", "SEC_NEW"}, _splits())
+
+    assert prices == {"SEC_OLD": pytest.approx(close), "SEC_NEW": pytest.approx(close)}
+
+
+def test_a_chain_known_only_after_the_cut_keeps_the_predecessors_own_bars(env: Env) -> None:
+    """No look-ahead: a chain stamped after close(S-1) is not read on S, so the
+    predecessor keeps its own bars and the successor's splits do not apply."""
+    close = _copy_bar(env, "SEC_OLD", T_I)
+    _chain(env, "SEC_OLD", "SEC_NEW", session_close(T_I) + timedelta(minutes=1))
+    splits = _splits(("SEC_NEW", F_I, 2.0))
+
+    prices = planning.reference_prices(env.conn, F_I, {"SEC_OLD"}, splits)
+
+    assert prices == {"SEC_OLD": pytest.approx(close)}
+
+
+def test_a_predecessor_with_two_live_successors_is_not_priced(env: Env) -> None:
+    """#3051 (fail closed): which successor holds the position is never guessed."""
+    _copy_bar(env, "SEC_OLD", T_I)
+    known = session_close(T_I) - timedelta(minutes=1)
+    _chain(env, "SEC_OLD", "SEC_NEW", known)
+    _chain(env, "SEC_OLD", "SEC_NEW2", known)
+
+    with pytest.raises(ValueError, match=r"SEC_OLD.*more than one live successor"):
+        planning.reference_prices(env.conn, F_I, {"SEC_OLD"}, _splits())
 
 
 # --- review fixes (safety-reviewer and quant-auditor on #431) ---------------------------
@@ -1347,6 +1434,32 @@ def test_only_the_windows_overrides_naming_t_i_apply(env: Env) -> None:
     override(T_I, env.window.window_id)  # type: ignore[arg-type]
     dual_b = _decisions(env.plan(run=env.run_on(F_I)))["SEC_DUAL_B"]
     assert (dual_b.decision, dual_b.side, dual_b.reason) == ("override", None, "exclude_name")
+
+
+def test_daily_exclude_written_on_t_plans_a_sale_on_t_plus_one(
+    fixture_store_path: Path, tmp_path: Path
+) -> None:
+    with open_env(fixture_store_path, tmp_path, cadence="daily") as env:
+        assert due_rebalance(env.window, [], [], T_I, MAX_CATCH_UP, cadence="daily") is None
+        stamp = session_close(T_I)
+        journal.append(
+            env.conn,
+            OverrideRow(
+                window_id=env.window.window_id,  # type: ignore[arg-type]
+                made_at=stamp,
+                rebalance_session=T_I,
+                security_id="SEC_DUAL_A",
+                kind="exclude_name",
+                reason="the owner's reason, long enough",
+                known_at=stamp,
+                ingested_at=stamp,
+            ),
+        )
+        outcome = env.plan(cadence="daily")
+        held = _decisions(outcome)["SEC_DUAL_A"]
+        assert env.run.session == F_I == next_session(T_I)
+        assert outcome.rebalance_session == T_I
+        assert (held.decision, held.side, held.reason) == ("override", "sell", "exclude_name")
 
 
 # --- the shared listing tie rule (#534) ---------------------------------------------------

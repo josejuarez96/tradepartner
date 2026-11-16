@@ -13,7 +13,7 @@ import pytest
 from tradepartner.backtest import engine
 from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.store_provider import StoreProvider
-from tradepartner.config import Settings
+from tradepartner.config import Cadence, Settings
 from tradepartner.execution import planning
 from tradepartner.store import journal, registry, schema
 from tradepartner.store.schema import SchemaVersionError
@@ -84,8 +84,10 @@ def test_dollar_volume_paper_and_backtest_rows_agree_on_both_sides_of_snapshot(
     """The same registered rank rule and store give identical per-date records."""
     frozen_settings = test_planning._frozen_settings
 
-    def dollar_volume_settings(turnover_top_fraction: float | None = None) -> Settings:
-        settings = frozen_settings(turnover_top_fraction)
+    def dollar_volume_settings(
+        turnover_top_fraction: float | None = None, *, cadence: Cadence = test_planning.CADENCE
+    ) -> Settings:
+        settings = frozen_settings(turnover_top_fraction, cadence=cadence)
         return settings.model_copy(
             update={
                 "universe": settings.universe.model_copy(

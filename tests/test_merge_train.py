@@ -55,6 +55,7 @@ def _pr(**overrides: object) -> object:
         "body": BODY,
         "fragment_texts": (FRAGMENT,),
         "unresolved_threads": 0,
+        "stale_reviews": (),
     }
     fields.update(overrides)
     return mt.PullRequest(**fields)
@@ -188,6 +189,34 @@ def test_class_a_only_pr_is_eligible_without_owner_ok() -> None:
     """A class-A-only PR (src/ and tests/ paths) is eligible without owner-ok label."""
     class_a_paths = ("src/tradepartner/x.py", "tests/test_x.py", "changelog.d/12-thing.md")
     assert _eligible(paths=class_a_paths) is None
+
+
+def test_a_family_registry_change_is_class_b_although_under_src(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3126: `config_backtest.py` holds FAMILIES and FAMILY_PARENTS, the owner's
+    root-or-child call, so it needs the owner-ok label like any class-B file."""
+    monkeypatch.setattr(mt.ready_pr, "required_reviews", lambda _paths: ())
+    paths = ("src/tradepartner/config_backtest.py", "changelog.d/12-thing.md")
+    refusal = _eligible(_pr(fragment_texts=(FRAGMENT,)), paths=paths)
+    assert refusal is not None and "class B (src/tradepartner/config_backtest.py)" in refusal
+    assert _eligible(_pr(labels=("owner-ok",), fragment_texts=(FRAGMENT,)), paths=paths) is None
+
+
+def test_an_exam_ledger_change_is_class_b_although_under_docs_research(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3147 (ADR 0016 amendment 2026-11-07, rule 3): any change to the exam ledger,
+    its `budget` and `budget_adr` fields included, lands only on the owner's word and
+    "never in an orchestrator train", so not even `owner-ok` makes it eligible."""
+    monkeypatch.setattr(mt.ready_pr, "required_reviews", lambda _paths: ())
+    paths = ("docs/research/exam-ledger.toml", "changelog.d/12-thing.md")
+    for labels in ((), ("owner-ok",)):
+        refusal = _eligible(_pr(labels=labels, fragment_texts=(FRAGMENT,)), paths=paths)
+        assert refusal is not None and "docs/research/exam-ledger.toml never rides" in refusal
+    assert "docs/research/exam-ledger.toml" in mt.CLASS_B_PATHS
+    other = ("docs/research/some-report.md", "changelog.d/12-thing.md")
+    assert _eligible(_pr(fragment_texts=(FRAGMENT,)), paths=other) is None
 
 
 # --- AC3: order --------------------------------------------------------------------------
@@ -633,6 +662,7 @@ class FakeRunner:
             "body": f"Closes #{number}\n\n- [x] done\n",
             "fragment_texts": (FRAGMENT,),
             "unresolved_threads": 0,
+            "stale_reviews": (),
             "title": f"PR {number}",
         }
         fields.update(pr_overrides)
@@ -2332,3 +2362,17 @@ def test_shell_runner_pr_data_stops_on_an_unreadable_or_incomplete_thread_read(
     `STOPPED:` (fail closed), never counts as zero unresolved threads."""
     with pytest.raises(mt.StoppedError, match=match):
         _real_pr_data(tmp_path, monkeypatch, pages, [])
+
+
+def test_a_review_that_no_longer_covers_the_head_is_ineligible() -> None:
+    """#3318: (i2) refuses a stale review, an unread one, and passes a covered one."""
+    verdict = (_c("safety-reviewer: PASS\nreviewed at " + "b" * 40),)
+    stale = _pr(stale_reviews=("safety-reviewer",))
+    reason = _eligible(stale, paths=SAFETY_PATHS, comments=verdict)
+    assert reason is not None
+    assert reason.startswith("(i2)")
+    assert "no longer covers" in reason
+    unread = _pr(stale_reviews=None)
+    assert (_eligible(unread, paths=SAFETY_PATHS, comments=verdict) or "").startswith("(i2)")
+    covered = _pr(stale_reviews=(), labels=("owner-ok",))
+    assert _eligible(covered, paths=SAFETY_PATHS, comments=verdict) is None

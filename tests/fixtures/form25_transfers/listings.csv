@@ -1,0 +1,110 @@
+security_id,ticker,exchange,class_title,valid_from,known_at,ingested_at,source,provenance,retracted
+0000101538,UAMY,NYSE_AMERICAN,"Common Stock, $0.01 par value",2021-08-16,2021-08-16T16:01:39.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0000101538,UAMY,NYSE,"Common Stock, $0.01 par value",2022-08-16,2022-08-16T10:43:50.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0000732026,TRT,NYSE,"Common Stock, no par value",2019-09-23,2019-09-23T17:35:35.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0000732026,TRT,NYSE_AMERICAN,"Common Stock, no par value",2021-12-02,2021-12-02T19:33:59.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0000732026,TRT,NYSE,"Common Stock, no par value",2022-02-14,2022-02-14T16:36:11.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0000732026,TRT,NYSE_AMERICAN,"Common Stock, no par value",2022-11-10,2022-11-10T14:43:44.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0000732026,TRT,NYSE,"Common Stock, no par value",2023-02-10,2023-02-10T16:34:21.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0000732026,TRT,NYSE_AMERICAN,"Common Stock, no par value",2023-09-27,2023-09-27T15:37:34.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0000732026,TRT,NYSE,"Common Stock, no par value",2023-11-13,2023-11-13T14:30:44.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0000732026,TRT,NYSE_AMERICAN,"Common Stock, no par value",2024-11-12,2024-11-12T16:49:33.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0000732026,TRT,NYSE,"Common Stock, no par value",2025-02-13,2025-02-13T15:28:35.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0000732026,TRT,NYSE_AMERICAN,"Common Stock, no par value",2025-09-19,2025-09-19T16:07:38.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0000732026,TRT,NYSE,"Common Stock, no par value",2025-11-14,2025-11-14T13:49:53.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0000732026,TRT,NYSE_AMERICAN,"Common Stock, no par value",2026-02-13,2026-02-13T14:44:09.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0000732026,TRT,NASDAQ,"Common Stock, no par value",2026-09-24,2026-09-24T15:30:56.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001104485,NOG,NYSE,,2004-12-20,2026-10-04T02:16:55.488897+0000,2026-10-04T02:45:12.462042+0000,edgar,snapshot_static,false
+0001104485,NOG,NYSE,"Common Stock, par value $0.001",2019-08-02,2019-08-03T00:01:13.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001104485,NOG,NYSE_AMERICAN,"Common Stock, $0.001 par value",2020-03-12,2020-03-12T20:39:33.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001104485,NOG,NYSE,"Common Stock, par value $0.001",2020-05-11,2020-05-11T20:35:13.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001104485,NOG,NYSE_AMERICAN,"Common Stock, $0.001 par value",2020-07-10,2020-07-10T20:43:54.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001104485,NOG,NYSE,"Common Stock, par value $0.001",2020-08-07,2020-08-07T18:54:39.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001104485,NOG,NYSE_AMERICAN,"Common Stock, $0.001 par value",2021-03-12,2021-03-12T21:31:47.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001104485,NOG,NYSE,"Common Stock, par value $0.001",2021-05-07,2021-05-07T20:16:30.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001130713,OSTK,NASDAQ,"Common Stock, $0.0001 par value",2020-08-06,2020-08-06T13:01:54.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001130713,BYON,NYSE,"Common Stock, $0.0001 par value per share",2024-02-23,2024-02-23T13:03:36.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001130713,BBBY,NYSE,"Common Stock, $0.0001 par value",2025-10-27,2025-10-27T20:22:41.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001130713,NXH,NASDAQ,"Common Stock, $0.0001 par value",2026-11-05,2026-11-05T21:28:25.000000+0000,2026-11-07T00:44:33.880180+0000,edgar,filing,false
+0001130713:warrants-to-purchase-shares-of-common-stock,BBBY WS,NYSE,Warrants to Purchase Shares of Common Stock,2025-10-27,2025-10-27T20:22:41.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001309082,CEI,NYSE,"Common Stock, $0.001 par value",2022-06-08,2022-06-08T16:10:48.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001309082,CEI,NYSE_AMERICAN,"Common Stock, $0.001 Par Value Per Share",2022-06-08,2022-06-08T16:35:37.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001309082,CEI,NYSE,"Common Stock, $0.001 par value",2024-03-25,2024-03-25T12:55:57.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001309082,CEIN,NYSE,,2024-08-08,2024-08-26T15:41:28.000000+0000,2026-11-09T05:32:31.131101+0000,edgar,snapshot,false
+0001309082,CEIN,NYSE,"Common Stock, $0.001 par value",2024-08-26,2024-08-26T15:41:28.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001410098,CRMD,NYSE_AMERICAN,"Common stock, $0.001 par value",2020-08-10,2020-08-10T20:02:17.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001410098,CRMD,NYSE,"Common stock, $0.001 par value",2020-11-05,2020-11-05T21:38:27.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001410098,CRMD,NASDAQ,"Common Stock, $0.001 Par Value",2021-03-30,2021-03-30T20:51:20.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001500881,EU,NYSE_AMERICAN,Common Shares,2023-04-28,2023-04-28T20:33:11.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001500881,EU,NYSE,Common Shares,2023-06-07,2023-06-07T20:48:29.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001500881,EU,NASDAQ,Common Shares,2024-03-28,2024-03-28T19:38:57.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001595974,RUBI,NYSE,"Common stock, par value $0.00001 per share",2019-07-31,2019-07-31T21:08:40.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001595974,MGNI,NASDAQ,"Common stock, par value $0.00001 per share",2020-08-10,2020-08-10T21:05:12.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001789029,IPV,NYSE,"Common stock, par value $0.0001 per share",2021-06-02,2021-06-02T10:33:19.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001789029,AEVA,NYSE,"Common stock, $0.0001 par value per share",2021-06-02,2021-06-02T21:01:13.000000+0000,2026-11-09T22:58:02.728087+0000,edgar,filing,false
+0001789029,AEVA,NASDAQ,"Common stock, $0.0001 par value per share",2025-03-20,2025-03-20T23:53:12.000000+0000,2026-11-09T22:58:02.728087+0000,edgar,filing,false
+0001789029,AEVA,NASDAQ,"Common stock, $0.0001 par value per share",2026-05-07,2026-05-07T22:21:06.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001789029,AEVA,NASDAQ,"Common stock, $0.0001 par value per share",2026-05-07,2026-11-10T00:48:51.584215+0000,2026-11-10T00:48:51.584215+0000,edgar,filing,true
+0001789029:redeemable-warrants,IPV WS,NYSE,"Redeemable warrants, exercisable for shares of common stock at an exercise price of $11.50 per share",2021-06-02,2021-06-02T10:33:19.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001789029:units,IPV.U,NYSE,"Units, each consisting of one share of common stock and one-half of one redeemable warrant",2021-06-02,2021-06-02T10:33:19.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001789029:warrants-to-purchase-common-stock,AEVAW,NASDAQ,Warrants to purchase common stock,2025-03-20,2025-03-20T23:53:12.000000+0000,2026-11-09T22:58:02.728087+0000,edgar,filing,false
+0001789029:warrants-to-purchase-one-share-of-common-stock,AEVA.WS,NYSE,Warrants to purchase one share of common stock,2021-06-02,2021-06-02T21:01:13.000000+0000,2026-11-09T22:58:02.728087+0000,edgar,filing,false
+0001823524,TMPM,NASDAQ,Class A Ordinary Shares included as part of the units,2020-11-30,2020-11-30T21:40:16.000000+0000,2026-11-04T05:20:49.198392+0000,edgar,filing,false
+0001823524,TMPMW,NASDAQ,Class A Ordinary Shares included as part of the units,2022-03-17,2022-03-17T20:11:15.000000+0000,2026-11-04T05:20:49.198392+0000,edgar,filing,false
+0001823524,TMPM,NASDAQ,Class A Ordinary Shares included as part of the units,2022-03-17,2022-03-17T20:14:53.000000+0000,2026-11-04T05:20:49.198392+0000,edgar,filing,false
+0001823524:redeemable-warrants-included-as-part-of-the-units,TMPMW,NASDAQ,"Redeemable warrants included as part of the units, each whole warrant exercisable for one Class A Ordinary Share at an exercise price of $11.50",2020-11-30,2020-11-30T21:40:16.000000+0000,2026-11-04T05:20:49.198392+0000,edgar,filing,false
+0001823524:redeemable-warrants-included-as-part-of-the-units,TMPMW,NASDAQ,"Redeemable warrants included as part of the units, each whole warrant exercisable for one Class A Ordinary Share at an exercise price of $11.50",2022-03-17,2022-03-17T20:14:53.000000+0000,2026-11-04T05:20:49.198392+0000,edgar,filing,false
+0001823524:redeemable-warrants-included-as-part-of-the-units,TMPM,NASDAQ,"Redeemable warrants included as part of the units, each whole warrant exercisable for one Class A Ordinary Share at an exercise price of $11.50",2022-03-17,2022-03-17T20:11:15.000000+0000,2026-11-04T05:20:49.198392+0000,edgar,filing,false
+0001823524:units,TMPMU,NASDAQ,"Units, each consisting of one Class A Ordinary Share, $0.0001 par value, and one-third of one redeemable warrant",2020-11-30,2020-11-30T21:40:16.000000+0000,2026-11-04T05:20:49.198392+0000,edgar,filing,false
+0001823587,YSAC,NASDAQ,"Class A common stock, $0.0001 par value included as part of the units",2021-08-06,2021-08-06T20:37:08.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001823587,SKYH,NYSE,"Class A common stock, par value $0.0001 per share",2022-03-28,2022-03-28T20:05:32.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001823587,SKYH,NYSE_AMERICAN,"Class A common stock, par value $0.0001 per share",2023-10-10,2023-10-10T20:55:27.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001823587,SKYH,NYSE,"Class A common stock, par value $0.0001 per share",2024-03-27,2024-03-27T20:02:18.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001823587,SKYH,NYSE_AMERICAN,"Class A common stock, par value $0.0001 per share",2024-05-14,2024-05-14T20:02:10.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001823587,SKYH,NYSE,"Class A common stock, par value $0.0001 per share",2025-03-27,2025-03-27T20:01:35.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001823587:units,YSACU,NASDAQ,"Units, each consisting of one share of Class A common stock, $0.0001 par value, and one-half of one redeemable warrant",2021-08-06,2021-08-06T20:37:08.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001823587:warrants,YSACW,NASDAQ,"Warrants, each whole warrant exercisable for one share of Class A common stock at an exercise price of $11.50 per share",2021-08-06,2021-08-06T20:37:08.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001823587:warrants,SKYH WS,NYSE,"Warrants, each whole warrant exercisable for one share of Class A common stock at an exercise price of $11.50 per share",2022-03-28,2022-03-28T20:05:32.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001823587:warrants,SKYH WS,NYSE_AMERICAN,"Warrants, each whole warrant exercisable for one share of Class A common stock at an exercise price of $11.50 per share",2023-10-10,2023-10-10T20:55:27.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001823587:warrants,SKYH WS,NYSE,"Warrants, each whole warrant exercisable for one share of Class A common stock at an exercise price of $11.50 per share",2024-03-27,2024-03-27T20:02:18.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001823587:warrants,SKYH WS,NYSE_AMERICAN,"Warrants, each whole warrant exercisable for one share of Class A common stock at an exercise price of $11.50 per share",2024-05-14,2024-05-14T20:02:10.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001823587:warrants,SKYH WS,NYSE,"Warrants, each whole warrant exercisable for one share of Class A common stock at an exercise price of $11.50 per share",2025-03-27,2025-03-27T20:01:35.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001825079,SPFR,NYSE,Class A Ordinary Shares included as part of the units,2021-01-15,2021-01-15T21:06:09.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001825079:common-stock,VLD,NYSE,"Common stock, par value $0.00001 per share",2021-11-16,2021-11-16T22:09:10.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001825079:common-stock,VELO,NASDAQ,"Common Stock, $0.00001 par value per share",2025-11-12,2026-11-10T00:48:51.584215+0000,2026-11-10T00:48:51.584215+0000,edgar,filing,true
+0001825079:common-stock,VELO,NASDAQ,"Common Stock, $0.00001 par value per share",2025-11-12,2025-11-12T21:01:59.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001825079:redeemable-warrants-included-as-part-of-the-units,SPFR WS,NYSE,"Redeemable warrants included as part of the units, each whole warrant exercisable for one Class A Ordinary Share at an exercise price of $11.50",2021-01-15,2021-01-15T21:06:09.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001825079:redeemable-warrants-included-as-part-of-the-units,SPFR.WS,NYSE,"Redeemable warrants included as part of the units, each whole warrant exercisable for one Class A ordinary share at an exercise price of $11.50",2021-08-13,2021-08-13T20:09:16.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001825079:units,SPFR.U,NYSE,"Units, each consisting of one Class A Ordinary Share, $0.0001 par value, and one-fourth of one redeemable warrant",2021-01-15,2021-01-15T21:06:09.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001825079:warrants-to-purchase-one-share-of-common-stock,VLD WS,NYSE,"Warrants to purchase one share of common stock, each at an exercise price of $11.50 per share",2021-11-16,2021-11-16T22:09:10.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001825079@2025-11-12,VELO,NASDAQ,"Common Stock, $0.00001 par value per share",2025-11-12,2025-11-12T21:01:59.000000+0000,2026-11-09T22:58:02.728087+0000,edgar,filing,false
+0001830029,ADEX,NYSE,"Common Stock, par value $0.0001 per share",2021-04-15,2021-04-15T21:00:39.000000+0000,2026-11-04T05:20:49.198392+0000,edgar,filing,false
+0001830029,ADEX,NYSE_AMERICAN,"Common Stock, par value $0.0001 per share",2023-03-28,2023-03-28T21:31:03.000000+0000,2026-11-04T05:20:49.198392+0000,edgar,filing,false
+0001830029,GRDI,NASDAQ,"Common stock, par value $0.0001 per share",2024-04-15,2026-11-10T00:48:51.584215+0000,2026-11-10T00:48:51.584215+0000,edgar,filing,true
+0001830029,GRDI,NASDAQ,"Common stock, par value $0.0001 per share",2024-04-15,2024-04-15T22:08:40.000000+0000,2026-11-04T05:20:49.198392+0000,edgar,filing,false
+0001830029:redeemable-warrants,ADEX.WS,NYSE,"Redeemable warrants, exercisable for shares of common stock at an exercise price of $11.50 per share",2021-04-15,2021-04-15T21:00:39.000000+0000,2026-11-04T05:20:49.198392+0000,edgar,filing,false
+0001830029:redeemable-warrants,ADEX.WS,NYSE_AMERICAN,"Redeemable warrants, exercisable for shares of common stock at an exercise price of $11.50 per share",2023-03-28,2023-03-28T21:31:03.000000+0000,2026-11-04T05:20:49.198392+0000,edgar,filing,false
+0001830029:redeemable-warrants,GRDI-W,NASDAQ,"Redeemable Warrants, each whole warrant exercisable for one share of common stock at an exercise price of $11.50 per share",2024-04-15,2024-04-15T22:08:40.000000+0000,2026-11-04T05:20:49.198392+0000,edgar,filing,false
+0001830029:units,ADEX.U,NYSE,"Units, each consisting of one share of common stock and one-half of one redeemable warrant",2021-04-15,2021-04-15T21:00:39.000000+0000,2026-11-04T05:20:49.198392+0000,edgar,filing,false
+0001830029:units,ADEX.U,NYSE_AMERICAN,"Units, each consisting of one share of common stock andone-halfof one redeemable warrant",2023-03-28,2023-03-28T21:31:03.000000+0000,2026-11-04T05:20:49.198392+0000,edgar,filing,false
+0001830029@2024-04-15,GRDI,NASDAQ,"Common stock, par value $0.0001 per share",2024-04-15,2024-04-15T22:08:40.000000+0000,2026-11-09T22:58:02.728087+0000,edgar,filing,false
+0001847874,FWAC,NASDAQ,"Class A Ordinary Shares, par value $0.0001",2021-07-07,2021-07-07T20:32:02.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001847874,true,NASDAQ,"Class A ordinary shares, par value $0.0001",2022-03-30,2022-03-30T21:01:17.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001847874,FWAC,NASDAQ,"Class A Ordinary Shares, par value $0.0001",2022-05-13,2022-05-13T21:20:05.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001847874,BEEP,NASDAQ,,2023-08-28,2026-11-09T22:40:03.171699+0000,2026-11-09T22:58:02.728087+0000,edgar,snapshot,false
+0001847874:common-stock,BEEP,NYSE_AMERICAN,"Common Stock, $0.0001 par value per share",2023-11-13,2023-11-13T22:11:55.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001847874:common-stock,BEEP,NYSE,"Common Stock, $0.0001 par value per share",2024-03-22,2024-03-22T12:56:08.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001847874:common-stock,BEEP,NYSE_AMERICAN,"Common Stock, $0.0001 par value per share",2024-08-13,2024-08-13T20:18:55.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001847874:common-stock,BEEP,NYSE,"Common Stock, $0.0001 par value per share",2024-11-13,2024-11-13T21:22:12.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001847874:common-stock,BEEP,NASDAQ,"Common Stock, $0.0001 par value per share",2025-08-12,2025-08-12T20:06:09.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0001871745,DSAQ,NYSE,"Class A Common Stock, par value $0.0001 per share",2021-11-15,2021-11-15T19:52:18.000000+0000,2026-11-04T05:20:49.198392+0000,edgar,filing,false
+0001871745,DSAQ,NONE,"Class A common stock, par value $0.0001 per share",2024-05-20,2024-05-20T20:43:39.000000+0000,2026-11-04T05:20:49.198392+0000,edgar,filing,false
+0001871745:redeemable-warrants,DSAQ. WS,NYSE,"Redeemable warrants, each warrant exercisable for one share of Class A common stock, each at an exercise price of $11.50 per share",2021-11-15,2021-11-15T19:52:18.000000+0000,2026-11-09T22:58:02.728087+0000,edgar,filing,false
+0001871745:redeemable-warrants,DSAQ.WS,NYSE,"Redeemable warrants, each warrant exercisable for one share of Class A common stock, each at an exercise price of $11.50 per share",2021-11-15,2021-11-15T21:34:20.000000+0000,2026-11-09T22:58:02.728087+0000,edgar,filing,false
+0001871745:redeemable-warrants,DSAQ.W,NONE,"Redeemable warrants, each warrant exercisable for one share of Class A common stock at an exercise price of $11.50 per share",2023-03-31,2023-03-31T21:09:27.000000+0000,2026-11-09T22:58:02.728087+0000,edgar,filing,false
+0001871745:units,DSAQ.U,NYSE,"Units, each consisting of one share of Class A common stock and one-half of one redeemable warrant",2021-11-15,2021-11-15T19:52:18.000000+0000,2026-11-09T22:58:02.728087+0000,edgar,filing,false
+0001871745:units,DSAQ.U,NONE,"Units, each consisting of one share of Class A common stock and one-half of one redeemable warrant",2024-05-20,2024-05-20T20:43:39.000000+0000,2026-11-09T22:58:02.728087+0000,edgar,filing,false
+0002043699,NHIC,NASDAQ,,2025-01-02,2026-10-04T02:16:55.488897+0000,2026-10-04T02:45:12.462042+0000,edgar,snapshot_static,false
+0002043699,NHIC,NASDAQ,Class A ordinary shares included as part of the units,2025-05-12,2025-05-12T23:33:22.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0002043699:redeemable-warrants-included-as-part-of-the-units,NHICW,NASDAQ,"Redeemable warrants included as part of the units, each whole warrant exercisable for one Class A ordinary share at an exercise price of $11.50",2025-05-12,2025-05-12T23:33:22.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false
+0002043699:units,NHICU,NASDAQ,"Units, each consisting of one Class A ordinary share, $0.0001 par value, and one-half of one redeemable warrant",2025-05-12,2025-05-12T23:33:22.000000+0000,2026-10-04T02:45:12.462042+0000,edgar,filing,false

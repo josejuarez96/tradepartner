@@ -21,7 +21,9 @@ Steps, in order (each one stops the run with a reason on failure):
    Other STATUS sections ("Blocked", "Decisions needed") may be edited freely. The PR
    ticks no plan box in ``docs/plans/`` (a fold may), and when the branch's issue carries
    a ``task:Tn`` label its fragment holds ``task: Tn (PR #<this PR>)``: the fold ticks and
-   collapses the line after merge (#2280).
+   collapses the line after merge (#2280). A PR touching ``docs/research/exam-ledger.toml``
+   passes T381b's ``check_append_only`` against ``origin/main``'s copy, whatever the flags
+   (#3147).
 4. Local checks: ruff check, ruff format --check, mypy, the fragment check and
    ``tests/test_docs_budget.py`` always, plus the whole-tree static invariant tests
    (``STATIC_INVARIANT_TESTS``, ``-n 2``, ~25 s, #2367). No other local pytest by default:
@@ -99,6 +101,10 @@ STATUS_LIST = "## Recently done"
 CHANGELOG_LIST = "## [Unreleased]"
 FRAGMENT_DIRS = ("docs/status.d/", "changelog.d/")
 PLANS_PREFIX = "docs/plans/"
+#: The exam ledger (ADR 0016 amendment 2026-11-07, rule 3): class B whatever its path
+#: (`merge_train.CLASS_B_PATHS`), and every PR touching it passes T381b's
+#: `check_append_only` against `origin/main`'s copy (#3147).
+EXAM_LEDGER = "docs/research/exam-ledger.toml"
 # A fragment's plan-task line (#2280), the shape scripts/fragments.py writes (TASK_LINE_RE).
 FRAGMENT_TASK_RE = re.compile(r"^task: (?P<id>T\d+[a-z]?\d?) \(PR #(?P<pr>\d+)\)$")
 PLAN_BOX_RE = re.compile(r"^- \[(?P<done>[ x])\] \*\*(?P<id>T\d+[a-z]?\d?)[ :]")
@@ -128,6 +134,25 @@ QUANT_PREFIXES = (
     "src/tradepartner/ingest",
     "src/tradepartner/backfill.py",
     "src/tradepartner/health",
+    "src/tradepartner/diskfloor.py",
+    # the data adapters the first lists missed (#3319)
+    "src/tradepartner/adapters/accession_rows.py",
+    "src/tradepartner/adapters/borrow.py",
+    "src/tradepartner/adapters/daily_index.py",
+    "src/tradepartner/adapters/form4_",
+    "src/tradepartner/adapters/fred_",
+    "src/tradepartner/adapters/index_reconcile.py",
+    "src/tradepartner/adapters/openfigi",
+    "src/tradepartner/adapters/rates.py",
+    "src/tradepartner/adapters/stamp_",
+    "src/tradepartner/corpus/",
+    # the research package: event studies, gates and the labeling job (#3319)
+    "src/tradepartner/research/",
+    # store repairs and retractions rewrite stored facts (#3319)
+    "src/tradepartner/repair",
+    "src/tradepartner/retract.py",
+    "src/tradepartner/action_retract.py",
+    "src/tradepartner/close_gap.py",
     "src/tradepartner/backtest/",
     "src/tradepartner/execution/",
     # the Lab page's child-process modules register and run hypotheses (#2304)
@@ -152,6 +177,17 @@ SAFETY_PREFIXES = (
     "src/tradepartner/execution/",
     "src/tradepartner/errors.py",
     "src/tradepartner/llm/",
+    # the real LLM input path: Claude calls and the spend ceiling (#3319)
+    "src/tradepartner/research/labeling/",
+    # the off-Mac ping sends to a URL kept in config
+    "src/tradepartner/heartbeat.py",
+    # modules that unwrap a secret (#3319 safety review)
+    "src/tradepartner/research/models.py",
+    "src/tradepartner/adapters/fred_raw.py",
+    "src/tradepartner/adapters/openfigi_raw.py",
+    "src/tradepartner/store/raw_arch",
+    # runs the override write and the localhost bind check
+    "src/tradepartner/dashboard/app.py",
     # the dashboard kill-switch pages and override test (#773, #2337)
     "src/tradepartner/dashboard/book_page.py",
     "src/tradepartner/dashboard/override_page.py",
@@ -180,6 +216,25 @@ SAFETY_PREFIXES = (
     ".pre-commit-config.yaml",
     "pyproject.toml",
     "uv.lock",
+)
+# src files that need no specialist review, listed on purpose (#3319). Any other
+# `src/**/*.py` must match a prefix above (tests/test_ready_pr.py), so a new module is
+# reviewed by default and exempting one is a visible edit here. Package markers and the
+# dashboard's read-only display pages only.
+NO_REVIEW_PATHS = (
+    "src/tradepartner/__init__.py",
+    "src/tradepartner/adapters/__init__.py",
+    "src/tradepartner/dashboard/__init__.py",
+    "src/tradepartner/dashboard/backtest_page.py",
+    "src/tradepartner/dashboard/header.py",
+    "src/tradepartner/dashboard/health_page.py",
+    "src/tradepartner/dashboard/home_page.py",
+    "src/tradepartner/dashboard/ops_page.py",
+    "src/tradepartner/dashboard/performance_page.py",
+    "src/tradepartner/dashboard/research_page.py",
+    "src/tradepartner/dashboard/theme.py",
+    "src/tradepartner/dashboard/trades_page.py",
+    "src/tradepartner/dashboard/trials_page.py",
 )
 LOCAL_CHECKS: tuple[tuple[str, ...], ...] = (
     ("uv", "run", "ruff", "check", "."),
@@ -223,8 +278,9 @@ TREE_SCAN_TESTS: dict[str, tuple[str, ...]] = {
     "src/tradepartner/backtest/": ("tests/backtest/test_store_provider.py",),
 }
 # A diff touching any of these runs pytest, locally and in CI on a PR; anything else skips it
-# (pushes to main always run the full suite).
-TEST_TRIGGER_PREFIXES = ("src/", "tests/", "scripts/", ".github/")
+# (pushes to main always run the full suite). `.streamlit/` is the dashboard's config, which
+# its tests read (#3222); ci_tested_tree.py's DASHBOARD_TEST_PREFIXES also lists it.
+TEST_TRIGGER_PREFIXES = ("src/", "tests/", "scripts/", ".github/", ".streamlit/")
 TEST_TRIGGER_FILES = ("pyproject.toml", "uv.lock", ".python-version")
 # A CI run with the full suite takes 24-34 min; a shorter default loops (each timeout
 # re-merges main and starts a new run).
@@ -388,10 +444,8 @@ def missing_reviews(required: set[str], comments: Sequence[str]) -> list[str]:
     return sorted(r for r in required if latest.get(r) != "pass")
 
 
-def tick_reviewer_boxes(
-    body: str, required: set[str], comments: Sequence[str]
-) -> tuple[str, list[str], list[str], list[str], dict[str, str]]:
-    """Return the edited body, other boxes, changed lines, missing SHAs, and review SHAs."""
+def review_shas(comments: Sequence[str]) -> dict[str, str]:
+    """Each agent's latest verdict comment's ``reviewed at <sha>``, if that comment has one."""
     reviewed_at: dict[str, str] = {}
     for comment in comments:
         verdict = VERDICT_RE.match(comment)
@@ -402,6 +456,14 @@ def tick_reviewer_boxes(
                 reviewed_at[agent] = sha.group(1)
             else:
                 reviewed_at.pop(agent, None)
+    return reviewed_at
+
+
+def tick_reviewer_boxes(
+    body: str, required: set[str], comments: Sequence[str]
+) -> tuple[str, list[str], list[str], list[str], dict[str, str]]:
+    """Return the edited body, other boxes, changed lines, missing SHAs, and review SHAs."""
+    reviewed_at = review_shas(comments)
     # Only boxes outside fenced code blocks count, and only the template's own reviewer
     # line is ticked, and only when exactly one such line is unticked (#1823).
     lines = body.splitlines(keepends=True)
@@ -698,8 +760,45 @@ def lacks_changelog_bullets(branch: str, fragment_texts: Sequence[str]) -> bool:
     return True
 
 
+def exam_ledger_refusal(main_text: str | None, branch_text: str | None) -> str | None:
+    """Why a PR's copy of the exam ledger (`branch_text`, None when the PR deletes it)
+    may not replace `origin/main`'s (`main_text`, None when main has none), or None.
+
+    T381b's `check_append_only` is the rule; a new ledger is checked as appended to an
+    empty one with its own `budget` and `budget_adr` (#3147)."""
+    from tradepartner.execution import exam_ledger
+
+    if branch_text is None:
+        return f"this PR deletes {EXAM_LEDGER}; the ledger is append-only"
+    try:
+        if main_text is None:
+            ledger = exam_ledger.load_ledger(branch_text)
+            main_text = f"budget = {ledger.budget}\nbudget_adr = {json.dumps(ledger.budget_adr)}\n"
+        exam_ledger.check_append_only(main_text, branch_text)
+    except exam_ledger.ExamLedgerRefused as exc:
+        return str(exc)
+    return None
+
+
+def exam_ledger_budget_change(main_text: str | None, branch_text: str) -> str | None:
+    """The `budget` / `budget_adr` change a PR's ledger copy makes, worded for the
+    owner, or None. `check_append_only` lets `budget` move with any new `budget_adr`,
+    so only the class-B rule (the owner's word) guards that pair (#3147)."""
+    from tradepartner.execution import exam_ledger
+
+    if main_text is None:
+        return None
+    old, new = exam_ledger.load_ledger(main_text), exam_ledger.load_ledger(branch_text)
+    parts = []
+    if old.budget != new.budget:
+        parts.append(f"budget {old.budget} -> {new.budget}")
+    if old.budget_adr != new.budget_adr:
+        parts.append(f"budget_adr {old.budget_adr!r} -> {new.budget_adr!r}")
+    return "; ".join(parts) or None
+
+
 def tests_needed(paths: Sequence[str]) -> bool:
-    """Whether the diff can make pytest fail: it touches code, tests, scripts or deps."""
+    """Whether the diff can make pytest fail: it touches code, tests, CI, deps or config."""
     return any(p.startswith(TEST_TRIGGER_PREFIXES) or p in TEST_TRIGGER_FILES for p in paths)
 
 
@@ -868,6 +967,27 @@ def ready(
                 "(or the line `task: Tn (PR #n)` first in it); the fold ticks and collapses "
                 "the plan line after merge (#2280)"
             )
+    # #3147: the exam ledger is append-only (T381b's check) and class B; outside the
+    # --allow-shared-files block, so no flag skips it.
+    if EXAM_LEDGER in touched:
+        ledger_main = (
+            r.git("show", f"{main_ref}:{EXAM_LEDGER}")
+            if r.git_ok("cat-file", "-e", f"{main_ref}:{EXAM_LEDGER}")
+            else None
+        )
+        # --no-renames: a renamed ledger is a deletion at its old path, as in `touched`.
+        gone = r.git(
+            "diff", "--no-renames", "--name-only", "--diff-filter=D", f"{main_ref}...HEAD"
+        ).splitlines()
+        ledger_branch = None if EXAM_LEDGER in gone else r.read(EXAM_LEDGER)
+        if refusal := exam_ledger_refusal(ledger_main, ledger_branch):
+            raise ReadyError(f"{EXAM_LEDGER}: {refusal} (ADR 0016 rule 3, #3147)")
+        assert ledger_branch is not None  # a deletion is refused above
+        budget = exam_ledger_budget_change(ledger_main, ledger_branch)
+        say(
+            f"{EXAM_LEDGER}: append-only check passed; class B, the owner's word lands it"
+            + (f" (changes {budget})" if budget else "")
+        )
     # #2280: every `task:` line the diff adds names this PR, sits in this issue's fragment
     # and is one of the issue's `task:` labels; a labelled issue's fragment has its line.
     # Outside the --allow-shared-files block: a merged task line marks a task done for claims.
@@ -970,16 +1090,13 @@ def ready(
             "latest PASS review comment needs `reviewed at <sha>` before ticking the "
             "reviewer box: " + ", ".join(missing_sha)
         )
-    if ticked:
-        for agent in sorted(required):
-            sha = reviewed_at[agent]
-            if not r.git_ok("merge-base", "--is-ancestor", sha, "HEAD") or agent in (
-                required_reviews(_own_changes_since(r, main_ref, sha, touched))
-            ):
-                raise ReadyError(
-                    f"{agent} review no longer covers the current head; rerun it before "
-                    "ticking the reviewer box"
-                )
+    # Every run, not only the one that ticks the box: commits pushed after a ticked PASS
+    # still need a review of the new code (#3318).
+    if stale := review_covers_head(r, main_ref, required, reviewed_at, touched):
+        raise ReadyError(
+            f"{', '.join(stale)} review no longer covers the current head; rerun it "
+            "before marking ready"
+        )
     for line in ticked:
         say(f"reviewer box: {line}")
     if ticked and not dry_run:
@@ -1032,7 +1149,9 @@ def _own_patch(r: Runner, main_ref: str, ref: str, path: str) -> list[str]:
     return [HUNK_RE.sub("@@ @@", ln) for ln in out.splitlines() if not ln.startswith("index ")]
 
 
-def _own_changes_since(r: Runner, main_ref: str, sha: str, touched: Sequence[str]) -> list[str]:
+def _own_changes_since(
+    r: Runner, main_ref: str, sha: str, touched: Sequence[str], head: str = "HEAD"
+) -> list[str]:
     """PR-owned paths whose own change differs between the reviewed ``sha`` and ``HEAD``.
 
     A path counts only if it changed in ``sha..HEAD`` and is in the PR's diff against
@@ -1042,16 +1161,43 @@ def _own_changes_since(r: Runner, main_ref: str, sha: str, touched: Sequence[str
     Paths no reviewer gates (docs/plans, changelog.d) are dropped by ``required_reviews``.
     """
     out: list[str] = []
-    for path in r.git("diff", "--no-renames", "--name-only", "-z", f"{sha}..HEAD").split("\0"):
+    for path in r.git("diff", "--no-renames", "--name-only", "-z", f"{sha}..{head}").split("\0"):
         if not path or path not in touched:
             continue
-        if r.git("ls-tree", sha, "--", path) == r.git("ls-tree", "HEAD", "--", path):
+        if r.git("ls-tree", sha, "--", path) == r.git("ls-tree", head, "--", path):
             continue
-        if r.git("diff", "--numstat", sha, "HEAD", "--", path).startswith("-\t-"):
+        if r.git("diff", "--numstat", sha, head, "--", path).startswith("-\t-"):
             out.append(path)  # binary: no line patch to compare
-        elif _own_patch(r, main_ref, sha, path) != _own_patch(r, main_ref, "HEAD", path):
+        elif _own_patch(r, main_ref, sha, path) != _own_patch(r, main_ref, head, path):
             out.append(path)
     return out
+
+
+def review_covers_head(
+    r: Runner,
+    main_ref: str,
+    required: set[str],
+    reviewed_at: Mapping[str, str],
+    touched: Sequence[str],
+    head: str = "HEAD",
+) -> list[str]:
+    """Required reviewers whose ``reviewed at`` commit no longer covers ``head`` (#3318).
+
+    A review covers the head when its commit is an ancestor of ``head`` and no PR-owned
+    path a reviewer gates changed since, so a merge of main that touches none of the PR's
+    own files still passes (#1851). A reviewer with no recorded commit, or one the clone
+    cannot see, is stale: fail closed.
+    """
+    stale: list[str] = []
+    for agent in sorted(required):
+        sha = reviewed_at.get(agent)
+        if (
+            not sha
+            or not r.git_ok("merge-base", "--is-ancestor", sha, head)
+            or agent in required_reviews(_own_changes_since(r, main_ref, sha, touched, head))
+        ):
+            stale.append(agent)
+    return stale
 
 
 def _merge_main(r: Runner, main_ref: str, say: Callable[[str], None]) -> None:

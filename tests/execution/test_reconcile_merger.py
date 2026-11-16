@@ -34,8 +34,10 @@ from tradepartner.execution.reconcile import (
     Explanations,
     JournalOpenOrder,
     OpenMerger,
+    ProposedAdjustment,
     Reconciliation,
     compare,
+    removal_paid_on,
 )
 from tradepartner.execution.reconcile_run import explanations_as_of, reconcile_now
 from tradepartner.store.db import insert_row, open_for_write, open_read_only
@@ -790,6 +792,73 @@ def test_the_acquirer_joins_the_names_mapped_to_broker_symbols(
     assert found.mergers[MTUM].kind == "stock"
 
 
+#: A predecessor of `SPY` in a successor chain (#821): the store keys its bars under
+#: `SPY` once the chain is known (#3009).
+OLD_SPY = "SEC_OLDSPY"
+
+
+def _chain(settings: Settings, known_at: datetime) -> None:
+    """A live `successor_chains` row `OLD_SPY -> SPY` known from `known_at`."""
+    with open_for_write(settings) as conn:
+        insert_row(
+            conn,
+            "successor_chains",
+            {
+                "predecessor_id": OLD_SPY,
+                "successor_id": SPY,
+                "evidence_accession": "SYNTH-8K12B-1",
+                "evidence_form": "8-K12B",
+                "retracted": False,
+                "withdrawn_known_at": None,
+                "known_at": known_at,
+                "ingested_at": known_at,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+
+
+def test_a_chained_predecessor_acquirer_reads_through_the_chain_known_at_the_cut(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """#3009: a merger naming a chained predecessor as its acquirer is read as the
+    successor the chain known at close(S-1) maps it to, so the acquirer gets the
+    successor's symbol and reference price; with the chain known only after the cut
+    the stored id stays (no look-ahead)."""
+    _hold(journal_settings, fake, open_window)
+    _merger(journal_settings, kind="stock", acquirer=OLD_SPY, share_ratio=0.25)
+    _chain(journal_settings, CUT + timedelta(microseconds=1))
+
+    before = _open(journal_settings, open_window, S)
+    assert before.mergers[MTUM].acquirer == OLD_SPY
+    assert OLD_SPY not in before.reference_prices
+
+    known = _open(journal_settings, open_window, S2)
+    assert known.mergers[MTUM].acquirer == SPY
+    assert known.symbols[SPY] == "SPY"
+    assert known.reference_prices[SPY] > 0
+
+
+def test_a_chained_predecessor_acquirer_receipt_reconciles_under_the_successor(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#3009: the `SPY` receipt of a merger naming `SPY`'s chained predecessor is
+    journaled under `SPY`, as for a merger naming `SPY` itself, not a quantity break."""
+    _hold(journal_settings, fake, open_window)
+    _merger(journal_settings, kind="stock", acquirer=OLD_SPY, share_ratio=0.25)
+    _chain(journal_settings, KNOWN)
+    _removed(fake)
+    fake.extra_quantity["SPY"] = 2.0
+
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S).status == OK
+    removal, receipt = _adjustments(journal_settings, open_window)
+    assert (receipt.kind, receipt.security_id, receipt.quantity) == ("merger_receipt", SPY, 2.0)
+    assert _merger_id(removal) == _merger_id(receipt) == M1
+
+
 def test_a_stock_merger_without_a_receipt_halts_on_quantity(
     journal_settings: Settings,
     fake: BookedFake,
@@ -1430,3 +1499,98 @@ def test_all_cil_stock_merger_rebuilds_due_for_later_payment(
         (-10.0, 0.0),
         (None, 125.19),
     ]
+
+
+def test_a_merger_paid_on_its_effective_session_is_stated_there_when_reconciled_later(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2722: the broker paid the due on S (its `MA` activity's date); the
+    reconcile that first sees it runs on S2. The removal is stated on S."""
+    _hold(journal_settings, fake, open_window)
+    _merger(journal_settings)
+    _removed(fake, DUE)
+    fake.activities.append(
+        CashActivity(
+            activity_id="MA-MTUM-S",
+            activity_type="MA",
+            date=S,
+            status="executed",
+            net_amount=DUE,
+            symbol="MTUM",
+        )
+    )
+
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S2).status == OK
+
+    (row,) = _adjustments(journal_settings, open_window)
+    assert _merger_id(row) == M1 and row.cash == pytest.approx(DUE)
+    assert row.session == S
+
+
+def test_a_merger_payment_dated_before_the_session_before_its_effective_date_is_floored(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#2722: the removal is never stated before `previous_session(effective_date)`,
+    the earliest removal the merger reads as its own. Effective S3, a credit
+    dated S, reconciled on S4: stated on S2."""
+    _hold(journal_settings, fake, open_window)
+    _merger(journal_settings, effective=S3, payable=S3)
+    _removed(fake, DUE)
+    fake.activities.append(
+        CashActivity(
+            activity_id="MA-MTUM-early",
+            activity_type="MA",
+            date=S,
+            status="executed",
+            net_amount=DUE,
+            symbol="MTUM",
+        )
+    )
+
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, S4).status == OK
+
+    (row,) = _adjustments(journal_settings, open_window)
+    assert _merger_id(row) == M1
+    assert row.session == S2
+
+
+@pytest.mark.parametrize("kind", ["stock", "stock_and_cash"])
+def test_a_stock_merger_removal_is_never_restated_to_the_paid_session(kind: str) -> None:
+    """#2722, fail closed: a stock or stock-and-cash merger's `merger_receipt` stays
+    on the reconcile's session, so its removal is not moved alone (a session
+    would hold neither name)."""
+    credit = CashActivity(
+        activity_id="MA-MTUM-S",
+        activity_type="MA",
+        date=S,
+        status="executed",
+        net_amount=DUE,
+        symbol="MTUM",
+    )
+    explanations = Explanations(
+        symbols={MTUM: "MTUM", SPY: "SPY"},
+        activities=(credit,),
+        mergers={MTUM: _merger_open(kind=kind, acquirer=SPY, share_ratio=0.5)},
+    )
+    removal = ProposedAdjustment(
+        "corporate_action_cash",
+        MTUM,
+        -HELD,
+        DUE,
+        "merger",
+        merger_id=M1,
+        merger_terms={"merger_kind": kind},
+    )
+    assert removal_paid_on(removal, explanations, 0.01) is None
+    # The same row as a cash merger's is restated: only the kind stops it.
+    cash = Explanations(
+        symbols={MTUM: "MTUM"}, activities=(credit,), mergers={MTUM: _merger_open()}
+    )
+    plain = replace(removal, merger_terms={"merger_kind": "cash"})
+    assert removal_paid_on(plain, cash, 0.01) == S

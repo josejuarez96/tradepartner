@@ -56,6 +56,10 @@ class Case:
     #: Extra shares facts `(security_id, as_of_date, value, known_at)` the
     #: store-backed test inserts first; the fixture has one fact per name.
     facts: tuple[tuple[str, date, float, datetime], ...] = ()
+    #: Extra `classifications` rows `(security_id, issuer_class, known_at)` the
+    #: store-backed test inserts first (#3076): the fixture's rows carry no tag. Each
+    #: keeps the name's fixture type, rule and SIC, so only the tag changes.
+    tags: tuple[tuple[str, str, datetime], ...] = ()
 
     @property
     def id(self) -> str:
@@ -79,6 +83,14 @@ CASES = [
         "exclude_sic_ranges",
         [[7300, 7399]],
         removed={sid: (3, "sic:7372") for sid in DEFAULT_MEMBERS},
+    ),
+    # #3076: SEC_SPLIT_BETWEEN tagged `mlp` from 2017; the live default excludes it by
+    # rule 1, and `[]` (the rule before #3076) admits it again.
+    Case(
+        "exclude_issuer_classes",
+        [],
+        admitted={"SEC_SPLIT_BETWEEN"},
+        tags=(("SEC_SPLIT_BETWEEN", "mlp", datetime(2017, 3, 1, 21, 0, tzinfo=UTC)),),
     ),
     Case("min_price", 20, removed={"SEC_SPLIT_BETWEEN": (4, "min_price")}),
     # SEC_DUAL_A's last-session dollar volume (~6.1M) is below 20M, its
@@ -146,6 +158,24 @@ CASES = [
         facts=SHARES_MOVE,
         admitted={"SEC_SPLIT_BETWEEN"},
     ),
+    # #3055: a post-split count dated before the ex-date and filed after it. Off, rule 8
+    # splits it again (45.9M shares) and the name out-ranks the dual-class company; on,
+    # it is read as already split (15.3M).
+    Case(
+        "shares_split_dating",
+        True,
+        admitted={"SEC_DUAL_A", "SEC_DUAL_B"},
+        removed={"SEC_SPLIT_BETWEEN": (8, "top_n_by_cap")},
+        base={"top_n_by_cap": 1},
+        facts=(
+            (
+                "SEC_SPLIT_BETWEEN",
+                date(2019, 1, 4),
+                15_300_000.0,
+                datetime(2019, 2, 5, 21, 0, tzinfo=UTC),
+            ),
+        ),
+    ),
     Case(
         "accepted_price_jumps",
         ["SEC_SPLIT_BETWEEN@2019-04-05"],
@@ -212,6 +242,22 @@ def test_override_via_settings_changes_membership_as_expected(
                 "class_member": "",
                 "value": value,
                 "filing_accession": f"case-{security_id}-{as_of.isoformat()}",
+                "known_at": known,
+                "ingested_at": known,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+    for security_id, tag, known in case.tags:
+        insert_row(
+            fixture_store,
+            "classifications",
+            {
+                "security_id": security_id,
+                "sic": 7372,
+                "security_type": "common",
+                "rule": "common_default",
+                "issuer_class": tag,
                 "known_at": known,
                 "ingested_at": known,
                 "source": "edgar",

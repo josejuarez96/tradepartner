@@ -23,7 +23,14 @@
 4. **Run** the engine over a `StoreProvider` whose factory opens one short-lived
    read-only connection per step, at the base level and every
    `costs.sensitivity_per_side_bps` level, from the frozen `Settings`.
-5. **Write** through `results.write_results` in one chunk; it records `failed`
+5. **Exit coverage** (plan T329, spec amendment #2670): while the results are in
+   memory, `exit_coverage` reads `DataProvider.delisting_reasons` at the trial's data
+   cutoff for the base level's `delisting_exits` and `with_exit_coverage` adds the
+   `EXIT_COVERAGE_COUNTS` to that level's last rebalance row, under every policy
+   (`none` included), so they are written as `trial_rebalance_counts` rows at the
+   trial's last rebalance session. They sit beside the engine output, not in it: the
+   engine result, the trial's vintage and every pinned digest are unchanged.
+6. **Write** through `results.write_results` in one chunk; it records `failed`
    (`store changed during run`) when the data vintage at the trial's cutoff
    moved since the open (`registry.write_result`, #1232).
 
@@ -95,17 +102,20 @@ from __future__ import annotations
 
 import math
 import traceback
-from collections.abc import Mapping
-from dataclasses import dataclass
-from datetime import date
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+from datetime import UTC, date, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Final, Literal, cast
 
 import duckdb
+import polars as pl
 
 from tradepartner.backtest import engine, placebo
-from tradepartner.backtest.engine import BacktestResult
+from tradepartner.backtest import frozen as frozen_module
+from tradepartner.backtest.engine import BacktestResult, DelistingExit
 from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.holdout import (
     Decision,
@@ -118,10 +128,17 @@ from tradepartner.backtest.holdout import (
     default_in_sample_window,
     gap_sessions,
 )
-from tradepartner.backtest.hypothesis import load_frozen
-from tradepartner.backtest.results import write_results
+from tradepartner.backtest.hypothesis import (
+    _overlay,
+    _reset_inert,
+    frozen_hash_matches,
+    load_frozen,
+)
+from tradepartner.backtest.provider import DataProvider
+from tradepartner.backtest.results import hypothesis_cadence, metric_rows, write_results
 from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.store_provider import StoreProvider
+from tradepartner.calendar import session_close
 from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import ENGINE_FAMILIES, Cadence, Settings, get_settings
 from tradepartner.store import lab_registry, lab_schema, registry, schema
@@ -149,13 +166,85 @@ class RunOutcome:
     error: str | None = None
 
 
+#: The per-trial delisting exit coverage counts (plan T329), written on the base cost
+#: level's last rebalance row under every policy: the booked delisting exits, those
+#: with no single matching classified reason at the cutoff, and those whose matching
+#: classified reason was first known after the exit's deciding read but by the cutoff
+#: (informational: under the owner's 2026-10-31 rule such a reason applies).
+EXIT_COVERAGE_COUNTS: Final = (
+    "n_exit_coverage_exits",
+    "n_exit_coverage_unknown",
+    "n_exit_coverage_after_read",
+)
+_UNKNOWN_REASON: Final = "unknown"
+
+
+def exit_coverage_counts(exits: Sequence[DelistingExit], reasons: pl.DataFrame) -> dict[str, int]:
+    """`EXIT_COVERAGE_COUNTS` for `exits` from `reasons`, a `delisting_reasons` read at
+    the trial's cutoff (every row `known_at <= cutoff`). An exit's reason is matched as
+    the engine matches it (plan T328c): the single row whose `delisting_form` and
+    `delisting_filed_at` equal the exit's and whose `delisting_exchange` is the exit's
+    listing exchange. None, two or more, or an `unknown` row counts as unknown; a
+    classified match with `known_at` after the exit's `read_time` counts as after-read.
+    Pure."""
+    by_id: dict[str, list[dict[str, Any]]] = {}
+    for row in reasons.iter_rows(named=True):
+        by_id.setdefault(row["security_id"], []).append(row)
+    unknown = after_read = 0
+    for e in exits:
+        key = (e.delisting_form, e.delisting_filed_at, e.exchange)
+        matched = [
+            row
+            for row in by_id.get(e.security_id, ())
+            if None not in key
+            and (row["delisting_form"], row["delisting_filed_at"], row["delisting_exchange"]) == key
+        ]
+        if len(matched) != 1 or matched[0]["reason"] == _UNKNOWN_REASON:
+            unknown += 1
+        elif matched[0]["known_at"] > e.read_time:
+            after_read += 1
+    return {
+        "n_exit_coverage_exits": len(exits),
+        "n_exit_coverage_unknown": unknown,
+        "n_exit_coverage_after_read": after_read,
+    }
+
+
+def exit_coverage(
+    provider: DataProvider, cutoff: datetime, exits: Sequence[DelistingExit]
+) -> dict[str, int]:
+    """`exit_coverage_counts` for `exits` over `provider.delisting_reasons(cutoff, ids)`
+    for the exits' security ids; no read when there is no exit."""
+    ids = sorted({e.security_id for e in exits})
+    if not ids:
+        return exit_coverage_counts((), pl.DataFrame())
+    return exit_coverage_counts(exits, provider.delisting_reasons(cutoff, ids))
+
+
+def with_exit_coverage(
+    results: Mapping[float, BacktestResult], base_level: float, counts: Mapping[str, int]
+) -> dict[float, BacktestResult]:
+    """`results` with `counts` added to the base level's last rebalance row's counts
+    (module docstring, step 5); unchanged when that level has no rebalance row. Every
+    other field and level is the engine's, untouched."""
+    out = dict(results)
+    base = out[base_level]
+    if not base.rebalances:
+        return out
+    last = base.rebalances[-1]
+    row = replace(last, counts={**last.counts, **counts})
+    out[base_level] = replace(base, rebalances=(*base.rebalances[:-1], row))
+    return out
+
+
 def _on_store(live: Settings, store_path: Path | str | None) -> Settings:
     """`live` with `store.path` set to `store_path` (default: unchanged), for
     the connection factories only."""
     if store_path is None:
         return live
-    store = live.store.model_copy(update={"path": str(store_path)})
-    return live.model_copy(update={"store": store})
+    return type(live).model_validate(
+        {**live.model_dump(), "store": {**live.store.model_dump(), "path": str(store_path)}}
+    )
 
 
 def _marked_copy(conn: duckdb.DuckDBPyConnection, live: Settings) -> bool:
@@ -227,6 +316,28 @@ def _close(
     return RunOutcome(handle.trial_id, status, error=error)
 
 
+def _refuse_incomplete_holdout(
+    conn: duckdb.DuckDBPyConnection, slug: str, sessions: Sequence[date], now: datetime
+) -> None:
+    """Raise `ValueError` when a holdout spend's window reaches a rebalance session whose
+    close is after `now` or after the store's last stored price session (#3328): the
+    run would burn the family's exam over months that do not exist yet."""
+    row = conn.execute("SELECT max(session) FROM prices_daily").fetchone()
+    last_stored: date | None = row[0] if row is not None else None
+    for session in sessions:
+        if session_close(session) > now:
+            why = f"its close is after {now.isoformat()}"
+        elif last_stored is None or session > last_stored:
+            why = f"the store's last price session is {last_stored}"
+        else:
+            continue
+        raise ValueError(
+            f"{slug}: refused_incomplete_holdout: the holdout window is not complete; "
+            f"the first missing month is {session:%Y-%m} (rebalance {session}; {why}); "
+            "no trial was opened and no holdout was spent"
+        )
+
+
 def _gap_values(decision: Decision, frozen: Frozen, series: dict[date, float]) -> dict[str, object]:
     """The gap at the time of an override, JSON-safe (a NaN share is stored as null)."""
     return {
@@ -295,6 +406,7 @@ def run_hypothesis(
     kind: Literal["tracking"] | None = None,
     keep_marking_frames: bool = False,
     measured_cost_bps: float | None = None,
+    now: datetime | None = None,
 ) -> RunOutcome:
     """Run `slug`'s latest registration over `[start, end]` as one trial and return
     its `RunOutcome` (module docstring).
@@ -323,6 +435,12 @@ def run_hypothesis(
     ADR 0023), all before any trial exists. The trial's `note` is the shock tag
     (`placebo.shock_note`: `placebo=<mode> seed=<n>`, `signal_delay=<d>`), then `; ` and
     the `note` given; at the defaults exactly the `note` given.
+
+    A holdout spend whose window has a rebalance session closing after `now` (default
+    the current instant) or after the store's last stored price session raises
+    `ValueError("<slug>: refused_incomplete_holdout: ...")` naming the first missing
+    month, before any trial exists: a forward holdout is never spent before its months
+    are complete (#3328).
 
     The results keep no step's marking frame unless `keep_marking_frames` (#1417:
     nothing written reads them, and over a long daily run they grow without bound);
@@ -373,17 +491,22 @@ def run_hypothesis(
                 slug, measured_cost_bps, params, tracking=tracking, decision=decision
             )
         shock = frozen_values(hypothesis)
-        if shock.get("strategy.placebo", "none") != "none" and (
-            tracking or decision.kind == "holdout"
-        ):
+        # The effective params, not `frozen_values`: a family whose `strategy` section is
+        # inert stores no placebo key, but the engine reads `params.strategy` (#3322).
+        if params.strategy.placebo != "none" and (tracking or decision.kind == "holdout"):
             # A fake signal never spends a holdout or feeds a tracking book (ADR 0023).
             raise ValueError(
-                f"{slug}: refused_placebo: strategy.placebo is {shock['strategy.placebo']!r}; "
+                f"{slug}: refused_placebo: strategy.placebo is {params.strategy.placebo!r}; "
                 "a placebo file runs in sample only, never on the holdout or as a tracking run"
             )
         sessions = gap_sessions(window, cadence)
+        cutoff = read_time(sessions[-1], cadence) if sessions else None
         refused = decision.outcome not in ("run", "needs_gap")
         holdout = decision.kind == "holdout" and not refused
+        if holdout:
+            _refuse_incomplete_holdout(
+                conn, slug, sessions, now if now is not None else datetime.now(UTC)
+            )
         # A refusal is always recorded `in_sample` (it spent nothing), whatever
         # `decision.kind` says: `refused_gap` keeps the holdout `Decision` its gate
         # started from (`holdout.decide`'s `replace(spend, outcome="refused_gap", ...)`),
@@ -403,7 +526,7 @@ def run_hypothesis(
             kind=trial_kind,
             start_session=window.start,
             end_session=window.end,
-            data_cutoff=read_time(sessions[-1], cadence) if sessions else None,
+            data_cutoff=cutoff,
             synthetic=synthetic,
             run_by=run_by,
             holdout_repeat=holdout and decision.holdout_repeat,
@@ -429,7 +552,9 @@ def run_hypothesis(
     if refused:
         return _close(store, handle, cast(Status, decision.outcome), decision.message)
     try:
-        with StoreProvider(partial(open_read_only, store), handle, params) as provider:
+        with StoreProvider(
+            partial(open_read_only, store), handle, params, refuse_forked_chains=True
+        ) as provider:
             if decision.outcome == "needs_gap":
                 series = {
                     s: provider.survivorship_gap(read_time(s, cadence)).count_share
@@ -472,6 +597,10 @@ def run_hypothesis(
                 family=hypothesis.family,
                 keep_marking_frames=keep_marking_frames,
             )
+            base_level = params.costs.per_side_bps
+            if cutoff is not None:
+                counts = exit_coverage(provider, cutoff, results[base_level].delisting_exits)
+                results = with_exit_coverage(results, base_level, counts)
         with open_for_write(store) as conn:
             status = write_results(conn, handle, results, params)
     except Exception as exc:
@@ -480,3 +609,117 @@ def run_hypothesis(
     if status == "ok":
         return RunOutcome(handle.trial_id, "ok", results)
     return RunOutcome(handle.trial_id, "failed")
+
+
+class ReplayRefused(ValueError):
+    """A replay that would not run the trial's registered parameters."""
+
+
+@contextmanager
+def _replay_registry(handle: registry.TrialHandle) -> Iterator[duckdb.DuckDBPyConnection]:
+    """An in-memory stand-in for the registry connection `StoreProvider` checks its handle
+    against: it holds the replayed trial's `trials` row (its `started_at`) and no result row,
+    so the check "an open trial" passes without the replayed store being written."""
+    conn = duckdb.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE trials (trial_id BIGINT, started_at TIMESTAMPTZ)")
+        conn.execute("CREATE TABLE trial_results (trial_id BIGINT)")
+        conn.execute("INSERT INTO trials VALUES (?, ?)", [handle.trial_id, handle.started_at])
+        yield conn
+    finally:
+        conn.close()
+
+
+def replay_trial(
+    trial_id: int,
+    store_path: Path | str,
+    *,
+    holdout_replay: bool = False,
+    settings: Settings | None = None,
+) -> list[registry.MetricRow]:
+    """Run trial `trial_id` again over `store_path` and return the metric rows the run
+    produces (T398; ADR 0029, `store.reproduce`). Writes nothing: no `trials`,
+    `trial_results`, `trial_metrics` or lab row, no decision; the store is opened read-only.
+
+    The trial runs as it ran: its own registration (the `hypotheses` row it names, not
+    the slug's latest), its stored window and kind, its frozen parameters over the live
+    settings for every other key, and the cost levels it was evaluated at (the base, the
+    sensitivity ladder and any `measured` level its metrics hold). The metrics are
+    `results.metric_rows`, the function `write_results` writes them with.
+
+    `store_path` must carry the `reproduction` marker (`store.reproduce`): a copy of the
+    real store made by `reproduce_trial`. `_marked_copy` is unchanged, so an unmarked copy
+    of the real store is still refused for every other caller
+    (`registry.UnmarkedStoreRefused` here too). A holdout trial raises `ValueError`
+    unless `holdout_replay`: the replay spends no holdout, but a caller must say it is
+    replaying one."""
+    from tradepartner.store import reproduce
+
+    live = settings if settings is not None else get_settings()
+    store = _on_store(live, store_path)
+    with open_read_only(store) as conn:
+        if not reproduce.has_reproduction_marker(conn):
+            raise registry.UnmarkedStoreRefused(
+                "replay_trial runs only on a store carrying the reproduction marker "
+                "(store.reproduce.reproduce_trial makes one)"
+            )
+        facts = reproduce.read_trial(conn, trial_id)
+        if facts.kind == "holdout" and not holdout_replay:
+            raise ValueError(f"trial {trial_id} is a holdout trial; a holdout replay is explicit")
+        hypothesis = registry.get_hypothesis_by_id(conn, facts.hypothesis_id)
+        if hypothesis.family not in ENGINE_FAMILIES:
+            raise ValueError(f"{hypothesis.slug!r} is in family {hypothesis.family!r}, not run")
+        params = _overlay(
+            _reset_inert(live, frozen_module.inert_sections(hypothesis.family)),
+            frozen_values(hypothesis),
+        )
+        if not frozen_hash_matches(params, hypothesis.params_sha256, family=hypothesis.family):
+            # The values this replay would run hash to something other than what the
+            # registration recorded: the stored parameters were changed.
+            raise ReplayRefused(
+                f"hypothesis {hypothesis.slug!r}: the frozen parameters to run do not hash to "
+                f"the registered {hypothesis.params_sha256}; the replay is refused"
+            )
+        measured = reproduce.stored_measured_levels(conn, trial_id)
+        handle = registry._issue_handle(
+            trial_id=trial_id,
+            hypothesis_id=hypothesis.hypothesis_id,
+            family=hypothesis.family,
+            params_sha256=hypothesis.params_sha256,
+            kind=facts.kind,
+            synthetic=facts.synthetic,
+            started_at=facts.started_at,
+            store_max_ingested_at=facts.store_max_ingested_at,
+            detail_level=registry.DETAIL_LEVEL_FULL,
+            data_vintage=facts.data_vintage,
+            database=None,
+        )
+        cadence = hypothesis_cadence(conn, handle)
+    levels = {params.costs.per_side_bps, *params.costs.sensitivity_per_side_bps, *measured}
+    with (
+        _replay_registry(handle) as stub,
+        StoreProvider(
+            partial(open_read_only, store),
+            handle,
+            params,
+            registry_connect=lambda: _borrowed(stub),
+            refuse_forked_chains=True,
+        ) as provider,
+    ):
+        results = engine.run(
+            params,
+            provider,
+            facts.start_session,
+            facts.end_session,
+            handle,
+            sorted(levels),
+            family=hypothesis.family,
+            keep_marking_frames=False,
+        )
+    return metric_rows(results, params, cadence=cadence, family=hypothesis.family)
+
+
+@contextmanager
+def _borrowed(conn: duckdb.DuckDBPyConnection) -> Iterator[duckdb.DuckDBPyConnection]:
+    """`conn` for one `with`, left open (it belongs to the caller)."""
+    yield conn

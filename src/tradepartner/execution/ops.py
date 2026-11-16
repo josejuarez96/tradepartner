@@ -155,7 +155,12 @@ from tradepartner.execution.window import window_cadence
 from tradepartner.ingest import MODE as INGEST_MODE
 from tradepartner.ingest import OK as INGEST_OK
 from tradepartner.store import journal, registry
-from tradepartner.store.asof import adjusted_prices_as_of
+from tradepartner.store.asof import (
+    UNEXPLAINED_DUPLICATE,
+    adjusted_prices_as_of,
+    dropped_dividends_as_of,
+    packaged_dividend_reviews,
+)
 from tradepartner.store.benchmarks import BenchmarkIdentityError, benchmark_security_ids
 from tradepartner.store.journal import (
     CLOSING_STOP_STATES,
@@ -813,7 +818,7 @@ def _runs_for_switch(
         "LEFT JOIN paper_run_results s ON s.run_id = r.run_id "
         "WHERE r.window_id = ? AND ("
         "s.run_id IS NULL "
-        "OR (list_contains(?, s.status) "
+        "OR (s.status IN (SELECT unnest(?)) "
         "AND (? IS NULL OR ? <= r.started_at OR ? <= s.finished_at)) "
         "OR r.run_id = (SELECT max(run_id) FROM paper_runs WHERE window_id = ?)"
         ") ORDER BY r.run_id",
@@ -907,7 +912,7 @@ def _open_orders_count(conn: duckdb.DuckDBPyConnection, window_id: int) -> int:
     row = conn.execute(
         "SELECT COUNT(*) FROM orders o JOIN paper_runs r ON r.run_id = o.run_id "
         "WHERE r.window_id = ? AND o.client_order_id NOT IN "
-        "(SELECT client_order_id FROM order_events WHERE list_contains(?, status))",
+        "(SELECT client_order_id FROM order_events WHERE status IN (SELECT unnest(?)))",
         [window_id, list(TERMINAL_ORDER_STATUSES)],
     ).fetchone()
     assert row is not None
@@ -1432,15 +1437,41 @@ def _benchmark_series(
 ) -> dict[date, float]:
     """SPY's dividend- and split-adjusted close known at `as_of`, at `sessions`.
     `BenchmarkIdentityError` for a missing or ambiguous identity; `ValueError`
-    naming the first session with no bar."""
+    naming the first session with no bar.
+
+    The dividends are gated on the packaged reviewed list (#3026, as the backtest
+    reads them since #3015): a listed duplicate not yet repaired applies once. An
+    equal-amount group the list does not explain, ex after `base` and on or before
+    the last session, fails closed: `ValueError` naming each excluded payment, so
+    the card shows no SPY line rather than one missing a payment (a group ex on or
+    before `base` scales every session alike and leaves the rebased line as is).
+    A malformed reviewed list (`ReviewsError`, a `ValueError`) fails closed too."""
     ids = benchmark_security_ids(conn, [_BENCHMARK_SYMBOL], start=base, through=max(sessions))
+    spy = ids[_BENCHMARK_SYMBOL]
+    reviews = packaged_dividend_reviews()
+    dropped = dropped_dividends_as_of(
+        conn, as_of, [spy], settings=settings, dividend_reviews=reviews
+    )
+    excluded = sorted(
+        {
+            (ex_date, float(amount))
+            for ex_date, amount, reason in dropped.select(
+                "ex_date", "ratio_or_amount", "reason"
+            ).iter_rows()
+            if reason == UNEXPLAINED_DUPLICATE and base < ex_date <= max(sessions)
+        }
+    )
+    if excluded:
+        named = ", ".join(f"{d.isoformat()} {a:g}" for d, a in excluded)
+        raise ValueError(f"benchmark has an unexplained duplicate dividend: ex {named}")
     frame = adjusted_prices_as_of(
         conn,
         as_of,
-        [ids[_BENCHMARK_SYMBOL]],
+        [spy],
         include_dividends=True,
         settings=settings,
         sessions_from=base,
+        dividend_reviews=reviews,
     )
     closes = {s: float(c) for s, c in zip(frame["session"], frame["close"], strict=True)}
     for s in sessions:
@@ -1712,7 +1743,7 @@ def _waiting_span(conn: duckdb.DuckDBPyConnection, now: datetime) -> waiting.Spa
     book_column = "book_id" if _alerts_have_book(conn) else f"'{DEFAULT_BOOK_ID}'"
     rows = conn.execute(
         f'SELECT alert_id, {book_column}, kind, session, "at" FROM alerts '
-        'WHERE list_contains(?, kind) AND "at" >= ? AND "at" <= ? '
+        'WHERE kind IN (SELECT unnest(?)) AND "at" >= ? AND "at" <= ? '
         "AND known_at <= ? ORDER BY alert_id",
         [list(waiting.NOTED_ALERT_KINDS), span.start_at, now, now],
     ).fetchall()

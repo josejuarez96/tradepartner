@@ -127,6 +127,9 @@ _WORDS: Final[dict[str, tuple[str, str, str | None]]] = {
         "tradepartner paper status --book {book}",
     ),
 }
+#: A `reconcile_break` item's sentence when the break restricts no name (#3189):
+#: an immaterial break, or one known only by a broker symbol (`unknown_symbol`).
+_UNRESTRICTED_BREAK: Final = "Nothing is restricted by it; check it in Alpaca, then true it up."
 #: Most urgent first; `waiting.KIND_ORDER` with delisting cash after the lagging order.
 _URGENCY: Final[tuple[str, ...]] = (
     "kill_switch_engaged",
@@ -145,7 +148,8 @@ _RED_KINDS: Final = frozenset({"kill_switch_engaged", "missed_run"})
 @dataclass(frozen=True)
 class NeedsYou:
     """One "Needs you" item: `action` is text to show (a command to copy or where
-    to look); nothing runs it. `aged` marks a break past its frozen age (red)."""
+    to look); nothing runs it. `aged` marks a break past its frozen age (red),
+    `restricts` a break that restricts its name (`waiting.WaitingItem`)."""
 
     book_id: str
     kind: str
@@ -153,6 +157,7 @@ class NeedsYou:
     sentence: str
     action: str
     aged: bool = False
+    restricts: bool = False
 
 
 @dataclass(frozen=True)
@@ -252,6 +257,8 @@ def _needs_you(
             title = f"{title}: {item.line}" if item.line else title
             step = waiting.shakedown_next_step(item.line)
             sentence = f"{step[:1].upper()}{step[1:]}."
+        if item.kind == "reconcile_break" and not item.restricts:
+            sentence = _UNRESTRICTED_BREAK
         if item.aged:
             title = f"{title}, for too long"
         out.append(
@@ -262,6 +269,7 @@ def _needs_you(
                 sentence,
                 action,
                 aged=item.aged,
+                restricts=item.restricts,
             )
         )
     for late in overdue:
@@ -295,8 +303,10 @@ def _status(
             text = "A book is halted"
         elif any(n.kind == "missed_run" for n in needs):
             text = "A daily run was missed"
-        else:
+        elif any(n.aged and n.restricts for n in needs):
             text = "A break has waited too long; trading is restricted, not halted"
+        else:
+            text = "A break has waited too long; the book is not halted"
         return StatusLine("red", text, clock, nxt)
     if unreadable:
         text = f"Some records could not be read ({', '.join(unreadable)}); trading is not affected"
@@ -305,7 +315,7 @@ def _status(
         word = "item needs" if len(needs) == 1 else "items need"
         effect = (
             "trading is restricted in a name, the book is not halted"
-            if any(n.kind == "reconcile_break" for n in needs)
+            if any(n.kind == "reconcile_break" and n.restricts for n in needs)
             else "trading is not affected"
         )
         text = f"{len(needs)} {word} a look; {effect}"

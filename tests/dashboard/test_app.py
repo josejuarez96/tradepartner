@@ -24,7 +24,7 @@ from pathlib import Path
 import duckdb
 import pytest
 import streamlit as st
-from dashboard_nav import NavCall, nav_calls_fixture  # noqa: F401
+from dashboard_nav import NavCall, app_test, nav_calls_fixture  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.config import Settings
@@ -63,7 +63,7 @@ def _run_app(monkeypatch: pytest.MonkeyPatch, store_path: Path, page: str = "Hom
     monkeypatch.setenv("STORE__PATH", str(store_path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
     monkeypatch.setenv("DASHBOARD_TEST_PAGE", page)
-    at = AppTest.from_file(_APP_PATH, default_timeout=60)
+    at = app_test(_APP_PATH)
     at.run()
     return at
 

@@ -521,9 +521,84 @@ def test_a_spinoff_row_stales_only_a_trial_that_reads_spin_offs(
     )
     assert not lab_queries.is_stale(lab_store, plain_trial)
     assert lab_queries.is_stale(lab_store, reading_trial)
-    shared: dict[tuple[datetime, bool], datetime | None] = {}
+    shared: lab_queries.Vintages = {}
     assert lab_queries._is_current(lab_store, plain_trial, _checkout(), shared)
     assert not lab_queries._is_current(lab_store, reading_trial, _checkout(), shared)
+
+
+def _insert_reason_fact(
+    conn: duckdb.DuckDBPyConnection, *, security_id: str, known_at: datetime, ingested_at: datetime
+) -> None:
+    """One `delisting_reasons` row (#2670, T328d)."""
+    insert_row(
+        conn,
+        "delisting_reasons",
+        {
+            "security_id": security_id,
+            "delisting_form": "25",
+            "delisting_class_title": "Common Stock",
+            "delisting_exchange": "NASDAQ",
+            "delisting_filed_at": known_at,
+            "reason": "bankruptcy",
+            "reason_evidence_form": "8-K",
+            "reason_evidence_accession": f"acc-{security_id}",
+            "reason_source": "eightk_item",
+            "reason_known_at": known_at,
+            "known_at": known_at,
+            "ingested_at": ingested_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+
+def test_a_reason_row_by_the_cutoff_makes_only_a_policy_trial_not_current(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """T328d (#2670): `_is_current` reads the trial's frozen
+    `backtest.delisting_failure_return`, so a `delisting_reasons` row known after the
+    cutoff leaves both trials current, and one known by the cutoff makes a
+    `failure_v1` variant's counted trial not current while a `none` one stays
+    current. The shared memo is keyed by `(cutoff, spin_offs, delisting_policy)`, so
+    a `none` variant's cut does not stand in for a `failure_v1` one's."""
+    sweep = _sweep(lab_store, settings, n_variants=2)
+    plain = _variant(lab_store, settings, sweep, 1)
+    policy = _variant(
+        lab_store,
+        settings,
+        sweep,
+        2,
+        params=_params(**{"backtest.delisting_failure_return": "failure_v1"}),
+    )
+    vintage = registry.data_vintage(lab_store, _CUTOFF)
+    assert vintage is not None
+    _insert_trial(lab_store, plain.hypothesis_id, data_vintage_value=vintage)
+    _insert_trial(lab_store, policy.hypothesis_id, data_vintage_value=vintage)
+    plain_trial = lab_queries.counted_trial(lab_store, plain.hypothesis_id, sweep.sweep_id)
+    policy_trial = lab_queries.counted_trial(lab_store, policy.hypothesis_id, sweep.sweep_id)
+    assert plain_trial is not None and lab_queries.is_current(lab_store, plain_trial)
+    assert policy_trial is not None and lab_queries.is_current(lab_store, policy_trial)
+    _insert_reason_fact(
+        lab_store,
+        security_id="SEC_REASON_LATE",
+        known_at=_CUTOFF + timedelta(microseconds=1),
+        ingested_at=vintage + timedelta(days=3),
+    )
+    assert lab_queries.is_current(lab_store, plain_trial)
+    assert lab_queries.is_current(lab_store, policy_trial)
+    _insert_reason_fact(
+        lab_store,
+        security_id="SEC_REASON_READ",
+        known_at=_CUTOFF,
+        ingested_at=vintage + timedelta(days=4),
+    )
+    assert lab_queries.is_current(lab_store, plain_trial)
+    assert not lab_queries.is_current(lab_store, policy_trial)
+    assert lab_queries.is_stale(lab_store, policy_trial)
+    shared: lab_queries.Vintages = {}
+    assert lab_queries._is_current(lab_store, plain_trial, _checkout(), shared)
+    assert not lab_queries._is_current(lab_store, policy_trial, _checkout(), shared)
+    assert set(shared) == {(_CUTOFF, False, "none"), (_CUTOFF, False, "failure_v1")}
 
 
 # --- the counting rule, branch by branch ---------------------------------------

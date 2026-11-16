@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import csv
 import errno
+import faulthandler
 import hashlib
 import os
 import re
@@ -50,6 +51,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from _pytest.faulthandler import fault_handler_stderr_fd_key
 
 from tradepartner.adapters import edgar_raw
 from tradepartner.config import Settings
@@ -313,6 +315,39 @@ def _order_shard_items(items: list[pytest.Item], rootdir: Path) -> None:
     items.sort(key=priority)
 
 
+def _timeout_seconds(item: pytest.Item) -> float:
+    """The pytest-timeout limit for `item`, in its own precedence: the
+    `timeout` mark, else `--timeout`, else the ini."""
+    mark = item.get_closest_marker("timeout")
+    if mark is not None and mark.args:
+        return float(mark.args[0])
+    if mark is not None and "timeout" in mark.kwargs:
+        return float(mark.kwargs["timeout"])
+    option = item.config.getoption("timeout", None)
+    if option is not None:
+        return float(option)
+    return float(item.config.getini("timeout") or 0.0)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item: pytest.Item) -> Iterator[None]:
+    """Dump every thread's stack a few seconds before pytest-timeout fires
+    (#3039). The thread method writes its dump through captured stderr and
+    then kills the xdist worker, so CI showed only "node down"; faulthandler
+    writes to pytest's own copy of the real stderr, which reaches the log,
+    and does not exit (pytest-timeout still ends the test)."""
+    timeout = _timeout_seconds(item)
+    fd = item.config.stash.get(fault_handler_stderr_fd_key, None)
+    armed = timeout > 0 and fd is not None
+    if armed:
+        faulthandler.dump_traceback_later(max(timeout - 5.0, timeout * 0.8), file=fd)
+    try:
+        yield
+    finally:
+        if armed:
+            faulthandler.cancel_dump_traceback_later()
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Keep only this shard's items, when CI sets `PYTEST_SHARD_INDEX`/`_COUNT` (#1112).
 
@@ -415,8 +450,12 @@ def _single_threaded_duckdb() -> Iterator[None]:
 
 @pytest.fixture(autouse=True)
 def _reset_edgar_rate_limit_block() -> None:
-    """Start every test with `edgar_raw`'s process-wide block cleared (#761)."""
+    """Start every test with `edgar_raw`'s process-wide block cleared (#761)
+    and its limiter's stamp forgotten (#3039: a test that fakes
+    `time.monotonic` leaves a stamp from its own clock behind)."""
+    edgar_raw._RATE_LIMIT_BLOCK._waits_running = 0
     edgar_raw._RATE_LIMIT_BLOCK.clear()
+    edgar_raw._LIMITER._last_request_monotonic = None
 
 
 @pytest.fixture
@@ -755,3 +794,29 @@ def _plenty_of_free_disk(monkeypatch: pytest.MonkeyPatch) -> None:
     from tradepartner import diskfloor
 
     monkeypatch.setattr(diskfloor, "free_bytes", lambda path: 1_000_000_000_000)
+
+
+def open_paper_window(settings: Settings, started_at: datetime, *, window_id: int = 1) -> None:
+    """Insert one open paper window (no stop) started at `started_at`; its
+    first session is the XNYS session on or after that New York date."""
+    from tradepartner.store.db import insert_row, open_for_write
+
+    with open_for_write(settings) as conn:
+        insert_row(
+            conn,
+            "paper_windows",
+            {
+                "window_id": window_id,
+                "hypothesis_id": 1,
+                "first_rebalance_session": started_at.date(),
+                "account_id": "paper",
+                "starting_cash": 100_000.0,
+                "starting_equity": 100_000.0,
+                "code_version": "test",
+                "started_at": started_at,
+                "frozen_json": "{}",
+                "frozen_sha256": "0" * 64,
+                "known_at": started_at,
+                "ingested_at": started_at,
+            },
+        )

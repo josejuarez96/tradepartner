@@ -58,7 +58,14 @@ from execution.test_run_trade import (
     env,
     window,
 )
-from tradepartner.adapters.broker import Asset, OrderRequest, Side, UnknownOrderError
+from tradepartner.adapters.broker import (
+    Asset,
+    Order,
+    OrderRequest,
+    OrderStatus,
+    Side,
+    UnknownOrderError,
+)
 from tradepartner.adapters.fake_broker import (
     Expire,
     FakeBroker,
@@ -89,14 +96,18 @@ from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
 from tradepartner.execution.lock import LockHeld, run_lock
 from tradepartner.execution.outcomes import NOT_EXECUTED, POSITION_RETURN, REALISED_PNL
-from tradepartner.execution.reconcile_run import reconcile_command
+from tradepartner.execution.reconcile_run import (
+    reconcile_command,
+    settle_pending_unresolved,
+    unresolved_orders,
+)
 from tradepartner.execution.reserve import open_buy_reserve
 from tradepartner.execution.resume import RELEASED
 from tradepartner.execution.window import stop as window_stop
 from tradepartner.execution.wrapper import WRITE_FAILED_EXIT_CODE
 from tradepartner.store import registry
 from tradepartner.store.asof import live_actions_as_of
-from tradepartner.store.db import open_read_only
+from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
     AdjustmentRow,
     OverrideRow,
@@ -1503,30 +1514,150 @@ def test_an_unacknowledged_buy_past_the_longer_poll_ends_the_run_ok_pending_unre
     assert reserve == Decimal("33283.40")
 
 
-def test_the_next_runs_start_cancels_an_order_the_broker_never_got_and_reattempts_it(
-    env: Env, window: PaperWindowRow
+@pytest.mark.parametrize("status", [OrderStatus.ACCEPTED, OrderStatus.EXPIRED])
+def test_a_confirmed_order_settles_from_its_broker_id_in_any_state(
+    env: Env, window: PaperWindowRow, status: OrderStatus
 ) -> None:
-    """Item 4 (c), unknown: step 3 of the next run (2019-05-02, a catch-up in the
-    window) cancels it `not_received` before step 4 reconciles; the decision,
-    open again, gets one new attempt on that run, which fills; both of that
-    run's reconciliations are `ok`."""
+    """#3335: the coid lookup keeps missing, but the broker knows the order under
+    the broker id the submit reply gave, open or already terminal: it is journaled
+    `accepted` with that id, never `not_received`."""
     coid, _ = _unresolved_buy(env)
-    nxt = env.run(at(F_0_PLUS_1))
-    assert nxt.status == "ok", env.result(env.latest_run())
+    (broker_id,) = env.query(
+        "SELECT broker_order_id FROM order_events WHERE client_order_id = ? "
+        "AND status = 'pending_unresolved'",
+        [coid],
+    )[0]
+    assert window.window_id is not None
+    [row] = unresolved_orders(env.connect, window.window_id)
+
+    class _Lagging:
+        """A broker whose coid lookup misses while its id lookup answers."""
+
+        def get_order(self, client_order_id: str) -> Order:
+            raise UnknownOrderError(client_order_id)
+
+        def get_order_by_broker_id(self, broker_order_id: str) -> Order:
+            assert broker_order_id == broker_id
+            return Order(
+                client_order_id=row.client_order_id,
+                symbol=row.symbol,
+                side=Side(row.side),
+                notional=row.notional,
+                quantity=row.quantity,
+                status=status,
+                submitted_at=env.clock.now,
+                broker_order_id=broker_id,
+            )
+
+    settled = settle_pending_unresolved(
+        _Lagging(),  # type: ignore[arg-type]
+        env.connect,
+        env.clock,
+        [row],
+    )
+    assert settled == (coid,)
     assert _events(env, coid) == [
         ("pending", None),
         ("pending_unresolved", None),
-        ("cancelled", "not_received"),
+        ("accepted", None),
     ]
-    settled_at = env.query(
-        "SELECT known_at FROM order_events WHERE client_order_id = ? AND status = 'cancelled'",
+
+
+def test_a_failed_broker_id_lookup_fails_closed(env: Env, window: PaperWindowRow) -> None:
+    """#3335: a lookup by broker id that errors leaves the order unsettled."""
+    coid, _ = _unresolved_buy(env)
+    assert window.window_id is not None
+    [row] = unresolved_orders(env.connect, window.window_id)
+
+    class _Down:
+        def get_order(self, client_order_id: str) -> Order:
+            raise UnknownOrderError(client_order_id)
+
+        def get_order_by_broker_id(self, broker_order_id: str) -> Order:
+            raise ConnectionError("down")
+
+    with pytest.raises(ReconciliationError, match="lookup by that id failed"):
+        settle_pending_unresolved(_Down(), env.connect, env.clock, [row])  # type: ignore[arg-type]
+    assert _events(env, coid) == [("pending", None), ("pending_unresolved", None)]
+
+
+def test_a_confirmed_broker_id_belonging_to_another_coid_fails_closed(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """A broker-id read-back for another client order cannot acknowledge this one."""
+    coid, _ = _unresolved_buy(env)
+    assert window.window_id is not None
+    [row] = unresolved_orders(env.connect, window.window_id)
+
+    class _WrongCoid:
+        def get_order(self, client_order_id: str) -> Order:
+            raise UnknownOrderError(client_order_id)
+
+        def get_order_by_broker_id(self, broker_order_id: str) -> Order:
+            return Order(
+                client_order_id="another-order",
+                symbol=row.symbol,
+                side=Side(row.side),
+                notional=row.notional,
+                quantity=row.quantity,
+                status=OrderStatus.ACCEPTED,
+                submitted_at=env.clock.now,
+                broker_order_id=broker_order_id,
+            )
+
+    with pytest.raises(ReconciliationError, match="belongs to client_order_id another-order"):
+        settle_pending_unresolved(_WrongCoid(), env.connect, env.clock, [row])  # type: ignore[arg-type]
+    assert _events(env, coid) == [("pending", None), ("pending_unresolved", None)]
+
+
+def test_paper_resume_does_not_close_a_confirmed_order_not_received(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """#3335: `paper resume` is how an owner releases a halted window, so it too
+    reads a confirmed order by its broker id and refuses rather than closing it
+    `not_received` (which would let the next run resend it)."""
+    coid, _ = _unresolved_buy(env)
+    with pytest.raises(ReconciliationError, match="confirmed by the broker"):
+        _resume(env)
+    assert _events(env, coid) == [("pending", None), ("pending_unresolved", None)]
+
+
+def test_an_unresolved_order_with_no_journaled_broker_id_still_closes_not_received(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Journals written before #3335 carry no broker id on `pending_unresolved`:
+    the old `not_received` close still applies to them."""
+    coid, _ = _unresolved_buy(env)
+    with open_for_write(env.settings) as conn:
+        conn.execute(
+            "UPDATE order_events SET broker_order_id = NULL "
+            "WHERE client_order_id = ? AND status = 'pending_unresolved'",
+            [coid],
+        )
+    nxt = env.run(at(F_0_PLUS_1))
+    assert nxt.status == "ok", env.result(env.latest_run())
+    assert _events(env, coid)[-1] == ("cancelled", "not_received")
+
+
+def test_a_confirmed_order_whose_coid_lookup_lags_is_not_closed_not_received_or_resent(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """#3335: the submit reply's broker id is journaled on `pending_unresolved`;
+    when the coid lookup still misses on the next run, that run stops with a
+    `ReconciliationError` instead of closing the order `not_received` (which would
+    reopen the decision for a resend). No new submit is made."""
+    coid, _ = _unresolved_buy(env)
+    (broker_id,) = env.query(
+        "SELECT broker_order_id FROM order_events WHERE client_order_id = ? "
+        "AND status = 'pending_unresolved'",
         [coid],
-    )[0][0]
-    assert settled_at <= _first_reconciled_at(env, nxt.run_id)
-    assert _reconciliations(env, nxt.run_id) == ["ok", "ok"]
-    attempts = _attempts(env, "SEC_TRANSFER")
-    assert [(a[0] == coid, a[2]) for a in attempts] == [(True, "cancelled"), (False, "filled")]
-    assert sorted(env.held()) == ["DUALB", "SPFT", "TRNS"]
+    )[0]
+    assert broker_id is not None
+    submits = len(env.submits())
+    with pytest.raises(ReconciliationError, match="confirmed by the broker"):
+        env.run(at(F_0_PLUS_1))
+    assert len(env.submits()) == submits
+    assert _events(env, coid) == [("pending", None), ("pending_unresolved", None)]
 
 
 def test_the_next_runs_start_acknowledges_and_collects_an_order_the_broker_did_get(
@@ -1639,11 +1770,10 @@ def test_after_the_longer_poll_outside_the_submit_window_the_rest_is_never_sent(
     assert _reconciliations(env, outcome.run_id)[-1] == "pending_unresolved"
     assert env.count("kill_switch") == 0
 
-    nxt = env.run(at(F_0_PLUS_1))
-    assert nxt.status == "ok", env.result(env.latest_run())
-    assert _events(env, coid)[-1] == ("cancelled", "not_received")
-    assert sorted(env.held()) == ["DUALB", "SPFT", "TRNS"]
-    assert _reconciliations(env, nxt.run_id) == ["ok", "ok"]
+    # DUALB's submit was confirmed, so it is never closed not_received (#3335).
+    with pytest.raises(ReconciliationError, match="confirmed by the broker"):
+        env.run(at(F_0_PLUS_1))
+    assert _events(env, coid) == [("pending", None), ("pending_unresolved", None)]
 
 
 def test_an_unresolved_sells_proceeds_are_not_spent_and_its_name_stays_held(
@@ -1735,16 +1865,63 @@ def test_paper_resume_under_the_switch_settles_it_by_the_read_back(
         "accepted",
         "filled",
     ]
+    accepted_at, raw_json = env.query(
+        "SELECT event_at, raw_json FROM order_events "
+        "WHERE client_order_id = ? AND status = 'accepted'",
+        [coid],
+    )[0]
+    broker_order = env.fake.get_order(coid)
+    assert accepted_at == broker_order.submitted_at
+    assert json.loads(raw_json)["client_order_id"] == coid
+    assert json.loads(raw_json)["broker_order_id"] == broker_order.broker_order_id
     assert len(env.submits()) == submits
+
+
+def test_paper_resume_refuses_a_broker_read_back_with_wrong_order_shape(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A confirmed order with a limit shape cannot be acknowledged or released."""
+    coid, _ = _unresolved_buy(env)
+    assert window.window_id is not None
+    [row] = unresolved_orders(env.connect, window.window_id)
+    (broker_id,) = env.query(
+        "SELECT broker_order_id FROM order_events WHERE client_order_id = ? "
+        "AND status = 'pending_unresolved'",
+        [coid],
+    )[0]
+    switch.engage(
+        env.settings, env.clock, window_id=window.window_id, source="owner", reason="test"
+    )
+
+    def wrong_shape(read_id: str) -> Order:
+        assert read_id == broker_id
+        return Order(
+            client_order_id=coid,
+            symbol=row.symbol,
+            side=Side(row.side),
+            notional=row.notional,
+            quantity=row.quantity,
+            status=OrderStatus.ACCEPTED,
+            submitted_at=env.clock.now,
+            broker_order_id=broker_id,
+            order_type="limit",
+            limit_price=100.0,
+        )
+
+    monkeypatch.setattr(env.fake, "get_order_by_broker_id", wrong_shape)
+    with pytest.raises(ReconciliationError, match=r"refused_order_shape.*order_type"):
+        _resume(env)
+    assert _events(env, coid) == [("pending", None), ("pending_unresolved", None)]
+    assert _engaged(env, window)
 
 
 def test_paper_reconcile_under_the_switch_settles_it_by_the_read_back(
     env: Env, window: PaperWindowRow
 ) -> None:
-    """Item 4 (c): with the switch engaged, `paper reconcile` settles the order by
-    the read-back before it reconciles (the broker never got it: `cancelled`,
-    `not_received`), so its reconciliation is `ok`, not `pending_unresolved`; it
-    submits nothing and releases nothing."""
+    """Item 4 (c): with the switch engaged, `paper reconcile` reads the order back
+    before it reconciles. The submit was confirmed and the coid read misses (the
+    fake's `Vanish`), so it is not closed `not_received` (#3335): the command
+    raises `ReconciliationError`; it submits nothing and releases nothing."""
     coid, _ = _unresolved_buy(env)
     assert window.window_id is not None
     engaged = switch.engage(
@@ -1752,8 +1929,8 @@ def test_paper_reconcile_under_the_switch_settles_it_by_the_read_back(
     )
     assert isinstance(engaged, int)
     submits = len(env.submits())
-    result = reconcile_command(env.settings, env.connect, env.fake, _ticking(env))
-    assert result.status == "ok"
-    assert _events(env, coid)[-1] == ("cancelled", "not_received")
+    with pytest.raises(ReconciliationError, match="confirmed by the broker"):
+        reconcile_command(env.settings, env.connect, env.fake, _ticking(env))
+    assert _events(env, coid)[-1] == ("pending_unresolved", None)
     assert _engaged(env, window)
     assert len(env.submits()) == submits

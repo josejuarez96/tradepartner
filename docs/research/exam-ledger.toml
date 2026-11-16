@@ -1,0 +1,67 @@
+# Exam ledger: one [[exam]] entry per forward return exam start, programme-wide.
+# The rule: ADR 0016, amendment 2026-11-07 (#3146), rules 1 to 5
+# (docs/decisions/0016-development-boundary-and-forward-exams.md).
+#
+# CLASS B WHATEVER ITS PATH: every change lands only on the owner's word, never in a
+# merge train (rule 3; the classifier exception is #3147).
+#
+# APPEND-ONLY:
+# - an entry is never removed or reordered;
+# - only window_id, outcome and outcome_on ever change;
+# - window_id changes once, from 0 to the store's paper_windows.window_id;
+# - outcome moves forward only: pending -> running | not_started, then
+#   running -> passed | failed | failed_futility | failed_void, and a terminal outcome
+#   never changes; unexamined is terminal when appended;
+# - not_started only for an entry whose paper start never succeeded (window_id 0);
+#   it stays in the file and does not count toward the budget.
+# Checked on every PR touching this file by T381b's check_append_only against origin/main
+# (run by scripts/ready_pr.py, #3147).
+#
+# BACKFILL: an exam window that froze no exam line (started before T381a, or on a forward
+# holdout already spent) is recorded by one class-B PR with its real window_id,
+# kill_line = "none" and outcome "unexamined" (terminal, counts toward the budget).
+#
+# ORDER OF WORK FOR ONE EXAM:
+# 1. post the kill line on the finalist's issue;
+# 2. a class-B PR appends the entry (outcome "pending", window_id 0);
+# 3. run paper start from a checkout that has it;
+# 4. a class-B PR sets window_id and outcome "running";
+# 5. a class-B PR sets the terminal outcome.
+# T381a refuses an exam start (exam_ledger_invalid, exam_ledger_mismatch,
+# exam_budget_spent) when this file and the store's exam windows disagree, or when the
+# budget is spent.
+#
+# FIELDS OF AN [[exam]] ENTRY:
+#   seq                     1, 2, ... contiguous
+#   hypothesis              the hypothesis file's slug
+#   hypothesis_fingerprint  its registry fingerprint
+#   family                  its family
+#   book_id                 the paper book
+#   window_id               paper_windows.window_id; 0 only while pending or not_started
+#   start_date              the window's first rebalance session (T_0), a TOML date
+#   kill_line               URL of the kill line comment on the finalist's issue; "none" only if unexamined
+#   campaign_k              k stated in the kill line (idea-pipeline multiplicity rule); -1 if none
+#   outcome                 pending | running | passed | failed | failed_futility | failed_void | unexamined | not_started
+#   outcome_on              date the outcome was last set (the start date while pending or running)
+#
+# Example (not an entry):
+# [[exam]]
+# seq = 1
+# hypothesis = "<slug>"
+# hypothesis_fingerprint = "<sha256>"
+# family = "<family>"
+# book_id = "<book>"
+# window_id = 0
+# start_date = 2027-01-04
+# kill_line = "https://github.com/josejuarez96/tradepartner/issues/<n>#issuecomment-<id>"
+# campaign_k = -1
+# outcome = "pending"
+# outcome_on = 2027-01-04
+
+# The programme budget of record. A fifth exam needs a class-B ADR amendment that names
+# the new count AND a config change (rule 5); this pair moves only with them.
+budget = 4
+budget_adr = "docs/decisions/0016-development-boundary-and-forward-exams.md#amendment-2026-11-07-3146-the-four-exam-budget-is-counted-in-the-store-and-in-a-git-tracked-ledger"
+
+# Entries: none. No exam has started as far as git shows (origin/main 1e8eeeea, 2026-11-07);
+# the store count is checked read-only before this lands (ADR 0016 #3146 amendment, rule 6).

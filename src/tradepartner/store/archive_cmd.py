@@ -1,6 +1,7 @@
-"""What `tradepartner archive migrate-cache` and `archive restore` do (plan T362,
-#2743), kept out of `cli.py` so the CLI names no raw-archive module (the look-ahead
-boundary scan, `tests/lookahead/test_raw_archive_boundary.py`).
+"""What `tradepartner archive migrate-cache`, `archive restore` (plan T362, #2743)
+and `archive rederive` (plan T352, #2714) do, kept out of `cli.py` so the CLI names
+no raw-archive module (the look-ahead boundary scan,
+`tests/lookahead/test_raw_archive_boundary.py`).
 
 `migrate_cache` is a dry run unless `apply` is set: it lists `edgar.cache_dir`,
 hashes the move and backup classes, asks the archive which hashes it holds and
@@ -17,14 +18,16 @@ from __future__ import annotations
 
 import hashlib
 from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 
 from tradepartner import diskfloor
 from tradepartner.config import Settings
 from tradepartner.store import raw_archive_migrate as migrate
+from tradepartner.store import raw_rederive
 from tradepartner.store.db import StoreLockedError, open_read_only
 from tradepartner.store.raw_archive import (
     ICloudItems,
@@ -52,12 +55,13 @@ from tradepartner.store.raw_archive_plan import (
 
 IcloudFactory = Callable[[Settings], ICloudItems]
 
-#: Every refusal the two commands turn into a plain message and a non-zero exit.
+#: Every refusal the commands turn into a plain message and a non-zero exit.
 REFUSALS: tuple[type[BaseException], ...] = (
     migrate.MigrationRefusedError,
     migrate.MigrationStoppedError,
     migrate.RestoreRefusedError,
     MigrationPlanRefusedError,
+    raw_rederive.RederiveRefused,
     RawArchiveICloudError,
     RawArchiveIntegrityError,
     RawArchiveMissingError,
@@ -165,9 +169,17 @@ def _store_write_lock_free(settings: Settings) -> Iterator[None]:
 
 def migrate_cache(settings: Settings, icloud: ICloudItems, *, apply: bool) -> list[str]:
     """The dry-run plan, or the run's summary with `apply` (module docstring)."""
+    return migrate_cache_checked(settings, icloud, apply=apply)[0]
+
+
+def migrate_cache_checked(
+    settings: Settings, icloud: ICloudItems, *, apply: bool
+) -> tuple[list[str], bool]:
+    """`migrate_cache`'s lines and whether any archived body failed verification
+    (`mismatched`, now or on a retry), which the command turns into a non-zero exit."""
     cache_dir = cache_dir_of(settings)
     if not apply:
-        return _dry_run(settings, cache_dir)
+        return _dry_run(settings, cache_dir), False
     require_archive_root(settings)
     with _store_write_lock_free(settings):
         result = migrate.apply_migration(settings, cache_dir, icloud)
@@ -176,6 +188,9 @@ def migrate_cache(settings: Settings, icloud: ICloudItems, *, apply: bool) -> li
         for state in (
             "evicted",
             "pending_upload",
+            "mismatched",
+            "evict_failed",
+            "status_failed",
             "moved",
             "duplicate",
             "duplicate_kept",
@@ -184,7 +199,15 @@ def migrate_cache(settings: Settings, icloud: ICloudItems, *, apply: bool) -> li
     )
     backed = ", ".join(
         f"{state} {result.backup_count(state)}"
-        for state in ("evicted", "pending_upload", "backed_up", "changed")
+        for state in (
+            "evicted",
+            "pending_upload",
+            "mismatched",
+            "evict_failed",
+            "status_failed",
+            "backed_up",
+            "changed",
+        )
     )
     pending_total = len(_pending_paths(cache_dir))
     lines = [
@@ -203,7 +226,12 @@ def migrate_cache(settings: Settings, icloud: ICloudItems, *, apply: bool) -> li
     ):
         if count:
             lines.append(f"retry {state}: {count}")
-    return lines
+    corrupt = bool(
+        result.count("mismatched") or result.backup_count("mismatched") or result.retry_mismatched
+    )
+    if corrupt:
+        lines.append("INTEGRITY: an archived body does not match its hash; it was not evicted")
+    return lines, corrupt
 
 
 def restore(settings: Settings, icloud: ICloudItems, *, path: str, run: str | None) -> list[str]:
@@ -214,3 +242,28 @@ def restore(settings: Settings, icloud: ICloudItems, *, path: str, run: str | No
     if not result.restored:
         return [f"nothing left to restore under {path!r}; every archived file is already back"]
     return [f"restored {len(result.restored)} file(s) under {path!r}; the archive keeps its copies"]
+
+
+def rederive(
+    settings: Settings,
+    icloud: ICloudItems,
+    *,
+    mode: str,
+    accessions: Sequence[str],
+    file_dates: Sequence[date],
+    release: str | None,
+    expect: int | None,
+    expect_digest: str | None,
+) -> list[str]:
+    """`raw_rederive.rederive`'s report lines: a dry run without `release`."""
+    result = raw_rederive.rederive(
+        settings,
+        icloud,
+        mode=mode,
+        accessions=accessions,
+        file_dates=file_dates,
+        release=release,
+        expect=expect,
+        expect_digest=expect_digest,
+    )
+    return result.lines()

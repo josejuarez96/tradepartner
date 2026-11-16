@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import duckdb
@@ -323,6 +323,22 @@ def test_a_holdout_after_the_registration_day_is_forward(
     view = lab_files.preview(path, settings, ready)
 
     assert view.holdout_kind == "forward"
+
+
+def test_a_new_family_previewed_on_an_evening_is_forward_from_the_new_york_day(
+    lab_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    docs: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3154: 21:00 EST on 11-01 is 02:00 UTC on 11-02. A family with no hypothesis
+    yet, previewed then with holdout.start 11-02, is forward, as registering it is."""
+    path = docs / "sweeps" / "fixture-sweep.md"
+    text = path.read_text().replace("start = 2023-01-03", "start = 2026-11-02", 1)
+    path.write_text(text.replace("end = 2025-12-31", "end = 2099-12-31", 1))
+    monkeypatch.setattr(lab_files, "utc_now", lambda: datetime(2026, 11, 2, 2, 0, tzinfo=UTC))
+
+    assert lab_files.preview(path, settings, lab_store).holdout_kind == "forward"
 
 
 def test_a_refused_file_previews_as_a_refusal(

@@ -1262,3 +1262,127 @@ def test_a_tradable_gap_across_a_split_divides_the_carried_close(tmp_path) -> No
     )
     conn.close()
     assert (mark.mark_price, mark.value) == (5.0, 40.0)
+
+
+# --- a held chained predecessor (#3051) --------------------------------------------------
+
+#: `A`'s 1:1 chain successor (#821): the store files `A`'s bars under it once
+#: the chain is known.
+N = "SEC_N"
+
+
+def _chain(
+    conn: duckdb.DuckDBPyConnection, known_at: datetime, successor: str = N, predecessor: str = A
+) -> None:
+    insert_row(
+        conn,
+        "successor_chains",
+        {
+            "predecessor_id": predecessor,
+            "successor_id": successor,
+            "evidence_accession": f"SEC-{predecessor}-{successor}",
+            "evidence_form": "8-K12B",
+            "retracted": False,
+            "withdrawn_known_at": None,
+            "source": "edgar",
+            "provenance": "filing",
+            **_stamp(known_at),
+        },
+    )
+
+
+def _split(security_id: str, ex_date: date, ratio: float) -> pl.DataFrame:
+    return pl.DataFrame(
+        [
+            {
+                "security_id": security_id,
+                "action_type": "split",
+                "ex_date": ex_date,
+                "ratio_or_amount": ratio,
+            }
+        ],
+        schema=NO_ACTIONS.schema,
+    )
+
+
+def _chained_store(tmp_path, chain_known: datetime | None, *, forked: bool = False) -> None:
+    d1, d2 = date(2026, 10, 5), date(2026, 10, 6)
+    write_conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(write_conn)
+    _bar(write_conn, A, d1, 10.0)
+    _bar(write_conn, N, d2, 12.0)
+    if chain_known is not None:
+        _chain(write_conn, chain_known)
+        if forked:
+            _chain(write_conn, chain_known, successor="SEC_N2")
+    write_conn.close()
+
+
+def test_a_held_chained_predecessor_is_marked_at_its_successors_bars(tmp_path) -> None:
+    """#3051: hold `A` on d1 and d2; a chain `A -> N` known before close(d1)
+    files `A`'s d1 bar under `N` (#821) and `N` trades on d2. Both sessions are
+    marked under `A` (the ledger's name): d1 at `A`'s own close re-keyed, d2 at
+    `N`'s close, instead of raising `no price for SEC_A`."""
+    d1, d2 = date(2026, 10, 5), date(2026, 10, 6)
+    _chained_store(tmp_path, session_close(d1) - timedelta(hours=1))
+    conn = _reopen_read_only(tmp_path)
+    try:
+        ledger = _ledger_for({d1: {A: 50.0}, d2: {A: 50.0}})
+        marks = marks_for(conn, _window(), ledger, [d1, d2], {A: True}, actions=NO_ACTIONS)
+    finally:
+        conn.close()
+
+    assert [(m.session, m.security_id, m.mark_price, m.value) for m in marks] == [
+        (d1, A, 10.0, 500.0),
+        (d2, A, 12.0, 600.0),
+    ]
+
+
+def test_a_chain_known_after_a_marked_session_is_not_read_for_it(tmp_path) -> None:
+    """No look-ahead (#3051): a chain stamped between close(d1) and close(d2)
+    re-keys nothing in d1's read (d1 is priced from `A`'s own bar as known at
+    close(d1)), and d2 reads `N`'s bar under the chain known by then. A d1 bar
+    of `N` known only at close(d2) never prices d1."""
+    d1, d2 = date(2026, 10, 5), date(2026, 10, 6)
+    _chained_store(tmp_path, session_close(d1) + timedelta(hours=1))
+    write_conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    _bar(write_conn, N, d1, 99.0, known_at=session_close(d2))
+    write_conn.close()
+    conn = _reopen_read_only(tmp_path)
+    try:
+        ledger = _ledger_for({d1: {A: 50.0}, d2: {A: 50.0}})
+        marks = marks_for(conn, _window(), ledger, [d1, d2], {A: True}, actions=NO_ACTIONS)
+    finally:
+        conn.close()
+
+    assert [(m.session, m.mark_price) for m in marks] == [(d1, 10.0), (d2, 12.0)]
+
+
+def test_a_predecessor_with_two_live_successors_halts_the_mark(tmp_path) -> None:
+    """#3051 (fail closed): which successor's bars price the position is never
+    guessed; the mark raises `StaleDataError` (the run's halt path: alert, no
+    order), not a crash."""
+    d1 = date(2026, 10, 5)
+    _chained_store(tmp_path, session_close(d1) - timedelta(hours=1), forked=True)
+    conn = _reopen_read_only(tmp_path)
+    try:
+        ledger = _ledger_for({d1: {A: 50.0}})
+        with pytest.raises(StaleDataError, match=r"SEC_A.*more than one live successor"):
+            marks_for(conn, _window(), ledger, [d1], {A: True}, actions=NO_ACTIONS)
+    finally:
+        conn.close()
+
+
+def test_a_successor_split_the_ledger_cannot_count_halts_the_mark(tmp_path) -> None:
+    """#3051 (fail closed): the chained read keys the successor's split to `N`,
+    so the ledger's quantity of `A` never counts it; a mark on the split's
+    basis would misstate the value, so it halts instead."""
+    d1, d2 = date(2026, 10, 5), date(2026, 10, 6)
+    _chained_store(tmp_path, session_close(d1) - timedelta(hours=1))
+    conn = _reopen_read_only(tmp_path)
+    try:
+        ledger = _ledger_for({d1: {A: 50.0}, d2: {A: 50.0}})
+        with pytest.raises(StaleDataError, match=r"SEC_A.*SEC_N.*split"):
+            marks_for(conn, _window(), ledger, [d1, d2], {A: True}, actions=_split(N, d2, 2.0))
+    finally:
+        conn.close()

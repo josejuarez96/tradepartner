@@ -127,10 +127,18 @@ def _on_run(
             k = len(plan.variants)
             rules = lab_registry.family_rules(store, sweep.family)
             floor = rules.min_sharpe_variance_annual if rules else 0.0
+            undefined = lab_registry.family_v_floor(rules) if rules else None
             excess = results.next_trial_cost(
-                store, sweep.family, basis="excess_spy", added=k, floor=floor
+                store,
+                sweep.family,
+                basis="excess_spy",
+                added=k,
+                floor=floor,
+                undefined_floor=undefined,
             )
-            raw = results.next_trial_cost(store, sweep.family, basis="raw", added=k, floor=floor)
+            raw = results.next_trial_cost(
+                store, sweep.family, basis="raw", added=k, floor=floor, undefined_floor=undefined
+            )
             if (k, excess, raw) != (expected_k, expected_excess, expected_raw):
                 st.session_state[_OUTCOME] = (
                     "Trial cost changed since this dialog opened; nothing ran. "
@@ -374,11 +382,22 @@ def _on_hypothesis_run(
                 return
             rules = lab_registry.family_rules(store, hypothesis.family)
             floor = rules.min_sharpe_variance_annual if rules else 0.0
+            undefined = lab_registry.family_v_floor(rules) if rules else None
             excess = results.next_trial_cost(
-                store, hypothesis.family, basis="excess_spy", added=1, floor=floor
+                store,
+                hypothesis.family,
+                basis="excess_spy",
+                added=1,
+                floor=floor,
+                undefined_floor=undefined,
             )
             raw = results.next_trial_cost(
-                store, hypothesis.family, basis="raw", added=1, floor=floor
+                store,
+                hypothesis.family,
+                basis="raw",
+                added=1,
+                floor=floor,
+                undefined_floor=undefined,
             )
             if (excess, raw) != (expected_excess, expected_raw):
                 st.session_state[_OUTCOME] = (
@@ -704,11 +723,22 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
                     else:
                         rules = lab_registry.family_rules(conn, hypothesis.family)
                         floor = rules.min_sharpe_variance_annual if rules else 0.0
+                        undefined = lab_registry.family_v_floor(rules) if rules else None
                         excess = results.next_trial_cost(
-                            conn, hypothesis.family, basis="excess_spy", added=1, floor=floor
+                            conn,
+                            hypothesis.family,
+                            basis="excess_spy",
+                            added=1,
+                            floor=floor,
+                            undefined_floor=undefined,
                         )
                         raw = results.next_trial_cost(
-                            conn, hypothesis.family, basis="raw", added=1, floor=floor
+                            conn,
+                            hypothesis.family,
+                            basis="raw",
+                            added=1,
+                            floor=floor,
+                            undefined_floor=undefined,
                         )
                         if st.button("Run", key=f"run_{file.name}"):
                             _hypothesis_dialog(settings, hypothesis, window, excess, raw)
@@ -742,10 +772,18 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
                 continue
             rules = lab_registry.family_rules(conn, sweep.family)
             floor = rules.min_sharpe_variance_annual if rules else 0.0
+            undefined = lab_registry.family_v_floor(rules) if rules else None
             excess = results.next_trial_cost(
-                conn, sweep.family, basis="excess_spy", added=k, floor=floor
+                conn,
+                sweep.family,
+                basis="excess_spy",
+                added=k,
+                floor=floor,
+                undefined_floor=undefined,
             )
-            raw = results.next_trial_cost(conn, sweep.family, basis="raw", added=k, floor=floor)
+            raw = results.next_trial_cost(
+                conn, sweep.family, basis="raw", added=k, floor=floor, undefined_floor=undefined
+            )
             predicted = sum(
                 settings.lab.seconds_per_variant_default[p.cadence] for p in plan.variants
             )

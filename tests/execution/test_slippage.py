@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import duckdb
 import pytest
@@ -280,3 +280,439 @@ def test_the_report_line_names_the_reason_when_the_summary_is_unavailable() -> N
         "slippage n/a (not an XNYS session: 2026-10-17)"
     ]
     assert slippage.slippage_report_lines(None) == []
+
+
+# --- `paper cost`: the measured per-side cost (T383, #3118 item 3) -------------------
+
+_MON, _TUE, _WED, _THU = (
+    date(2026, 10, 26),
+    date(2026, 10, 27),
+    date(2026, 10, 28),
+    date(2026, 10, 29),
+)
+_REBALANCE_RUN, _STOP_RUN = 1, 9
+
+
+def _cost_fill(
+    order: str,
+    side: str,
+    security: str,
+    session: date,
+    qty: float,
+    price: float,
+    fill_id: int,
+    *,
+    run_id: int = _REBALANCE_RUN,
+    known: datetime | None = None,
+) -> OrderedFill:
+    at = _at(session)
+    stamp = known or at
+    row = FillRow(
+        fill_id=fill_id,
+        client_order_id=order,
+        filled_at=at,
+        quantity=qty,
+        price=price,
+        price_implied=False,
+        broker_fill_id=f"b{fill_id}",
+        source="broker_status",
+        known_at=stamp,
+        ingested_at=stamp,
+    )
+    return OrderedFill(
+        fill=row,
+        side=side,
+        security_id=security,
+        symbol=security,
+        run_id=run_id,
+        window_id=1,
+        order_session=session,
+    )
+
+
+#: Hand-computed: o1 buy +100 bp on 1,010; o2 buy -50 bp on 2,985 (two fills at 99.5);
+#: o3 sell +200 bp on 980; o4 sell -100 bp on 2,020. Buys -48,250 / 3,995 = -12.0776;
+#: sells -6,000 / 3,000 = -2.0; pooled -54,250 / 6,995 = -7.7556, frozen as -10.
+_COST_FILLS = [
+    _cost_fill("o1", "buy", "A", _MON, 10, 101.0, 1),
+    _cost_fill("o2", "buy", "B", _MON, 10, 99.5, 2),
+    _cost_fill("o2", "buy", "B", _MON, 20, 99.5, 3),
+    _cost_fill("o3", "sell", "C", _TUE, 20, 49.0, 4),
+    _cost_fill("o4", "sell", "D", _TUE, 10, 202.0, 5),
+]
+_COST_OPENS = {("A", _MON): 100.0, ("B", _MON): 100.0, ("C", _TUE): 50.0, ("D", _TUE): 200.0}
+_LATER = datetime(2026, 11, 2, 22, tzinfo=UTC)
+
+
+def _cost(
+    fills: list[OrderedFill],
+    *,
+    cutoff: datetime = _LATER,
+    stop_at: datetime | None = None,
+    month_end: frozenset[date] = frozenset(),
+    known: dict[str, datetime] | None = None,
+    opens: dict[tuple[str, date], float] | None = None,
+) -> slippage.MeasuredCost:
+    return slippage.measured_cost(
+        fills,
+        _COST_OPENS if opens is None else opens,
+        cutoff,
+        stop_run_ids=frozenset({_STOP_RUN}),
+        stop_at=stop_at,
+        month_end_sessions=month_end,
+        orders_known_at=known or {},
+    )
+
+
+def test_the_cost_weights_each_order_by_its_filled_notional_with_the_sign_per_side() -> None:
+    out = _cost(_COST_FILLS)
+    assert out.slippage.buy.wmean_bp == pytest.approx(-48_250 / 3_995)
+    assert out.slippage.sell.wmean_bp == pytest.approx(-2.0)
+    assert out.slippage.overall.wmean_bp == pytest.approx(-54_250 / 6_995)
+    assert (out.slippage.buy.count, out.slippage.sell.count) == (2, 2)
+    assert out.figure_bp == -10.0
+
+
+def test_the_figure_rounds_to_the_nearest_5_bp_and_a_tie_rounds_up() -> None:
+    assert [slippage.round_to_5bp(v) for v in (61.4, 62.4, 62.5, 57.5, -7.7556, -2.5)] == [
+        60.0,
+        60.0,
+        65.0,
+        60.0,
+        -10.0,
+        0.0,
+    ]
+
+
+def test_stop_run_orders_and_orders_on_or_after_the_stop_session_are_left_out() -> None:
+    fills = [
+        *_COST_FILLS,
+        _cost_fill("s1", "sell", "A", _TUE, 5, 1.0, 6, run_id=_STOP_RUN),  # -9,900 bp
+        _cost_fill("late", "buy", "A", _WED, 5, 1.0, 7),  # a rebalance after the stop
+    ]
+    # 22:00 New York on Tuesday is Wednesday in UTC: Tuesday's session had closed,
+    # so the stop starts at Wednesday's session and Tuesday's orders stay in.
+    out = _cost(fills, stop_at=datetime(2026, 10, 28, 2, tzinfo=UTC))
+    assert (out.stop_run, out.after_stop, out.stop_session) == (1, 1, _WED)
+    assert out.slippage.overall.wmean_bp == pytest.approx(-54_250 / 6_995)
+
+
+def test_the_stop_stamp_is_read_as_a_new_york_session() -> None:
+    during = slippage.stop_session_of(datetime(2026, 10, 27, 15, tzinfo=UTC))  # 11:00 NY
+    evening = slippage.stop_session_of(datetime(2026, 10, 28, 1, tzinfo=UTC))  # 21:00 NY Tue
+    weekend = slippage.stop_session_of(datetime(2026, 10, 31, 3, tzinfo=UTC))  # Fri 23:00 NY
+    assert (during, evening, weekend) == (_TUE, _WED, date(2026, 11, 2))
+    out = _cost(_COST_FILLS, stop_at=datetime(2026, 10, 27, 15, tzinfo=UTC))
+    assert (out.after_stop, out.slippage.sell.count) == (2, 0)
+
+
+def test_no_bar_off_session_and_pending_are_counted_apart_never_an_error() -> None:
+    off = _cost_fill("off", "buy", "A", _MON, 1, 100.0, 8)
+    off = OrderedFill(
+        fill=FillRow(
+            **{**off.fill.__dict__, "filled_at": _at(_TUE), "known_at": _at(_TUE)},
+        ),
+        side=off.side,
+        security_id=off.security_id,
+        symbol=off.symbol,
+        run_id=off.run_id,
+        window_id=off.window_id,
+        order_session=_MON,
+    )
+    fills = [
+        *_COST_FILLS,
+        _cost_fill("nobar", "buy", "Z", _MON, 1, 10.0, 9),
+        off,
+        _cost_fill("pend", "sell", "A", _THU, 1, 10.0, 10),
+    ]
+    out = _cost(fills, cutoff=datetime(2026, 10, 29, 16, tzinfo=UTC))  # Thursday, mid-session
+    assert (out.slippage.no_bar, out.slippage.off_session, out.slippage.pending) == (1, 1, 1)
+    assert out.slippage.overall.wmean_bp == pytest.approx(-54_250 / 6_995)
+
+
+def test_orders_on_sessions_a_month_end_book_traded_are_figured_beside_the_pool() -> None:
+    out = _cost(_COST_FILLS, month_end=frozenset({_MON}))
+    assert out.month_end.count == 2
+    assert out.month_end.wmean_bp == pytest.approx(-48_250 / 3_995)
+    assert out.slippage.overall.count == 4  # still in the pool
+
+
+def test_nothing_known_after_the_cutoff_changes_the_cost() -> None:
+    cutoff = session_close(_TUE)
+    later = cutoff + timedelta(minutes=1)
+    base = _cost(_COST_FILLS, cutoff=cutoff)
+    added = [
+        *_COST_FILLS,
+        _cost_fill("o4", "sell", "D", _TUE, 90, 1.0, 11, known=later),  # a late fill
+        _cost_fill("lateorder", "buy", "A", _TUE, 1, 1.0, 12),  # its order known later
+    ]
+    out = _cost(added, cutoff=cutoff, known={"lateorder": later})
+    assert out == base
+
+
+def test_the_window_cost_opens_nothing_known_after_the_cutoff(
+    store: duckdb.DuckDBPyConnection,
+) -> None:
+    """Store-backed: a fill, an order and a bar known after the cutoff change nothing."""
+    _seed_cost_window(store)
+    cutoff = session_close(_TUE)
+    before = slippage.window_cost(store, 1, cutoff)
+    later = cutoff + timedelta(hours=1)
+    _journal_order(store, "late", "buy", "A", _TUE, known=later)
+    _journal_fill(store, 20, "late", _TUE, 1, 1.0, known=later)
+    _journal_fill(store, 21, "o4", _TUE, 50, 1.0, known=later)
+    store.execute(
+        "UPDATE prices_daily SET known_at = ?, ingested_at = ? WHERE security_id = 'C'",
+        [later, later],
+    )
+    after = slippage.window_cost(store, 1, cutoff)
+    assert before.slippage.overall.wmean_bp == pytest.approx(-54_250 / 6_995)
+    assert after.slippage.overall.count == 3  # C's bar is now unknown at the cutoff
+    assert after.slippage.no_bar == 1
+    assert after.figure_bp is not None
+    # once known, the late fill moves o4's VWAP and the late order is counted (no bar
+    # for A on Tuesday); C's bar stays unknown as of its own session's close
+    much_later = slippage.window_cost(store, 1, later + timedelta(days=30))
+    assert much_later.slippage.no_bar == 2
+    assert much_later.slippage.sell.wmean_bp != after.slippage.sell.wmean_bp
+
+
+def test_the_window_cost_reads_stop_runs_the_stop_and_month_end_sessions(
+    store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_cost_window(store)
+    _journal_run(store, _STOP_RUN, 1, _WED, "stop")
+    _journal_order(store, "s1", "sell", "A", _WED, run_id=_STOP_RUN)
+    _journal_fill(store, 30, "s1", _WED, 5, 1.0)
+    stamp = datetime(2026, 10, 28, 2, tzinfo=UTC)
+    store.execute(
+        'INSERT INTO paper_window_stops (window_id, "at", state, known_at, ingested_at) '
+        "VALUES (1, ?, 'requested', ?, ?)",
+        [stamp, stamp, stamp],
+    )
+    # window 2 is another book, month_end, which traded on Monday
+    store.execute(
+        "INSERT INTO paper_windows (window_id, hypothesis_id, first_rebalance_session, "
+        "account_id, starting_cash, starting_equity, code_version, started_at, frozen_json, "
+        "frozen_sha256, book_id, known_at, ingested_at) VALUES (2, 7, ?, 'PA2', 1, 1, 't', ?, "
+        "'{}', ?, 'main', ?, ?)",
+        [_MON, _at(_MON), "0" * 64, _at(_MON), _at(_MON)],
+    )
+    _journal_run(store, 2, 2, _MON, "rebalance")
+    _journal_order(store, "m1", "buy", "A", _MON, run_id=2)
+    monkeypatch.setattr(
+        slippage, "_hypothesis_cadence", lambda _c, hid: "month_end" if hid == 7 else "daily"
+    )
+    out = slippage.window_cost(store, 1, _LATER)
+    assert (out.stop_run, out.stop_session, out.month_end.count) == (1, _WED, 2)
+    assert out.slippage.overall.count == 4
+
+
+def _journal_run(
+    conn: duckdb.DuckDBPyConnection, run_id: int, window_id: int, session: date, kind: str
+) -> None:
+    at = _at(session) - timedelta(hours=7)
+    conn.execute(
+        "INSERT INTO paper_runs (run_id, window_id, session, kind, started_at, invoked_by, "
+        "code_version, known_at, ingested_at) VALUES (?, ?, ?, ?, ?, 'scheduler', 't', ?, ?)",
+        [run_id, window_id, session, kind, at, at, at],
+    )
+
+
+def _journal_order(
+    conn: duckdb.DuckDBPyConnection,
+    order: str,
+    side: str,
+    security: str,
+    session: date,
+    *,
+    run_id: int = _REBALANCE_RUN,
+    known: datetime | None = None,
+) -> None:
+    at = known or _at(session) - timedelta(hours=6)
+    conn.execute(
+        "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, phase, "
+        "security_id, symbol, side, notional, sells_in_flight_at_submit, known_at, "
+        "ingested_at) VALUES (?, 1, ?, ?, 1, ?, ?, ?, ?, 1, false, ?, ?)",
+        [order, run_id, session, side, security, security, side, at, at],
+    )
+
+
+def _journal_fill(
+    conn: duckdb.DuckDBPyConnection,
+    fill_id: int,
+    order: str,
+    session: date,
+    qty: float,
+    price: float,
+    *,
+    known: datetime | None = None,
+) -> None:
+    at = _at(session)
+    stamp = known or at
+    conn.execute(
+        "INSERT INTO fills (fill_id, client_order_id, filled_at, quantity, price, "
+        "price_implied, broker_fill_id, source, known_at, ingested_at) VALUES "
+        "(?, ?, ?, ?, ?, false, ?, 'broker_feed', ?, ?)",
+        [fill_id, order, at, qty, price, f"b{fill_id}", stamp, stamp],
+    )
+
+
+def _seed_cost_window(conn: duckdb.DuckDBPyConnection) -> None:
+    """Window 1 (`daily`) with `_COST_FILLS` journaled and their bars."""
+    conn.execute(
+        "INSERT INTO paper_windows (window_id, hypothesis_id, first_rebalance_session, "
+        "account_id, starting_cash, starting_equity, code_version, started_at, frozen_json, "
+        "frozen_sha256, book_id, known_at, ingested_at) VALUES (1, 1, ?, 'PA1', 1, 1, 't', ?, "
+        "'{}', ?, 'daily', ?, ?)",
+        [_MON, _at(_MON), "0" * 64, _at(_MON), _at(_MON)],
+    )
+    _journal_run(conn, _REBALANCE_RUN, 1, _MON, "rebalance")
+    for item in _COST_FILLS:
+        if (
+            conn.execute(
+                "SELECT 1 FROM orders WHERE client_order_id = ?", [item.fill.client_order_id]
+            ).fetchone()
+            is None
+        ):
+            _journal_order(
+                conn, item.fill.client_order_id, item.side, item.security_id, item.order_session
+            )  # type: ignore[arg-type]
+        _journal_fill(
+            conn,
+            item.fill.fill_id or 0,
+            item.fill.client_order_id,
+            item.order_session,  # type: ignore[arg-type]
+            item.fill.quantity,
+            item.fill.price,
+        )
+    for (security, session), open_ in _COST_OPENS.items():
+        _bar_on(conn, security, session, open_=open_, close=open_)
+
+
+# --- the arrival split (#3179) ---------------------------------------------------------
+
+_PRE_OPEN = datetime(2026, 10, 14, 13, 0, tzinfo=UTC)  # 09:00 New York, before the open
+_AT_OPEN = datetime(2026, 10, 14, 13, 30, tzinfo=UTC)  # 09:30 New York, the open itself
+_MIDSESSION = datetime(2026, 10, 14, 14, 45, tzinfo=UTC)  # 10:45 New York (T377's window)
+
+
+def test_an_order_submitted_before_the_open_arrives_at_the_open() -> None:
+    assert slippage.arrival_price(100.0, SESSION, _PRE_OPEN) == 100.0
+
+
+def test_an_order_submitted_at_or_after_the_open_has_no_arrival_price() -> None:
+    """The store holds only the daily bar: a price after the open is never guessed."""
+    assert slippage.arrival_price(100.0, SESSION, _AT_OPEN) is None
+    assert slippage.arrival_price(100.0, SESSION, _MIDSESSION) is None
+    assert slippage.arrival_price(100.0, SESSION, None) is None
+
+
+def test_the_two_terms_carry_the_totals_sign_per_side() -> None:
+    # arrival 101 then fill 101.5 on an open of 100: the buy paid the move (+100) and
+    # its own trading (+50); the sell gained the move (-100) and paid nothing back (-50)
+    buy = slippage.split_bp("buy", 101.5, 100.0, 101.0)
+    sell = slippage.split_bp("sell", 101.5, 100.0, 101.0)
+    assert buy == (pytest.approx(100.0), pytest.approx(50.0))
+    assert sell == (pytest.approx(-100.0), pytest.approx(-50.0))
+
+
+_SPLIT_FILLS = [
+    _fill("buy", "A", 100.37, 1, order="b1", qty=7.0),
+    _fill("buy", "A", 100.41, 2, order="b1", qty=3.0),
+    _fill("buy", "B", 199.13, 3, order="b2", qty=4.0),
+    _fill("sell", "A", 99.71, 4, order="s1", qty=11.0),
+    _fill("sell", "B", 200.29, 5, order="s2", qty=2.0),
+]
+_SPLIT_OPENS = {("A", SESSION): 100.03, ("B", SESSION): 199.77}
+
+
+def test_every_orders_total_is_exactly_the_sum_of_its_two_terms() -> None:
+    for item in _SPLIT_FILLS:
+        open_price = _SPLIT_OPENS[(item.security_id, SESSION)]
+        arrival = slippage.arrival_price(open_price, SESSION, _PRE_OPEN)
+        assert arrival is not None
+        drift, impact = slippage.split_bp(item.side, item.fill.price, open_price, arrival)
+        assert drift + impact == slippage.slippage_bp(item.side, item.fill.price, open_price)
+
+
+def test_the_split_sums_exactly_to_the_unchanged_total_per_group() -> None:
+    submitted = {o: _PRE_OPEN for o in ("b1", "b2", "s1", "s2")}
+    before = slippage.summarise(_SPLIT_FILLS, _SPLIT_OPENS, AFTER)
+    out = slippage.summarise(_SPLIT_FILLS, _SPLIT_OPENS, AFTER, submitted)
+    assert (out.buy, out.sell, out.overall) == (before.buy, before.sell, before.overall)
+    for group, split in (
+        (out.buy, out.buy_split),
+        (out.sell, out.sell_split),
+        (out.overall, out.overall_split),
+    ):
+        assert split.count == group.count
+        assert split.total_wmean_bp == group.wmean_bp
+        assert split.open_to_arrival_wmean_bp is not None
+        assert split.arrival_to_fill_wmean_bp is not None
+        assert (
+            split.open_to_arrival_wmean_bp + split.arrival_to_fill_wmean_bp == split.total_wmean_bp
+        )
+    assert out.no_arrival == 0
+
+
+def test_an_order_without_an_arrival_price_stays_in_the_total_and_is_counted() -> None:
+    submitted = {"b1": _PRE_OPEN, "b2": _MIDSESSION, "s1": _AT_OPEN}  # s2 has none
+    before = slippage.summarise(_SPLIT_FILLS, _SPLIT_OPENS, AFTER)
+    out = slippage.summarise(_SPLIT_FILLS, _SPLIT_OPENS, AFTER, submitted)
+    assert out.overall == before.overall  # the total is untouched
+    assert (out.no_arrival, out.overall_split.count, out.buy_split.count) == (3, 1, 1)
+    assert out.sell_split == slippage.ArrivalSplit(0, None, None, None)
+    only_b1 = slippage.summarise(_SPLIT_FILLS[:2], _SPLIT_OPENS, AFTER)
+    assert out.buy_split.total_wmean_bp == only_b1.buy.wmean_bp
+
+
+def test_without_submit_times_every_measured_order_has_no_arrival_price() -> None:
+    out = slippage.summarise(_SPLIT_FILLS, _SPLIT_OPENS, AFTER)
+    assert (out.no_arrival, out.overall_split.count) == (4, 0)
+    pending = slippage.summarise(_SPLIT_FILLS, _SPLIT_OPENS, NOW, {"b1": _PRE_OPEN})
+    assert (pending.pending, pending.no_arrival) == (4, 0)  # pending is not measured
+
+
+def test_the_split_line_names_both_terms_and_the_orders_without_an_arrival() -> None:
+    out = slippage.summarise(
+        [_fill("buy", "A", 100.5, 1), _fill("sell", "A", 99.0, 2)],
+        {("A", SESSION): 100.0},
+        AFTER,
+        {"o1": _PRE_OPEN, "o2": _MIDSESSION},
+    )
+    assert slippage.slippage_report_lines(out) == [
+        slippage.slippage_line(out),
+        "slippage split at arrival (bp, open->arrival + arrival->fill = total, per order "
+        "with an arrival price): buy n=1 +0.00 + +50.00 = +50.00; sell n=0; "
+        "all n=1 +0.00 + +50.00 = +50.00; no arrival price 1",
+    ]
+
+
+def test_window_slippage_reads_each_orders_journaled_submit_time(
+    store: duckdb.DuckDBPyConnection,
+) -> None:
+    _seed_cost_window(store)  # every order journaled at 05:00 New York, before the open
+    store.execute(
+        "UPDATE orders SET known_at = ?, ingested_at = ? WHERE client_order_id = 'o4'",
+        [session_close(_TUE) - timedelta(hours=5), session_close(_TUE) - timedelta(hours=5)],
+    )
+    out = slippage.window_slippage(store, 1, _LATER)
+    assert out.overall.wmean_bp == pytest.approx(-54_250 / 6_995)  # the total as before
+    assert (out.no_arrival, out.overall_split.count, out.sell_split.count) == (1, 3, 1)
+    assert out.sell_split.total_wmean_bp == pytest.approx(200.0)  # o3 alone
+
+
+def test_the_measured_cost_splits_at_the_orders_known_at_and_keeps_its_figure() -> None:
+    known = {
+        o: datetime.combine(s, datetime.min.time(), UTC)
+        for o, s in (("o1", _MON), ("o2", _MON), ("o3", _TUE), ("o4", _TUE))
+    }
+    base = _cost(_COST_FILLS)
+    out = _cost(_COST_FILLS, known=known)
+    assert out.figure_bp == base.figure_bp == -10.0
+    assert out.slippage.overall == base.slippage.overall
+    split = out.slippage.overall_split
+    assert (split.count, split.total_wmean_bp) == (4, out.slippage.overall.wmean_bp)
+    assert split.open_to_arrival_wmean_bp == 0.0
+    assert split.arrival_to_fill_wmean_bp == split.total_wmean_bp

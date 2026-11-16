@@ -20,6 +20,7 @@ from execution.test_reconcile_run import (
     CUT,
     FUNDING,
     MTUM,
+    ROOMY,
     SPY,
     BookedFake,
     FixedClock,
@@ -33,11 +34,14 @@ from execution.test_reconcile_run import (
     fake,  # noqa: F401  (fixture)
 )
 from tradepartner.adapters.broker import CashActivity
-from tradepartner.calendar import next_session
+from tradepartner.calendar import next_session, session_close
 from tradepartner.config import Settings
 from tradepartner.errors import ReconciliationError
 from tradepartner.execution import reconcile_run
 from tradepartner.execution.reconcile import OK, OVERDUE_DELISTING_CASH
+from tradepartner.execution.reconcile_run import _journal_state, _ledger
+from tradepartner.store.asof import live_actions_as_of
+from tradepartner.store.db import open_read_only
 from tradepartner.store.journal import PaperWindowRow
 
 AFTER = date(2026, 10, 9)  # the first session after the cash window
@@ -476,3 +480,104 @@ def test_late_delisting_cash_with_no_removal_row_raises_in_the_lot_ledger() -> N
 
     with pytest.raises(LotLedgerError, match="no removal row"):
         book.run(D0312)
+
+
+# --- #2722: a cash removal is stated on the session the broker paid it --------
+
+S2 = next_session(S)  # Friday 2026-10-02
+S3 = next_session(S2)  # Monday 2026-10-05
+
+
+def _held_through_s(
+    settings: Settings, broker: BookedFake, window: PaperWindowRow, clock: FixedClock
+) -> None:
+    """10 `MTUM` held and reconciled `ok` on S (the cash base), then a delisting
+    known at close(S), before the next reconcile's cut."""
+    broker.activities.append(FUNDING)
+    run_id = _hold(settings, broker, window, {(MTUM, "MTUM"): 10.0})
+    assert _reconcile(settings, broker, window, clock, run_id=run_id).status == OK
+    _delisting(settings, MTUM, session_close(S) - timedelta(hours=1))
+
+
+def _paid(broker: BookedFake, proceeds: float, day: date, tagged: float | None = None) -> None:
+    """The broker removed the 10 `MTUM` and credited `proceeds`, with an `MA`
+    activity of `tagged` (default `proceeds`) dated `day`."""
+    broker.extra_quantity["MTUM"] = -10.0
+    broker.extra_cash = proceeds
+    broker.activities.append(_credit("MTUM", proceeds if tagged is None else tagged, day))
+
+
+def test_a_cash_removal_is_stated_on_the_session_the_broker_paid_it(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """The live ACA shape (#2722, owner decision 2026-10-31): the broker paid the
+    cash on S2 (its `MA` activity's date), the reconcile that first sees it runs
+    on S3. The removal is stated on S2, so the S2 mark holds the cash, not the
+    delisted shares; the next reconcile books nothing again."""
+    _held_through_s(journal_settings, fake, open_window, fixed_clock)
+    proceeds = 10 * _reference(journal_settings, MTUM)
+    _paid(fake, proceeds, S2)
+    _at(fixed_clock, S3)
+
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, session=S3).status == OK
+
+    (row,) = _adjustments(journal_settings, open_window)
+    assert (row.kind, row.quantity, row.cash) == ("corporate_action_cash", -10.0, proceeds)
+    assert row.session == S2
+    # The S2 mark's ledger (the one `paper run` marks S2 with after this
+    # reconcile): the cash, no shares; S keeps the shares.
+    with open_read_only(journal_settings) as conn:
+        state = _journal_state(conn, open_window.window_id or 0, fixed_clock())
+        actions = live_actions_as_of(conn, session_close(S2))
+        on_s2 = _ledger(state, actions, open_window, S2, ROOMY.reconcile_quantity_tolerance)
+        on_s = _ledger(state, actions, open_window, S, ROOMY.reconcile_quantity_tolerance)
+    assert MTUM not in on_s2.positions
+    assert on_s2.cash == pytest.approx(on_s.cash + proceeds)
+    assert on_s.positions[MTUM] == pytest.approx(10.0)
+    again = next_session(S3)
+    _at(fixed_clock, again)
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, session=again).status == OK
+    assert len(_adjustments(journal_settings, open_window)) == 1
+
+
+def test_a_payment_dated_before_the_cash_base_is_stated_on_the_bases_session(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """An activity dated before the base's session (posted after S's `ok`
+    reconcile read the broker) is stated no earlier than the base, whose cash
+    did not hold it: never a session whose base already counts the broker's cash."""
+    _held_through_s(journal_settings, fake, open_window, fixed_clock)
+    proceeds = 10 * _reference(journal_settings, MTUM)
+    _paid(fake, proceeds, date(2026, 9, 30))
+    _at(fixed_clock, S3)
+
+    assert _reconcile(journal_settings, fake, open_window, fixed_clock, session=S3).status == OK
+
+    (row,) = _adjustments(journal_settings, open_window)
+    assert row.session == S
+
+
+def test_a_tagged_credit_that_is_not_the_removals_cash_keeps_the_reconcile_session(
+    journal_settings: Settings,
+    fake: BookedFake,  # noqa: F811
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Fail closed: when the tagged credits do not sum to the cash the removal
+    took, the payment date is not evidenced, so the row stays on the reconcile's
+    session (the behaviour before #2722)."""
+    _held_through_s(journal_settings, fake, open_window, fixed_clock)
+    proceeds = 10 * _reference(journal_settings, MTUM)
+    _paid(fake, proceeds, S2, tagged=proceeds / 2)
+    _at(fixed_clock, S3)
+
+    _reconcile(journal_settings, fake, open_window, fixed_clock, session=S3)
+
+    removals = [a for a in _adjustments(journal_settings, open_window) if a.quantity is not None]
+    assert [a.session for a in removals] == [S3]

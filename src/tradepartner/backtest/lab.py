@@ -35,20 +35,27 @@ In order:
    `holdout.decide` as `kind=in_sample` over its default in-sample window
    (`lab_queries.default_window`, `holdout.default_in_sample_window` at its
    cadence), so every variant has its `TrialHandle` before the group's first
-   provider call. The group runs through `engine.run_many` over a
-   `StoreProvider` that, between steps, waits out any quiet interval with its
-   step connection closed. Each variant is then closed in its own write chunk
-   with one `sweep_trials` row: `ok` through `results.write_results` at
-   `lab.sweep_detail_level`; `failed` with its own error's message when its own
-   computation failed; `failed` with `shared read failed` on every variant
-   still open when a shared read failed; `failed` with `store changed during
-   run` when the data vintage at its own cutoff differs between the trial's
-   open and the write.
+   provider call. The group runs through `engine.run_many` over a `StoreProvider` that,
+   between steps, waits out any quiet interval with its step connection closed. While
+   the results are in memory, one `delisting_reasons` read at the group's cutoff gives
+   each run variant its delisting exit coverage counts (`run.with_exit_coverage`, plan
+   T329), under every policy, on its base level's last rebalance row; an error there
+   fails every variant of the group with its message. The counts are a run-time
+   snapshot outside the data vintage, so a reason ingested mid-run moves them and
+   fails nothing. Each group is then checked and closed under one write lock,
+   with one `sweep_trials` row per variant: `ok` through
+   `results.write_results` at `lab.sweep_detail_level`; `failed` with its own error's
+   message when its own computation failed; `failed` with `shared read failed` on
+   every variant still open when a shared read failed; `failed` with `store changed
+   during run` when the data vintage at its own cutoff differs between the trial's
+   open and the write. If a group write fails, it rolls back and each variant
+   is retried in its own write chunk.
 4. **Close the run**: the counts, the seconds, `n_trials_at_end`
    (`results.family_n`, the one N function), `sr_star_annual_at_end`
    (`expected_max_sharpe` at that N over the family's excess-basis
-   `family_sharpes` variance floored at the family rules'
-   `min_sharpe_variance_annual`), and `completed` from `lab_queries.sweep_state`.
+   `family_sharpes` variance through `lab_registry.floored_variance`: floored at
+   the rules' `min_sharpe_variance_annual`, or `family_v_floor` when undefined,
+   #3127), and `completed` from `lab_queries.sweep_state`.
 
 **Quiet intervals** (spec, Definitions). The runner holds no connection
 between groups. Inside an interval it opens no trial, holds no connection and
@@ -99,6 +106,7 @@ from pathlib import Path
 from typing import Final, Literal, Protocol, cast
 
 import duckdb
+import polars as pl
 
 from tradepartner import calendar
 from tradepartner.backtest import engine, placebo, quiet
@@ -109,6 +117,7 @@ from tradepartner.backtest.holdout import Flags, Frozen, Reasons, Window, decide
 from tradepartner.backtest.hypothesis import load_frozen
 from tradepartner.backtest.metrics import expected_max_sharpe
 from tradepartner.backtest.results import family_n, write_results
+from tradepartner.backtest.run import exit_coverage_counts, with_exit_coverage
 from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.store_provider import Connect, StoreProvider
 from tradepartner.config import Cadence, HypothesisFamily, Settings, clean_message, get_settings
@@ -249,7 +258,7 @@ class _PausingProvider(StoreProvider):
         timing: _Timing,
     ) -> None:
         self._timing = timing
-        super().__init__(connect, handle, frozen_settings)
+        super().__init__(connect, handle, frozen_settings, refuse_forked_chains=True)
 
     def _at(self, t: datetime) -> duckdb.DuckDBPyConnection:
         if self._conn is None or self._step_t != t:
@@ -267,6 +276,7 @@ class _Opened:
     window: Window
     cutoff: datetime
     vintage: datetime | None
+    vintage_gates: registry.VintageGates
     frozen_settings: Settings | None = None
     status: TrialStatus | None = None
     message: str | None = None
@@ -278,8 +288,9 @@ class _Opened:
 def _on_store(live: Settings, store_path: Path | str | None) -> Settings:
     if store_path is None:
         return live
-    store = live.store.model_copy(update={"path": str(store_path)})
-    return live.model_copy(update={"store": store})
+    return type(live).model_validate(
+        {**live.model_dump(), "store": {**live.store.model_dump(), "path": str(store_path)}}
+    )
 
 
 def _describe(exc: BaseException) -> str:
@@ -492,6 +503,7 @@ def _open_group(
     default window) or a variant whose frozen settings cannot load is closed at
     once, in the same chunk, and never runs."""
     opened: list[_Opened] = []
+    snapshots: dict[tuple[datetime, registry.VintageGates], registry.TrialSnapshot] = {}
     for planned in group:
         record = registry.get_hypothesis_by_id(conn, planned.variant.hypothesis_id)
         window = lab_queries.default_window(conn, record.hypothesis_id, sweep.sweep_id)
@@ -503,6 +515,9 @@ def _open_group(
         )
         sessions = gap_sessions(window, cadence)
         cutoff = read_time(sessions[-1], cadence)
+        key = (cutoff, registry.vintage_gates(record))
+        if key not in snapshots:
+            snapshots[key] = registry.trial_snapshot(conn, cutoff, key[1])
         handle = registry.open_trial(
             conn,
             hypothesis_id=record.hypothesis_id,
@@ -515,11 +530,12 @@ def _open_group(
             settings=live,
             detail_level=live.lab.sweep_detail_level,
             note=placebo.shock_note(frozen_values(record)),
+            snapshot=snapshots[key],
         )
         (vintage,) = conn.execute(  # type: ignore[misc]
             "SELECT data_vintage FROM trials WHERE trial_id = ?", [handle.trial_id]
         ).fetchone()
-        entry = _Opened(planned, handle, window, cutoff, vintage)
+        entry = _Opened(planned, handle, window, cutoff, vintage, key[1])
         if decision.outcome != "run" or decision.kind != "in_sample":
             entry.status, entry.message = _refusal(decision.outcome), decision.message
         else:
@@ -561,10 +577,63 @@ def _run_group(
     elapsed = (timing.clock.now() - began).total_seconds()
     seconds = max(elapsed - (timing.paused_seconds - paused_before), 0.0) / max(len(running), 1)
     timing.wait_out_interval()
-    for entry in opened:
-        # A variant closed at its open never ran: its seconds are not a run time.
-        _close_variant(entry, sweep_run_id, store, live, seconds if entry.ran else 0.0)
+    _close_group(opened, sweep_run_id, store, live, seconds)
     return opened
+
+
+def _close_group(
+    opened: list[_Opened], sweep_run_id: int, store: Settings, live: Settings, seconds: float
+) -> None:
+    """Check and close a group under one store write lock, with per-trial fallback."""
+    before = [(entry.status, entry.message) for entry in opened]
+    try:
+        with open_for_write(store) as conn:
+            changed = _group_changed(conn, opened)
+            for entry in opened:
+                _write_variant(
+                    conn,
+                    entry,
+                    sweep_run_id,
+                    store,
+                    live,
+                    seconds if entry.ran else 0.0,
+                    changed.get(entry.handle.trial_id, False),
+                )
+    except Exception:
+        # A failed group write rolls back. Retry each trial in its own chunk so
+        # one bad result cannot prevent the other variants from being recorded.
+        for entry, (status, message) in zip(opened, before, strict=True):
+            entry.status, entry.message = status, message
+            _close_variant(entry, sweep_run_id, store, live, seconds if entry.ran else 0.0)
+    for entry in opened:
+        entry.results = None
+
+
+def _group_changed(conn: duckdb.DuckDBPyConnection, opened: list[_Opened]) -> dict[int, bool]:
+    """Compare each trial with one live fact scan per cutoff and vintage gate."""
+    changed: dict[int, bool] = {}
+    live_vintages: dict[tuple[datetime, bool, str], datetime | None] = {}
+    live_max: datetime | None = None
+    max_read = False
+    for entry in opened:
+        if not entry.ran:
+            continue
+        key = (
+            entry.cutoff,
+            entry.vintage_gates.spin_offs,
+            entry.vintage_gates.delisting_policy,
+        )
+        if key not in live_vintages:
+            live_vintages[key] = registry.data_vintage(
+                conn, key[0], spin_offs=key[1], delisting_policy=key[2]
+            )
+        changed[entry.handle.trial_id] = live_vintages[key] != entry.vintage
+        if entry.vintage is None:
+            if not max_read:
+                live_max = registry.store_max_ingested_at(conn)
+                max_read = True
+            changed[entry.handle.trial_id] |= live_max != entry.handle.store_max_ingested_at
+    return changed
 
 
 def _run_engine(
@@ -595,6 +664,7 @@ def _run_engine(
                 # write_results writes weights only at full detail (#1448).
                 keep_detail=first.handle.detail_level == "full",
             )
+            coverage = _exit_coverage(running, results, provider)
     except SharedReadFailed as exc:
         error = "".join(traceback.format_exception(exc))
         for entry in running:
@@ -612,17 +682,43 @@ def _run_engine(
             entry.status, entry.message = "failed", _describe(failure)
             entry.error = "".join(traceback.format_exception(failure))
         else:
-            entry.results = results[trial_id]
+            assert entry.frozen_settings is not None
+            entry.results = with_exit_coverage(
+                results[trial_id], entry.frozen_settings.costs.per_side_bps, coverage[trial_id]
+            )
+
+
+def _exit_coverage(
+    running: Sequence[_Opened], results: engine.RunManyResults, provider: StoreProvider
+) -> dict[int, dict[str, int]]:
+    """Each run variant's `run.EXIT_COVERAGE_COUNTS` (plan T329), from **one**
+    `delisting_reasons` read at the group's data cutoff (one window, so one cutoff)
+    for every run variant's base-level delisting exits, made while the results are in
+    memory and before anything is written (module docstring, step 3)."""
+    exits = {
+        o.handle.trial_id: results[o.handle.trial_id][
+            cast(Settings, o.frozen_settings).costs.per_side_bps
+        ].delisting_exits
+        for o in running
+        if o.handle.trial_id in results
+    }
+    ids = sorted({e.security_id for found in exits.values() for e in found})
+    reasons = provider.delisting_reasons(running[0].cutoff, ids) if ids else pl.DataFrame()
+    return {trial_id: exit_coverage_counts(found, reasons) for trial_id, found in exits.items()}
 
 
 def _close_variant(
-    entry: _Opened, sweep_run_id: int, store: Settings, live: Settings, seconds: float
+    entry: _Opened,
+    sweep_run_id: int,
+    store: Settings,
+    live: Settings,
+    seconds: float,
 ) -> None:
-    """Write the variant's outcome and its `sweep_trials` row in one write chunk.
+    """Fallback: check and write one variant in its own chunk.
     A variant that entered the engine fails `store changed during run` when the
     data vintage at its cutoff moved since the open, read under the variant's
-    frozen `adjust.apply_spin_offs` (backtest spec amendment #1894, item 6; T211d),
-    whatever its own outcome
+    frozen `adjust.apply_spin_offs` (backtest spec amendment #1894, item 6; T211d)
+    and `backtest.delisting_failure_return` (#2670, T328d), whatever its own outcome
     (req 2: every open variant of the group; its own error would otherwise count
     toward terminal failure on data that changed under it); else its result rows,
     or its own failure. A write that raises is closed `failed` in a chunk of its
@@ -631,34 +727,8 @@ def _close_variant(
     nor moves the terminal-failure count) and the next plain run reruns it."""
     try:
         with open_for_write(store) as conn:
-            spin_offs = (
-                entry.frozen_settings.adjust.apply_spin_offs
-                if entry.frozen_settings is not None
-                else False
-            )
-            changed = (
-                entry.ran
-                and registry.data_vintage(conn, entry.cutoff, spin_offs=spin_offs) != entry.vintage
-            )
-            if changed:
-                entry.status, entry.message = "failed", STORE_CHANGED_MESSAGE
-                registry.close_trial(conn, entry.handle, "failed", STORE_CHANGED_MESSAGE)
-            elif entry.results is not None and entry.status is None:
-                assert entry.frozen_settings is not None
-                status = write_results(
-                    conn,
-                    entry.handle,
-                    entry.results,
-                    entry.frozen_settings,
-                    detail_level=live.lab.sweep_detail_level,
-                )
-                entry.status = "ok" if status == "ok" else "failed"
-                entry.message = None if status == "ok" else STORE_CHANGED_MESSAGE
-            elif _has_no_result(conn, entry.handle):
-                entry.status = entry.status if entry.status is not None else "failed"
-                entry.message = clean_message(entry.message or "", store)
-                registry.close_trial(conn, entry.handle, entry.status, entry.message)
-            _write_sweep_trial(conn, entry, sweep_run_id, seconds)
+            changed = _group_changed(conn, [entry]).get(entry.handle.trial_id, False)
+            _write_variant(conn, entry, sweep_run_id, store, live, seconds, changed)
     except StoreLockedError as exc:
         entry.status, entry.message = "failed", clean_message(_describe(exc), store)
         entry.error = "".join(traceback.format_exception(exc))
@@ -670,6 +740,38 @@ def _close_variant(
                 registry.close_trial(conn, entry.handle, "failed", entry.message)
             _write_sweep_trial(conn, entry, sweep_run_id, seconds)
     entry.results = None
+
+
+def _write_variant(
+    conn: duckdb.DuckDBPyConnection,
+    entry: _Opened,
+    sweep_run_id: int,
+    store: Settings,
+    live: Settings,
+    seconds: float,
+    changed: bool,
+) -> None:
+    """Write a trial's result and sweep row after its store state was checked."""
+    if changed:
+        entry.status, entry.message = "failed", STORE_CHANGED_MESSAGE
+        registry.close_trial(conn, entry.handle, "failed", STORE_CHANGED_MESSAGE)
+    elif entry.results is not None and entry.status is None:
+        assert entry.frozen_settings is not None
+        status = write_results(
+            conn,
+            entry.handle,
+            entry.results,
+            entry.frozen_settings,
+            detail_level=live.lab.sweep_detail_level,
+            store_changed=False,
+        )
+        entry.status = "ok" if status == "ok" else "failed"
+        entry.message = None if status == "ok" else STORE_CHANGED_MESSAGE
+    elif _has_no_result(conn, entry.handle):
+        entry.status = entry.status if entry.status is not None else "failed"
+        entry.message = clean_message(entry.message or "", store)
+        registry.close_trial(conn, entry.handle, entry.status, entry.message)
+    _write_sweep_trial(conn, entry, sweep_run_id, seconds)
 
 
 def _has_no_result(conn: duckdb.DuckDBPyConnection, handle: TrialHandle) -> bool:
@@ -708,8 +810,10 @@ def _close_run(
         n_trials = family_n(conn, sweep.family)
         variance = registry.family_sharpes(conn, sweep.family).variance("excess_spy")
         rules = lab_registry.family_rules(conn, sweep.family)
-        floor = rules.min_sharpe_variance_annual if rules is not None else 0.0
-        floored = max(variance if variance is not None else 0.0, floor)
+        if rules is not None:
+            floored = lab_registry.floored_variance(rules, variance)
+        else:
+            floored = variance if variance is not None else 0.0
         sr_star = expected_max_sharpe(n_trials, floored) if n_trials >= 1 else 0.0
         lab_registry.close_sweep_run(
             conn,

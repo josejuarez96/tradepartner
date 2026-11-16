@@ -2,15 +2,17 @@
 criterion; plan task T108).
 
 `sweep_report(conn, slug)` reads a sweep's latest registration and its family in a
-number of reads that grows with the variants, never with the trials: the `sweeps`
-row and the family rules (`lab_registry`), every variant of every sweep in the
-family (one `sweep_variants` read), their registrations (one `hypotheses` read),
-their in-sample trials with results (one `trials` read), the variant states
+number of reads that grows with the variants, never with the trials: the `sweeps` row
+and the family rules (`lab_registry`), every variant of every sweep in the family (one
+`sweep_variants` read), their registrations (one `hypotheses` read), their in-sample
+trials with results (one `trials` read), the variant states
 (`lab_queries.variant_states`, a few reads per variant), the counted trials'
-base-level metrics (one `trial_metrics` read), **one** `registry.family_sharpes`
-call (itself one `trial_metrics` query per basis) and **one** `results.family_n`
-call (plus the parent family's N when the rules name a parent). Everything after
-the reads is pure over those rows.
+base-level metrics (one `trial_metrics` read), the shown trials' delisting exit
+coverage counts (one `trial_rebalance_counts` read; plan T329: each grid row shows its
+unknown exits over its exits and that share, blank at 0 exits), **one**
+`registry.family_sharpes` call (itself one `trial_metrics` query per basis) and
+**one** `results.family_n` call (plus the parent family's N when the rules name a
+parent). Everything after the reads is pure over those rows.
 
 **Variant states** (spec, Definitions "Selection statistic", "Complete sweep"; req 2;
 #1221). There is one classifier: `store.lab_queries.variant_states`, which the sweep
@@ -186,6 +188,19 @@ class VariantRow:
     max_drawdown: float | None
     red_flag: bool | None
     message: str | None
+    #: The shown trial's delisting exit coverage (plan T329): its booked delisting
+    #: exits and those with no single classified reason at its cutoff, from its
+    #: `trial_rebalance_counts`; None for a trial written before T329 or no trial.
+    exit_coverage_exits: int | None = None
+    exit_coverage_unknown: int | None = None
+
+    @property
+    def exit_coverage_unknown_share(self) -> float | None:
+        """`unknown / exits`; None (blank) at 0 exits or with no counts."""
+        exits, unknown = self.exit_coverage_exits, self.exit_coverage_unknown
+        if not exits or unknown is None:
+            return None
+        return unknown / exits
 
 
 @dataclass(frozen=True)
@@ -265,6 +280,11 @@ class FamilyStatus:
     declared_count: int
     rules: FamilyRules | None
     forward: bool = False
+    #: The family has a ledger entry marked `passed` (ADR 0016 #3146 rule 2(b)).
+    exam_passed: bool = False
+    #: The family's latest ledger entry's `campaign_k`; None when it has none or it
+    #: is -1. A diagnostic only: no refusal, gate or verdict reads it (#3146).
+    campaign_k: int | None = None
 
 
 @dataclass(frozen=True)
@@ -313,14 +333,17 @@ class VariantStanding:
 @dataclass(frozen=True)
 class OperationsBookLine:
     """An `operations_book` decision in `lab status` (strategy-lab spec req 1,
-    amendment 2026-10-10): the registered file, the sweep and variant index it runs."""
+    amendment 2026-10-10): the registered file, the sweep and variant index it runs,
+    or, for a pre-lab parent (paper spec amendment 2026-11-07 #3118 item 2), none."""
 
     hypothesis_id: int
     slug: str
     family: str
     decision_id: int
-    sweep_slug: str
-    variant_index: int
+    #: None for a pre-lab parent (#3118 item 2), whose slug is `parent_slug`.
+    sweep_slug: str | None
+    variant_index: int | None
+    parent_slug: str | None = None
 
 
 @dataclass(frozen=True)
@@ -437,6 +460,29 @@ def _metrics(
     return found
 
 
+_COVERAGE_NAMES: Final = ("n_exit_coverage_exits", "n_exit_coverage_unknown")
+
+
+def _exit_coverage(
+    conn: duckdb.DuckDBPyConnection, trial_ids: Iterable[int]
+) -> dict[int, dict[str, int]]:
+    """Each trial's delisting exit coverage counts (plan T329), in one
+    `trial_rebalance_counts` read; a trial with none is absent."""
+    wanted = sorted(set(trial_ids))
+    found: dict[int, dict[str, int]] = {}
+    if not wanted:
+        return found
+    rows = conn.execute(
+        "SELECT trial_id, name, sum(value) FROM trial_rebalance_counts "
+        "WHERE list_contains($ids::BIGINT[], trial_id) "
+        "AND list_contains($names::VARCHAR[], name) GROUP BY trial_id, name",
+        {"ids": wanted, "names": list(_COVERAGE_NAMES)},
+    ).fetchall()
+    for trial_id, name, value in rows:
+        found.setdefault(trial_id, {})[name] = int(value)
+    return found
+
+
 # --- variant states (pure) ---------------------------------------------------------
 
 
@@ -527,8 +573,10 @@ def _row(
     *,
     family_n: int,
     pair_sharpes: Sequence[float],
+    coverage: Mapping[str, int] | None = None,
 ) -> VariantRow:
     values = frozen_values(state.record)
+    coverage = coverage or {}
     trial = state.trial
     dsr: float | None = None
     if trial is not None and metrics is not None:
@@ -557,6 +605,8 @@ def _row(
         max_drawdown=shown.get("max_drawdown"),
         red_flag=trial.red_flag if trial is not None else None,
         message=state.message,
+        exit_coverage_exits=coverage.get("n_exit_coverage_exits"),
+        exit_coverage_unknown=coverage.get("n_exit_coverage_unknown"),
     )
 
 
@@ -659,18 +709,78 @@ def variant_standing(
 
 def _operations_books(conn: duckdb.DuckDBPyConnection) -> tuple[OperationsBookLine, ...]:
     """Every `operations_book` decision, oldest first, with the variant index it
-    names (from `sweep_variants`, never from the stored values alone)."""
+    names (from `sweep_variants`, never from the stored values alone), or, for a
+    pre-lab parent, none and the parent's slug (#3118 item 2)."""
     rows = conn.execute(
-        "SELECT d.hypothesis_id, h.slug, h.family, d.decision_id, s.slug, v.variant_index "
-        "FROM owner_decisions d JOIN hypotheses h USING (hypothesis_id) "
-        "JOIN sweep_variants v ON v.hypothesis_id = TRY_CAST(json_extract_string("
+        "SELECT d.hypothesis_id, h.slug, h.family, d.decision_id, s.slug, v.variant_index, "
+        "p.slug FROM owner_decisions d JOIN hypotheses h USING (hypothesis_id) "
+        "LEFT JOIN hypotheses p ON p.hypothesis_id = TRY_CAST(json_extract_string("
         "d.values_json, '$.variant_hypothesis_id') AS BIGINT) "
-        "JOIN sweeps s ON s.sweep_id = v.sweep_id "
+        "LEFT JOIN sweep_variants v ON v.hypothesis_id = p.hypothesis_id "
+        "LEFT JOIN sweeps s ON s.sweep_id = v.sweep_id "
         "WHERE d.kind = 'operations_book' ORDER BY d.decision_id"
     ).fetchall()
     return tuple(
-        OperationsBookLine(int(h), str(slug), str(family), int(d), str(sweep), int(index))
-        for h, slug, family, d, sweep, index in rows
+        OperationsBookLine(
+            int(h),
+            str(slug),
+            str(family),
+            int(d),
+            None if sweep is None else str(sweep),
+            None if index is None else int(index),
+            None if parent is None else str(parent),
+        )
+        for h, slug, family, d, sweep, index, parent in rows
+    )
+
+
+@dataclass(frozen=True)
+class PreLabStanding:
+    """A pre-lab parent's standing for an operations file (#3118 item 2): its latest
+    `ok`, non-synthetic, in-sample trial, whether it is current, and that trial's
+    base-level statistics, `dsr_excess` at today's N and V (as a variant row's)."""
+
+    trial_id: int
+    current: bool
+    excess_cagr_spy: float | None
+    sharpe_annual_excess_spy: float | None
+    dsr_excess: float | None
+    cost_drag: float | None
+    turnover_annual: float | None
+    max_drawdown: float | None
+
+
+def pre_lab_standing(
+    conn: duckdb.DuckDBPyConnection, hypothesis_id: int, *, code_vintage: str | None = None
+) -> PreLabStanding | None:
+    """The standing of pre-lab hypothesis `hypothesis_id` (`PreLabStanding`), or None
+    with no such trial. `ValueError` when the trial lacks a finite base-level metric
+    the DSR needs, as `variant_standing`."""
+    require_lab(conn)
+    vintage = code_vintage if code_vintage is not None else registry.code_tree_sha256()
+    found = lab_queries.latest_ok_trial(conn, hypothesis_id, code_vintage=vintage)
+    if found is None:
+        return None
+    trial, current = found
+    record = registry.get_hypothesis_by_id(conn, hypothesis_id)
+    base = float(frozen_values(record)[BASE_COST_KEY])
+    metrics = _metrics(conn, [(trial.trial_id, base)])[trial.trial_id]
+    dsr = deflated_sharpe(
+        metrics,
+        "excess_spy",
+        n_trials=results.family_n(conn, record.family),
+        pair_sharpes=registry.family_sharpes(conn, record.family).excess_spy,
+        periods_per_year=int(_number(metrics, "periods_per_year", trial.trial_id)),
+    ).dsr
+    return PreLabStanding(
+        trial_id=trial.trial_id,
+        current=current,
+        excess_cagr_spy=metrics.get("excess_cagr_spy"),
+        sharpe_annual_excess_spy=metrics.get("sharpe_annual_excess_spy"),
+        dsr_excess=dsr,
+        cost_drag=metrics.get("cost_drag"),
+        turnover_annual=metrics.get("turnover_annual"),
+        max_drawdown=metrics.get("max_drawdown"),
     )
 
 
@@ -695,6 +805,7 @@ def sweep_report(
         if s.trial is not None
     ]
     metrics = _metrics(conn, shown)
+    coverage = _exit_coverage(conn, (trial_id for trial_id, _ in shown))
     sharpes = registry.family_sharpes(conn, sweep.family)
     family_n = results.family_n(conn, sweep.family)
     rows = tuple(
@@ -703,6 +814,7 @@ def sweep_report(
             metrics[s.trial.trial_id] if s.trial is not None else None,
             family_n=family_n,
             pair_sharpes=sharpes.excess_spy,
+            coverage=coverage.get(s.trial.trial_id) if s.trial is not None else None,
         )
         for s in states
     )
@@ -793,6 +905,13 @@ def _pct(value: float | None) -> str:
     return "-" if value is None else f"{value * _PERCENT_POINTS:.2f}%"
 
 
+def _coverage(row: VariantRow) -> str:
+    """`unknown/exits` of the row's delisting exits, `-` without counts."""
+    if row.exit_coverage_exits is None or row.exit_coverage_unknown is None:
+        return "-"
+    return f"{row.exit_coverage_unknown}/{row.exit_coverage_exits}"
+
+
 def _varied(values: Mapping[str, Any]) -> str:
     return ", ".join(f"{key}={json.dumps(value)}" for key, value in sorted(values.items()))
 
@@ -821,7 +940,7 @@ def format_report(report: SweepReport) -> str:
     lines.append(
         "idx  slug  varied  cadence  anchor  status  excess_cagr_spy  "
         "sharpe_annual_excess_spy  dsr_excess  cost_drag  turnover_annual  "
-        "max_drawdown  red_flag"
+        "max_drawdown  red_flag  delisting_unknown  delisting_unknown_share"
     )
     for row in report.rows:
         lines.append(
@@ -830,7 +949,8 @@ def format_report(report: SweepReport) -> str:
             + (f" ({row.message})" if row.message else "")
             + f"  {_pct(row.excess_cagr_spy)}  {_fmt(row.sharpe_annual_excess_spy)}  "
             f"{_fmt(row.dsr_excess)}  {_pct(row.cost_drag)}  {_fmt(row.turnover_annual)}  "
-            f"{_pct(row.max_drawdown)}  {'-' if row.red_flag is None else row.red_flag}"
+            f"{_pct(row.max_drawdown)}  {'-' if row.red_flag is None else row.red_flag}  "
+            f"{_coverage(row)}  {_pct(row.exit_coverage_unknown_share)}"
         )
     d = report.distribution
     lines.append(
@@ -904,10 +1024,17 @@ def lab_status(
     now: datetime | None = None,
     system_tz: tzinfo | None = None,
     code_vintage: str | None = None,
+    exam_passed: frozenset[str] | None = None,
+    campaign_ks: Mapping[str, int] | None = None,
 ) -> LabStatus:
     """`lab status` (module docstring). `now`, `system_tz` and `code_vintage` stand in
     for the clock, the machine's zone and the checkout's code vintage (a test passes
-    them). Raises `LabNotInitialised` on a store without the lab tables."""
+    them). `exam_passed` (the families with a `passed` entry) and `campaign_ks` (each
+    family's latest recorded campaign k) come from `origin/main`'s copy of the exam
+    ledger, as plain data the caller reads (backtest code imports no execution module);
+    None when the ledger cannot be read. A family's pass and campaign k are read from
+    them only (plan T381a).
+    Raises `LabNotInitialised` on a store without the lab tables."""
     require_lab(conn)
     vintage = code_vintage if code_vintage is not None else registry.code_tree_sha256()
     families = [
@@ -939,6 +1066,8 @@ def lab_status(
                 declared_count=len(states.declared),
                 rules=rules,
                 forward=rules is not None and first is not None and rules.holdout_start > first,
+                exam_passed=exam_passed is not None and family in exam_passed,
+                campaign_k=None if campaign_ks is None else campaign_ks.get(family),
             )
         )
         for sweep_id, variant_states in sorted(states.by_sweep.items()):
@@ -982,6 +1111,13 @@ def lab_status(
     )
 
 
+def _exam_text(f: FamilyStatus) -> str:
+    """The family line's exam diagnostics (ADR 0016 decision 1; #3146 "Display")."""
+    k = "campaign k not recorded" if f.campaign_k is None else f"campaign k {f.campaign_k}"
+    label = "forward return exam passed" if f.exam_passed else "machine pass, edge unjudged"
+    return f"; {k}; {label}"
+
+
 def _rules_text(rules: FamilyRules, forward: bool = False) -> str:
     return (
         f"rules: parent {rules.parent_family or 'none (root)'}; in_sample_start "
@@ -989,7 +1125,8 @@ def _rules_text(rules: FamilyRules, forward: bool = False) -> str:
         f"{' (forward)' if forward else ''}; "
         f"fixed {json.dumps(rules.fixed_params, sort_keys=True)}; max holdout spends "
         f"{rules.max_family_holdout_spends}; max promotions {rules.max_family_promotions}; "
-        f"V floor {rules.min_sharpe_variance_annual}; lattice "
+        f"V floor {rules.min_sharpe_variance_annual} "
+        f"({lab_registry.family_v_floor(rules):.4f} for an undefined V); lattice "
         f"{json.dumps(rules.axis_lattice, sort_keys=True)}"
     )
 
@@ -1010,6 +1147,7 @@ def format_lab_status(status: LabStatus) -> str:
         lines.append(
             f"  {f.family}: N {f.n}; V raw {_fmt(f.sharpe_variance_annual_raw)}; V excess "
             f"{_fmt(f.sharpe_variance_annual_excess)}; declared count {f.declared_count}"
+            + _exam_text(f)
         )
         lines.append(
             "    " + (_rules_text(f.rules, f.forward) if f.rules is not None else "rules: none")
@@ -1027,7 +1165,11 @@ def format_lab_status(status: LabStatus) -> str:
     lines.append("operations books:")
     lines += [
         f"  {o.slug} ({o.family}, id {o.hypothesis_id}, decision {o.decision_id}): "
-        f"operations book of {o.sweep_slug} v{o.variant_index}, not promoted"
+        + (
+            f"operations book of {o.parent_slug} (pre-lab), not promoted"
+            if o.sweep_slug is None
+            else f"operations book of {o.sweep_slug} v{o.variant_index}, not promoted"
+        )
         for o in status.operations_books
     ] or ["  none"]
     lines.append("open sweeps:")

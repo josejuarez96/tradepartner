@@ -17,7 +17,7 @@ from typing import Any
 
 import duckdb
 import pytest
-from dashboard_nav import NavCall, nav_calls_fixture, nav_titles  # noqa: F401
+from dashboard_nav import NavCall, app_test, nav_calls_fixture, nav_titles  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.config import Settings
@@ -99,10 +99,10 @@ def _app(
         monkeypatch.setattr(
             ops, "performance_data", lambda conn, settings, book_id=None, *, now: read(str(book_id))
         )
-    at = AppTest.from_file(_APP_PATH)
+    at = app_test(_APP_PATH)
     at.run()
     monkeypatch.setenv("DASHBOARD_TEST_PAGE", _PAGE)
-    at.run(timeout=30)
+    at.run()
     return at
 
 
@@ -262,7 +262,7 @@ def test_one_book_has_no_selector_two_books_pick_as_ops_page_does(
     assert selector.options == ["b", "main"]
     assert selector.value == "main"  # `paper.book_id`, not the first token
     assert _metrics(at)["Daily P&L"] == "+1,000.00"
-    selector.set_value("b").run(timeout=30)
+    selector.set_value("b").run()
     assert not at.exception
     assert _metrics(at)["Daily P&L"] == "-250.00"
 

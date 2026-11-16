@@ -112,7 +112,8 @@ def confirm_filename_listings(
     ``cover_readings``; later cover pages cannot contradict a pre-cover
     prefix. A ticker assigned to two class ids raises `FilenameClassConflict`
     because the rule cannot choose which security receives the listing; the
-    caller fails that CIK closed (#2929).
+    caller fails that CIK closed (#2929), even when no 10-K precedes the first
+    cover page (#3190).
     The result is sorted by acceptance and accession, independent of input
     order. A refused verdict has no class assignment because it writes no row.
 
@@ -135,16 +136,9 @@ def confirm_filename_listings(
             key=lambda filing: (filing.accepted_at, filing.accession, filing.ticker),
         )
     )
-    if not candidates:
-        return ()
-    ciks = {filing.cik for filing in candidates}
-    if len(ciks) != 1:
-        raise ValueError("filename confirmation requires one security's CIK")
-
+    # #3190: the conflict check runs before the empty-candidates return, so a
+    # CIK with no pre-cover 10-K still fails closed for its Form 25 fallback.
     readings = tuple(cover_readings) + tuple(form25_readings)
-    reading_sets = tuple(
-        frozenset(_ticker(item.ticker) for item in reading.tickers) for reading in readings
-    )
     class_by_ticker: dict[str, str] = {}
     for reading in readings:
         for item in reading.tickers:
@@ -152,7 +146,14 @@ def confirm_filename_listings(
             previous = class_by_ticker.setdefault(ticker, item.class_id)
             if previous != item.class_id:
                 raise FilenameClassConflict(ticker)
-
+    if not candidates:
+        return ()
+    ciks = {filing.cik for filing in candidates}
+    if len(ciks) != 1:
+        raise ValueError("filename confirmation requires one security's CIK")
+    reading_sets = tuple(
+        frozenset(_ticker(item.ticker) for item in reading.tickers) for reading in readings
+    )
     later_prefixes = tuple(
         (filing.accepted_at, _ticker(filing.ticker))
         for filing in candidates

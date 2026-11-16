@@ -14,15 +14,15 @@ from typing import Any, Protocol
 import pytest
 
 from tradepartner.adapters.broker import Order, OrderRequest, Side
-from tradepartner.adapters.fake_broker import Expire, FakeBroker, PartialFill, Reject
-from tradepartner.calendar import session_close
+from tradepartner.adapters.fake_broker import Expire, FakeBroker, FillAt, PartialFill, Reject
+from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, LimitBreachError
 from tradepartner.execution import reconcile_run, switch
 from tradepartner.execution import resume as resume_module
 from tradepartner.execution.collect import collect
 from tradepartner.execution.lock import LockHeld, run_lock
-from tradepartner.execution.reconcile_run import reconcile_now
+from tradepartner.execution.reconcile_run import StatedBeforeTrueUp, reconcile_now
 from tradepartner.execution.resume import NO_WINDOW, REFUSED, RELEASED, resume
 from tradepartner.store import registry
 from tradepartner.store.db import open_for_write, open_read_only
@@ -64,6 +64,19 @@ PRICE = 100.0
 SPY = "SEC_SPY"  # a fixture name listed through 2026
 DAY1 = datetime(2026, 10, 1, 14, 0, tzinfo=UTC)  # the conftest clock: S = 2026-10-01
 DAY2 = datetime(2026, 10, 2, 14, 0, tzinfo=UTC)  # the next session
+
+
+def _spy_reference(
+    _conn: object,
+    session: date,
+    _names: object,
+    _actions: object,
+    *,
+    bar_sessions: dict[str, date] | None = None,
+) -> dict[str, float]:
+    if bar_sessions is not None:
+        bar_sessions[SPY] = previous_session(session)
+    return {SPY: PRICE}
 
 
 class SkewedFake(FakeBroker):
@@ -250,6 +263,8 @@ def _resume(
     *,
     accept: bool = False,
     accept_rejections: bool = False,
+    accept_fill_band: bool = False,
+    accept_fill_mismatch: bool = False,
     book_id: str | None = None,
 ) -> Any:
     # A real clock moves between reads; the release must be stamped after the
@@ -263,15 +278,21 @@ def _resume(
         "owner checked",
         accept,
         accept_rejections=accept_rejections,
+        accept_fill_band=accept_fill_band,
+        accept_fill_mismatch=accept_fill_mismatch,
         book_id=book_id,
     )
 
 
 def _collect(
-    settings: Settings, fake: FakeBroker, clock: FixedClock, orders: list[OrderRow]
+    settings: Settings,
+    fake: FakeBroker,
+    clock: FixedClock,
+    orders: list[OrderRow],
+    run_id: int = 1,
 ) -> Any:
     return collect(
-        fake, lambda: open_for_write(settings), orders, clock, "run", 1, FROZEN, settings
+        fake, lambda: open_for_write(settings), orders, clock, "run", run_id, FROZEN, settings
     )
 
 
@@ -326,7 +347,7 @@ def _lagging_third_fill(
     order = _order(settings, fake, run_id, coid, 2.0 + last, DAY1 - timedelta(hours=1))
     fake.apply(coid, PartialFill(1.0, 100.0))
     fake.apply(coid, PartialFill(1.0, 101.0))
-    _collect(settings, fake, clock, [order])
+    _collect(settings, fake, clock, [order], run_id)
     fake.lag_fills(None)
     fake.apply(coid, PartialFill(last, 102.0))
     first = reconcile_now(
@@ -354,7 +375,9 @@ def test_a_pending_order_the_fake_filled_is_settled_with_its_fills_before_its_fi
     fake: SkewedFake,
     window: PaperWindowRow,
     fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
     crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
     _order(
         journal_settings,
@@ -378,6 +401,359 @@ def test_a_pending_order_the_fake_filled_is_settled_with_its_fills_before_its_fi
         assert fill.fill.known_at <= filled_event[0].known_at
     assert fill.fill.quantity == 2.0
     assert not _engaged(journal_settings, window)
+
+
+@pytest.mark.parametrize("price, expected", [(200.0, REFUSED), (100.0, RELEASED)])
+def test_resume_judges_a_new_fill_and_reports_its_price(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+    price: float,
+    expected: str,
+) -> None:
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _order(journal_settings, fake, crashed, "tp-bad", 2.0, DAY1 - timedelta(hours=1))
+    fake.apply("tp-bad", FillAt(price))
+    _engage(journal_settings, window, fixed_clock)
+    seen: list[date] = []
+    cuts: list[datetime] = []
+    real_actions = resume_module.live_actions_as_of
+
+    def actions(conn: object, cut: datetime) -> object:
+        cuts.append(cut)
+        return real_actions(conn, cut)
+
+    def prices(
+        _conn: object,
+        session: date,
+        names: object,
+        _actions: object,
+        *,
+        bar_sessions: dict[str, date] | None = None,
+    ) -> dict[str, float]:
+        seen.append(session)
+        assert names == [SPY]
+        return _spy_reference(_conn, session, names, _actions, bar_sessions=bar_sessions)
+
+    monkeypatch.setattr(resume_module, "reference_prices", prices)
+    monkeypatch.setattr(resume_module, "live_actions_as_of", actions)
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert seen == [DAY1.date()]
+    assert cuts == [session_close(date(2026, 9, 30))]
+    assert outcome.status == expected, outcome.reasons
+    if expected == REFUSED:
+        assert any("fill_price_outside_band" in reason for reason in outcome.reasons)
+        assert _engaged(journal_settings, window)
+    assert _all_fills(journal_settings, "tp-bad")
+    assert outcome.fill_prices == (("tp-bad", price),)
+    if expected == REFUSED:
+        with open_read_only(journal_settings) as conn:
+            assert any(
+                event.reason and event.reason.startswith("fill_price_outside_band:")
+                for event in kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+            )
+        again = _resume(journal_settings, fake, fixed_clock)
+        assert again.status == REFUSED
+        assert any("prior fill_price_outside_band" in reason for reason in again.reasons)
+        assert _engaged(journal_settings, window)
+
+
+def test_accept_fill_band_releases_a_checked_bad_fill_and_journals_it(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3130: the owner checks the print and resumes with `accept_fill_band`. The
+    resume that first journals the bad fill still refuses (the owner has not seen
+    it); a later one with the flag releases, records the accepted fault in its
+    `resume_acceptances` row, and a later band fault refuses again."""
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _order(journal_settings, fake, crashed, "tp-bad", 2.0, DAY1 - timedelta(hours=1))
+    fake.apply("tp-bad", FillAt(200.0))
+    _engage(journal_settings, window, fixed_clock)
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
+    first = _resume(journal_settings, fake, fixed_clock, accept_fill_band=True)
+    assert first.status == REFUSED
+    assert any("fill_price_outside_band" in r for r in first.reasons)
+    plain = _resume(journal_settings, fake, fixed_clock)
+    assert plain.status == REFUSED
+    assert any("prior fill_price_outside_band" in r for r in plain.reasons)
+    accepted = _resume(journal_settings, fake, fixed_clock, accept_fill_band=True)
+    assert accepted.status == RELEASED, accepted.reasons
+    assert not _engaged(journal_settings, window)
+    with open_read_only(journal_settings) as conn:
+        (row,) = conn.execute(
+            "SELECT accepted_json FROM resume_acceptances WHERE resume_id = ?",
+            [accepted.resume_id],
+        ).fetchall()
+    entries = json.loads(row[0])
+    # The engagement and the crashed run's rejudged fill: both accepted, both named.
+    assert entries and {e["kind"] for e in entries} == {"fill_band"}
+    assert all("fill_price_outside_band" in e["message"] for e in entries)
+    assert any("tp-bad" in e["message"] for e in entries)
+    # A new band fault after that release refuses a plain resume again.
+    switch.engage(
+        journal_settings,
+        fixed_clock,
+        window_id=window.window_id,  # type: ignore[arg-type]
+        source="fault",
+        fault_type="SystemFaultError",
+        reason="SystemFaultError: fill_price_outside_band: tp-y 400 vs 100",
+    )
+    later = _resume(journal_settings, fake, fixed_clock)
+    assert later.status == REFUSED
+    assert any("tp-y" in r for r in later.reasons) and not any("tp-bad" in r for r in later.reasons)
+
+
+def test_accept_fill_band_must_be_a_bool(
+    journal_settings: Settings, fake: SkewedFake, fixed_clock: FixedClock
+) -> None:
+    with pytest.raises(TypeError, match="accept_fill_band"):
+        _resume(journal_settings, fake, fixed_clock, accept_fill_band=1)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("initially_engaged", [False, True])
+def test_bad_fill_stays_refused_if_fault_engagement_write_fails(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+    initially_engaged: bool,
+) -> None:
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=True)
+    _order(journal_settings, fake, crashed, "tp-bad-write", 2.0, DAY1 - timedelta(hours=1))
+    fake.apply("tp-bad-write", FillAt(200.0))
+    if initially_engaged:
+        _engage(journal_settings, window, fixed_clock)
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
+    monkeypatch.setattr(
+        resume_module.switch,
+        "engage",
+        lambda *_args, **_kwargs: switch.WriteFailed("store unavailable"),
+    )
+
+    first = _resume(journal_settings, fake, fixed_clock)
+
+    assert first.status == REFUSED
+    assert "kill switch write failed" in first.reasons[0]
+    assert ("NOT engaged" in first.reasons[0]) == (not initially_engaged)
+    assert _engaged(journal_settings, window) == initially_engaged
+    assert _all_fills(journal_settings, "tp-bad-write")
+
+    second = _resume(journal_settings, fake, fixed_clock)
+    assert second.status == REFUSED
+    assert any("fill_price_outside_band" in reason for reason in second.reasons)
+    assert _engaged(journal_settings, window) == initially_engaged
+
+
+def test_clock_step_back_rechecks_an_earlier_refused_invocation(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=True)
+    _order(journal_settings, fake, crashed, "tp-backward-bad", 2.0, DAY1 - timedelta(hours=1))
+    fake.apply("tp-backward-bad", FillAt(200.0))
+    _engage(journal_settings, window, fixed_clock)
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
+    real_engage = switch.engage
+    monkeypatch.setattr(
+        resume_module.switch,
+        "engage",
+        lambda *_args, **_kwargs: switch.WriteFailed("store unavailable"),
+    )
+    first = _resume(journal_settings, fake, fixed_clock)
+    assert first.status == REFUSED
+    assert "kill switch write failed" in first.reasons[0]
+    monkeypatch.setattr(resume_module.switch, "engage", real_engage)
+
+    fixed_clock.now = DAY1 - timedelta(minutes=1)
+    second = _resume(journal_settings, fake, fixed_clock)
+
+    assert second.status == REFUSED
+    assert any("fill_price_outside_band" in reason for reason in second.reasons)
+    assert window.window_id is not None
+    with open_read_only(journal_settings) as conn:
+        assert len(resume_invocations(conn)) == 2
+        assert not any(
+            event.state == "released" for event in kill_switch_events_for(conn, window.window_id)
+        )
+
+
+def test_accept_fill_band_never_accepts_a_rejudged_fill_nobody_has_seen(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review on #3140: a halt read's bad fill whose engagement write failed (#3027)
+    has no band engagement, so no output ever showed it. Even with the flag, the
+    resume that first rejudges it refuses (engaging and naming it); the next
+    flagged resume, after the owner has seen it, accepts it."""
+    started = DAY1 - timedelta(hours=1)
+    run_id = _run(journal_settings, window, started, finished=False)
+    order = _order(journal_settings, fake, run_id, "tp-unseen", 2.0, started)
+    fake.apply("tp-unseen", FillAt(200.0))
+    collect(
+        fake,
+        lambda: open_for_write(journal_settings),
+        [order],
+        fixed_clock,
+        "run",
+        run_id,
+        FROZEN,
+        journal_settings,
+    )
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
+    first = _resume(journal_settings, fake, fixed_clock, accept_fill_band=True)
+    assert first.status == REFUSED, first.reasons
+    assert any("tp-unseen" in r for r in first.reasons)
+    assert _engaged(journal_settings, window)
+    second = _resume(journal_settings, fake, fixed_clock, accept_fill_band=True)
+    assert second.status == RELEASED, second.reasons
+    assert any("tp-unseen" in a for a in second.accepted_fill_band)
+
+
+def test_a_shown_later_attempt_does_not_mark_an_earlier_attempt_seen() -> None:
+    """Review on #3140: `tp-x-1` is a prefix of `tp-x-12`; seen means `"<id> ("`."""
+    shown = ["SystemFaultError: fill_price_outside_band: tp-x-12 (SEC_SPY): fill price 400"]
+    seen = resume_module._band_fault_seen
+    assert seen("tp-x-12 (SEC_SPY): fill price 400 is outside 50%", shown)
+    assert not seen("tp-x-1 (SEC_SPY): fill price 400 is outside 50%", shown)
+
+
+@pytest.mark.parametrize("price, expected", [(200.0, REFUSED), (100.0, RELEASED)])
+def test_a_run_fill_whose_band_engagement_was_never_written_is_rejudged(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+    price: float,
+    expected: str,
+) -> None:
+    """#3027: a halt read journals a run-writer fill outside the band, then its
+    `engaged` write fails and the process exits. The run has no result row and no
+    band engagement exists, so only a rejudge of the run's own fills can refuse."""
+    started = DAY1 - timedelta(hours=1)
+    run_id = _run(journal_settings, window, started, finished=False)
+    order = _order(journal_settings, fake, run_id, "tp-halt-read", 2.0, started)
+    fake.apply("tp-halt-read", FillAt(price))
+    # The halt read's collection: writer `run`, the halted run's id.
+    collect(
+        fake,
+        lambda: open_for_write(journal_settings),
+        [order],
+        fixed_clock,
+        "run",
+        run_id,
+        FROZEN,
+        journal_settings,
+    )
+    assert _all_fills(journal_settings, "tp-halt-read")
+    sessions: list[date] = []
+
+    def prices(
+        _conn: object,
+        session: date,
+        names: object,
+        _actions: object,
+        *,
+        bar_sessions: dict[str, date] | None = None,
+    ) -> dict[str, float]:
+        sessions.append(session)
+        return _spy_reference(_conn, session, names, _actions, bar_sessions=bar_sessions)
+
+    monkeypatch.setattr(resume_module, "reference_prices", prices)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == expected, outcome.reasons
+    assert started.date() in sessions
+    if expected == REFUSED:
+        assert any("fill_price_outside_band" in reason for reason in outcome.reasons)
+        assert any("tp-halt-read" in reason for reason in outcome.reasons)
+        assert _engaged(journal_settings, window)
+        again = _resume(journal_settings, fake, fixed_clock)
+        assert again.status == REFUSED
+        assert _engaged(journal_settings, window)
+
+
+def test_a_run_band_halt_reason_with_its_fault_type_prefix_refuses_a_resume(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3028: a run's halt path engages with its headline, `SystemFaultError:
+    fill_price_outside_band: ...`; the prior-fault check must not need the token
+    at the start of the reason."""
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
+    started = DAY1 - timedelta(hours=1)
+    run_id = _run(journal_settings, window, started, finished=False)
+    _append(
+        journal_settings,
+        PaperRunResultRow(
+            run_id=run_id,
+            finished_at=started,
+            status="halted",
+            fault_type="SystemFaultError",
+            message="SystemFaultError: fill_price_outside_band: tp-x 200 vs 100",
+            clock_fault=False,
+            known_at=started,
+            ingested_at=started,
+        ),
+    )
+    switch.engage(
+        journal_settings,
+        fixed_clock,
+        window_id=window.window_id,  # type: ignore[arg-type]
+        source="fault",
+        fault_type="SystemFaultError",
+        reason="SystemFaultError: fill_price_outside_band: tp-x 200 vs 100",
+        run_id=run_id,
+    )
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED, outcome.reasons
+    assert any("prior SystemFaultError: fill_price_outside_band" in r for r in outcome.reasons)
+    assert _engaged(journal_settings, window)
+
+
+def test_resume_reports_a_new_fill_without_a_reference_price(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _order(journal_settings, fake, crashed, "tp-unpriced", 2.0, DAY1 - timedelta(hours=1))
+    fake.apply("tp-unpriced", FillAt(PRICE))
+    _engage(journal_settings, window, fixed_clock)
+
+    def no_reference(
+        *_args: object, bar_sessions: dict[str, date] | None = None
+    ) -> dict[str, float]:
+        raise ValueError("no bar known at close(S-1)")
+
+    monkeypatch.setattr(resume_module, "reference_prices", no_reference)
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.fill_prices == (("tp-unpriced", PRICE),)
+    assert outcome.fill_warnings == ("fill-price band: no reference price for tp-unpriced",)
+    assert not any("fill_price_outside_band" in reason for reason in outcome.reasons)
 
 
 def test_a_pending_order_the_broker_never_received_is_cancelled_not_received(
@@ -834,6 +1210,7 @@ def test_with_the_flag_a_synthetic_third_fill_completes_two_journaled_ones(
 
     assert outcome.status == RELEASED, outcome.reasons
     assert outcome.synthetic_fills == ("tp-lag",)
+    assert ("tp-lag", 102.0) in outcome.fill_prices
     rows = _all_fills(journal_settings, "tp-lag")
     assert [(q, p, src) for _, q, p, src, *_ in rows[:2]] == [
         (1.0, 100.0, "broker_feed"),
@@ -890,6 +1267,7 @@ def test_a_negative_implied_price_is_stored_with_price_implied(
     assert (source, implied) == ("broker_status", True)
     assert quantity == pytest.approx(1.0)
     assert price == pytest.approx(3 * 60.0 - 201.0)
+    assert ("tp-lag", price) in outcome.fill_prices
 
 
 def test_with_the_flag_an_order_the_broker_still_holds_open_is_refused(
@@ -1818,7 +2196,10 @@ def test_with_the_flag_the_lag_bound_still_refuses(
     fake: SkewedFake,
     window: PaperWindowRow,
     fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The fake fills at 100: the faulted run's fills are rejudged against the band (#3027).
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
     run_id = _halted_with_rejections(journal_settings, fake, fixed_clock, window)
     fixed_clock.now = DAY1
     _lagging_third_fill(journal_settings, fake, window, fixed_clock, "tp-lag")
@@ -1871,9 +2252,12 @@ def test_with_the_flag_a_run_with_a_verdict_and_a_lagging_order_is_still_refused
     journal_settings: Settings,
     fake: SkewedFake,
     fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """One halted run carries both a rejection-cap verdict and an order past the
     lag bound: the flag accepts the verdict and the lag still refuses."""
+    # The fake fills at 100: the faulted run's fills are rejudged against the band (#3027).
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
     capped = RiskConfig(max_rejections_per_run=1)
     window = _open_window(journal_settings, capped)
     at = DAY1 - timedelta(hours=1)
@@ -2001,12 +2385,15 @@ def test_a_skewed_clock_clamps_the_resume_acceptances_stamp_to_the_floor(
     window: PaperWindowRow,
     fixed_clock: FixedClock,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A rejection-cap verdict `--accept-rejections` clears, with a lagging
     order still refusing afterwards (reusing the existing
     `test_with_the_flag_the_lag_bound_still_refuses` setup): the clock steps
     back right before the `resume_acceptances` row, so its `known_at` is
     clamped to the invocation's own first reading instead of preceding it."""
+    # The fake fills at 100: the faulted run's fills are rejudged against the band (#3027).
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
     fixed_clock.now = DAY1
     run_id = _halted_with_rejections(journal_settings, fake, fixed_clock, window)
     fixed_clock.now = DAY1
@@ -2131,6 +2518,7 @@ def test_a_backward_step_before_the_cut_is_clamped_to_what_collect_wrote(
     window: PaperWindowRow,
     fixed_clock: FixedClock,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Settle stamps T1, collect journals a fill and its terminal event at T3,
     then the clock steps back to T2 (T1 < T2 < T3) before the journal cut.
@@ -2139,6 +2527,7 @@ def test_a_backward_step_before_the_cut_is_clamped_to_what_collect_wrote(
     reconciliation — a spurious mismatch. `collect`'s readings instead raise
     the floor (`_MonotonicStamps.observe`), so the cut is clamped to T3 and
     the reconciliation sees the fill it was stamped to see."""
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
     crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
     _order(
         journal_settings,
@@ -2324,6 +2713,12 @@ def test_b_s_resume_releases_b_alone_under_its_own_lock(
         (reconciliation,) = reconciliations_for(conn, b_id)
         assert reconciliations_for(conn, window.window_id) == []  # type: ignore[arg-type]
     assert reconciliation.book_id == "b"
+    with open_read_only(journal_settings) as conn:
+        # #2490: the invocation names its book, so its fill cursor is b's alone.
+        (invocation,) = resume_invocations(conn)
+        (cursor,) = fill_cursors(conn)
+    assert invocation.book_id == "b"
+    assert (cursor.writer_kind, cursor.writer_id) == ("resume", invocation.resume_id)
 
 
 def test_resume_for_a_book_with_no_window_is_no_window_beside_main(
@@ -2333,3 +2728,302 @@ def test_resume_for_a_book_with_no_window_is_no_window_beside_main(
     assert outcome.status == NO_WINDOW
     assert fake.calls == ()
     assert _count(journal_settings, "resume_invocations") == 0
+
+
+def test_two_books_resuming_at_once_both_release(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3030: book b's whole resume runs between main's `resume_invocations` row
+    and main's release (run locks are per book). Each release checks only its own
+    book's latest resume, so neither refuses the other."""
+    b_window = replace(window, window_id=None, book_id="b", account_id="PB1")
+    (b_id,) = _append(journal_settings, b_window)
+    b_window = replace(b_window, window_id=b_id)
+    _engage(journal_settings, window, fixed_clock)
+    _engage(journal_settings, b_window, fixed_clock)
+    b_fake = SkewedFake(
+        clock=fixed_clock, price_of=lambda _s: PRICE, auto_fill=False, account_id="PB1"
+    )
+    real_release = switch.release
+    b_outcomes: list[Any] = []
+
+    def interleaved(*args: Any, **kwargs: Any) -> int:
+        if not b_outcomes:
+            b_outcomes.append(None)
+            b_outcomes[0] = _resume(journal_settings, b_fake, fixed_clock, book_id="b")
+        return real_release(*args, **kwargs)
+
+    monkeypatch.setattr(resume_module.switch, "release", interleaved)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    (b_outcome,) = b_outcomes
+    assert b_outcome.status == RELEASED, b_outcome.reasons
+    assert outcome.status == RELEASED, outcome.reasons
+    assert b_outcome.resume_id > outcome.resume_id
+    assert not _engaged(journal_settings, window)
+    assert not _engaged(journal_settings, b_window)
+
+
+def test_a_resume_stated_before_a_true_up_refuses_with_the_reason(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3018: `reconcile_now` refuses a ledger stated before a true-up's
+    session. A resume states `command_session(now)`, so this needs a clock that
+    went back past a true-up; it then reports REFUSED with the reason (not a
+    traceback or a halt), writes no reconciliation and leaves the switch engaged."""
+    _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+
+    def refuse(*args: object, **kwargs: object) -> object:
+        raise StatedBeforeTrueUp(
+            "a true-up is stated for 2026-10-02, after 2026-10-01: reconcile 2026-10-02 or later"
+        )
+
+    monkeypatch.setattr(resume_module, "reconcile_now", refuse)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert outcome.reasons == (
+        "reconciliation refused: a true-up is stated for 2026-10-02, after 2026-10-01: "
+        "reconcile 2026-10-02 or later",
+    )
+    assert outcome.reconciliation_id is None and outcome.released_event_id is None
+    assert _engaged(journal_settings, window)
+
+
+# --- T400: a fill checked against its order; `--accept-fill-mismatch` ---------
+
+
+def _overfilled_order(
+    settings: Settings,
+    fake: SkewedFake,
+    run_id: int,
+    coid: str,
+    clock: FixedClock,
+    *,
+    broker_quantity: float = 4.0,
+    journal_quantity: float = 2.0,
+) -> OrderRow:
+    """An order the journal holds for `journal_quantity` that the broker holds, and
+    fills, for `broker_quantity`: the broker's books and the fill agree, the order does
+    not."""
+    at = DAY1 - timedelta(hours=1)
+    order = _order(settings, fake, run_id, coid, broker_quantity, at)
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "UPDATE orders SET quantity = ? WHERE client_order_id = ?", [journal_quantity, coid]
+        )
+    fake.apply(coid, FillAt(PRICE))
+    return replace(order, quantity=journal_quantity)
+
+
+def _halts(settings: Settings, window: PaperWindowRow) -> list[KillSwitchRow]:
+    with open_read_only(settings) as conn:
+        return kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+
+
+def test_a_mismatched_fill_halts_a_plain_resume_and_the_halt_names_the_fill_ids(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _overfilled_order(journal_settings, fake, crashed, "tp-a", fixed_clock)
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("fill_mismatch" in r for r in outcome.reasons)
+    assert _all_fills(journal_settings, "tp-a") == []
+    assert _engaged(journal_settings, window)
+    named = [
+        resume_module.fill_mismatch_ids(e.reason)
+        for e in _halts(journal_settings, window)
+        if resume_module.is_fill_mismatch_fault(e.reason)
+    ]
+    assert named == [("fake-fill-1",)]
+
+
+def test_accept_fill_mismatch_journals_the_named_fill_with_its_acceptance_and_releases(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _overfilled_order(journal_settings, fake, crashed, "tp-a", fixed_clock)
+    _engage(journal_settings, window, fixed_clock)
+    assert _resume(journal_settings, fake, fixed_clock).status == REFUSED
+
+    unaccepted = _resume(journal_settings, fake, fixed_clock, accept=True)
+    assert unaccepted.status == REFUSED and _all_fills(journal_settings, "tp-a") == []
+
+    accepted = _resume(journal_settings, fake, fixed_clock, accept_fill_mismatch=True)
+
+    assert accepted.status == RELEASED, accepted.reasons
+    assert accepted.accepted_fill_mismatch == ("fake-fill-1",)
+    assert [row[4] for row in _all_fills(journal_settings, "tp-a")] == ["fake-fill-1"]
+    with open_read_only(journal_settings) as conn:
+        (row,) = [r for r in resume_acceptances(conn) if r.resume_id == accepted.resume_id]
+    (entry,) = json.loads(row.accepted_json)
+    assert (entry["kind"], entry["fill_ids"]) == ("fill_mismatch", ["fake-fill-1"])
+    assert not _engaged(journal_settings, window)
+
+
+def test_accept_fill_mismatch_leaves_the_accepted_fill_out_of_later_reconciliations(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _overfilled_order(journal_settings, fake, crashed, "tp-a", fixed_clock)
+    _engage(journal_settings, window, fixed_clock)
+    _resume(journal_settings, fake, fixed_clock)
+    assert (
+        _resume(journal_settings, fake, fixed_clock, accept_fill_mismatch=True).status == RELEASED
+    )
+
+    again = reconcile_now(
+        journal_settings,
+        lambda: open_for_write(journal_settings),
+        fake,
+        window,
+        DAY1.date(),
+        fixed_clock,
+        lambda: open_for_write(journal_settings),
+        frozen=FROZEN,
+        as_of=fixed_clock.advance(minutes=1),
+    )
+
+    assert again.status == "ok", again.mismatches
+
+
+def test_a_journal_that_already_holds_an_overfill_does_not_release(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An overfill on a terminal order, the broker agreeing with the journal, once
+    reconciled `ok`; it is `overfilled` now."""
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
+    run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=True)
+    order = _overfilled_order(journal_settings, fake, run_id, "tp-a", fixed_clock)
+    _collect_unchecked(journal_settings, fake, fixed_clock, order, run_id)
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("overfilled" in r for r in outcome.reasons), outcome.reasons
+    assert _engaged(journal_settings, window)
+
+
+def _collect_unchecked(
+    settings: Settings, fake: SkewedFake, clock: FixedClock, order: OrderRow, run_id: int
+) -> None:
+    """Journal the order's fill and terminal event as an older build did, with no
+    fill check: the order row is widened for the collect and narrowed back."""
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "UPDATE orders SET quantity = 4 WHERE client_order_id = ?", [order.client_order_id]
+        )
+    _collect(settings, fake, clock, [replace(order, quantity=4.0)], run_id)
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "UPDATE orders SET quantity = 2 WHERE client_order_id = ?", [order.client_order_id]
+        )
+
+
+def test_a_fill_that_arrived_after_the_halt_is_not_accepted_by_it(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _overfilled_order(journal_settings, fake, crashed, "tp-a", fixed_clock)
+    _engage(journal_settings, window, fixed_clock)
+    assert _resume(journal_settings, fake, fixed_clock).status == REFUSED  # halt names fill 1
+    _overfilled_order(journal_settings, fake, crashed, "tp-b", fixed_clock)  # fill 2, unnamed
+
+    outcome = _resume(journal_settings, fake, fixed_clock, accept_fill_mismatch=True)
+
+    assert outcome.status == REFUSED
+    assert any("fake-fill-2" in r for r in outcome.reasons)
+    assert _all_fills(journal_settings, "tp-a") == [] == _all_fills(journal_settings, "tp-b")
+    assert _count(journal_settings, "resume_acceptances") == 0
+    assert _engaged(journal_settings, window)
+    # The new halt names the fill, so the next flagged resume covers both.
+    named = set(resume_module._named_fill_mismatches(_halts(journal_settings, window)))
+    assert named == {"fake-fill-1", "fake-fill-2"}
+    both = _resume(journal_settings, fake, fixed_clock, accept_fill_mismatch=True)
+    assert both.status == RELEASED, both.reasons
+    assert both.accepted_fill_mismatch == ("fake-fill-1", "fake-fill-2")
+
+
+def test_accept_fill_mismatch_with_no_halt_naming_a_fill_refuses(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock, accept_fill_mismatch=True)
+
+    assert outcome.status == REFUSED
+    assert any("nothing to accept" in r for r in outcome.reasons)
+    assert _engaged(journal_settings, window)
+
+
+def test_accept_fill_mismatch_does_not_share_a_resume_with_other_acceptances(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(resume_module, "reference_prices", _spy_reference)
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _overfilled_order(journal_settings, fake, crashed, "tp-a", fixed_clock)
+    _engage(journal_settings, window, fixed_clock)
+    _resume(journal_settings, fake, fixed_clock)
+
+    both = _resume(
+        journal_settings, fake, fixed_clock, accept_fill_mismatch=True, accept_rejections=True
+    )
+
+    assert both.status == REFUSED
+    assert any("resume again" in r for r in both.reasons)
+    assert [row[4] for row in _all_fills(journal_settings, "tp-a")] == ["fake-fill-1"]
+    assert _count(journal_settings, "resume_acceptances") == 1
+    assert _resume(journal_settings, fake, fixed_clock, accept_rejections=True).status == RELEASED
+
+
+def test_accept_fill_mismatch_must_be_a_bool(
+    journal_settings: Settings, fake: SkewedFake, fixed_clock: FixedClock
+) -> None:
+    with pytest.raises(TypeError, match="accept_fill_mismatch"):
+        _resume(journal_settings, fake, fixed_clock, accept_fill_mismatch=1)  # type: ignore[arg-type]

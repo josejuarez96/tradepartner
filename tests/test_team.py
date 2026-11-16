@@ -857,6 +857,66 @@ def test_status_lists_claims_frontier_loose_issues_and_parked(
     assert "BLOCKED PLAN TASKS: T8b, T10" in out
 
 
+# ── parked plan lines (#3182) ───────────────────────────────────────────────────────
+
+# T195's real wording (an inline `*Parked <date> ...*` note), T371's (`**Parked <date>**`),
+# a line that only mentions another task's park (lower-case, not its own note), and
+# parked-then-un-parked lines, the un-park dated after the park and on the same day.
+PARKED_PLAN = """# Plan: Parked fixture (Phase 2)
+
+## Tasks
+- [x] **T1: Config.** Depends on: n/a.
+- [ ] **T2: Lead floor.** Depends on: T1. *Parked 2026-10-16 (owner, #1726):* NO-GO.
+- [ ] **T3: Open tranche.** **Parked 2026-11-03** (#2950). Depends on: T1.
+- [ ] **T4: Evidence.** Depends on: T1 · E1 parked with T2 (parked by the owner on 2026-10-16).
+- [ ] **T5: Back on.** Depends on: T1. *Parked 2026-10-16.* *Un-parked 2026-11-07 (#3182).*
+- [ ] **T6: Same day.** Depends on: T1. *Parked 2026-11-01.* *Unparked 2026-11-01 (owner).*
+- [ ] **T7: Again.** Depends on: T1 · Parked 2026-10-01; Un-parked 2026-10-05; Parked 2026-10-09
+"""
+
+
+def test_park_note_reads_the_lines_own_dated_park_and_un_park_notes() -> None:
+    by_id = {t.id: t for t in team.parse_plan(PARKED_PLAN, "p")}
+    assert team.park_note(by_id["T2"]) == "Parked 2026-10-16"
+    assert team.park_note(by_id["T3"]) == "Parked 2026-11-03"
+    assert team.park_note(by_id["T7"]) == "Parked 2026-10-09"
+    for tid in ("T1", "T4", "T5", "T6"):
+        assert team.park_note(by_id[tid]) is None, tid
+
+
+def test_a_parked_task_is_not_ready_and_an_un_parked_one_is() -> None:
+    tasks = team.parse_plan(PARKED_PLAN, "p")
+    assert [t.id for t in team.ready_tasks(tasks)] == ["T4", "T5", "T6"]
+
+
+def test_claim_refuses_a_parked_task_with_the_reason(tmp_path: Path) -> None:
+    (tmp_path / "docs" / "plans").mkdir(parents=True)
+    (tmp_path / "docs" / "plans" / "parked.md").write_text(PARKED_PLAN)
+    (tmp_path / team.TEAM_FILE).write_text("atlas\n")
+    gh = FakeGitHub()
+    with pytest.raises(SystemExit, match=r"T2 is parked \(Parked 2026-10-16\)"):
+        team.cmd_claim(gh, tmp_path, "T2")
+    with pytest.raises(SystemExit, match="is parked"):  # --allow-unready does not unpark
+        team.cmd_claim(gh, tmp_path, "T3", allow_unready=True)
+    assert gh.issues == {}
+    assert team.cmd_claim(gh, tmp_path, "T5") == 0
+
+
+def test_status_lists_parked_tasks_apart_from_the_ready_ones(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "docs" / "plans").mkdir(parents=True)
+    (tmp_path / "docs" / "plans" / "parked.md").write_text(PARKED_PLAN)
+    (tmp_path / team.TEAM_FILE).write_text("atlas\n")
+    assert team.cmd_status(FakeGitHub(), tmp_path) == 0
+    out = capsys.readouterr().out
+    frontier = out.split("READY AND UNCLAIMED")[1].split("UNCLAIMED ISSUES")[0]
+    assert "T2 " not in frontier and "T3 " not in frontier and "T5 " in frontier
+    parked = "T2 (Parked 2026-10-16), T3 (Parked 2026-11-03), T7 (Parked 2026-10-09)"
+    assert f"PARKED PLAN TASKS: {parked}" in out
+    assert "BLOCKED PLAN TASKS: none" in out
+
+
 # ── prune ───────────────────────────────────────────────────────────────────────
 
 

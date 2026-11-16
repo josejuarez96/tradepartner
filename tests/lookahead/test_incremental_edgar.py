@@ -1028,14 +1028,28 @@ def test_the_nights_reach_every_case_the_line_lists(hundred_nights: _Run) -> Non
     ]
     assert gap_row[0][4] == night(date(2026, 1, 5))
     assert _index(run.incremental, "0000000102-26-000003")[0][4] == night(date(2026, 1, 8))
-    # A stamp that arrives only after its quarter settled: the adapter judged the
-    # accession unstampable at the settle, so it stays pending in both stores.
+    # A stamp that arrives only after its quarter settled (#2865): inside
+    # `edgar.unstampable_retry_days` the accession is asked again, so both stores
+    # index it on the first night SEC serves the stamp, known at its acceptance
+    # like every pending-then-stamped row, ingested that night and never before.
     for settings in (store, run.incremental):
-        assert _index(settings, "0000000106-25-000003") == []
-        assert _rows(
-            settings,
-            "SELECT accession FROM filing_index_pending WHERE accession = '0000000106-25-000003'",
-        ) == [("0000000106-25-000003",)]
+        assert _index(settings, "0000000106-25-000003") == [
+            (
+                "0000000106",
+                date(2025, 12, 23),
+                date(2025, 12, 23),
+                at(date(2025, 12, 23)),
+                night(date(2026, 1, 12)),
+            )
+        ]
+        assert (
+            _rows(
+                settings,
+                "SELECT accession FROM filing_index_pending "
+                "WHERE accession = '0000000106-25-000003'",
+            )
+            == []
+        )
     # The 25-NSEs: the subject keeps a paired one; an exchange-only one stays the exchange's.
     assert [r[0] for r in _index(store, "0000876661-26-000001")] == ["0000000105"]
     assert [r[0] for r in _index(store, "0000876661-26-000002")] == ["0000876661"]

@@ -74,6 +74,7 @@ from typing import Any
 from tradepartner import diskfloor
 from tradepartner.config import TOMBSTONE_DIR, Settings
 from tradepartner.store.raw_archive import (
+    EvictionReport,
     ICloudItems,
     adopt_file,
     archive_body,
@@ -115,8 +116,10 @@ class MigrationStoppedError(RuntimeError):
 @dataclass(frozen=True)
 class MigrationResult:
     """One `apply_migration` run. `states` maps each moved-class path to
-    `evicted`, `pending_upload` (local and counted), `moved` (archived, eviction
-    failed), `duplicate`, `duplicate_kept` or `changed`. Retry counts cover
+    `evicted`, `pending_upload` (local and counted), `mismatched` (the archived
+    body does not verify; never evicted), `evict_failed`, `status_failed` (each
+    retried next run), `moved` (archived, no eviction outcome), `duplicate`,
+    `duplicate_kept` or `changed`. Retry counts cover
     pending paths from earlier journals, including backup-class paths."""
 
     run_id: str
@@ -137,7 +140,8 @@ class MigrationResult:
 
     def backup_count(self, state: str) -> int:
         """How many backup-class paths ended in `state` (`evicted`,
-        `pending_upload`, `backed_up` or `changed`)."""
+        `pending_upload`, `backed_up`, `mismatched`, `evict_failed`,
+        `status_failed` or `changed`)."""
         return sum(1 for s in self.backup_states.values() if s == state)
 
 
@@ -243,6 +247,22 @@ def _pending_in_journal(journal: Path, records: list[dict[str, Any]]) -> dict[Pa
     unresolved = {"pending_upload", "missing", "mismatched", "evict_failed", "status_failed"}
     pending = {path: hashes[path] for path, state in states.items() if state in unresolved}
     return {journal: pending} if pending else {}
+
+
+def _eviction_state(report: EvictionReport, sha: str) -> str | None:
+    """The state one eviction pass gave `sha`, or None when it named none. Every
+    outcome is kept (a corrupt archived body is `mismatched`, never a clean move)."""
+    if sha in report.evicted or sha in report.already_evicted:
+        return "evicted"
+    for state, reported in (
+        ("pending_upload", report.pending_upload),
+        ("mismatched", report.mismatched),
+        ("evict_failed", report.evict_failed),
+        ("status_failed", report.status_failed),
+    ):
+        if sha in reported:
+            return state
+    return None
 
 
 @dataclass(frozen=True)
@@ -367,8 +387,13 @@ def apply_migration(
     for path, intent in list(intents.items()):  # an interrupted run's open intents
         if path not in states:
             settled(path, _settle(settings, cache_dir, icloud, intent, None))
+    manifest_written = any(r["op"] == "manifest" for r in records)
     for planned in plan.files:
-        if planned.klass is MigrationClass.MOVE and planned.path not in intents:
+        if (
+            planned.klass is MigrationClass.MOVE
+            and planned.path not in intents
+            and not manifest_written
+        ):
             sha = _sha256_file(cache_dir / planned.path)
             intent = _intent(planned, sha)
             _append(journal, intent)
@@ -386,14 +411,12 @@ def apply_migration(
         report = evict_uploaded(settings, hashes, icloud) if hashes else None
         if report is not None:
             for path in [p for p, st in states.items() if st in {"moved", "duplicate"}]:
-                sha = intents[path]["sha256"]
-                if sha in report.evicted or sha in report.already_evicted:
-                    states[path] = "evicted"
-                elif sha in report.pending_upload:
-                    states[path] = "pending_upload"
+                outcome = _eviction_state(report, intents[path]["sha256"])
+                if outcome is not None:
+                    states[path] = outcome
         _append(journal, {"op": "evicted", "states": states})
     elif intents:
-        states = next(r for r in _read_lines(journal) if r["op"] == "evicted")["states"]
+        states.update(next(r for r in _read_lines(journal) if r["op"] == "evicted")["states"])
     for record in _read_lines(journal):
         if record["op"] == "retry_eviction":
             states.update({p: state for p, state in record["states"].items() if p in states})
@@ -426,10 +449,9 @@ def apply_migration(
         )
         if report is not None:
             for path, sha in held.items():
-                if sha in report.evicted or sha in report.already_evicted:
-                    bstates[path] = "evicted"
-                elif sha in report.pending_upload:
-                    bstates[path] = "pending_upload"
+                outcome = _eviction_state(report, sha)
+                if outcome is not None:
+                    bstates[path] = outcome
         _append(journal, {"op": "bevicted", "states": bstates})
     else:
         bstates = bevicted["states"]

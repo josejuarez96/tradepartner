@@ -287,13 +287,24 @@ def _exchange_axis_mismatch(member: str, exchange: str) -> bool:
     return venue is not None and exchange in _EXCHANGE_CODES and venue != exchange
 
 
+def _exchange_key(raw: str) -> str:
+    """`raw` as `_EXCHANGES` keys it: upper case, `.`/`,` dropped, spaces
+    collapsed ("Cboe BZX Exchange, Inc." -> `CBOE BZX EXCHANGE INC`)."""
+    return " ".join(re.sub(r"[.,]", " ", raw.upper()).split())
+
+
+def _registered_exchange(raw: str) -> str | None:
+    """The code of the venue `_EXCHANGES` names exactly as `raw`, or `None`
+    for any other name (never a slug)."""
+    return _EXCHANGES.get(_exchange_key(raw))
+
+
 def normalize_exchange(raw: str) -> str:
     """The exchange code config uses for `raw`, from an exact-name table;
     any other name becomes its upper-case slug ("Nasdaq Global Select
     Market" -> `NASDAQ_GLOBAL_SELECT_MARKET`), which matches no listing, so
     ingest should report codes outside the table."""
-    text = " ".join(re.sub(r"[.,]", " ", raw.upper()).split())
-    return _EXCHANGES.get(text) or re.sub(r"[^A-Z0-9]+", "_", text).strip("_")
+    return _registered_exchange(raw) or re.sub(r"[^A-Z0-9]+", "_", _exchange_key(raw)).strip("_")
 
 
 # --- submissions and the filing index -------------------------------------
@@ -1162,10 +1173,19 @@ def _dei_facts(document: bytes, accession: str) -> _DeiFacts:
                 raise ValueError(f"{accession}: dei:{name} is nil but has text {text[:40]!r}")
             continue
         issue = (fact.metadata or {}).get("format_issue")
+        value = _trading_symbol(str(fact.value)) if name == "TradingSymbol" else fact.value
+        if name == "SecurityExchangeName" and _is_exchange_name_format(element):
+            # #3230: edgartools' `exchnameen` rejects some registered venues'
+            # written names ("Cboe BZX Exchange, Inc.") and maps others to
+            # codes this table lacks ("NYSE Chicago, Inc." -> `NYSECHX`); a
+            # name the exact-name table holds is read by the table. Any other
+            # name keeps the transform's value or its failure.
+            code = _registered_exchange("".join(element.itertext()))
+            if code is not None:
+                issue, value = None, code
         if issue:
             raise ValueError(f"{accession}: dei:{name}: {issue}")
         context = fact.context or {}
-        value = _trading_symbol(str(fact.value)) if name == "TradingSymbol" else fact.value
         if name == "TradingSymbol" and not value:
             continue  # quote-only text is no symbol, never an empty ticker
         key = (name, str(context.get("id", "")))
@@ -1176,6 +1196,12 @@ def _dei_facts(document: bytes, accession: str) -> _DeiFacts:
         seen[key] = value
         out.append((name, value, context))
     return _DeiFacts(out, ciks)
+
+
+def _is_exchange_name_format(element: Any) -> bool:
+    """Whether an iXBRL element declares the `ixt-sec:exchnameen` format."""
+    fmt = str(element.get("format") or "")
+    return fmt.rsplit(":", 1)[-1].strip().lower() == "exchnameen"
 
 
 @_fail_closed
@@ -1415,6 +1441,124 @@ def parse_delisting(
         form=form,
         class_title=class_title,
         exchange=normalize_exchange(text("exchange/entityName")),
+        accession=accession,
+        accepted_at=accepted_at,
+    )
+
+
+#: The forms an issuer files as an HTML document (#3084): its own Form 25
+#: and amendment. An exchange's 25-NSE is always the XML form, so an HTML
+#: 25-NSE is never read here.
+HTML_DELISTING_FORMS: Final = frozenset({"25", "25/A"})
+
+#: The venues an HTML Form 25's issuer block can name, in match order (a
+#: longer NYSE name before plain NYSE). Nasdaq's tiers ("The Nasdaq Capital
+#: Market") are one code, as `_MIC_EXCHANGES` reads them; Nasdaq BX and PHLX
+#: are other venues and match none.
+_FORM25_HTML_EXCHANGE = re.compile(
+    r"\b(?:(?P<NYSE_AMERICAN>NYSE\s*(?:AMERICAN|MKT|AMEX)|AMERICAN\s+STOCK\s+EXCHANGE)"
+    r"|(?P<NYSE_ARCA>NYSE\s*ARCA)"
+    r"|(?P<NYSE_CHICAGO>NYSE\s+CHICAGO|CHICAGO\s+STOCK\s+EXCHANGE)"
+    r"|(?P<NYSE_NATIONAL>NYSE\s+NATIONAL)"
+    r"|(?P<CBOE_BZX>CBOE\s+BZX|BATS\s+BZX)"
+    r"|(?P<OTHER>NASDAQ\s+(?:OMX\s+)?(?:BX|PHLX))"
+    r"|(?P<NASDAQ>NASDAQ)"
+    r"|(?P<NYSE>NEW\s+YORK\s+STOCK\s+EXCHANGE|NYSE))\b",
+    re.IGNORECASE,
+)
+#: The form's printed labels (General Instructions layout): the issuer and
+#: exchange stand above the first, the address above the second's line, the
+#: class above the third.
+_FORM25_ISSUER_LABEL = re.compile(
+    r"\(\s*exact\s+name\s+of\s+(?:the\s+)?(?:issuer|registrant)", re.I
+)
+_FORM25_ADDRESS_LABEL = re.compile(r"\(\s*address\b[^()<]{0,400}\)", re.I)
+_FORM25_CLASS_LABEL = re.compile(
+    r"\(\s*description\s+of\s+(?:the\s+)?class(?:es)?\s+of\s+securit", re.I
+)
+#: The heading line above the issuer block (`Commission File Number 001-39273`).
+_FORM25_FILE_NUMBER = re.compile(r"file\s+n(?:o|umber)\.?\s*:?\s*[\d-]*", re.I)
+#: Upper bounds of the two readings: the issuer block read back from its
+#: label, and a class description (the longest seen is about 200 characters).
+_FORM25_ISSUER_BLOCK_CHARS: Final = 600
+_FORM25_CLASS_MAX_CHARS: Final = 300
+
+
+def _form25_html_text(text: str) -> str:
+    """`text` with script and style bodies and every tag dropped, entities
+    unescaped and whitespace (no-break spaces too) collapsed to one space.
+    An unclosed script or style consumes the remaining document. Each scan
+    resumes after the preceding match, so malformed input stays linear."""
+    opener = re.compile(r"(?is)<(script|style)\b[^<>]*>")
+    closes = {
+        "script": re.compile(r"(?is)</script\s*>"),
+        "style": re.compile(r"(?is)</style\s*>"),
+    }
+    parts: list[str] = []
+    start = 0
+    while match := opener.search(text, start):
+        parts.append(text[start : match.start()])
+        close = closes[match.group(1).lower()].search(text, match.end())
+        if close is None:
+            start = len(text)
+            break
+        start = close.end()
+    parts.append(text[start:])
+    plain = " ".join(parts)
+    plain = re.sub(r"(?is)<[^<>]*>", " ", plain)
+    return " ".join(html.unescape(plain).replace("\xa0", " ").split())
+
+
+@_fail_closed
+def parse_delisting_html(
+    html_text: str, *, cik: str, form: str, accession: str, accepted_at: datetime
+) -> DelistingFiling:
+    """An issuer's HTML Form 25 or 25/A (#3084): the class description and
+    the exchange removing it, as the printed form lays them out, known at
+    `accepted_at`. The form states no CIK, so `cik` is the filer the index
+    lists it under (an issuer files its own; the caller passes only an
+    accession one CIK holds). `effective_on` is left to the store's Rule
+    12d2-2 default, as for `parse_delisting`.
+
+    Nothing is guessed (#609 D1): a document missing the issuer, address or
+    class label, an issuer block naming no known exchange or two different
+    ones, or an empty or overlong class description raises `ValueError`: no
+    row is written (the source counts and remembers it as unread, #3084)."""
+    if form not in HTML_DELISTING_FORMS:
+        raise ValueError(f"{accession}: not an issuer Form 25: {form!r}")
+    accepted_at = ensure_tz_aware_utc(accepted_at, field_name="accepted_at")
+    text = _form25_html_text(html_text)
+    issuer = _FORM25_ISSUER_LABEL.search(text)
+    described = _FORM25_CLASS_LABEL.search(text, issuer.end()) if issuer else None
+    if issuer is None or described is None:
+        raise ValueError(f"{accession}: {form} is not the Form 25 layout (labels not found)")
+
+    block = text[max(0, issuer.start() - _FORM25_ISSUER_BLOCK_CHARS) : issuer.start()]
+    headings = list(_FORM25_FILE_NUMBER.finditer(block))
+    if headings:
+        block = block[headings[-1].end() :]
+    codes = {match.lastgroup for match in _FORM25_HTML_EXCHANGE.finditer(block) if match.lastgroup}
+    if len(codes) != 1 or "OTHER" in codes:
+        found = ", ".join(sorted(codes)) or "none"
+        raise ValueError(
+            f"{accession}: {form} names no single exchange above its issuer label ({found}); "
+            "the exchange is not guessed, so the notice is not recorded"
+        )
+
+    addresses = list(_FORM25_ADDRESS_LABEL.finditer(text, issuer.end(), described.start()))
+    if not addresses:
+        raise ValueError(f"{accession}: {form} is not the Form 25 layout (no address label)")
+    class_title = text[addresses[-1].end() : described.start()].strip(" ,;:")
+    if not re.search(r"[A-Za-z]", class_title) or len(class_title) > _FORM25_CLASS_MAX_CHARS:
+        raise ValueError(
+            f"{accession}: {form} names no class of security above its description label; "
+            "the class is not guessed, so the notice is not recorded"
+        )
+    return DelistingFiling(
+        cik=_cik(cik),
+        form=form,
+        class_title=class_title,
+        exchange=codes.pop(),
         accession=accession,
         accepted_at=accepted_at,
     )

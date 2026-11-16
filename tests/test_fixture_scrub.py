@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import SecretStr
 
 from tradepartner import cli_record
 from tradepartner.cli_record import (
@@ -378,9 +379,14 @@ def test_openfigi_recorder_scrubs_api_key(tmp_path: Path, monkeypatch: pytest.Mo
     from tradepartner.adapters.openfigi_raw import record_mapping_fixture
 
     secret = "short-synthetic-openfigi-key"
-    monkeypatch.setenv("OPENFIGI_API_KEY", f"  {secret}  ")
+    monkeypatch.delenv("OPENFIGI_API_KEY", raising=False)
     path = tmp_path / "mapping.json"
-    record_mapping_fixture(path, ["VZ"], [{"echo": f"{secret} and   {secret}  "}])
+    record_mapping_fixture(
+        path,
+        ["VZ"],
+        [{"echo": f"{secret} and   {secret}  "}],
+        api_key=SecretStr(f"  {secret}  "),
+    )
     assert secret not in path.read_text()
     assert f"  {secret}  " not in path.read_text()
     assert json.loads(path.read_text())["headers"]["X-OPENFIGI-APIKEY"] == SCRUBBED

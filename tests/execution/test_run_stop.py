@@ -25,6 +25,7 @@ from execution.test_run_exits import (
 )
 from execution.test_run_trade import (
     F_0,
+    FAKE_CASH,
     T_0,
     Env,
     at,
@@ -32,13 +33,15 @@ from execution.test_run_trade import (
     env,
     window,
 )
-from tradepartner.adapters.broker import Asset
-from tradepartner.adapters.fake_broker import Expire
+from tradepartner.adapters.broker import Asset, CashActivity
+from tradepartner.adapters.fake_broker import Expire, FillAt
 from tradepartner.config import Settings
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
 from tradepartner.execution.exits import MissingAssetRefused
 from tradepartner.execution.plan import stop_session
+from tradepartner.execution.reconcile import FILLS_LAGGING
+from tradepartner.execution.reconcile_run import reconcile_command
 from tradepartner.execution.window import stop
 from tradepartner.store.db import open_read_only
 from tradepartner.store.journal import (
@@ -598,3 +601,66 @@ def test_a_held_name_missing_from_the_assets_read_fails_the_stop_run_closed(
     assert env.result(env.latest_run())[0] == "failed"
     assert env.query("SELECT count(*) FROM decisions WHERE decision = 'forced_exit'") == [(0,)]
     assert len(env.submits()) == submitted
+
+
+# --- a bare `paper reconcile` after the stop run's sells fill (#2996) ----------------------
+
+
+def _half_cent_up_price(quantity: Decimal, near: float) -> float:
+    """A price at or just above `near` at which `quantity` sells for a value whose
+    cents round up by almost half a cent: the broker books more cash than
+    `filled_quantity` x `filled_avg_price` says, as Alpaca's per-fill cent
+    rounding does."""
+    step = Decimal("0.0001")
+    price = Decimal(repr(near)).quantize(step)
+    for _ in range(100_000):
+        fraction = (quantity * price * 100) % 1
+        if Decimal("0.5") <= fraction < Decimal("0.502"):
+            return float(price)
+        price += step
+    raise AssertionError(f"no half-cent price near {near} for {quantity}")
+
+
+def test_a_bare_reconcile_after_a_pre_open_stop_run_s_sells_fill_does_not_halt(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """#2996: the 08:05 stop run submits every sell before the open and ends with
+    them still open; the broker fills them at the open; a bare `paper reconcile`
+    at 11:30, before any collector has journaled those fills, must not read the
+    sells' cash as a break and engage the kill switch. The account's funding
+    `JNLC` is dated the day before the window's start (the past cash-activity
+    regression, #1641), so it is inside the base and never a difference."""
+    assert window.window_id is not None
+    env.new_fake(round_cash_to_cent=True)  # the broker books each fill's cash to the cent
+    env.fake.activities.append(
+        CashActivity(
+            activity_id="20190429000000000::fund0001",
+            activity_type="JNLC",
+            date=date(2019, 4, 29),
+            status="executed",
+            net_amount=FAKE_CASH,
+        )
+    )
+    bought(env)
+    held = env.held()
+    request_stop(env, at(F_0, 22, 0))
+    env.fill_on_sleep = False
+    outcome = env.run(at(MAY_2, 12, 5))  # 08:05 New York, before the open
+    assert outcome.kind == "stop", env.result(env.latest_run())
+    sells = [o for o in env.fake.open_orders() if o.side == "sell"]
+    assert sorted(o.symbol for o in sells) == sorted(held)
+    env.clock.now = at(MAY_2, 13, 31)  # the open: the broker fills every sell
+    for order in sells:
+        price = _half_cent_up_price(Decimal(repr(order.quantity)), env.prices[order.symbol])
+        env.fake.apply(order.client_order_id, FillAt(price))
+    assert env.held() == {} or max(env.held().values()) < 1e-6
+
+    env.clock.now = at(MAY_2, 15, 30)  # 11:30 New York, nothing collected yet
+    result = reconcile_command(env.settings, env.connect, env.fake, env.clock)
+
+    # Deferred, never a re-base: the next collector journals the fills, and the
+    # reconciliation after it states the book.
+    assert result.status == FILLS_LAGGING, result.mismatches_json
+    assert sorted(result.lagging_ids) == sorted(o.client_order_id for o in sells)
+    with open_read_only(env.settings) as conn:
+        assert kill_switch_events_for(conn, window.window_id) == []

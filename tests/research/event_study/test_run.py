@@ -338,7 +338,31 @@ def test_event_stage_delisting_and_causal_matching(
     assert pooled_event["bucket"] == 1
 
 
-def test_stage_b_on_synthetic_store(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("extra_facts", "expected_mcap"),
+    [
+        ([], 13_000_000.0),
+        (
+            [
+                (date(2018, 6, 5), 1_500_000.0, datetime(2018, 6, 5, 20, tzinfo=UTC)),
+                (date(2018, 6, 4), 3_000_000.0, datetime(2018, 6, 6, 19, tzinfo=UTC)),
+            ],
+            19_500_000.0,
+        ),
+        (
+            [
+                (date(2018, 6, 5), 1_500_000.0, datetime(2018, 6, 5, 20, tzinfo=UTC)),
+                (date(2018, 6, 5), 1_750_000.0, datetime(2018, 6, 6, 19, tzinfo=UTC)),
+                (date(2018, 6, 5), 9_000_000.0, datetime(2018, 6, 7, 19, tzinfo=UTC)),
+            ],
+            22_750_000.0,
+        ),
+    ],
+    ids=["baseline", "late-older-period-amendment", "latest-period-revision"],
+)
+def test_stage_b_on_synthetic_store(
+    tmp_path: Path, extra_facts: list[tuple[date, float, datetime]], expected_mcap: float
+) -> None:
     """The driver reads real as-of bars and shares from the T302 fixture store."""
     import duckdb
     from fixtures.research.event_study_store import build_event_study_store
@@ -389,6 +413,22 @@ def test_stage_b_on_synthetic_store(tmp_path: Path) -> None:
                 "provenance": "filing",
             },
         )
+        for as_of_date, value, known_at in extra_facts:
+            insert_row(
+                conn,
+                "facts",
+                {
+                    "security_id": "ISSUER",
+                    "fact_name": "shares_outstanding",
+                    "as_of_date": as_of_date,
+                    "class_member": "",
+                    "value": value,
+                    "known_at": known_at,
+                    "ingested_at": known_at,
+                    "source": "test",
+                    "provenance": "filing",
+                },
+            )
     finally:
         conn.close()
     design = {
@@ -467,7 +507,7 @@ def test_stage_b_on_synthetic_store(tmp_path: Path) -> None:
 
     artifact = json.loads(result.artifact_path.read_text())
     early = next(row for row in artifact["events"] if row["event_id"] == "e")
-    assert early["mcap"] == 13_000_000.0  # June 7's later shares revision is excluded
+    assert early["mcap"] == expected_mcap  # facts known after the event stay excluded
     assert early["entry"] == "2018-06-07"
     assert early["r_2"] == pytest.approx(11 / 13 - 1)  # adjusted open reflects dividend
     assert early["peer_n_2"] == 1

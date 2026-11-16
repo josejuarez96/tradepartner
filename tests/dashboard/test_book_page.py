@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 import streamlit as st
-from dashboard_nav import nav_calls_fixture  # noqa: F401
+from dashboard_nav import app_test, nav_calls_fixture  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.config import RiskConfig, Settings
@@ -194,9 +194,9 @@ def _app(
         _live(monkeypatch, path)
     monkeypatch.setenv("STORE__PATH", str(path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(path.parent / "missing.env"))
-    at = AppTest.from_file(_APP).run()
+    at = app_test(_APP).run()
     monkeypatch.setenv("DASHBOARD_TEST_PAGE", "Books")
-    at.run(timeout=30)
+    at.run()
     return at
 
 
@@ -227,7 +227,7 @@ def test_version_37_store_shows_journal_outdated(
         raise AssertionError("expected outdated journal")
 
     monkeypatch.setattr(book_view, "build", outdated)
-    at.run(timeout=30)
+    at.run()
     assert not at.exception
     assert "journal outdated" in _text(at).lower()
     assert "paper plans require schema version" in _text(at)
@@ -339,7 +339,7 @@ def test_see_all_trades_opens_trades_for_the_book(
     monkeypatch.setattr(st, "switch_page", lambda page: opened.append(str(page)))
     at = _app(monkeypatch, _store(tmp_path / "s.duckdb"))
     [button] = [b for b in at.button if b.label == "See all trades"]
-    button.click().run(timeout=30)
+    button.click().run()
     assert opened == ["trades"]
     assert at.session_state[book_page.TRADES_BOOK_KEY] == "main"
 
@@ -352,7 +352,7 @@ def test_default_is_the_one_open_book_and_picker_switches(
     at = _app(monkeypatch, path, seen=seen)
     assert seen[-1] == "alpha"
     picker = next(b for b in at.selectbox if b.key == book_page.BOOK_KEY)
-    picker.set_value("main").run(timeout=30)
+    picker.set_value("main").run()
     assert seen[-1] == "main"
     assert at.header[0].value == "main"
 
@@ -368,10 +368,10 @@ def test_a_link_chooses_the_book(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
         "build",
         lambda conn, settings, book, now, *, top_n=5: (seen.append(book), _view(book))[1],
     )
-    at = AppTest.from_file(_APP).run()
+    at = app_test(_APP).run()
     monkeypatch.setenv("DASHBOARD_TEST_PAGE", "Books")
     at.query_params["book"] = "beta"
-    at.run(timeout=30)
+    at.run()
     assert seen[-1] == "beta"
 
 
@@ -405,7 +405,7 @@ def test_choosing_a_range_draws_that_range(monkeypatch: pytest.MonkeyPatch, tmp_
     view = _view(notes={"3M": book_stats.TOO_YOUNG_NOTE})
     at = _app(monkeypatch, _store(tmp_path / "s.duckdb"), view)
     assert "longer than the book's history" not in _text(at)
-    at.get("button_group")[0].set_value("3M").run(timeout=30)
+    at.get("button_group")[0].set_value("3M").run()
     assert not at.exception
     assert "longer than the book's history" in _text(at)
 
@@ -465,13 +465,13 @@ def _starter(monkeypatch: pytest.MonkeyPatch, starter: _Starter | None = None) -
 
 
 def _open_dialog(at: AppTest) -> None:
-    at.button(key=f"{book_page.STOP_BUTTON_KEY}_main").click().run(timeout=30)
+    at.button(key=f"{book_page.STOP_BUTTON_KEY}_main").click().run()
 
 
 def _confirm(at: AppTest, reason: str | None = _REASON) -> None:
     if reason is not None:
-        at.text_area(key=book_page.STOP_REASON_KEY).input(reason).run(timeout=30)
-    at.button(key=book_page.STOP_CONFIRM_KEY).click().run(timeout=30)
+        at.text_area(key=book_page.STOP_REASON_KEY).input(reason).run()
+    at.button(key=book_page.STOP_CONFIRM_KEY).click().run()
 
 
 def test_the_safety_card_draws_the_view_and_computes_nothing(
@@ -614,7 +614,7 @@ def test_past_the_bound_it_says_not_confirmed_and_neither_kills_nor_retries(
     _confirm(at)
     assert "NOT confirmed" in _text(at) and "within 330 seconds" in _text(at)
     assert len(starter.argvs) == 1 and not starter.children[0].terminated
-    at.run(timeout=30)
+    at.run()
     assert len(starter.argvs) == 1
 
 
@@ -630,9 +630,9 @@ def test_a_stale_second_click_with_the_same_reason_runs_nothing(
     assert len(starter.argvs) == 1
     assert at.session_state[book_page.STOP_REASON_KEY] == ""
     del at.session_state[book_page.STOP_OUTCOME_KEY]  # the form shows again
-    at.run(timeout=30)
+    at.run()
     at.session_state[book_page.STOP_REASON_KEY] = f"  {_REASON} "
-    at.button(key=book_page.STOP_CONFIRM_KEY).click().run(timeout=30)
+    at.button(key=book_page.STOP_CONFIRM_KEY).click().run()
     assert len(starter.argvs) == 1
     assert "already" in _text(at)
 
@@ -669,7 +669,7 @@ def test_a_copy_named_by_the_page_s_own_env_refuses(
     starter = _starter(monkeypatch)
     at = _app(monkeypatch, copy, live=False)
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(env))
-    at.run(timeout=30)
+    at.run()
     assert "not the live store" in _text(at)
     assert f"{book_page.STOP_BUTTON_KEY}_main" not in [b.key for b in at.button]
     assert starter.argvs == []
@@ -759,9 +759,9 @@ def test_a_real_render_adds_no_trial(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     monkeypatch.setattr(book_page, "_now", lambda: _NOW)
     monkeypatch.setenv("STORE__PATH", str(path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "missing.env"))
-    at = AppTest.from_file(_APP).run()
+    at = app_test(_APP).run()
     monkeypatch.setenv("DASHBOARD_TEST_PAGE", "Books")
-    at.run(timeout=30)
+    at.run()
     assert not at.exception, at.exception
     assert "Running a new report counts as one test." in _text(at)
     with open_for_write(settings) as conn:

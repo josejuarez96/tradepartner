@@ -184,6 +184,19 @@ def test_same_ticker_on_two_classes_fails_closed() -> None:
         )
 
 
+def test_conflict_fails_closed_without_a_precover_10k() -> None:
+    """#3190: no 10-K precedes the first cover page, yet the readings still
+    name one ticker for two classes: the conflict is raised, not `()`."""
+    with pytest.raises(FilenameClassConflict, match="conflicting class assignment for ABC"):
+        decide(
+            filing("ABC", 2020),
+            cover=(reading(("ABC", "class-a")),),
+            exhibits=(reading(("abc", "class-b")),),
+        )
+    with pytest.raises(FilenameClassConflict):
+        decide(cover=(reading(("ABC", "class-a")),), exhibits=(reading(("ABC", "class-b")),))
+
+
 def test_ticker_case_is_no_conflict() -> None:
     """#2929: `avy25` (a Form 25 file name) and `AVY25` (a cover page) on the
     same class are one ticker, not a conflict."""

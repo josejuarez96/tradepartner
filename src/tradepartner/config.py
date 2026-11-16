@@ -33,6 +33,7 @@ explicitly, e.g. for an alternate environment or a test fixture.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from collections.abc import Callable
@@ -190,6 +191,9 @@ class AlpacaConfig(BaseModel):
     opg_cutoff_minutes_before_open: int = Field(default=3, ge=2)
     actions_process_lag_days: int = Field(default=90, ge=0)
     actions_backfill_floor: date = date(2020, 6, 1)
+    #: #3054: `ingest --actions-backfill --name-changes-only` starts no earlier
+    #: (the store's bars start 2016-01-04).
+    name_change_backfill_floor: date = date(2016, 1, 1)
     registrant_quiet_days: int = Field(default=180, ge=1)
     # #843: how far before a rename's first cover-page row the new ticker may fill the
     # renamed company's bar hole (`ListingResolver.lead`). The 2016-2026 store's longest
@@ -262,10 +266,14 @@ class AlpacaConfig(BaseModel):
     #: Applied to NYSE listings only (`master_symbol`); the spelling is never
     #: guessed (CVNA, UAA, WLYB are real undotted symbols). Add a pair here
     #: when a NYSE class name has no bars; a value must be an Alpaca symbol.
+    #: `BIOB` (#3082): Bio-Rad's cover pages wrote class B `BIOb` from
+    #: 2019-08 to 2024-02 (a lower-case class letter folds to `BIOB`); not a
+    #: spelling rule, since `LEDs` (SemiLEDs, Nasdaq `LEDS`) has the same shape.
     class_symbols: dict[str, str] = Field(
         default_factory=lambda: {
             "BFA": "BF.A",
             "BFB": "BF.B",
+            "BIOB": "BIO.B",
             "HVTA": "HVT.A",
             "WSOB": "WSO.B",
         }
@@ -894,6 +902,18 @@ MIDSESSION_MIN_LENGTH_SLACK_MINUTES = 25
 
 _BOOK_TOKEN = re.compile(r"^[A-Za-z0-9]+$")
 
+# The forward return exam's pinned values (ADR 0016 amendment 2026-11-07, #3143, the
+# group-sequential exam; T381). The validator refuses looks other than these, a bound
+# below its pinned value at its look, another futility month, a count above the
+# four-exam budget and a skew guard below -0.85: the exam can be made stricter in
+# config, never looser. The bounds are the calibrated O'Brien-Fleming scale
+# c x sqrt(36 / L), c = 2.74903, rounded up to three decimals.
+PINNED_EXAM_LOOKS_MONTHS: tuple[int, ...] = (12, 24, 36)
+PINNED_EXAM_BOUNDS: tuple[float, ...] = (4.762, 3.367, 2.750)
+PINNED_EXAM_FUTILITY_MONTHS = 6
+PINNED_EXAM_MAX_COUNT = 4
+PINNED_EXAM_MIN_INSAMPLE_SKEW = -0.85
+
 
 class PaperConfig(BaseModel):
     """Paper-window and tracking-run settings (spec reqs 3, 7, 8, 10, 14).
@@ -967,15 +987,76 @@ class PaperConfig(BaseModel):
     status_slippage_sessions: int = Field(default=20, gt=0)
     #: The fill-price sanity band (#1981): a fill journaled by a run whose price is
     #: further than this fraction from the order's reference price (the close of S-1,
-    #: split-adjusted) halts the run with a `fill_price_outside_band` fault. 0.25 is
-    #: conservative: an overnight gap past a quarter of the prior close is rare for a
-    #: liquid US equity, so a normal opening gap never trips it, while a 100x or 0.01x
-    #: fill (a broker-side bad print, a unit error) is far outside. Read at run time,
-    #: never frozen, so the open windows see it.
-    max_fill_price_deviation: float = Field(default=0.25, gt=0, lt=1)
+    #: split-adjusted) halts the run with a `fill_price_outside_band` fault. 0.5
+    #: (#3130): real overnight gaps of 25% or more occur at about 8.6e-4 per
+    #: name-session (Audit C; INTC 10-30 at -29.3%), so 0.25 halted the books about
+    #: once in eight daily sessions, while a 100x, 0.01x or 10x fill (a broker-side bad
+    #: print, a unit error) is still far outside. The band is linear, [0.5x, 1.5x]:
+    #: a real gap past it still halts (Audit C's extract: one +51.6% takeover gap in
+    #: 7,165 name-sessions, about one halt in 35 daily sessions). A late split read
+    #: unadjusted (#2089): a 2:1 fill sits at 0.5x, on the edge; 3:2 at 0.67x passes;
+    #: a missed 1:2 reverse split at 2x halts. After a halt, `paper resume
+    #: --accept-fill-band` releases once the owner has checked the print. Read at run
+    #: time, never frozen, so the open windows see it.
+    max_fill_price_deviation: float = Field(default=0.5, gt=0, lt=1)
+    #: `paper report`'s cumulative economic-fidelity line (#3180), report only: the
+    #: window's cumulative paper return against the tracking trial's reads
+    #: `consistent` when the gap is at most `fidelity_max_gap_bps` (default 100 bp),
+    #: else `divergent`, and `too few periods` below `fidelity_min_periods` compared
+    #: periods (default 6). No check, gate or exit code reads them; run-time, never
+    #: frozen, so neither enters a window's `frozen_json` nor a trial's frozen set.
+    fidelity_max_gap_bps: float = Field(default=100.0, gt=0)
+    fidelity_min_periods: int = Field(default=6, ge=1)
     #: Per-book buy timing (paper spec amendment 2026-11-01 item 7, T369), keyed by
     #: book token; run-time, not frozen. A book absent from the map behaves as today.
     execution: dict[str, BookExecution] = Field(default_factory=dict)
+    #: The forward return exam's five keys (ADR 0016 amendment 2026-11-07, #3143;
+    #: T381): the looks in months, each look's t bound (both legs use the same one),
+    #: the futility month, the four-exam budget and the in-sample skew guard. Pinned
+    #: by `_validate_exam_keys`; T381a freezes them into an exam window at
+    #: `paper start`.
+    exam_looks_months: list[int] = Field(default_factory=lambda: list(PINNED_EXAM_LOOKS_MONTHS))
+    exam_bounds: list[float] = Field(default_factory=lambda: list(PINNED_EXAM_BOUNDS))
+    exam_futility_months: int = PINNED_EXAM_FUTILITY_MONTHS
+    exam_max_count: int = Field(default=PINNED_EXAM_MAX_COUNT, ge=0)
+    exam_min_insample_skew: float = PINNED_EXAM_MIN_INSAMPLE_SKEW
+
+    @model_validator(mode="after")
+    def _validate_exam_keys(self) -> PaperConfig:
+        if tuple(self.exam_looks_months) != PINNED_EXAM_LOOKS_MONTHS:
+            raise ValueError(
+                f"paper.exam_looks_months must be {list(PINNED_EXAM_LOOKS_MONTHS)} "
+                f"(ADR 0016, #3143), got {self.exam_looks_months}"
+            )
+        if len(self.exam_bounds) != len(PINNED_EXAM_BOUNDS):
+            raise ValueError(
+                f"paper.exam_bounds must have one bound per look "
+                f"({len(PINNED_EXAM_BOUNDS)}), got {self.exam_bounds}"
+            )
+        for look, bound, pinned in zip(
+            PINNED_EXAM_LOOKS_MONTHS, self.exam_bounds, PINNED_EXAM_BOUNDS, strict=True
+        ):
+            if not math.isfinite(bound) or bound < pinned:
+                raise ValueError(
+                    f"paper.exam_bounds at month {look} must be at least {pinned} "
+                    f"(ADR 0016, #3143), got {bound}"
+                )
+        if self.exam_futility_months != PINNED_EXAM_FUTILITY_MONTHS:
+            raise ValueError(
+                f"paper.exam_futility_months must be {PINNED_EXAM_FUTILITY_MONTHS} "
+                f"(ADR 0016, #3143), got {self.exam_futility_months}"
+            )
+        if self.exam_max_count > PINNED_EXAM_MAX_COUNT:
+            raise ValueError(
+                f"paper.exam_max_count must not be above {PINNED_EXAM_MAX_COUNT} "
+                f"(ADR 0016, the four-exam budget), got {self.exam_max_count}"
+            )
+        if self.exam_min_insample_skew < PINNED_EXAM_MIN_INSAMPLE_SKEW:
+            raise ValueError(
+                f"paper.exam_min_insample_skew must not be below "
+                f"{PINNED_EXAM_MIN_INSAMPLE_SKEW} (ADR 0016), got {self.exam_min_insample_skew}"
+            )
+        return self
 
     @field_validator("execution")
     @classmethod
@@ -1416,6 +1497,11 @@ class Settings(BaseSettings):
     # and `secret_values` redacts it from every stored message. Read and checked only
     # by `store/raw_archive_config.py`, never validated here (#1093).
     tradepartner_raw_archive: SecretStr | None = Field(default=None)
+    # #3153: the optional owner-held OpenFIGI key, env `OPENFIGI_API_KEY`, set in `.env`
+    # (`.env.example`; data-foundation spec). Read here, like every other secret, so the
+    # `.env` value is used and `secret_values` redacts it; `ingest_openfigi` passes it to
+    # `openfigi_raw.map_tickers`, which never reads the environment itself.
+    openfigi_api_key: SecretStr | None = Field(default=None)
 
     def __init__(self, **kwargs: Any) -> None:
         # A per-instance default (not a class-level `model_config` value) so

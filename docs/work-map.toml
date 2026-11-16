@@ -1809,3 +1809,8 @@ unblocks = ["issue:2896"]
 what = "Draft the idea-pipeline spec (docs/specs/idea-pipeline.md) for the owner's review: sources, filter, two speeds, accounting, minimal new work, decisions."
 why = "The project has a back half (validation) and no front half (candidates); a written process stops the drift into infrastructure between ad hoc lists."
 unblocks = ["spec:idea-pipeline"]
+
+[adr.0029]
+what = "Identity repairs keep source observations: a moved-out bar, action or master row is retracted (kept, with reason, release and rule, reversible row by row), every release runs a coverage check, and an independent answer key of about 20 cited security histories judges the resolver."
+why = "The sitting rehearsal deleted 26,889 bar keys on 81 securities that no id receives (APA, MAR, BATRA/K, LLYVA/K) on a ruling that the deleted bars themselves would have contradicted, and Alpaca bars are not in the raw archive (#3275, #3264)."
+unblocks = ["task:T389", "task:T394", "issue:3275"]

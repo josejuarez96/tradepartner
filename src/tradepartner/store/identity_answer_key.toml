@@ -1,0 +1,1396 @@
+# The identity answer key (#3275, ADR 0029, T394): hard security histories whose
+# true outcome is known from sources OUTSIDE this repo. CHECK ONLY: it judges
+# the resolver and is never read by a universe, signal, backtest or research
+# module (a source scan in tests/lookahead/test_check_only_inputs.py pins that).
+#
+# line_end.last is the LAST SESSION the security traded on that exchange line
+# (omitted: the line did not end). holds and line_end are in calendar days; bars
+# are sessions. Bar citations attest continued trading from filings and
+# releases, not a price history: a known limit, see #3282.
+#
+# Format (store/identity_answer_key.py): [[history]] with [[history.input]]
+# (events that reach the store), [[history.bars]] (sessions that had bars) and
+# [[history.expected]] (outcomes). Entities are CIKs, never store ids. Every
+# fact has cite = {kind, ref, date}: kind is accession | exchange_notice |
+# company_notice | press_release; ref is an EDGAR accession or an https URL;
+# date is the cited document's date. A fact with no citation, or a citation
+# dated after the check date, is refused by the loader.
+#
+# Input kinds: form25, 25-nse (an exchange's Form 25-NSE), 8-k12b, listing. A form25
+# or 25-nse may carry `effective`, the removal date its cited notice states; without
+# it a consumer assumes ten days after the filing (Rule 12d2-2(d)(1)). A `listing`
+# is dated by the cited cover page or filing that shows the line.
+#
+# Expected outcomes are written from the cited source alone, never from the
+# resolver's output or any stored row.
+
+[[history]]
+id = "apa-apache-holdco-2021"
+title = "Apache / APA Corp: NYSE and NYSE Chicago lines withdrawn in 2020 while Nasdaq stays; holdco takes the ticker 2021-03-01"
+
+# Apache (CIK 0000006769) listed on three exchanges: its FY2018 10-K cover (filed
+# 2019-03-01) names the New York Stock Exchange, the Chicago Stock Exchange and the
+# Nasdaq Global Select Market. The listing is dated by that cover; the Form 25 rows
+# below share its start in the fixture.
+[[history.input]]
+kind = "listing"
+cik = "0000006769"
+date = 2019-03-01
+exchange = "Nasdaq"
+ticker = "APA"
+cite = { kind = "accession", ref = "0001733037-19-000004", date = 2019-03-01 }
+
+# Apache (CIK 0000006769) filed one Form 25 per exchange on 2020-06-08. The
+# NYSE one says the Chicago line gets its own Form 25 and that the common stock
+# stays on the Nasdaq Global Select Market.
+[[history.input]]
+kind = "form25"
+cik = "0000006769"
+date = 2020-06-08
+exchange = "NYSE"
+ticker = "APA"
+cite = { kind = "accession", ref = "0001193125-20-163490", date = 2020-06-08 }
+
+[[history.input]]
+kind = "form25"
+cik = "0000006769"
+date = 2020-06-08
+exchange = "NYSE Chicago"
+ticker = "APA"
+cite = { kind = "accession", ref = "0001193125-20-163501", date = 2020-06-08 }
+
+# 2021-03-01: APA Corp (CIK 0001841666) is the successor issuer to Apache.
+[[history.input]]
+kind = "8-k12b"
+cik = "0001841666"
+date = 2021-03-01
+exchange = "Nasdaq"
+ticker = "APA"
+predecessor_cik = "0000006769"
+cite = { kind = "accession", ref = "0001193125-21-063695", date = 2021-03-01 }
+
+# Nasdaq's Form 25-NSE for Apache's common stock, signed 2021-03-04 ("ON 3/2/2021 -
+# APACHE CORPORATION REORGANIZED AS APA CORPORATION"): the Nasdaq line ends with the
+# reorganisation. The form states no effective date.
+[[history.input]]
+kind = "25-nse"
+cik = "0000006769"
+date = 2021-03-04
+exchange = "Nasdaq"
+ticker = "APA"
+cite = { kind = "accession", ref = "0001354457-21-000304", date = 2021-03-04 }
+
+# Bars: Apache traded on Nasdaq from the session after the Form 25s (2020-06-09)
+# through the last session before the reorganisation (Friday 2021-02-26); APA
+# Corp from 2021-03-01 "on an uninterrupted basis" (8-K12B).
+[[history.bars]]
+cik = "0000006769"
+ticker = "APA"
+first = 2020-06-09
+last = 2021-02-26
+cite = { kind = "accession", ref = "0001193125-20-163501", date = 2020-06-08 }
+
+[[history.bars]]
+cik = "0001841666"
+ticker = "APA"
+first = 2021-03-01
+cite = { kind = "accession", ref = "0001193125-21-063695", date = 2021-03-01 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0000006769"
+exchange = "NYSE"
+last = 2020-06-08
+cite = { kind = "press_release", ref = "https://au.finance.yahoo.com/news/apache-corporation-announces-exclusive-listing-204510289.html", date = 2020-05-27 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0000006769"
+exchange = "NYSE Chicago"
+last = 2020-06-08
+cite = { kind = "press_release", ref = "https://au.finance.yahoo.com/news/apache-corporation-announces-exclusive-listing-204510289.html", date = 2020-05-27 }
+
+# Apache's Nasdaq line ended with the reorganisation: Nasdaq's Form 25-NSE of
+# 2021-03-04 strikes Apache's common stock ("on 3/2/2021, Apache Corporation was
+# reorganized as APA Corporation"), while APA Corp's stock continued on Nasdaq
+# uninterrupted. Last Apache session 2021-02-26 is the Friday before the
+# 2021-03-01 effective date. Between the two Form 25s of 2020-06-08 and then,
+# the Nasdaq line did NOT end: the fact the rehearsal copy lost (#3264).
+[[history.expected]]
+kind = "line_end"
+cik = "0000006769"
+exchange = "Nasdaq"
+last = 2021-02-26
+cite = { kind = "accession", ref = "0001354457-21-000304", date = 2021-03-04 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0001841666"
+exchange = "Nasdaq"
+cite = { kind = "accession", ref = "0001193125-21-063695", date = 2021-03-01 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0000006769"
+ticker = "APA"
+first = 2020-06-09
+last = 2021-02-28
+cite = { kind = "accession", ref = "0001193125-21-063695", date = 2021-03-01 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0001841666"
+ticker = "APA"
+first = 2021-03-01
+cite = { kind = "accession", ref = "0001193125-21-063695", date = 2021-03-01 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0000006769"
+ticker = "APA"
+first = 2020-06-09
+last = 2021-02-26
+cite = { kind = "accession", ref = "0001193125-20-163501", date = 2020-06-08 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0001841666"
+ticker = "APA"
+first = 2021-03-01
+cite = { kind = "accession", ref = "0001193125-21-063695", date = 2021-03-01 }
+
+[[history]]
+id = "mar-nyse-chicago-2020"
+title = "Marriott: NYSE Chicago line withdrawn 2020-09-20 while Nasdaq continues"
+
+# Last session on NYSE Chicago is Friday 2020-09-18: the release says trading is
+# suspended before the open on Monday 2020-09-21 (withdrawal effective Sunday
+# 2020-09-20).
+# Marriott's FY2018 10-K cover (filed 2019-03-01) lists the Class A common stock on
+# the Nasdaq Global Select Market and the Chicago Stock Exchange.
+[[history.input]]
+kind = "listing"
+cik = "0001048286"
+date = 2019-03-01
+exchange = "Nasdaq"
+ticker = "MAR"
+cite = { kind = "accession", ref = "0001628280-19-002337", date = 2019-03-01 }
+
+# Marriott (CIK 0001048286) Form 25 for the Class A common stock on NYSE
+# Chicago, signed 2020-09-10. The company's release of 2020-08-31 says the
+# withdrawal takes effect 2020-09-20, NYSE Chicago suspends trading before the
+# open on 2020-09-21, and the stock stays on the Nasdaq Global Select Market.
+[[history.input]]
+kind = "form25"
+cik = "0001048286"
+date = 2020-09-10
+exchange = "NYSE Chicago"
+ticker = "MAR"
+cite = { kind = "accession", ref = "0001628280-20-013435", date = 2020-09-10 }
+
+[[history.bars]]
+cik = "0001048286"
+ticker = "MAR"
+first = 2020-09-21
+cite = { kind = "press_release", ref = "https://www.prnewswire.com/news-releases/marriott-international-inc-to-delist-from-nyse-chicago-stock-exchange-301120767.html", date = 2020-08-31 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0001048286"
+exchange = "NYSE Chicago"
+last = 2020-09-18
+cite = { kind = "press_release", ref = "https://www.prnewswire.com/news-releases/marriott-international-inc-to-delist-from-nyse-chicago-stock-exchange-301120767.html", date = 2020-08-31 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0001048286"
+exchange = "Nasdaq"
+cite = { kind = "press_release", ref = "https://www.prnewswire.com/news-releases/marriott-international-inc-to-delist-from-nyse-chicago-stock-exchange-301120767.html", date = 2020-08-31 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0001048286"
+ticker = "MAR"
+first = 2020-09-21
+cite = { kind = "press_release", ref = "https://www.prnewswire.com/news-releases/marriott-international-inc-to-delist-from-nyse-chicago-stock-exchange-301120767.html", date = 2020-08-31 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0001048286"
+ticker = "MAR"
+first = 2020-09-21
+cite = { kind = "press_release", ref = "https://www.prnewswire.com/news-releases/marriott-international-inc-to-delist-from-nyse-chicago-stock-exchange-301120767.html", date = 2020-08-31 }
+
+[[history]]
+id = "batra-batrk-split-off-2023"
+title = "BATRA and BATRK: Liberty Media tracking stock becomes Atlanta Braves Holdings stock by split-off 2023-07-18"
+# Liberty Media (CIK 0001560385) redeemed each Liberty Braves share for one Atlanta Braves Holdings
+# (CIK 0001958140) share at 5:00 p.m. New York time on Tuesday 2023-07-18, after the close; Series A and
+# C began on Nasdaq as BATRA and BATRK on 2023-07-19 (8-K). Not a successor issuer: no 8-K12B. The
+# Nasdaq Form 25 (25-NSE form type) covers both Liberty Braves series, so it is entered once. Liberty
+# Media's other Nasdaq classes (FWON, LSXM) continue, so no line_end is claimed for its Nasdaq line.
+# Only Series A (BATRA) is entered: the store holds one ticker per security per start date, so
+# Series C (BATRK, same dates, same 8-K) cannot share the fixture security (#3421).
+[[history.input]]
+kind = "listing"
+cik = "0001560385"
+date = 2023-03-01
+exchange = "Nasdaq"
+ticker = "BATRA"
+cite = { kind = "accession", ref = "0001558370-23-002514", date = 2023-03-01 }
+
+[[history.input]]
+kind = "25-nse"
+cik = "0001560385"
+date = 2023-07-18
+exchange = "Nasdaq"
+ticker = "BATRA"
+cite = { kind = "accession", ref = "0001354457-23-000512", date = 2023-07-18 }
+
+[[history.input]]
+kind = "listing"
+cik = "0001958140"
+date = 2023-07-19
+exchange = "Nasdaq"
+ticker = "BATRA"
+cite = { kind = "accession", ref = "0001104659-23-082076", date = 2023-07-18 }
+
+[[history.bars]]
+cik = "0001560385"
+ticker = "BATRA"
+first = 2023-03-01
+last = 2023-07-18
+cite = { kind = "accession", ref = "0001104659-23-076901", date = 2023-06-30 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0001560385"
+ticker = "BATRA"
+first = 2023-03-01
+last = 2023-07-18
+cite = { kind = "accession", ref = "0001104659-23-076901", date = 2023-06-30 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0001560385"
+ticker = "BATRA"
+first = 2023-03-01
+last = 2023-07-18
+cite = { kind = "accession", ref = "0001104659-23-076901", date = 2023-06-30 }
+
+[[history.bars]]
+cik = "0001958140"
+ticker = "BATRA"
+first = 2023-07-19
+cite = { kind = "accession", ref = "0001104659-23-082076", date = 2023-07-18 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0001958140"
+ticker = "BATRA"
+first = 2023-07-19
+cite = { kind = "accession", ref = "0001104659-23-082076", date = 2023-07-18 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0001958140"
+ticker = "BATRA"
+first = 2023-07-19
+cite = { kind = "accession", ref = "0001104659-23-082076", date = 2023-07-18 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0001958140"
+exchange = "Nasdaq"
+cite = { kind = "accession", ref = "0001104659-23-082076", date = 2023-07-18 }
+
+
+[[history]]
+id = "llyva-llyvk-split-off-2025"
+title = "LLYVA and LLYVK: Liberty Media tracking stock becomes Liberty Live Holdings stock by split-off 2025-12-15"
+# Same shape as BATRA/BATRK, 2025. Liberty Media redeemed each Liberty Live share for one Liberty Live
+# Group (Liberty Live Holdings, CIK 0002078416) share at 4:05 p.m. New York time on Monday 2025-12-15,
+# after the close; Series A and C trade on Nasdaq from 2025-12-16. Liberty Media's other Nasdaq classes
+# continue, so no line_end is claimed for its line.
+# Only Series A (LLYVA) is entered; Series C (LLYVK) has the same dates and sources but cannot share
+# the fixture security (#3421).
+[[history.input]]
+kind = "listing"
+cik = "0001560385"
+date = 2025-12-08
+exchange = "Nasdaq"
+ticker = "LLYVA"
+cite = { kind = "accession", ref = "0001104659-25-119086", date = 2025-12-08 }
+
+[[history.input]]
+kind = "25-nse"
+cik = "0001560385"
+date = 2025-12-15
+exchange = "Nasdaq"
+ticker = "LLYVA"
+cite = { kind = "accession", ref = "0001354457-25-001270", date = 2025-12-15 }
+
+[[history.input]]
+kind = "listing"
+cik = "0002078416"
+date = 2025-12-16
+exchange = "Nasdaq"
+ticker = "LLYVA"
+cite = { kind = "accession", ref = "0001104659-25-121239", date = 2025-12-15 }
+
+[[history.bars]]
+cik = "0001560385"
+ticker = "LLYVA"
+first = 2025-12-08
+last = 2025-12-15
+cite = { kind = "accession", ref = "0001104659-25-121239", date = 2025-12-15 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0001560385"
+ticker = "LLYVA"
+first = 2025-12-08
+last = 2025-12-15
+cite = { kind = "accession", ref = "0001104659-25-121239", date = 2025-12-15 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0001560385"
+ticker = "LLYVA"
+first = 2025-12-08
+last = 2025-12-15
+cite = { kind = "accession", ref = "0001104659-25-121239", date = 2025-12-15 }
+
+[[history.bars]]
+cik = "0002078416"
+ticker = "LLYVA"
+first = 2025-12-16
+cite = { kind = "accession", ref = "0001104659-25-121239", date = 2025-12-15 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0002078416"
+ticker = "LLYVA"
+first = 2025-12-16
+cite = { kind = "accession", ref = "0001104659-25-121239", date = 2025-12-15 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0002078416"
+ticker = "LLYVA"
+first = 2025-12-16
+cite = { kind = "accession", ref = "0001104659-25-121239", date = 2025-12-15 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0002078416"
+exchange = "Nasdaq"
+cite = { kind = "accession", ref = "0001104659-25-120675", date = 2025-12-12 }
+
+
+[[history]]
+id = "ua-uaa-ticker-swap-2016"
+title = "Under Armour: UA.C becomes UA and Class A moves from UA to UAA on 2016-12-07"
+# One issuer (CIK 0001336917), NYSE. Class C was issued 2016-04-07 and listed as UA.C from 2016-04-08.
+# From the start of trading on 2016-12-07 Class A moves from UA to UAA and Class C takes UA. "UA" is
+# therefore two securities, before and after 2016-12-07; the key names holders by CIK, so it cannot
+# tell the two classes apart. It pins Class A as UA until 2016-12-06, Class C as UA.C from 2016-04-08
+# to 2016-12-06 and Class A as UAA from 2016-12-07; Class C as UA from 2016-12-07 is not entered.
+[[history.input]]
+kind = "listing"
+cik = "0001336917"
+date = 2016-02-22
+exchange = "NYSE"
+ticker = "UA"
+cite = { kind = "accession", ref = "0001336917-16-000064", date = 2016-02-22 }
+
+[[history.input]]
+kind = "listing"
+cik = "0001336917"
+date = 2016-04-08
+exchange = "NYSE"
+ticker = "UA.C"
+cite = { kind = "accession", ref = "0001336917-17-000017", date = 2017-02-23 }
+
+[[history.input]]
+kind = "listing"
+cik = "0001336917"
+date = 2016-12-07
+exchange = "NYSE"
+ticker = "UAA"
+cite = { kind = "accession", ref = "0001336917-16-000116", date = 2016-11-28 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0001336917"
+ticker = "UA"
+first = 2016-02-22
+last = 2016-12-06
+cite = { kind = "accession", ref = "0001336917-17-000017", date = 2017-02-23 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0001336917"
+ticker = "UA.C"
+first = 2016-04-08
+last = 2016-12-06
+cite = { kind = "accession", ref = "0001336917-17-000017", date = 2017-02-23 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0001336917"
+ticker = "UAA"
+first = 2016-12-07
+cite = { kind = "accession", ref = "0001336917-16-000116", date = 2016-11-28 }
+
+[[history.bars]]
+cik = "0001336917"
+ticker = "UA.C"
+first = 2016-04-08
+last = 2016-12-06
+cite = { kind = "accession", ref = "0001336917-17-000017", date = 2017-02-23 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0001336917"
+ticker = "UA.C"
+first = 2016-04-08
+last = 2016-12-06
+cite = { kind = "accession", ref = "0001336917-17-000017", date = 2017-02-23 }
+
+[[history.bars]]
+cik = "0001336917"
+ticker = "UAA"
+first = 2016-12-07
+cite = { kind = "accession", ref = "0001336917-16-000116", date = 2016-11-28 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0001336917"
+ticker = "UAA"
+first = 2016-12-07
+cite = { kind = "accession", ref = "0001336917-16-000116", date = 2016-11-28 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0001336917"
+exchange = "NYSE"
+cite = { kind = "accession", ref = "0001336917-17-000017", date = 2017-02-23 }
+
+
+[[history]]
+id = "alphabet-google-holdco-2015"
+title = "Alphabet / Google: holding company with a new CIK, GOOG and GOOGL continue on Nasdaq 2015-10-02"
+# Google (CIK 0001288776) became a subsidiary of Alphabet (CIK 0001652044) on Friday 2015-10-02;
+# Alphabet is the successor issuer under Rule 12g-3(a) and its Class A and Class C shares "continue to
+# trade on the NASDAQ Global Select Market on an uninterrupted basis under the symbol GOOG and GOOGL"
+# with new CUSIPs (8-K12B). No Form 25. Google's side of the listing is dated by its FY2014 10-K cover
+# (Nasdaq Global Select Market); its tickers GOOG and GOOGL are those the 8-K12B says continue. Only GOOGL (Class A) is entered;
+# GOOG (Class C) has the same dates and source but cannot share the fixture security (#3421).
+[[history.input]]
+kind = "listing"
+cik = "0001288776"
+date = 2015-02-09
+exchange = "Nasdaq"
+ticker = "GOOGL"
+cite = { kind = "accession", ref = "0001288776-15-000008", date = 2015-02-09 }
+
+[[history.input]]
+kind = "8-k12b"
+cik = "0001652044"
+date = 2015-10-02
+exchange = "Nasdaq"
+ticker = "GOOGL"
+predecessor_cik = "0001288776"
+cite = { kind = "accession", ref = "0001193125-15-336577", date = 2015-10-02 }
+
+[[history.bars]]
+cik = "0001288776"
+ticker = "GOOGL"
+first = 2015-02-09
+last = 2015-10-01
+cite = { kind = "accession", ref = "0001193125-15-336577", date = 2015-10-02 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0001288776"
+ticker = "GOOGL"
+first = 2015-02-09
+last = 2015-10-01
+cite = { kind = "accession", ref = "0001193125-15-336577", date = 2015-10-02 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0001288776"
+ticker = "GOOGL"
+first = 2015-02-09
+last = 2015-10-01
+cite = { kind = "accession", ref = "0001193125-15-336577", date = 2015-10-02 }
+
+[[history.bars]]
+cik = "0001652044"
+ticker = "GOOGL"
+first = 2015-10-02
+cite = { kind = "accession", ref = "0001193125-15-336577", date = 2015-10-02 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0001652044"
+ticker = "GOOGL"
+first = 2015-10-02
+cite = { kind = "accession", ref = "0001193125-15-336577", date = 2015-10-02 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0001652044"
+ticker = "GOOGL"
+first = 2015-10-02
+cite = { kind = "accession", ref = "0001193125-15-336577", date = 2015-10-02 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0001288776"
+exchange = "Nasdaq"
+last = 2015-10-01
+cite = { kind = "accession", ref = "0001193125-15-336577", date = 2015-10-02 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0001652044"
+exchange = "Nasdaq"
+cite = { kind = "accession", ref = "0001193125-15-336577", date = 2015-10-02 }
+
+
+[[history]]
+id = "swx-holdco-2017"
+title = "Southwest Gas Holdings: holding company, same ticker and CUSIP, NYSE uninterrupted from 2017-01-01"
+# Southwest Gas Corporation (CIK 0000092416) became a subsidiary of Southwest Gas Holdings (CIK
+# 0001692115) effective Sunday 2017-01-01; the holdco is the successor issuer (Rule 12g-3(a)) and its
+# common stock "continue[s] to trade on the New York Stock Exchange on an uninterrupted basis under the
+# symbol SWX". 2017-01-02 was a market holiday, so the last session of the old issuer is Friday
+# 2016-12-30 and the first of the holdco Tuesday 2017-01-03.
+[[history.input]]
+kind = "listing"
+cik = "0000092416"
+date = 2016-02-25
+exchange = "NYSE"
+ticker = "SWX"
+cite = { kind = "accession", ref = "0001193125-16-477109", date = 2016-02-25 }
+
+[[history.input]]
+kind = "8-k12b"
+cik = "0001692115"
+date = 2017-01-01
+exchange = "NYSE"
+ticker = "SWX"
+predecessor_cik = "0000092416"
+cite = { kind = "accession", ref = "0001193125-17-000274", date = 2017-01-03 }
+
+[[history.bars]]
+cik = "0000092416"
+ticker = "SWX"
+first = 2016-02-25
+last = 2016-12-30
+cite = { kind = "accession", ref = "0001193125-17-000274", date = 2017-01-03 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0000092416"
+ticker = "SWX"
+first = 2016-02-25
+last = 2016-12-30
+cite = { kind = "accession", ref = "0001193125-17-000274", date = 2017-01-03 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0000092416"
+ticker = "SWX"
+first = 2016-02-25
+last = 2016-12-31
+cite = { kind = "accession", ref = "0001193125-17-000274", date = 2017-01-03 }
+
+[[history.bars]]
+cik = "0001692115"
+ticker = "SWX"
+first = 2017-01-03
+cite = { kind = "accession", ref = "0001193125-17-000274", date = 2017-01-03 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0001692115"
+ticker = "SWX"
+first = 2017-01-03
+cite = { kind = "accession", ref = "0001193125-17-000274", date = 2017-01-03 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0001692115"
+ticker = "SWX"
+first = 2017-01-01
+cite = { kind = "accession", ref = "0001193125-17-000274", date = 2017-01-03 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0000092416"
+exchange = "NYSE"
+last = 2016-12-30
+cite = { kind = "accession", ref = "0001193125-17-000274", date = 2017-01-03 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0001692115"
+exchange = "NYSE"
+cite = { kind = "accession", ref = "0001193125-17-000274", date = 2017-01-03 }
+
+
+[[history]]
+id = "fiserv-fisv-to-fi-2023"
+title = "Fiserv: Nasdaq to NYSE, FISV becomes FI on 2023-06-07, one security"
+# Fiserv (CIK 0000798354) announced on 2023-05-24 that it was transferring its listing from Nasdaq to
+# the NYSE and "expects to begin trading on the NYSE June 7, 2023, under a new ticker FI"; the stock
+# continues on Nasdaq until the transfer is complete. Nasdaq's Form 25 (Rule 12d2-2(c)) is signed
+# Tuesday 2023-06-06, the last Nasdaq session. The NYSE start is the release's expected date;
+# the FY2023 Q2 10-Q cover (0000798354-23-000014, filed 2023-07-27) shows FI on the NYSE.
+[[history.input]]
+kind = "listing"
+cik = "0000798354"
+date = 2023-02-23
+exchange = "Nasdaq"
+ticker = "FISV"
+cite = { kind = "accession", ref = "0000798354-23-000004", date = 2023-02-23 }
+
+[[history.input]]
+kind = "form25"
+cik = "0000798354"
+date = 2023-06-06
+exchange = "Nasdaq"
+ticker = "FISV"
+cite = { kind = "accession", ref = "0001193125-23-161601", date = 2023-06-06 }
+
+[[history.input]]
+kind = "listing"
+cik = "0000798354"
+date = 2023-06-07
+exchange = "NYSE"
+ticker = "FI"
+cite = { kind = "accession", ref = "0001193125-23-154199", date = 2023-05-25 }
+
+[[history.bars]]
+cik = "0000798354"
+ticker = "FISV"
+first = 2023-05-25
+last = 2023-06-06
+cite = { kind = "accession", ref = "0001193125-23-154199", date = 2023-05-25 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0000798354"
+ticker = "FISV"
+first = 2023-05-25
+last = 2023-06-06
+cite = { kind = "accession", ref = "0001193125-23-154199", date = 2023-05-25 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0000798354"
+ticker = "FISV"
+first = 2023-02-23
+last = 2023-06-06
+cite = { kind = "accession", ref = "0001193125-23-154199", date = 2023-05-25 }
+
+[[history.bars]]
+cik = "0000798354"
+ticker = "FI"
+first = 2023-06-07
+cite = { kind = "accession", ref = "0001193125-23-154199", date = 2023-05-25 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0000798354"
+ticker = "FI"
+first = 2023-06-07
+cite = { kind = "accession", ref = "0001193125-23-154199", date = 2023-05-25 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0000798354"
+ticker = "FI"
+first = 2023-06-07
+cite = { kind = "accession", ref = "0001193125-23-154199", date = 2023-05-25 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0000798354"
+exchange = "Nasdaq"
+last = 2023-06-06
+cite = { kind = "accession", ref = "0001193125-23-161601", date = 2023-06-06 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0000798354"
+exchange = "NYSE"
+cite = { kind = "accession", ref = "0001193125-23-154199", date = 2023-05-25 }
+
+
+[[history]]
+id = "meta-fb-to-meta-2022"
+title = "Meta Platforms: FB becomes META on Nasdaq 2022-06-09, same issuer and CUSIP"
+# A ticker change within one line: Class A common "will begin trading on The Nasdaq Global Select Market
+# under the new ticker symbol META prior to market open on June 9, 2022" (8-K of 2022-05-31); it
+# "will continue to be listed on NASDAQ and its CUSIP number will remain unchanged". The last FB
+# session is Wednesday 2022-06-08.
+[[history.input]]
+kind = "listing"
+cik = "0001326801"
+date = 2022-02-03
+exchange = "Nasdaq"
+ticker = "FB"
+cite = { kind = "accession", ref = "0001326801-22-000018", date = 2022-02-03 }
+
+[[history.input]]
+kind = "listing"
+cik = "0001326801"
+date = 2022-06-09
+exchange = "Nasdaq"
+ticker = "META"
+cite = { kind = "accession", ref = "0001326801-22-000070", date = 2022-05-31 }
+
+[[history.bars]]
+cik = "0001326801"
+ticker = "FB"
+first = 2022-05-31
+last = 2022-06-08
+cite = { kind = "accession", ref = "0001326801-22-000070", date = 2022-05-31 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0001326801"
+ticker = "FB"
+first = 2022-05-31
+last = 2022-06-08
+cite = { kind = "accession", ref = "0001326801-22-000070", date = 2022-05-31 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0001326801"
+ticker = "FB"
+first = 2022-02-03
+last = 2022-06-08
+cite = { kind = "accession", ref = "0001326801-22-000070", date = 2022-05-31 }
+
+[[history.bars]]
+cik = "0001326801"
+ticker = "META"
+first = 2022-06-09
+cite = { kind = "accession", ref = "0001326801-22-000070", date = 2022-05-31 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0001326801"
+ticker = "META"
+first = 2022-06-09
+cite = { kind = "accession", ref = "0001326801-22-000070", date = 2022-05-31 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0001326801"
+ticker = "META"
+first = 2022-06-09
+cite = { kind = "accession", ref = "0001326801-22-000070", date = 2022-05-31 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0001326801"
+exchange = "Nasdaq"
+cite = { kind = "accession", ref = "0001326801-22-000070", date = 2022-05-31 }
+
+
+[[history]]
+id = "dds-nyse-to-txse-2026"
+title = "Dillard's DDS: NYSE to the Texas Stock Exchange, Form 25 filed after the NYSE line ended"
+# Dillard's (CIK 0000028917) moved its Class A common stock (DDS) from the NYSE to the TXSE: "trading ...
+# on the NYSE as primary listings will end at market close on October 2, 2026 ... trading on the TXSE ...
+# will begin at market open on October 5, 2026", same symbol (8-K of 2026-09-18). The Form 25 is signed
+# 2026-10-05, after the NYSE line ended, and takes effect ten days later: a Form 25 that is a transfer,
+# not a delisting. DDT, the trust's capital securities, belongs to another registrant and is left out.
+[[history.input]]
+kind = "form25"
+cik = "0000028917"
+date = 2026-10-05
+exchange = "NYSE"
+ticker = "DDS"
+cite = { kind = "accession", ref = "0001104659-26-113491", date = 2026-10-05 }
+
+[[history.input]]
+kind = "listing"
+cik = "0000028917"
+date = 2026-10-05
+exchange = "TXSE"
+ticker = "DDS"
+cite = { kind = "accession", ref = "0001104659-26-111370", date = 2026-09-28 }
+
+[[history.bars]]
+cik = "0000028917"
+ticker = "DDS"
+first = 2026-09-18
+last = 2026-10-02
+cite = { kind = "accession", ref = "0001104659-26-108945", date = 2026-09-18 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0000028917"
+ticker = "DDS"
+first = 2026-09-18
+last = 2026-10-02
+cite = { kind = "accession", ref = "0001104659-26-108945", date = 2026-09-18 }
+
+[[history.bars]]
+cik = "0000028917"
+ticker = "DDS"
+first = 2026-10-05
+cite = { kind = "accession", ref = "0001104659-26-111370", date = 2026-09-28 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0000028917"
+ticker = "DDS"
+first = 2026-10-05
+cite = { kind = "accession", ref = "0001104659-26-111370", date = 2026-09-28 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0000028917"
+ticker = "DDS"
+first = 2026-09-18
+cite = { kind = "accession", ref = "0001104659-26-108945", date = 2026-09-18 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0000028917"
+exchange = "NYSE"
+last = 2026-10-02
+cite = { kind = "accession", ref = "0001104659-26-108945", date = 2026-09-18 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0000028917"
+exchange = "TXSE"
+cite = { kind = "accession", ref = "0001104659-26-111370", date = 2026-09-28 }
+
+
+[[history]]
+id = "tcbi-nasdaq-to-txse-2026"
+title = "Texas Capital TCBI: Nasdaq to the Texas Stock Exchange 2026-10-08"
+# Texas Capital Bancshares (CIK 0001077428): Nasdaq listing and trading end "at market close on October 7,
+# 2026" and TXSE trading begins at market open 2026-10-08 (8-K of 2026-09-14, confirmed in the past tense
+# by the Form 8-A12B of 2026-10-08). The common stock's ticker then changes to TXCP on 2026-11-09; the
+# filing that shows it is dated 2026-11-13, after this key's as-of day, so the change is not entered. The TCBI spans on the TXSE therefore end at the last cover
+# page that shows TCBI there (10-Q 0001077428-26-000080, filed 2026-10-22), not open.
+[[history.input]]
+kind = "form25"
+cik = "0001077428"
+date = 2026-10-07
+exchange = "Nasdaq"
+ticker = "TCBI"
+cite = { kind = "accession", ref = "0001077428-26-000070", date = 2026-10-07 }
+
+[[history.input]]
+kind = "listing"
+cik = "0001077428"
+date = 2026-10-08
+exchange = "TXSE"
+ticker = "TCBI"
+cite = { kind = "accession", ref = "0001077428-26-000074", date = 2026-10-08 }
+
+[[history.bars]]
+cik = "0001077428"
+ticker = "TCBI"
+first = 2026-09-14
+last = 2026-10-07
+cite = { kind = "accession", ref = "0001077428-26-000061", date = 2026-09-14 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0001077428"
+ticker = "TCBI"
+first = 2026-09-14
+last = 2026-10-07
+cite = { kind = "accession", ref = "0001077428-26-000061", date = 2026-09-14 }
+
+[[history.bars]]
+cik = "0001077428"
+ticker = "TCBI"
+first = 2026-10-08
+last = 2026-10-22
+cite = { kind = "accession", ref = "0001077428-26-000080", date = 2026-10-22 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0001077428"
+ticker = "TCBI"
+first = 2026-10-08
+last = 2026-10-22
+cite = { kind = "accession", ref = "0001077428-26-000080", date = 2026-10-22 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0001077428"
+ticker = "TCBI"
+first = 2026-09-14
+last = 2026-10-22
+cite = { kind = "accession", ref = "0001077428-26-000080", date = 2026-10-22 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0001077428"
+exchange = "Nasdaq"
+last = 2026-10-07
+cite = { kind = "accession", ref = "0001077428-26-000061", date = 2026-09-14 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0001077428"
+exchange = "TXSE"
+cite = { kind = "accession", ref = "0001077428-26-000074", date = 2026-10-08 }
+
+
+[[history]]
+id = "iboc-nasdaq-to-txse-2026"
+title = "International Bancshares IBOC: Nasdaq to the Texas Stock Exchange 2026-10-19"
+# International Bancshares (CIK 0000315709): Nasdaq listing and trading "cease at the close of trading on
+# Friday, October 16, 2026" and TXSE trading "begin[s] at market open on Monday, October 19, 2026" under the
+# same ticker (8-K of 2026-10-06). The Nasdaq Form 25 is signed 2026-10-16.
+[[history.input]]
+kind = "form25"
+cik = "0000315709"
+date = 2026-10-16
+exchange = "Nasdaq"
+ticker = "IBOC"
+cite = { kind = "accession", ref = "0001104659-26-116638", date = 2026-10-16 }
+
+[[history.input]]
+kind = "listing"
+cik = "0000315709"
+date = 2026-10-19
+exchange = "TXSE"
+ticker = "IBOC"
+cite = { kind = "accession", ref = "0001104659-26-115337", date = 2026-10-13 }
+
+[[history.bars]]
+cik = "0000315709"
+ticker = "IBOC"
+first = 2026-10-06
+last = 2026-10-16
+cite = { kind = "accession", ref = "0001104659-26-113899", date = 2026-10-06 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0000315709"
+ticker = "IBOC"
+first = 2026-10-06
+last = 2026-10-16
+cite = { kind = "accession", ref = "0001104659-26-113899", date = 2026-10-06 }
+
+[[history.bars]]
+cik = "0000315709"
+ticker = "IBOC"
+first = 2026-10-19
+cite = { kind = "accession", ref = "0001104659-26-115337", date = 2026-10-13 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0000315709"
+ticker = "IBOC"
+first = 2026-10-19
+cite = { kind = "accession", ref = "0001104659-26-115337", date = 2026-10-13 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0000315709"
+ticker = "IBOC"
+first = 2026-10-06
+cite = { kind = "accession", ref = "0001104659-26-113899", date = 2026-10-06 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0000315709"
+exchange = "Nasdaq"
+last = 2026-10-16
+cite = { kind = "accession", ref = "0001104659-26-113899", date = 2026-10-06 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0000315709"
+exchange = "TXSE"
+cite = { kind = "accession", ref = "0001104659-26-115337", date = 2026-10-13 }
+
+
+[[history]]
+id = "chk-chapter-11-new-equity-2021"
+title = "Chesapeake Energy CHK: old NYSE equity suspended 2020-06-29, new CHK on Nasdaq from 2021-02-10"
+# Chesapeake (CIK 0000895126, the same CIK throughout) filed Chapter 11 on Sunday 2020-06-28. The NYSE
+# "on June 29, 2020 ... suspended [trading] prior to market open" (Form 25-NSE notice, removal at the
+# opening of 2020-07-31), so the last NYSE session is Friday 2020-06-26. All old equity was cancelled
+# on the Plan's effective date 2021-02-09 and new common stock issued, which applied to list on Nasdaq
+# as CHK. The first Nasdaq session 2021-02-10 is derived: the 10-K's successor period starts then; no
+# filing says "began trading on February 10". Nothing in the key claims CHK for the months between.
+[[history.input]]
+kind = "25-nse"
+cik = "0000895126"
+date = 2020-07-20
+exchange = "NYSE"
+ticker = "CHK"
+effective = 2020-07-31
+cite = { kind = "accession", ref = "0000876661-20-000569", date = 2020-07-20 }
+
+[[history.input]]
+kind = "listing"
+cik = "0000895126"
+date = 2021-02-10
+exchange = "Nasdaq"
+ticker = "CHK"
+cite = { kind = "accession", ref = "0000895126-21-000035", date = 2021-02-09 }
+
+[[history.bars]]
+cik = "0000895126"
+ticker = "CHK"
+first = 2020-06-26
+last = 2020-06-26
+cite = { kind = "accession", ref = "0000876661-20-000569", date = 2020-07-20 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0000895126"
+ticker = "CHK"
+first = 2020-06-26
+last = 2020-06-26
+cite = { kind = "accession", ref = "0000876661-20-000569", date = 2020-07-20 }
+
+[[history.bars]]
+cik = "0000895126"
+ticker = "CHK"
+first = 2021-02-10
+cite = { kind = "accession", ref = "0000895126-22-000029", date = 2022-02-24 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0000895126"
+ticker = "CHK"
+first = 2021-02-10
+cite = { kind = "accession", ref = "0000895126-22-000029", date = 2022-02-24 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0000895126"
+ticker = "CHK"
+first = 2021-02-10
+cite = { kind = "accession", ref = "0000895126-21-000053", date = 2021-02-12 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0000895126"
+exchange = "NYSE"
+last = 2020-06-26
+cite = { kind = "accession", ref = "0000876661-20-000569", date = 2020-07-20 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0000895126"
+exchange = "Nasdaq"
+cite = { kind = "accession", ref = "0000895126-21-000053", date = 2021-02-12 }
+
+
+[[history]]
+id = "htz-chapter-11-otc-then-nasdaq-2021"
+title = "Hertz Global HTZ: NYSE suspension 2020-10-29, a year over the counter, new HTZ on Nasdaq 2021-11-09"
+# Hertz Global (CIK 0001657853): the NYSE "suspended trading ... after the market close on October 29,
+# 2020" and filed Form 25-NSE on 2020-10-30 to remove the stock at the opening of 2020-11-10; it traded
+# only over the counter (HTZGQ, later HTZZ) until the reorganised company's common stock began trading on
+# Nasdaq as HTZ on 2021-11-09. There is no national listing between the two HTZ lines, and the key claims
+# no holder for HTZ in that gap. The OTC symbol dates are not pinned and are not entered.
+[[history.input]]
+kind = "25-nse"
+cik = "0001657853"
+date = 2020-10-30
+exchange = "NYSE"
+ticker = "HTZ"
+effective = 2020-11-10
+cite = { kind = "accession", ref = "0000876661-20-001005", date = 2020-10-30 }
+
+[[history.input]]
+kind = "listing"
+cik = "0001657853"
+date = 2021-11-09
+exchange = "Nasdaq"
+ticker = "HTZ"
+cite = { kind = "accession", ref = "0001104659-21-135222", date = 2021-11-08 }
+
+[[history.bars]]
+cik = "0001657853"
+ticker = "HTZ"
+first = 2020-10-29
+last = 2020-10-29
+cite = { kind = "accession", ref = "0001657853-20-000106", date = 2020-11-03 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0001657853"
+ticker = "HTZ"
+first = 2020-10-29
+last = 2020-10-29
+cite = { kind = "accession", ref = "0001657853-20-000106", date = 2020-11-03 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0001657853"
+ticker = "HTZ"
+first = 2020-10-29
+last = 2020-10-29
+cite = { kind = "accession", ref = "0001657853-20-000106", date = 2020-11-03 }
+
+[[history.bars]]
+cik = "0001657853"
+ticker = "HTZ"
+first = 2021-11-09
+cite = { kind = "accession", ref = "0001657853-22-000012", date = 2022-02-23 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0001657853"
+ticker = "HTZ"
+first = 2021-11-09
+cite = { kind = "accession", ref = "0001657853-22-000012", date = 2022-02-23 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0001657853"
+ticker = "HTZ"
+first = 2021-11-09
+cite = { kind = "accession", ref = "0001657853-22-000012", date = 2022-02-23 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0001657853"
+exchange = "NYSE"
+last = 2020-10-29
+cite = { kind = "accession", ref = "0001657853-20-000106", date = 2020-11-03 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0001657853"
+exchange = "Nasdaq"
+cite = { kind = "accession", ref = "0001657853-22-000012", date = 2022-02-23 }
+
+
+[[history]]
+id = "ftr-chapter-11-new-ticker-2021"
+title = "Frontier Communications: old FTR struck from Nasdaq 2020-04-29, new common on Nasdaq as FYBR 2021-05-04"
+# Frontier (CIK 0000020520): Nasdaq filed Form 25-NSE on 2020-04-29 and the old common stock traded on
+# OTC Pink as FTRCQ. On the Plan's effective date 2021-04-30 all old equity was cancelled and 244,400,000
+# new shares issued by the same registrant (successor issuer, Rule 12g-3(a)); the release says the common
+# stock "is expected to commence trading on the NASDAQ ... under the ticker symbol FYBR at market open on
+# May 4, 2021" (the 8-A12B is of 2021-05-03). The last session of the old FTR on Nasdaq is not stated in
+# any filing found, so no end is claimed for it.
+[[history.input]]
+kind = "25-nse"
+cik = "0000020520"
+date = 2020-04-29
+exchange = "Nasdaq"
+ticker = "FTR"
+effective = 2020-05-08
+cite = { kind = "accession", ref = "0001354457-20-000170", date = 2020-04-29 }
+
+[[history.input]]
+kind = "listing"
+cik = "0000020520"
+date = 2021-05-04
+exchange = "Nasdaq"
+ticker = "FYBR"
+cite = { kind = "accession", ref = "0001140361-21-015200", date = 2021-04-30 }
+
+[[history.bars]]
+cik = "0000020520"
+ticker = "FYBR"
+first = 2021-05-04
+cite = { kind = "accession", ref = "0001140361-21-015200", date = 2021-04-30 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0000020520"
+ticker = "FYBR"
+first = 2021-05-04
+cite = { kind = "accession", ref = "0001140361-21-015200", date = 2021-04-30 }
+
+[[history.expected]]
+kind = "holds"
+cik = "0000020520"
+ticker = "FYBR"
+first = 2021-05-04
+cite = { kind = "accession", ref = "0001140361-21-015424", date = 2021-05-03 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0000020520"
+exchange = "Nasdaq"
+cite = { kind = "accession", ref = "0001140361-21-015424", date = 2021-05-03 }
+
+
+[[history]]
+id = "sivb-halt-chapter-11-2023"
+title = "SVB Financial SIVB: Nasdaq halt 2023-03-10, suspension 2023-03-28, Form 25-NSE removal 2023-05-12"
+# SVB Financial (CIK 0000719739): trading in the common stock "was halted on March 10, 2023 and will be
+# suspended on March 28, 2023" and Nasdaq will file Form 25-NSE (8-K); Chapter 11 was filed 2023-03-17;
+# the Form 25-NSE of 2023-05-02 removes the stock "effective at the opening of the trading session on May
+# 12, 2023". Derived: a halt on Friday 2023-03-10 leaves Thursday 2023-03-09 as the last session with
+# bars; no filing says so.
+[[history.input]]
+kind = "25-nse"
+cik = "0000719739"
+date = 2023-05-02
+exchange = "Nasdaq"
+ticker = "SIVB"
+effective = 2023-05-12
+cite = { kind = "accession", ref = "0001354457-23-000327", date = 2023-05-02 }
+
+[[history.bars]]
+cik = "0000719739"
+ticker = "SIVB"
+first = 2023-03-09
+last = 2023-03-09
+cite = { kind = "accession", ref = "0001193125-23-073665", date = 2023-03-17 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0000719739"
+ticker = "SIVB"
+first = 2023-03-09
+last = 2023-03-09
+cite = { kind = "accession", ref = "0001193125-23-073665", date = 2023-03-17 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0000719739"
+exchange = "Nasdaq"
+last = 2023-03-09
+cite = { kind = "accession", ref = "0001193125-23-073665", date = 2023-03-17 }
+
+
+[[history]]
+id = "bbby-nasdaq-suspension-2023"
+title = "Bed Bath & Beyond BBBY: Nasdaq delisting determination 2023-04-24, suspended at the open of 2023-05-03, Form 25-NSE 2023-07-10"
+# Bed Bath & Beyond (CIK 0000886158): Nasdaq notified the company on 2023-04-24 that the stock "will be
+# delisted" and "Trading ... will be suspended at the opening of business on May 3, 2023" (8-K), so the
+# last Nasdaq session is Tuesday 2023-05-02. It then traded over the counter (BBBYQ, 8-K cover of
+# 2023-06-28). The Nasdaq Form 25-NSE is signed 2023-07-10 and states effective 2023-07-20.
+[[history.input]]
+kind = "25-nse"
+cik = "0000886158"
+date = 2023-07-10
+exchange = "Nasdaq"
+ticker = "BBBY"
+effective = 2023-07-20
+cite = { kind = "accession", ref = "0001354457-23-000478", date = 2023-07-10 }
+
+[[history.bars]]
+cik = "0000886158"
+ticker = "BBBY"
+first = 2023-04-25
+last = 2023-05-02
+cite = { kind = "accession", ref = "0001193125-23-115523", date = 2023-04-25 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0000886158"
+ticker = "BBBY"
+first = 2023-04-25
+last = 2023-05-02
+cite = { kind = "accession", ref = "0001193125-23-115523", date = 2023-04-25 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0000886158"
+exchange = "Nasdaq"
+last = 2023-05-02
+cite = { kind = "accession", ref = "0001193125-23-115523", date = 2023-04-25 }
+
+
+[[history]]
+id = "rev-nyse-suspension-2022"
+title = "Revlon REV: NYSE suspended trading after the close of 2022-10-20, Form 25-NSE removal 2022-11-01"
+# Revlon (CIK 0000887921): after the failed appeal "the NYSE ... has suspended trading ... after the market
+# close on October 20, 2022"; on October 21 the NYSE applied to remove the Class A stock at the opening of
+# November 1, 2022; it traded over the counter as REVRQ from 2022-10-21 (10-Q for the quarter to
+# 2022-09-30). The last NYSE session is Thursday 2022-10-20.
+[[history.input]]
+kind = "25-nse"
+cik = "0000887921"
+date = 2022-10-21
+exchange = "NYSE"
+ticker = "REV"
+effective = 2022-11-01
+cite = { kind = "accession", ref = "0000876661-22-000877", date = 2022-10-21 }
+
+[[history.bars]]
+cik = "0000887921"
+ticker = "REV"
+first = 2022-10-20
+last = 2022-10-20
+cite = { kind = "accession", ref = "0000887921-22-000021", date = 2022-11-08 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0000887921"
+ticker = "REV"
+first = 2022-10-20
+last = 2022-10-20
+cite = { kind = "accession", ref = "0000887921-22-000021", date = 2022-11-08 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0000887921"
+exchange = "NYSE"
+last = 2022-10-20
+cite = { kind = "accession", ref = "0000887921-22-000021", date = 2022-11-08 }
+
+
+[[history]]
+id = "rad-nyse-suspension-2023"
+title = "Rite Aid RAD: NYSE suspended trading on 2023-10-16 (last session 2023-10-13) after the Chapter 11 filing, Form 25-NSE removal 2023-11-13"
+# Rite Aid (CIK 0000084129) filed Chapter 11 on Sunday 2023-10-15. The NYSE "on October 16, 2023 ...
+# determined that the Common Stock ... should be suspended from trading" and will remove it at the opening
+# of 2023-11-13 (Form 25-NSE notice, EX-99.25); the 10-Q (filed 2023-10-18) says that on October 16 the
+# NYSE announced delisting proceedings and "Trading ... was immediately suspended"; the company's 8-K says
+# the stock "began trading exclusively on the over-the-counter market on October 17, 2023". DERIVED, and
+# conservative: no cited filing gives the hour of the 10-16 suspension, so the last NYSE session is taken
+# as Friday 2023-10-13 (the NYSE suspended Chesapeake pre-open on the day of its determination, the same
+# pattern); if the stock traded on 10-16 the last session was 2023-10-16.
+[[history.input]]
+kind = "25-nse"
+cik = "0000084129"
+date = 2023-10-31
+exchange = "NYSE"
+ticker = "RAD"
+effective = 2023-11-13
+cite = { kind = "accession", ref = "0001143313-23-000135", date = 2023-10-31 }
+
+[[history.bars]]
+cik = "0000084129"
+ticker = "RAD"
+first = 2023-10-13
+last = 2023-10-13
+cite = { kind = "accession", ref = "0001558370-23-016503", date = 2023-10-18 }
+
+[[history.expected]]
+kind = "bars"
+cik = "0000084129"
+ticker = "RAD"
+first = 2023-10-13
+last = 2023-10-13
+cite = { kind = "accession", ref = "0001558370-23-016503", date = 2023-10-18 }
+
+[[history.expected]]
+kind = "line_end"
+cik = "0000084129"
+exchange = "NYSE"
+last = 2023-10-13
+cite = { kind = "accession", ref = "0001558370-23-016503", date = 2023-10-18 }

@@ -1,0 +1,2 @@
+security_id,start_ex_date,group_size,ticker,evidence
+0001383414,2026-04-15,2,PNNT,"Base plus supplemental dividend of equal amount declared together each month (8-K exhibit 99.1 press releases; https://pnnt.pennantpark.com/dividends-splits). Accepted risk: a true duplicate inside a PNNT pair is not caught; any other group size or a differing amount on the day still fails. #3462"

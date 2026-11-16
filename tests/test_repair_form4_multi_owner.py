@@ -14,6 +14,7 @@ from unittest.mock import patch
 import duckdb
 import httpx
 import pytest
+from conftest import open_paper_window
 from typer.testing import CliRunner
 
 from tradepartner import cli
@@ -505,3 +506,25 @@ def _all_rows(settings: Settings) -> list[tuple[object, ...]]:
             "known_at, ingested_at, source "
             "FROM sec_form4_transactions ORDER BY accession, filer_cik, line_no"
         ).fetchall()
+
+
+def test_refuses_rows_known_inside_an_open_paper_window(settings: Settings, tmp_path: Path) -> None:
+    accessions = _four_accessions(settings)
+    manifest = tmp_path / "manifest.json"
+    recheck_form4_multi_owner(
+        settings,
+        manifest,
+        max_requests=8,
+        fetch_xml=lambda _s, _c, _i, a: _xml(director=a == accessions[0]),
+    )
+    with open_for_write(settings) as conn:
+        registry.open_data_release(
+            conn, conn, name="multi-2720", backup_path="b.duckdb", reason="#2720"
+        )
+    open_paper_window(settings, datetime(2025, 1, 2, 14, tzinfo=UTC))
+    before = _all_rows(settings)
+    with pytest.raises(MultiOwnerRepairRefused, match="open paper window"):
+        repair_form4_multi_owner(settings, manifest, "multi-2720", 1, clock=lambda: NOW)
+    assert _all_rows(settings) == before
+    with open_for_write(settings) as conn:
+        assert conn.execute("SELECT count(*) FROM ingestion_runs").fetchone() == (0,)
