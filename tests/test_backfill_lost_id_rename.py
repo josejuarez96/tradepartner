@@ -312,9 +312,12 @@ def test_an_orphan_change_with_two_heirs_stays_put() -> None:
 
 
 def test_a_change_of_a_listed_id_is_never_carried() -> None:
-    """The lost id still has a listing: the change is its own, as before."""
+    """The lost id still has a listing: the change is its own, as before.
+    (Its row names another class: a same-class later successor would own the
+    receiver's bars from its start, #3474.)"""
+    lost_row = {**_row(LOST, "SQL", date(2025, 3, 27)), "class_title": "Class B Common Stock"}
     resolver = ListingResolver(
-        [_row(RECEIVER, "ATLN", date(2024, 12, 9)), _row(LOST, "SQL", date(2025, 3, 27))],
+        [_row(RECEIVER, "ATLN", date(2024, 12, 9)), lost_row],
         symbol_changes=[_change_row(LOST)],
     )
     assert resolver.symbols(RECEIVER, *OCT) == ["ATLN"]
