@@ -92,14 +92,12 @@ def test_the_amount_is_the_stored_double_exactly() -> None:
 
 
 def test_the_committed_list_pins_its_counts() -> None:
-    """196 groups (184 at the amendment, 10 by #1666, 2 by #1720): a later edit is
-    deliberate. #3054 settled STX 2021-05-11 as a duplicate (was unresolved). #3460
-    added PNNT 2026-11-13 as distinct."""
+    """189 hand groups; PNNT's seven pairs are covered by the recurring entry."""
     groups = reviewed_groups()
-    assert Counter(g.verdict for g in groups) == {"duplicate": 181, "distinct": 13, "unresolved": 2}
+    assert Counter(g.verdict for g in groups) == {"duplicate": 181, "distinct": 6, "unresolved": 2}
     assert all(g.evidence for g in groups)
     assert min(g.ex_date for g in groups) == date(2019, 6, 27)
-    assert max(g.ex_date for g in groups) == date(2026, 11, 13)
+    assert max(g.ex_date for g in groups) == date(2026, 10, 15)
 
 
 @pytest.mark.parametrize(
@@ -108,8 +106,6 @@ def test_the_committed_list_pins_its_counts() -> None:
         ("AIV", date(2020, 11, 3), 8.2, "duplicate"),
         ("TDG", date(2025, 9, 2), 90.0, "duplicate"),
         ("MKTW", date(2026, 3, 18), 0.2, "duplicate"),
-        ("PNNT", date(2026, 10, 15), 0.04, "distinct"),
-        ("PNNT", date(2026, 11, 13), 0.04, "distinct"),
         ("PFLT", date(2026, 10, 15), 0.0033, "duplicate"),
         ("F", date(2025, 2, 18), 0.15, "distinct"),
         ("CHRD", date(2023, 11, 13), 1.25, "distinct"),
@@ -328,20 +324,20 @@ def test_the_next_months_pnnt_pair_is_accepted_by_the_committed_entry() -> None:
 
 def test_the_committed_entry_starts_at_the_earliest_hand_row() -> None:
     [entry] = recurring_pairs()
-    hand = [g.ex_date for g in reviewed_groups() if g.security_id == PNNT]
     assert (entry.security_id, entry.group_size) == (PNNT, 2)
-    assert entry.start_ex_date == min(hand)
+    assert entry.start_ex_date == date(2026, 4, 15)
 
 
-def test_the_entry_gives_every_committed_pnnt_month_the_hand_rows_class() -> None:
-    hand = [g for g in reviewed_groups() if g.security_id == PNNT]
-    rows = _live(*((PNNT, g.ex_date, g.amount, i, T3) for g in hand for i in "ab"))
-    with_rows = equal_amount_groups(rows, reviewed_groups())
-    entry_only = equal_amount_groups(rows, [])
-    assert [(g.key, g.group_class) for g in entry_only] == [
-        (g.key, g.group_class) for g in with_rows
+def test_every_former_pnnt_hand_month_passes_health_without_hand_rows() -> None:
+    dates = [
+        date(2026, m, d)
+        for m, d in [(4, 15), (5, 15), (7, 15), (8, 14), (9, 15), (10, 15), (11, 13)]
     ]
-    assert {g.group_class for g in entry_only} == {"accepted"}
+    assert not [g for g in reviewed_groups() if g.security_id == PNNT]
+    rows = _live(*((PNNT, ex, 0.04, i, T3) for ex in dates for i in "ab"))
+    groups = equal_amount_groups(rows, reviewed_groups())
+    assert [g.ex_date for g in groups] == dates
+    assert {g.group_class for g in groups} == {"accepted"}
 
 
 def test_a_third_row_or_a_differing_amount_on_the_day_still_fails() -> None:
