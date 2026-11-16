@@ -2030,6 +2030,67 @@ def test_orphans_are_judged_as_of_the_run_not_later_listings(orphan_store: Setti
     assert result.orphan_keys == 2
 
 
+def test_the_orphan_line_reads_the_latest_name_known_at_the_run(orphan_store: Settings) -> None:
+    # #3270 (1): the display-name query is as-of the run, not the newest row.
+    with open_for_write(orphan_store) as conn:
+        insert_row(
+            conn, "securities", _security(DEAD, datetime(2019, 1, 2, 21, tzinfo=UTC), "Old Name")
+        )
+        insert_row(
+            conn,
+            "securities",
+            _security(DEAD, datetime(2027, 1, 4, 21, tzinfo=UTC), "Later Name")
+            | {"ingested_at": datetime(2027, 1, 5, tzinfo=UTC)},
+        )
+    result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
+    [line] = [x for x in result.lines() if "ORPHAN" in x]
+    assert line == (
+        f"  ORPHAN {DEAD} (Old Name): 2 bar keys 2021-06-01..2021-06-02 that no id receives"
+    )
+
+
+def test_the_orphan_line_ignores_a_retracted_securities_name(orphan_store: Settings) -> None:
+    # #3270 (1): a retracted row's name is not the id's display name.
+    with open_for_write(orphan_store) as conn:
+        insert_row(
+            conn, "securities", _security(DEAD, datetime(2019, 1, 2, 21, tzinfo=UTC), "Old Name")
+        )
+        insert_row(
+            conn,
+            "securities",
+            {
+                **_security(DEAD, datetime(2021, 5, 1, 21, tzinfo=UTC), "Withdrawn Name"),
+                "retracted": True,
+            },
+        )
+    result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
+    [line] = [x for x in result.lines() if "ORPHAN" in x]
+    assert line == (
+        f"  ORPHAN {DEAD} (Old Name): 2 bar keys 2021-06-01..2021-06-02 that no id receives"
+    )
+
+
+def test_the_command_refuses_allow_orphans_with_a_dry_run(orphan_store: Settings) -> None:
+    # #3270 (2): a dry run must not silently accept the count it never checks.
+    app = cli.make_app(settings=lambda: orphan_store, clock=lambda: RUN)
+    before = _bars(orphan_store)
+    result = CliRunner().invoke(app, ["repair-resolution", "--dry-run", "--allow-orphans", "2"])
+    assert result.exit_code == cli.USAGE_ERROR
+    assert "--allow-orphans" in result.output and "--dry-run" in result.output
+    assert _bars(orphan_store) == before
+
+
+def test_the_command_refuses_a_negative_allow_orphans(orphan_store: Settings) -> None:
+    # #3270 (3): a negative count is a usage error, not a refusal after the read.
+    app = cli.make_app(settings=lambda: orphan_store, clock=lambda: RUN)
+    before = _bars(orphan_store)
+    expect = ["--expect-bar-rows", "3", "--expect-action-rows", "1", "--release", REL]
+    result = CliRunner().invoke(app, ["repair-resolution", *expect, "--allow-orphans=-1"])
+    assert result.exit_code == cli.USAGE_ERROR
+    assert "--allow-orphans" in result.output
+    assert _bars(orphan_store) == before
+
+
 def test_the_command_refuses_orphans_until_the_count_is_passed(orphan_store: Settings) -> None:
     app = cli.make_app(settings=lambda: orphan_store, clock=lambda: RUN)
     runner = CliRunner()
@@ -2066,6 +2127,23 @@ def test_a_retracted_class_id_is_moved_only_by_its_own_ticker(orphan_store: Sett
     assert ("0000000089:class-a", date(2021, 6, 1)) in result.found.bars
     assert (cls, date(2021, 6, 1)) in result.orphans  # ZZZZ: nobody receives it
     assert ("0000000089:class-a", date(2021, 6, 1)) not in result.orphans  # GONE: base/heir
+
+
+def test_a_retracted_class_id_whose_same_cik_lists_its_ticker_is_moved(
+    orphan_store: Settings,
+) -> None:
+    # quant-auditor on #3266 (follow-up #3270): the P&G shape on its own CIK --
+    # a retracted `:common-stock` id whose plain-CIK base still lists its ticker.
+    base, cls = "0000000088", "0000000088:common-stock"
+    with open_for_write(orphan_store) as conn:
+        insert_row(conn, "listings", _listing(base, "PG", date(2019, 1, 2)))
+        insert_row(conn, "listings", _listing(cls, "PG", date(2019, 1, 2)))
+        insert_row(conn, "prices_daily", _bar(cls, date(2021, 6, 1)))
+    with open_for_write(orphan_store) as conn:
+        conn.execute("UPDATE listings SET retracted = true WHERE security_id = ?", [cls])
+    result = repair_resolution(orphan_store, clock=lambda: RUN, dry_run=True)
+    assert (cls, date(2021, 6, 1)) in result.found.bars
+    assert (cls, date(2021, 6, 1)) not in result.orphans  # PG: the same CIK's base id
 
 
 # --- #3290: the orphan test reads the id's own former ticker ---

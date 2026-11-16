@@ -553,11 +553,11 @@ def _held_tickers(
             (row["valid_from"], _norm(row["ticker"]), row["class_title"])
         )
 
-    retracted: dict[str, set[str]] = defaultdict(set)  # an id's own rows, retracted too
+    own_tickers: dict[str, set[str]] = defaultdict(set)  # the id's own rows, retracted too
     for sid, ticker in conn.execute(
         "SELECT security_id, ticker FROM listings WHERE known_at <= ?", [at]
     ).fetchall():
-        retracted[str(sid)].add(_norm(str(ticker)))
+        own_tickers[str(sid)].add(_norm(str(ticker)))
 
     # The id's own withdrawn rows (#3290): master-retract moves an id's common
     # ticker to a class or successor id, and a leftover warrant row or a raw
@@ -595,7 +595,7 @@ def _held_tickers(
     def listed_on(security_id: str, day: date) -> set[str]:
         rows = listed.get(security_id, [])
         if not rows:  # a retracted id: its own retracted listing rows (#3265 review)
-            return set(retracted.get(security_id, ()))
+            return set(own_tickers.get(security_id, ()))
         started = [r for r in rows if r[0] <= day]
         if not started:
             return {t for _, t in rows}
@@ -1230,8 +1230,10 @@ def repair_resolution(
         names = {
             _base_id(str(sid)): str(name)
             for sid, name in conn.execute(
-                "SELECT security_id, name FROM securities QUALIFY "
-                "row_number() OVER (PARTITION BY security_id ORDER BY known_at DESC) = 1"
+                "SELECT security_id, name FROM securities WHERE known_at <= ? AND NOT retracted "
+                "QUALIFY row_number() OVER (PARTITION BY security_id "
+                "ORDER BY known_at DESC, ingested_at DESC) = 1",
+                [started],
             ).fetchall()
             if name is not None
         }

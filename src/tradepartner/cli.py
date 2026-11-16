@@ -3316,6 +3316,13 @@ def make_app(
         ] = None,
     ) -> None:
         """Delete Alpaca bars and actions the resolver no longer assigns to their security."""
+        if dry_run and allow_orphans is not None:
+            raise _fail(
+                "--allow-orphans is checked only by a real run: drop it with --dry-run",
+                USAGE_ERROR,
+            )
+        if allow_orphans is not None and allow_orphans < 0:
+            raise _fail("--allow-orphans must be 0 or more", USAGE_ERROR)
         expect = _repair_expect(dry_run, expect_bar_rows, expect_action_rows, release)
         s = settings()
         if (missing := _store_missing(s)) is not None:
