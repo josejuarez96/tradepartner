@@ -42,7 +42,7 @@ The block below is the only part the registry parses (`research/experiment.py`).
 - Keep other fenced blocks out of the parameter block; its first bare ` ``` ` line
   closes it.
 - For a reusable return event study, add `[study]` and one or more `[[study.kill]]`
-  tables inside this same block. Every study key is required, including cost,
+  tables inside this same block. Every study key except `matching` and `delisting_return` is required, including cost,
   borrow, `z`, and `cluster_by`; `study.configurations` must cover the kill lines
   and fit within `budget.configurations`. Kill readings are `raw`,
   `beta_adjusted`, `size_tight`, or `size_tight_beta_adjusted`. `delisting_return`
