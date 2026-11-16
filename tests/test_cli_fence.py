@@ -556,3 +556,22 @@ def test_the_store_version_the_command_needs_is_50(tmp_path: Path) -> None:
     settings = _store(tmp_path)
     with duckdb.connect(settings.store.path, read_only=True) as conn:
         assert schema.stored_version(conn) == 50
+
+
+def test_a_fence_running_past_the_last_completed_session_inside_an_open_window_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _store(tmp_path)
+    _window(settings, first=DAYS[3])
+    monkeypatch.setattr(
+        fence_cmd, "members_provider", lambda conn, settings: lambda session: {"C"}
+    )  # the id is not in today's universe, but could enter it later
+    refused = _invoke(
+        settings,
+        [
+            *["fence", "add", "--reason", "r", "--issue", ISSUE, "--security-id", "A"],
+            *["--from", "2020-06-01", "--to", "2020-12-31", "--count", "1"],
+        ],
+    )
+    assert refused.exit_code == 1 and "past the last completed session" in refused.output
+    assert _rows(settings) == []

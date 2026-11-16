@@ -271,6 +271,14 @@ def _window_overlap_refusals(
         for window in windows:
             if row.to_session < window.first_rebalance_session:
                 continue
+            if row.to_session > completed:
+                problems.append(
+                    f"{row.security_id}: the window runs to {row.to_session.isoformat()}, past "
+                    f"the last completed session {completed.isoformat()}, inside open window "
+                    f"{window.window_id} (book {window.book_id!r}); the future universe cannot "
+                    "be checked"
+                )
+                break
             start = max(row.from_session, window.first_rebalance_session)
             overlap = [d for d in sessions if start <= d <= min(row.to_session, completed)]
             probe = overlap or [completed]
