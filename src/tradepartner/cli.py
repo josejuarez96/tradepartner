@@ -3610,6 +3610,13 @@ def make_app(
                 "of this security and ex-date, after review (#3246)"
             ),
         ] = None,
+        skip_collisions: Annotated[
+            bool,
+            typer.Option(
+                help="leave every collision no --allow-collision or distinct group covers "
+                "unwritten (stored row kept), write the rest, and list each skip (#3484)"
+            ),
+        ] = False,
     ) -> None:
         """Ask Alpaca again for the splits and dividends of committed months (#3054),
         or, with --span, of named securities over the whole range at once (#3074)."""
@@ -3668,6 +3675,7 @@ def make_app(
                 securities=named,
                 span=span,
                 allow_collisions=allowed,
+                skip_collisions=skip_collisions,
             )
         except ValueError as exc:
             raise _fail(_scrubbed(f"refused: {exc}", s), USAGE_ERROR) from None
@@ -3677,6 +3685,8 @@ def make_app(
             typer.echo(f"  {'would write' if result.dry_run else 'wrote'} {line}")
         for line in result.refused:
             typer.echo(f"  refused {line}")
+        for line in result.skipped:
+            typer.echo(f"  {'would skip' if result.dry_run else 'skipped'} {line}")
         typer.echo(result.summary())
         raise typer.Exit(0 if result.ok else 1)
 

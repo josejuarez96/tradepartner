@@ -158,3 +158,65 @@ def test_a_class_added_later_with_an_identical_event_is_refused_unless_allowed(
     caller's allow entry for the class covers it."""
     refused = _then(settings, [_div(OLD)], [_div(NEW, action_id="d2")])
     assert not refused.ok
+
+
+def _collision_and_new(settings: Settings, **kwargs: Any) -> Any:
+    """OLD holds 0.25 live; the source then answers a duplicate under NEW and a new OLD split."""
+    first = [_div(OLD)]
+    second = [_div(NEW, action_id="d2"), _split(OLD)]
+    return _then(settings, first, second, **kwargs)
+
+
+def test_without_skip_collisions_one_collision_refuses_the_whole_run(settings: Settings) -> None:
+    result = _collision_and_new(settings)  # existing behaviour (#3246), kept (#3484)
+    assert not result.ok and result.skipped == ()
+    assert _count(settings) == 1
+
+
+def test_skip_collisions_writes_the_new_row_and_leaves_the_collision(settings: Settings) -> None:
+    result = _collision_and_new(settings, skip_collisions=True)
+    line = f"collision {NEW} dividend {EX} 0.25 known_at={STAMP}"
+    assert result.ok and result.skipped == (line,) and result.refused == ()
+    assert [r.split()[:2] for r in result.rows] == [["new", OLD]]
+    assert "1 collision(s) skipped" in result.summary()
+    assert _rows(
+        settings, "SELECT security_id, action_type FROM corporate_actions ORDER BY 1, 2"
+    ) == [
+        (OLD, "dividend"),
+        (OLD, "split"),
+    ]
+
+
+def test_skip_collisions_leaves_the_stored_row_and_its_known_at(settings: Settings) -> None:
+    prices = _committed(settings)
+    _open_release(settings)
+    prices.actions = [_div(OLD)]
+    _refetch(settings, prices, since=SINCE, securities=[OLD, NEW])
+    sql = "SELECT security_id, ratio_or_amount, known_at, ingested_at FROM corporate_actions"
+    before = _rows(settings, sql)
+    prices.actions = [_div(NEW, action_id="d2")]
+    result = _refetch(
+        settings,
+        prices,
+        since=SINCE,
+        securities=[OLD, NEW],
+        clock=lambda: AGAIN,
+        skip_collisions=True,
+    )
+    assert result.ok and len(result.skipped) == 1 and result.added == ()
+    assert _rows(settings, sql) == before
+
+
+def test_a_dry_run_with_skip_collisions_lists_what_it_would_skip(settings: Settings) -> None:
+    result = _collision_and_new(settings, skip_collisions=True, dry_run=True)
+    assert len(result.skipped) == 1 and result.refused == ()
+    assert result.added == (("split", 1),)
+    assert _count(settings) == 1
+
+
+def test_skip_collisions_with_an_allow_entry_writes_the_covered_collision(
+    settings: Settings,
+) -> None:
+    result = _collision_and_new(settings, skip_collisions=True, allow_collisions=[(NEW, EX)])
+    assert result.ok and result.skipped == ()
+    assert _count(settings) == 3

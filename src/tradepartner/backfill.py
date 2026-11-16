@@ -1590,6 +1590,10 @@ class ActionsRefetch:
     #: (#3246): a real run writes none of a month holding one and fails; a
     #: dry run lists them here, not in `rows`.
     refused: tuple[str, ...] = ()
+    #: With `skip_collisions` (#3484): the collision rows left unwritten (a dry
+    #: run: that would be), same line format as `refused`. The stored row and
+    #: its `known_at` are untouched.
+    skipped: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -1601,7 +1605,8 @@ class ActionsRefetch:
         verb = "would add" if self.dry_run else "added"
         counts = ", ".join(f"{n} {kind}" for kind, n in self.added) or "nothing"
         unit = "span" if self.span else "month(s)"
-        return f"actions refetch over {len(self.runs)} {unit}: {verb} {counts}"
+        skips = f"; {len(self.skipped)} collision(s) skipped" if self.skipped else ""
+        return f"actions refetch over {len(self.runs)} {unit}: {verb} {counts}{skips}"
 
 
 def span_settings(settings: Settings, *, through: date, today: date) -> Settings:
@@ -1633,6 +1638,7 @@ def refetch_actions(
     securities: Collection[str] | None = None,
     span: bool = False,
     allow_collisions: Collection[tuple[str, date]] = (),
+    skip_collisions: bool = False,
 ) -> ActionsRefetch:
     """Ask the source again for the splits and dividends of the committed
     months `since..through` (#3054), with no bars: a month the backfill
@@ -1668,7 +1674,12 @@ def refetch_actions(
     (`store.dividend_reviews`) or its `(security, ex-date)` is in
     `allow_collisions`: a dry run lists it in `ActionsRefetch.refused`; a
     real run asks every month first (a dry pass, `_refuse_ahead`, #3303) and
-    refuses the whole run before writing any month, ending one `failed` run."""
+    refuses the whole run before writing any month, ending one `failed` run.
+
+    `skip_collisions` (#3484): such an uncovered collision is instead left
+    unwritten (the stored live row and its `known_at` stay), every other row
+    writes, and each skipped row is listed in `ActionsRefetch.skipped`; no
+    refusal, no pre-pass. A covered collision still writes."""
     if isinstance(since, datetime) or not isinstance(since, date):
         raise TypeError(f"since must be a date, got {since!r}")
     if isinstance(through, datetime) or not isinstance(through, date) or through < since:
@@ -1683,10 +1694,11 @@ def refetch_actions(
     totals: Counter[str] = Counter()
     written: list[str] = []
     refused: list[str] = []
+    skipped: list[str] = []
     runs: list[SourceRun] = []
     windows = [(since, through)] if span else month_windows(since, through)
     allowed = _allowed_collisions(allow_collisions)
-    if not dry_run:
+    if not dry_run and not skip_collisions:
         # #3303: a real run asks every month first, as the dry run does, and
         # refuses the whole run before writing if any month would refuse.
         # #3312: the write reuses those answers, so each month is asked once.
@@ -1712,6 +1724,7 @@ def refetch_actions(
             span,
             allowed,
             refused,
+            skipped if skip_collisions else None,
         )
         runs.append(run)
         if run.status != FILLED:
@@ -1723,6 +1736,7 @@ def refetch_actions(
         tuple(sorted(written)),
         span,
         tuple(sorted(refused)),
+        tuple(sorted(skipped)),
     )
 
 
@@ -1860,6 +1874,7 @@ def _refetch_month(
         frozenset(),
     ),
     refused: list[str] | None = None,
+    skipped: list[str] | None = None,
 ) -> SourceRun:
     """One month (or the one span) of `refetch_actions`; adds the rows it
     moved to `totals` and names each row written in `written`."""
@@ -1904,9 +1919,14 @@ def _refetch_month(
         )
         moved = _action_counts(conn) - before
         lines, blocked = _rows_written(conn, stamp, allowed)
-        if refused is not None:
+        if skipped is not None:
+            # #3484: drop the collision rows this write just stamped; the
+            # stored rows are not touched. Counted apart, as a dry run does.
+            _drop_stamped(conn, stamp, blocked)
+            skipped.extend(blocked)
+        elif refused is not None:
             refused.extend(blocked)
-        if blocked and not dry_run:
+        if blocked and not dry_run and skipped is None:
             raise ValueError(
                 f"{len(blocked)} collision row(s): a new id on a security, type and ex-date "
                 f"that already holds a live one; nothing written: {'; '.join(blocked)}"
@@ -2027,6 +2047,26 @@ def _rows_written(
         else:
             lines.append(line)
     return lines, blocked
+
+
+def _drop_stamped(conn: duckdb.DuckDBPyConnection, stamp: datetime, lines: Sequence[str]) -> None:
+    """Delete the rows `lines` (from `_rows_written`) name among those this
+    write inserted at `stamp` (#3484); rows stored by earlier runs differ in
+    `ingested_at` and are never matched."""
+    for line in lines:
+        _tag, sid, kind, ex, amount, known = line.split()
+        conn.execute(
+            "DELETE FROM corporate_actions WHERE ingested_at = ? AND security_id = ? "
+            "AND action_type = ? AND ex_date = ? AND ratio_or_amount = ? AND known_at = ?",
+            [
+                stamp,
+                sid,
+                kind,
+                date.fromisoformat(ex),
+                float(amount),
+                datetime.fromisoformat(known.removeprefix("known_at=")),
+            ],
+        )
 
 
 def _action_counts(conn: duckdb.DuckDBPyConnection) -> Counter[str]:
