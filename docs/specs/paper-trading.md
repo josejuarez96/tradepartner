@@ -963,6 +963,16 @@ Req 2's open answers:
 - **Alpaca facts unverified:** quantity precision, id length, same-session proceeds in `cash`, corporate-action handling, CUSIP on assets, non-fractionable share of the universe, whether a fractional sell of a name that lost `fractionable` after its decision is accepted (if not, a full exit of it halts at submit or counts as a rejection, and stays open, #395), the fills endpoint and the request limit are all recording-task questions (req 2); the adapter refuses to construct without the recorded precision, and an unmapped status halts.
 - **Owner-only steps:** recording paper responses, `paper start`, `kill`/`resume` (a crash needs a resume, so an unattended month with a crash is a missed rebalance until the owner looks: alerted, and bounded by the catch-up window), the gap sign-off, ADR 0009's acceptance and the phase-close evidence need the owner's keys and machine.
 
+## Amendment 2026-11-16 (#3475): a fenced security is never a paper candidate, and a large fence stops the run
+
+The security fence is defined in the [data-foundation spec](data-foundation.md)'s amendment of the same date; the universe exclusion and the fence vintage are in the [backtest spec](backtest.md)'s. Paper reads its universe through the same provider, so:
+
+1. **No candidate from a fenced security.** A security the fence holds on the session of a run's plan never enters the universe and so is never a candidate; the run writes its fence count line and fence vintage in its `signals` row, so a run is reproducible against the fence it read.
+2. **The run stops when the fence is too large.** Beside the collapsed-universe guard (req 7, #1550), the run raises when the fenced share of the universe at the plan's session is above `fence.max_security_share` or `fence.max_session_share`: the `stale` result, no order, the switch untouched, one alert `fence_too_large` naming the shares and the limits. It is a stop, not an exclusion, because a large fence means the store is not trustworthy enough to trade on (the owner, 2026-11-15, #3475).
+3. **Acceptance (testable).** On the fixture store with a fence over more than the limit the run ends `stale` with one `fence_too_large` alert and no order; under the limit it plans normally with the fenced id absent from its candidates; the `signals` row holds the count line and vintage.
+
+**Open question for the owner (not decided here): a position already held when its security is fenced.** Options, each with what it costs: (a) hold it and mark it at the last unfenced close, no new buys, and alert daily until the owner decides; (b) sell it at the next open like any name that leaves the universe (req 7 step 6 does this today), on data the fence says is wrong; (c) freeze it: neither buy, sell nor mark from the fenced bars, and show the book's value with it carried at cost; (d) refuse to fence a held security without an explicit owner flag on the write. The fence code does none of these until he picks; until then `fence add` refuses an id any open book holds (data-foundation amendment, item 3), so no position can be in this state.
+
 ## Open questions
 
 Answers go on #247. Questions 4, 13 and 14 are answered below and 12 by ADR 0010 (#256); the rest before the task that implements them.
