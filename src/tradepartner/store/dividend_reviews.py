@@ -22,6 +22,15 @@ reads the file (refusing a malformed one, naming the row) and
 reconciliation apply to the live rows: per `(security_id, ex_date,
 ratio_or_amount)` the identities and their class. Amounts compare by exact
 equality with the stored `DOUBLE`, never a tolerance.
+
+A security that declares a base and a supplemental dividend of equal amount on
+one ex-date every period (PNNT, #3462) would need a hand row per period. Its
+recurring pair entry in `dividend_recurring_pairs.csv` replaces that: from the
+entry's start ex-date, a same-ex-date group of that security is accepted when
+the live rows of the day are exactly the entry's group size, all of one
+amount. Any other size, or a differing amount on the day, stays a violation.
+The accepted risk, a true duplicate hiding inside such a pair, is bounded to
+that one security and stated in the entry's evidence.
 """
 
 from __future__ import annotations
@@ -61,6 +70,9 @@ COLUMNS: Final = (
 #: The identities every listed group was reviewed as.
 REVIEWED_IDENTITIES: Final = 2
 _FILE: Final = "dividend_reviews.csv"
+_PAIRS_FILE: Final = "dividend_recurring_pairs.csv"
+#: The recurring-pair file's columns, in order.
+PAIR_COLUMNS: Final = ("security_id", "start_ex_date", "group_size", "ticker", "evidence")
 
 #: `(security_id, ex_date, amount)`.
 GroupKey = tuple[str, date, float]
@@ -175,6 +187,73 @@ def reviewed_groups() -> tuple[ReviewedGroup, ...]:
 
 
 @dataclass(frozen=True)
+class RecurringPair:
+    """One security that pays `group_size` equal-amount dividends on one
+    ex-date every period (#3462), from `start_ex_date` on."""
+
+    security_id: str
+    start_ex_date: date
+    group_size: int
+    ticker: str
+    #: The declaration pattern that makes the group distinct, and the risk taken.
+    evidence: str
+
+
+def parse_recurring_pairs(text: str) -> tuple[RecurringPair, ...]:
+    """The recurring-pair entries in the CSV `text`, in file order. Raises
+    `ReviewsError`, naming the line, on another header, a short or long row,
+    an empty id or evidence, a start that is not an XNYS session, a group size
+    below 2, or a security listed twice."""
+    reader = csv.reader(io.StringIO(text))
+    header = next(reader, None)
+    if header is None or tuple(header) != PAIR_COLUMNS:
+        raise ReviewsError(f"{_PAIRS_FILE} line 1: header {header!r} is not {list(PAIR_COLUMNS)}")
+    out: list[RecurringPair] = []
+    seen: dict[str, int] = {}
+    for values in reader:
+        line = reader.line_num
+        if not values:
+            continue
+
+        def fail(why: str, line: int = line) -> ReviewsError:
+            return ReviewsError(f"{_PAIRS_FILE} line {line}: {why}")
+
+        if len(values) != len(PAIR_COLUMNS):
+            raise fail(f"{len(values)} fields, not {len(PAIR_COLUMNS)}")
+        raw = dict(zip(PAIR_COLUMNS, values, strict=True))
+        sid = raw["security_id"].strip()
+        if not sid:
+            raise fail("empty security_id")
+        try:
+            start = date.fromisoformat(raw["start_ex_date"].strip())
+        except ValueError:
+            raise fail(f"start_ex_date {raw['start_ex_date']!r} is not a date") from None
+        if not is_session(start):
+            raise fail(f"start_ex_date {start} is not an XNYS session")
+        try:
+            size = int(raw["group_size"])
+        except ValueError:
+            raise fail(f"group_size {raw['group_size']!r} is not an integer") from None
+        if size < REVIEWED_IDENTITIES:
+            raise fail(f"group_size {size} is below {REVIEWED_IDENTITIES}")
+        evidence = raw["evidence"].strip()
+        if not evidence:
+            raise fail("empty evidence")
+        if (first := seen.get(sid)) is not None:
+            raise fail(f"security {sid} is listed again (line {first})")
+        seen[sid] = line
+        out.append(RecurringPair(sid, start, size, raw["ticker"].strip(), evidence))
+    return tuple(out)
+
+
+def recurring_pairs() -> tuple[RecurringPair, ...]:
+    """The packaged recurring-pair entries (`parse_recurring_pairs` over
+    `tradepartner/store/dividend_recurring_pairs.csv`)."""
+    text = resources.files("tradepartner.store").joinpath(_PAIRS_FILE).read_text(encoding="utf-8")
+    return parse_recurring_pairs(text)
+
+
+@dataclass(frozen=True)
 class Identity:
     """One live vendor record of a group: its id and when it became known."""
 
@@ -210,7 +289,9 @@ _LISTED_CLASS: Final[dict[str, GroupClass]] = {
 
 
 def equal_amount_groups(
-    live_dividend_rows: pl.DataFrame, reviewed: Iterable[ReviewedGroup]
+    live_dividend_rows: pl.DataFrame,
+    reviewed: Iterable[ReviewedGroup],
+    recurring: Iterable[RecurringPair] | None = None,
 ) -> tuple[EqualAmountGroup, ...]:
     """Classify every equal-amount cash dividend key of the live rows
     against the reviewed list (spec amendment 2026-10-12, "The health rule").
@@ -224,7 +305,15 @@ def equal_amount_groups(
     are never part of it, so two identities known at different times are one
     key. Per key:
 
-    - more than one identity and not listed: `violation`;
+    - more than one identity and not listed: `violation`, unless a
+      `recurring` entry covers it (#3462): the security has an entry,
+      the ex-date is on or after its start, and the live dividend rows of
+      the security on that ex-date number exactly the entry's group size, all
+      of this key's amount: `accepted`, carrying a `distinct` row built from
+      the entry. A group of another size, or a differing amount on the day,
+      stays a `violation`. `recurring` defaults to the packaged entries. Only
+      the rows passed are read (already as-of `t`), so a row not yet known
+      never joins a pair and the entry adds no later knowledge;
     - listed with exactly two identities: `accepted` (`distinct`),
       `unresolved`, or `pending` (`duplicate`: not repaired yet);
     - a listed `duplicate` with one identity: `repaired`;
@@ -254,6 +343,10 @@ def equal_amount_groups(
         identities[key][str(action_id)] = known_at
     listed: dict[GroupKey, ReviewedGroup] = {group.key: group for group in reviewed}
     re_sent = _re_sent_retracts(identities, listed.values())
+    entries = {e.security_id: e for e in (recurring_pairs() if recurring is None else recurring)}
+    on_day: dict[tuple[str, date], int] = defaultdict(int)
+    for day_key, day_found in identities.items():
+        on_day[(day_key[0], day_key[1])] += len(day_found)
     out: list[EqualAmountGroup] = []
     for key in sorted(identities.keys() | listed.keys()):
         found = identities.get(key, {})
@@ -266,7 +359,18 @@ def equal_amount_groups(
         elif group is None:
             if count <= 1:
                 continue
-            group_class = "violation"
+            entry = entries.get(key[0])
+            if (
+                entry is not None
+                and key[1] >= entry.start_ex_date
+                and count == entry.group_size == on_day[(key[0], key[1])]
+            ):
+                group_class = "accepted"  # #3462: the security's recurring base plus supplemental
+                group = ReviewedGroup(
+                    key[0], key[1], key[2], DISTINCT, "", entry.ticker, entry.evidence
+                )
+            else:
+                group_class = "violation"
         elif count == 0:
             continue
         elif group.verdict == DUPLICATE and (
