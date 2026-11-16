@@ -1382,6 +1382,10 @@ class BarsDeleted:
             + (f"; {len(self.wider)} extra rows held by the same keys" if self.wider else "")
         )
 
+    def lines(self) -> list[str]:
+        """One line per extra row a retraction would also move, for the terminal."""
+        return [f"  WIDER {line}" for line in self.wider]
+
 
 def _bars_in_range(
     conn: duckdb.DuckDBPyConnection, security_id: str, first: date, last: date
@@ -1567,6 +1571,10 @@ class DividendsRetracted:
             f"already repaired {self.already_repaired}, stale {len(self.stale)}"
             + (f"; {len(self.wider)} extra rows held by the same keys" if self.wider else "")
         )
+
+    def lines(self) -> list[str]:
+        """One line per extra row a retraction would also move, for the terminal."""
+        return [f"  WIDER {line}" for line in self.wider]
 
 
 def _stale_reason(
@@ -1812,6 +1820,10 @@ class SpinoffSplitsRetracted:
             f"stale {len(self.stale)}"
             + (f"; {len(self.wider)} extra rows held by the same keys" if self.wider else "")
         )
+
+    def lines(self) -> list[str]:
+        """One line per extra row a retraction would also move, for the terminal."""
+        return [f"  WIDER {line}" for line in self.wider]
 
 
 def _spinoff_split_stale(rows: list[tuple[Any, ...]], entry: SpinoffSplit) -> str | None:
