@@ -220,3 +220,34 @@ def test_skip_collisions_with_an_allow_entry_writes_the_covered_collision(
     result = _collision_and_new(settings, skip_collisions=True, allow_collisions=[(NEW, EX)])
     assert result.ok and result.skipped == ()
     assert _count(settings) == 3
+
+
+def test_a_skipped_collision_leaves_no_cancel_of_a_stored_dividend(settings: Settings) -> None:
+    """quant-auditor on #3485: a new id on a stored id's date, paired as the re-date of an
+    id-less key, would cancel that key; skipping the collision must skip that cancel too."""
+    prices = _committed(settings)
+    _open_release(settings)
+    day2 = EX + timedelta(days=1)
+    idless = replace(_div(OLD), source_action_id=None)
+    d1 = replace(_div(OLD, amount=0.30, action_id="d1"), ex_date=day2)
+    prices.actions = [idless, d1]
+    _refetch(settings, prices, since=SINCE, securities=[OLD])
+    sql = (
+        "SELECT source_action_id, ex_date, ratio_or_amount, cancelled FROM corporate_actions "
+        "QUALIFY row_number() OVER (PARTITION BY security_id, coalesce(nullif(source_action_id,''),"
+        " action_type||'|'||CAST(ex_date AS VARCHAR)) ORDER BY ingested_at DESC, known_at DESC)=1 "
+        "ORDER BY 2, 1"
+    )
+    before = _rows(settings, sql)
+    d2 = replace(_div(OLD, amount=0.40, action_id="d2"), ex_date=day2)
+    prices.actions = [d1, d2]
+    result = _refetch(
+        settings,
+        prices,
+        since=SINCE,
+        securities=[OLD],
+        clock=lambda: AGAIN,
+        skip_collisions=True,
+    )
+    assert result.ok
+    assert _rows(settings, sql) == before

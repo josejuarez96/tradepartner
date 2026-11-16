@@ -1909,22 +1909,38 @@ def _refetch_month(
         before = _action_counts(conn)
         stats: dict[str, int] = {}
         stamp = ensure_tz_aware_utc(clock(), field_name="clock()")
-        added = _add_actions(
-            conn,
-            prepared["actions"],
-            window,
-            ingested_at=stamp,
-            covered=prepared["covered"],
-            stats=stats,
-        )
-        moved = _action_counts(conn) - before
+
+        def add(actions: Sequence[CorporateAction]) -> int:
+            return _add_actions(
+                conn,
+                actions,
+                window,
+                ingested_at=stamp,
+                covered=prepared["covered"],
+                stats=stats,
+            )
+
+        added = add(prepared["actions"])
         lines, blocked = _rows_written(conn, stamp, allowed)
-        if skipped is not None:
-            # #3484: drop the collision rows this write just stamped; the
-            # stored rows are not touched. Counted apart, as a dry run does.
-            _drop_stamped(conn, stamp, blocked)
+        if skipped is not None and blocked:
+            # #3484: undo this write whole (every row it stamped), then write
+            # again without the collision actions: a skipped row must not leave
+            # its side effects (a cancel of a stored key) behind.
+            drop = _blocked_identities(conn, stamp, blocked)
+            conn.execute("DELETE FROM corporate_actions WHERE ingested_at = ?", [stamp])
+            stats.clear()
+            keep = [
+                a
+                for a in prepared["actions"]
+                if (a.security_id, a.action_type.value, a.ex_date, a.source_action_id or "")
+                not in drop
+            ]
+            added = add(keep)
+            lines, again = _rows_written(conn, stamp, allowed)
+            assert not again, "a collision row survived its own removal"
             skipped.extend(blocked)
-        elif refused is not None:
+        moved = _action_counts(conn) - before
+        if skipped is None and refused is not None:
             refused.extend(blocked)
         if blocked and not dry_run and skipped is None:
             raise ValueError(
@@ -1932,7 +1948,7 @@ def _refetch_month(
                 f"that already holds a live one; nothing written: {'; '.join(blocked)}"
             )
         # A dry run's refused rows would not be written: they are not "would add".
-        moved.subtract(Counter(line.split()[2] for line in blocked))
+        moved.subtract(Counter(line.split()[2] for line in (blocked if skipped is None else ())))
         totals.update(+moved)
         written.extend(lines)
         by_type = ", ".join(f"{kind}={n}" for kind, n in sorted(moved.items())) or "none"
@@ -2049,15 +2065,18 @@ def _rows_written(
     return lines, blocked
 
 
-def _drop_stamped(conn: duckdb.DuckDBPyConnection, stamp: datetime, lines: Sequence[str]) -> None:
-    """Delete the rows `lines` (from `_rows_written`) name among those this
-    write inserted at `stamp` (#3484); rows stored by earlier runs differ in
-    `ingested_at` and are never matched."""
+def _blocked_identities(
+    conn: duckdb.DuckDBPyConnection, stamp: datetime, lines: Sequence[str]
+) -> set[tuple[str, str, date, str]]:
+    """The `(security, type, ex-date, source id)` of each row `lines` (from
+    `_rows_written`) names among those stamped at `stamp` (#3484)."""
+    found: set[tuple[str, str, date, str]] = set()
     for line in lines:
         _tag, sid, kind, ex, amount, known = line.split()
-        conn.execute(
-            "DELETE FROM corporate_actions WHERE ingested_at = ? AND security_id = ? "
-            "AND action_type = ? AND ex_date = ? AND ratio_or_amount = ? AND known_at = ?",
+        rows = conn.execute(
+            "SELECT coalesce(source_action_id, '') FROM corporate_actions WHERE ingested_at = ? "
+            "AND security_id = ? AND action_type = ? AND ex_date = ? AND ratio_or_amount = ? "
+            "AND known_at = ?",
             [
                 stamp,
                 sid,
@@ -2066,7 +2085,9 @@ def _drop_stamped(conn: duckdb.DuckDBPyConnection, stamp: datetime, lines: Seque
                 float(amount),
                 datetime.fromisoformat(known.removeprefix("known_at=")),
             ],
-        )
+        ).fetchall()
+        found.update((sid, kind, date.fromisoformat(ex), str(r[0])) for r in rows)
+    return found
 
 
 def _action_counts(conn: duckdb.DuckDBPyConnection) -> Counter[str]:
