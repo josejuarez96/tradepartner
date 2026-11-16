@@ -25,6 +25,7 @@ from test_backfill_refetch_actions import (
     _rows,
 )
 
+from tradepartner import backfill
 from tradepartner.adapters.prices import ActionType, CorporateAction, action_first_seen_known_at
 from tradepartner.config import Settings
 from tradepartner.ingest import FAILED
@@ -278,3 +279,102 @@ def test_a_skipped_id_takes_its_earlier_revisions_with_it(settings: Settings) ->
     )
     assert result.ok and len(result.skipped) == 1
     assert _count(settings) == 1
+
+
+def test_skip_refuses_a_stamp_already_held_by_an_earlier_write(settings: Settings) -> None:
+    prices = _committed(settings)
+    _open_release(settings)
+    prices.actions = [_div(OLD)]
+    first = _refetch(settings, prices, since=SINCE, securities=[OLD, NEW], clock=lambda: AGAIN)
+    assert first.ok
+    sql = "SELECT security_id, source_action_id, ingested_at FROM corporate_actions"
+    before = _rows(settings, sql)
+    prices.actions = [_div(NEW, action_id="d2")]
+    second = _refetch(
+        settings,
+        prices,
+        since=SINCE,
+        securities=[OLD, NEW],
+        clock=lambda: AGAIN,
+        skip_collisions=True,
+    )
+    assert not second.ok
+    assert "stamp" in second.runs[-1].message
+    assert _rows(settings, sql) == before
+
+
+def test_rows_written_carries_blocked_source_id(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prices = _committed(settings)
+    _open_release(settings)
+    prices.actions = [_div(OLD)]
+    _refetch(settings, prices, since=SINCE, securities=[OLD, NEW])
+    prices.actions = [_div(NEW, action_id="d2")]
+    captured: list[Any] = []
+    actual = backfill._rows_written
+
+    def rows(*args: Any, **kwargs: Any) -> Any:
+        result = actual(*args, **kwargs)
+        captured.append(result)
+        return result
+
+    monkeypatch.setattr(backfill, "_rows_written", rows)
+    _refetch(
+        settings, prices, since=SINCE, securities=[OLD, NEW], clock=lambda: AGAIN, dry_run=True
+    )
+    _lines, blocked, identities = next(result for result in captured if result[1])
+    assert blocked == [f"collision {NEW} dividend {EX} 0.25 known_at={STAMP}"]
+    assert identities == {(NEW, "dividend", EX, "d2")}
+
+
+def test_idless_skip_keeps_stored_id_revision_on_same_key(settings: Settings) -> None:
+    prices = _committed(settings)
+    _open_release(settings)
+    prices.actions = [_div(OLD, amount=0.25, action_id="stored")]
+    assert _refetch(settings, prices, since=SINCE, securities=[OLD]).ok
+    prices.actions = [
+        replace(_div(OLD, amount=0.40), source_action_id=None),
+        _div(OLD, amount=0.30, action_id="stored"),
+    ]
+    result = _refetch(
+        settings, prices, since=SINCE, securities=[OLD], clock=lambda: AGAIN, skip_collisions=True
+    )
+    assert result.ok and len(result.skipped) == 1
+    assert _rows(
+        settings,
+        "SELECT ratio_or_amount FROM corporate_actions "
+        "WHERE source_action_id = 'stored' ORDER BY ingested_at",
+    ) == [(0.25,), (0.30,)]
+
+
+def test_surviving_collision_raises_even_under_optimized_python(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prices = _committed(settings)
+    _open_release(settings)
+    prices.actions = [_div(OLD)]
+    assert _refetch(settings, prices, since=SINCE, securities=[OLD, NEW]).ok
+    prices.actions = [_div(NEW, action_id="d2"), _split(OLD)]
+    actual = backfill._rows_written
+    calls = 0
+
+    def rows(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        result = actual(*args, **kwargs)
+        if calls == 2:
+            return result[0], [f"collision {NEW} dividend {EX} 0.25 known_at={STAMP}"], set()
+        return result
+
+    monkeypatch.setattr(backfill, "_rows_written", rows)
+    result = _refetch(
+        settings,
+        prices,
+        since=SINCE,
+        securities=[OLD, NEW],
+        clock=lambda: AGAIN,
+        skip_collisions=True,
+    )
+    assert not result.ok
+    assert "ValueError: a collision row survived its own removal" in result.runs[-1].message

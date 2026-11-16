@@ -1909,6 +1909,13 @@ def _refetch_month(
         before = _action_counts(conn)
         stats: dict[str, int] = {}
         stamp = ensure_tz_aware_utc(clock(), field_name="clock()")
+        prior_stamp = conn.execute(
+            "SELECT count(*) FROM corporate_actions WHERE ingested_at = ?", [stamp]
+        ).fetchone()
+        if skipped is not None and prior_stamp is not None and prior_stamp[0]:
+            raise ValueError(
+                f"refetch-actions skip-collisions stamp {stamp.isoformat()} already holds rows"
+            )
 
         def add(actions: Sequence[CorporateAction]) -> int:
             return _add_actions(
@@ -1921,12 +1928,11 @@ def _refetch_month(
             )
 
         added = add(prepared["actions"])
-        lines, blocked = _rows_written(conn, stamp, allowed)
+        lines, blocked, drop = _rows_written(conn, stamp, allowed)
         if skipped is not None and blocked:
             # #3484: undo this write whole (every row it stamped), then write
             # again without the collision actions: a skipped row must not leave
             # its side effects (a cancel of a stored key) behind.
-            drop = _blocked_identities(conn, stamp, blocked)
             conn.execute("DELETE FROM corporate_actions WHERE ingested_at = ?", [stamp])
             stats.clear()
             # Every revision of a skipped id goes with it (not only the one
@@ -1937,11 +1943,15 @@ def _refetch_month(
                 a
                 for a in prepared["actions"]
                 if (a.security_id, a.source_action_id) not in ids
-                and (a.security_id, a.action_type.value, a.ex_date) not in keys
+                and (
+                    a.source_action_id
+                    or (a.security_id, a.action_type.value, a.ex_date) not in keys
+                )
             ]
             added = add(keep)
-            lines, again = _rows_written(conn, stamp, allowed)
-            assert not again, "a collision row survived its own removal"
+            lines, again, _ = _rows_written(conn, stamp, allowed)
+            if again:
+                raise ValueError("a collision row survived its own removal")
             skipped.extend(blocked)
         moved = _action_counts(conn) - before
         if skipped is None and refused is not None:
@@ -1986,7 +1996,7 @@ def _rows_written(
         frozenset(),
         frozenset(),
     ),
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], set[tuple[str, str, date, str]]]:
     """The `corporate_actions` rows this write stamped at `stamp`, one line
     each: `"<tag> <security> <type> <ex-date> <amount> known_at=<stamp>"`
     with the exact stored amount (#3074 review). The tag is `revision` when
@@ -1996,8 +2006,9 @@ def _rows_written(
     a live event stored before this write on another id of the same CIK
     holds that type, ex-date and amount or ratio (a source re-issuing an
     event under a new id would apply it twice); else `new`.
-    Returns the lines to write and the lines refused (#3246): a live
-    `collision` that `allowed` (`_allowed_collisions`) does not cover."""
+    Returns the lines to write, the lines refused (#3246), and the refused
+    rows' source identities: a live `collision` that `allowed`
+    (`_allowed_collisions`) does not cover."""
     allow_pairs, distinct = allowed
     rows = conn.execute(
         """
@@ -2017,7 +2028,7 @@ def _rows_written(
             QUALIFY row_number() OVER (PARTITION BY security_id ORDER BY known_at DESC) = 1
         )
         SELECT w.security_id, w.action_type, w.ex_date, w.ratio_or_amount, w.cancelled,
-               w.known_at,
+               w.known_at, coalesce(w.source_action_id, ''),
                EXISTS (
                    SELECT 1 FROM ident o
                    WHERE o.security_id = w.security_id AND o.key = w.key
@@ -2049,7 +2060,20 @@ def _rows_written(
     ).fetchall()
     lines: list[str] = []
     blocked: list[str] = []
-    for sid, kind, ex, amount, cancelled, known_at, revision, same_id, same_cik, live in rows:
+    blocked_identities: set[tuple[str, str, date, str]] = set()
+    for (
+        sid,
+        kind,
+        ex,
+        amount,
+        cancelled,
+        known_at,
+        source_id,
+        revision,
+        same_id,
+        same_cik,
+        live,
+    ) in rows:
         collision = same_id or same_cik
         tag = "revision" if revision else "collision" if collision else "new"
         line = (
@@ -2064,34 +2088,10 @@ def _rows_written(
         )
         if tag == "collision" and not cancelled and not covered:
             blocked.append(line)
+            blocked_identities.add((sid, kind, ex, source_id))
         else:
             lines.append(line)
-    return lines, blocked
-
-
-def _blocked_identities(
-    conn: duckdb.DuckDBPyConnection, stamp: datetime, lines: Sequence[str]
-) -> set[tuple[str, str, date, str]]:
-    """The `(security, type, ex-date, source id)` of each row `lines` (from
-    `_rows_written`) names among those stamped at `stamp` (#3484)."""
-    found: set[tuple[str, str, date, str]] = set()
-    for line in lines:
-        _tag, sid, kind, ex, amount, known = line.split()
-        rows = conn.execute(
-            "SELECT coalesce(source_action_id, '') FROM corporate_actions WHERE ingested_at = ? "
-            "AND security_id = ? AND action_type = ? AND ex_date = ? AND ratio_or_amount = ? "
-            "AND known_at = ?",
-            [
-                stamp,
-                sid,
-                kind,
-                date.fromisoformat(ex),
-                float(amount),
-                datetime.fromisoformat(known.removeprefix("known_at=")),
-            ],
-        ).fetchall()
-        found.update((sid, kind, date.fromisoformat(ex), str(r[0])) for r in rows)
-    return found
+    return lines, blocked, blocked_identities
 
 
 def _action_counts(conn: duckdb.DuckDBPyConnection) -> Counter[str]:
