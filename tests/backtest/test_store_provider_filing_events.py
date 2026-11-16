@@ -381,3 +381,22 @@ def test_the_recording_fake_records_the_read_and_hides_the_late_row() -> None:
         "filing_events", T_CLOSE, ids=("SEC_SOLO",), forms=("8-K",), items=("2.02",)
     )
     assert fake.read_times() == {T_CLOSE, T_NEXT_CLOSE}
+
+
+def test_index_read_is_cut_at_t_between_acceptance_and_index_stamp(store: Store) -> None:
+    # A-DUAL is accepted 08:00 NY; the index row is stamped (known) 09:00 NY. At 08:30 the
+    # event is visible but the index has no row known yet, so the cross-check is null.
+    at = datetime(2024, 3, 5, 8, 30, tzinfo=_NY)
+    frame = _read(store, at).filter(pl.col("accession") == MISMATCH)
+    assert frame.height == 2
+    assert frame[FILING_INDEX_ACCEPTED_COLUMN].null_count() == 2
+    later = _read(store, datetime(2024, 3, 5, 9, 0, tzinfo=_NY)).filter(
+        pl.col("accession") == MISMATCH
+    )
+    assert later[FILING_INDEX_ACCEPTED_COLUMN].to_list() == [MISMATCH_STAMP] * 2
+
+
+def test_a_filed_on_index_revision_known_at_t_does_not_move_the_stamp(store: Store) -> None:
+    t = session_close(date(2024, 3, 7))  # after the A-1630 revision (2024-03-07 12:00 UTC)
+    row = _read(store, t).filter(pl.col("accession") == "A-1630")
+    assert row[FILING_INDEX_ACCEPTED_COLUMN].to_list() == row["accepted_at"].to_list()
