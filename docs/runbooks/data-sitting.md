@@ -946,12 +946,12 @@ Purpose: tell vendor absence from late processing for the rows step 13 cannot re
   uv run tradepartner refetch-actions --span --since 2016-01-04 --through <last committed backfill day> --release actions-3074 --security "$(cat ~/tradepartner-probes/sitting-inputs/spyacts3074-after9.txt)" --dry-run
   ```
 
-- [ ] **Read step 14's dry run before any write.** It prints `new`, `revision` and `collision` rows. Check SPY's two dates. Stop and open no release on any `revision` or `collision`, or a new split with no matching raw price gap; use the detailed rules below. If it lists no row, use the no-release path below. Only after this check, run the apply block.
+- [ ] **Read step 14's dry run before any write.** It prints `new`, `revision` and `collision` rows. Check SPY's two dates. Stop and open no release on any `revision` or `collision`, or a new split with no matching raw price gap; use the detailed rules below. If it lists no row, use the no-release path below. Only after this check, run the apply block. **#3484:** once the owner has read the listed collisions, the apply line may add `--skip-collisions` (it works with `--span`): each uncovered collision is left unwritten with its `skipped collision ...` line, the other rows write, and a collision the owner judges distinct goes in `--allow-collision <security>:<ex-date>`. Paste the skipped lines on #3074.
 
   ```bash
   uv run tradepartner store backup
   uv run tradepartner decision data-release open --name actions-3074 --backup <actions3074-copy> --reason "#3074 span refetch, no-rename actions"
-  uv run tradepartner refetch-actions --span --since 2016-01-04 --through <last committed backfill day> --release actions-3074 --security "$(cat ~/tradepartner-probes/sitting-inputs/spyacts3074-after9.txt)"
+  uv run tradepartner refetch-actions --span --since 2016-01-04 --through <last committed backfill day> --release actions-3074 --security "$(cat ~/tradepartner-probes/sitting-inputs/spyacts3074-after9.txt)" --skip-collisions   # only after the owner reads the collisions (#3484)
   uv run tradepartner health --check
   health_rows 14
   ```

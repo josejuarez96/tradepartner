@@ -127,6 +127,32 @@ def _collide(settings: Settings, **kwargs: Any) -> Any:
     )
 
 
+def test_a_span_run_with_skip_collisions_writes_the_rest_and_lists_the_skip(
+    settings: Settings,
+) -> None:
+    prices = _committed(settings)
+    _open_release(settings)
+    _refetch(settings, prices, since=SINCE, through=THROUGH, span=True, securities=[ACME])
+    prices.actions = [
+        _dividend(action_id="acme-q2-reissued"),
+        _dividend(amount=0.5, action_id="acme-other", ex_date=EX + timedelta(days=1)),
+    ]
+    result = _refetch(
+        settings,
+        prices,
+        since=SINCE,
+        through=THROUGH,
+        span=True,
+        securities=[ACME],
+        clock=lambda: AGAIN,
+        skip_collisions=True,
+    )
+    assert result.ok and result.span and result.refused == ()
+    assert result.skipped == (f"collision {ACME} dividend {EX} 0.25 known_at={STAMP}",)
+    assert [r.split()[:2] for r in result.rows] == [["new", ACME]]
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(2,)]
+
+
 def test_a_real_run_with_a_collision_writes_nothing_and_fails(settings: Settings) -> None:
     result = _collide(settings)
     assert not result.ok and result.runs[-1].status == FAILED
