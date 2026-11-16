@@ -28,9 +28,14 @@ from tradepartner.store.asof import filing_events_as_of
 from tradepartner.store.filing_index import first_known
 
 _NEW_YORK = ZoneInfo("America/New_York")
-#: EDGAR's dissemination cut: a filing accepted after 17:30 New York is
-#: disseminated the next EDGAR business day (a rule of the source).
+#: EDGAR's dissemination cut, as `health.EDGAR_FILING_DATE_CUTOFF` (same `<`):
+#: a filing accepted at or after 17:30 New York is public the next business day.
 _EDGAR_CUT = time(17, 30)
+#: Federal closures by executive order, which `USFederalHolidayCalendar` lacks
+#: (2018-12-05 national mourning; Christmas Eve 2018, 2019 and 2020). Pinned.
+EDGAR_EXTRA_CLOSURES: frozenset[date] = frozenset(
+    {date(2018, 12, 5), date(2018, 12, 24), date(2019, 12, 24), date(2020, 12, 24)}
+)
 
 
 def day_zero(accepted_at: datetime) -> date:
@@ -50,15 +55,19 @@ def _federal_holidays(year: int) -> frozenset[date]:
 
 
 def edgar_business_day(day: date) -> bool:
-    """A weekday that is not a US federal holiday (EDGAR is closed on those)."""
-    return day.weekday() < 5 and day not in _federal_holidays(day.year)
+    """A weekday that is not a US federal holiday or closure (EDGAR is shut)."""
+    return (
+        day.weekday() < 5
+        and day not in _federal_holidays(day.year)
+        and day not in EDGAR_EXTRA_CLOSURES
+    )
 
 
 def disseminated_on(accepted_at: datetime) -> date:
     """The New York date EDGAR makes the filing public (rule 9)."""
     local = accepted_at.astimezone(_NEW_YORK)
     day = local.date()
-    if edgar_business_day(day) and local.time() <= _EDGAR_CUT:
+    if edgar_business_day(day) and local.time() < _EDGAR_CUT:
         return day
     day += timedelta(days=1)
     while not edgar_business_day(day):
@@ -100,6 +109,7 @@ def session_events(
         else:
             events.append(release)
     amendments = filing_events_as_of(conn, t, forms=["8-K/A"], items=["2.02"])
+    amendments = amendments.filter(amendments["security_id"].is_in(list(members)))
     n_amend = len(
         {
             a["accession"]

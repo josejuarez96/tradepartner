@@ -62,6 +62,14 @@ def test_dissemination_after_an_edgar_holiday() -> None:
     assert day_zero(accepted) == date(2019, 10, 14)
     assert disseminated_on(accepted) == date(2019, 10, 15)
     assert disseminated_on(_utc(2019, 10, 11, 21, 15)) == date(2019, 10, 11)  # 17:15
+    assert disseminated_on(_utc(2019, 10, 11, 21, 30)) == date(2019, 10, 15)  # 17:30 is late
+
+
+def test_dissemination_after_an_executive_order_closure() -> None:
+    # Monday 2019-12-23 18:00 New York; 2019-12-24 is an XNYS session, EDGAR shut.
+    accepted = _utc(2019, 12, 23, 23)
+    assert day_zero(accepted) == date(2019, 12, 24)
+    assert disseminated_on(accepted) == date(2019, 12, 26)
 
 
 def _store(rows: list[dict[str, Any]], *, cut: datetime | None = None) -> duckdb.DuckDBPyConnection:
@@ -185,7 +193,7 @@ def test_entry_start_is_optional_and_hashed(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("value", ['"2020-01-02"', "2020-01-02T00:00:00Z", "20200102"])
 def test_entry_start_must_be_a_date(tmp_path: Path, value: str) -> None:
-    with pytest.raises(ExperimentFileError, match="entry_start"):
+    with pytest.raises(ExperimentFileError, match="must be a TOML date"):
         _parse(tmp_path, _with_start(value))
 
 
