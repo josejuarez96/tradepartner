@@ -3386,6 +3386,8 @@ def make_app(
         except ValueError as exc:
             raise _fail(_scrubbed(f"refused: {exc}", s), USAGE_ERROR) from None
         typer.echo(result.summary())
+        for line in result.lines():
+            typer.echo(line)
 
     @app.command("recheck-form4-multi-owner")
     def recheck_form4_multi_owner_command(
@@ -3584,6 +3586,8 @@ def make_app(
         except ValueError as exc:
             raise _fail(_scrubbed(f"refused: {exc}", s), USAGE_ERROR) from None
         typer.echo(result.summary())
+        for line in result.lines():
+            typer.echo(line)
         for line in result.stale:
             typer.echo(line)
         if result.stale:
@@ -3735,6 +3739,8 @@ def make_app(
         except ValueError as exc:
             raise _fail(_scrubbed(f"refused: {exc}", s), USAGE_ERROR) from None
         typer.echo(result.summary())
+        for line in result.lines():
+            typer.echo(line)
         for line in result.stale:
             typer.echo(line)
         if result.stale:

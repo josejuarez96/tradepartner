@@ -2271,6 +2271,75 @@ def test_a_key_that_holds_another_sources_revision_is_listed_and_refused(
     assert _retracted(store) == []
 
 
+def test_a_bar_key_that_holds_another_sources_revision_is_listed_and_refused(
+    store: Settings,
+) -> None:
+    """`retract` moves every revision of a key; the old delete spared other sources.
+    The dry run lists the extra row; the real run refuses before moving anything."""
+    with open_for_write(store) as conn:
+        insert_row(
+            conn,
+            "prices_daily",
+            _bar(DEAD, date(2021, 6, 2), source="fixture", known=datetime(2021, 6, 4, tzinfo=UTC)),
+        )
+    before = _bars(store)
+    dry = _delete_bars(store, dry_run=True)
+    assert len(dry.wider) == 1 and "fixture revision" in dry.wider[0]
+    assert "2021-06-02" in dry.wider[0] and dry.lines() == [f"  WIDER {dry.wider[0]}"]
+    assert "1 extra rows held by the same keys" in dry.summary()
+    app = cli.make_app(settings=lambda: store, clock=lambda: RUN)
+    shown = CliRunner().invoke(
+        app,
+        [
+            "repair-bars",
+            "--security",
+            DEAD,
+            "--from",
+            "2021-06-01",
+            "--to",
+            "2021-06-15",
+            "--release",
+            REL,
+            "--dry-run",
+        ],
+    )
+    assert shown.exit_code == 0, shown.output
+    assert f"  WIDER {dry.wider[0]}" in shown.output
+    with pytest.raises(RepairRefused, match="extra rows would be retracted"):
+        _delete_bars(store, expect=(3, 1), release=REL)
+    assert _bars(store) == before
+    assert _retracted(store) == []
+
+
+def test_a_dividend_dry_run_lists_the_extra_rows_held_by_its_keys(
+    dividends: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dry run lists each extra row a retraction would also move, as
+    `repair-resolution` does; a real run refuses on any. No stored dividend
+    identity reaches the detector today (a second row of the identity makes
+    the entry stale first), so the detector's line is stubbed."""
+    line = (
+        "corporate_actions key ('0000000001', 'b', 'dividend', 2021-06-15) also holds a "
+        "fixture revision known 2026-10-04 18:00:00+00:00 (ex-date 2021-06-15)"
+    )
+    monkeypatch.setattr(repair, "_wider_identities", lambda *a, **k: [line])
+    dry = _retract(dividends, dry_run=True)
+    assert dry.wider == (line,)
+    assert dry.lines() == [f"  WIDER {line}"]
+    assert "1 extra rows held by the same keys" in dry.summary()
+    monkeypatch.setattr(repair, "reviewed_groups", lambda: LIST)
+    app = cli.make_app(settings=lambda: dividends, clock=lambda: RUN)
+    shown = CliRunner().invoke(
+        app, ["repair-dividends", "--release", REL, "--to", str(EX), "--dry-run"]
+    )
+    assert shown.exit_code == 0, shown.output
+    assert f"  WIDER {line}" in shown.output
+    with pytest.raises(RepairRefused, match="extra rows would be retracted"):
+        _retract(dividends, expect=1, release=REL)
+    assert _actions(dividends) == ALL_ACTIONS
+    assert _retracted(dividends) == []
+
+
 def test_a_redated_spinoff_identity_retracts_in_one_call(store: Settings) -> None:
     child, ex = "0000000003", date(2021, 6, 15)
     with open_for_write(store) as conn:
