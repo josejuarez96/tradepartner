@@ -251,3 +251,30 @@ def test_a_skipped_collision_leaves_no_cancel_of_a_stored_dividend(settings: Set
     )
     assert result.ok
     assert _rows(settings, sql) == before
+
+
+def test_a_skipped_id_takes_its_earlier_revisions_with_it(settings: Settings) -> None:
+    """quant-auditor on #3485: the source answers an id twice (0.40 on one day, then 0.25 on
+    the stored event's day); skipping the collision must not write the first revision live."""
+    prices = _committed(settings)
+    _open_release(settings)
+    prices.actions = [_div(OLD)]
+    _refetch(settings, prices, since=SINCE, securities=[OLD, NEW])
+    day2 = EX + timedelta(days=1)
+    early = replace(
+        _div(NEW, amount=0.40, action_id="d2"),
+        ex_date=day2,
+        known_at=action_first_seen_known_at(EX) - timedelta(days=1),
+    )
+    late = replace(_div(NEW, action_id="d2"), known_at=action_first_seen_known_at(EX))
+    prices.actions = [early, late]
+    result = _refetch(
+        settings,
+        prices,
+        since=SINCE,
+        securities=[OLD, NEW],
+        clock=lambda: AGAIN,
+        skip_collisions=True,
+    )
+    assert result.ok and len(result.skipped) == 1
+    assert _count(settings) == 1

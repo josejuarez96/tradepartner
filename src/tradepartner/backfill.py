@@ -1929,11 +1929,15 @@ def _refetch_month(
             drop = _blocked_identities(conn, stamp, blocked)
             conn.execute("DELETE FROM corporate_actions WHERE ingested_at = ?", [stamp])
             stats.clear()
+            # Every revision of a skipped id goes with it (not only the one
+            # that collided); an id-less action is matched by type and ex-date.
+            ids = {(sid, src) for sid, _k, _e, src in drop if src}
+            keys = {(sid, kind, ex) for sid, kind, ex, src in drop if not src}
             keep = [
                 a
                 for a in prepared["actions"]
-                if (a.security_id, a.action_type.value, a.ex_date, a.source_action_id or "")
-                not in drop
+                if (a.security_id, a.source_action_id) not in ids
+                and (a.security_id, a.action_type.value, a.ex_date) not in keys
             ]
             added = add(keep)
             lines, again = _rows_written(conn, stamp, allowed)
