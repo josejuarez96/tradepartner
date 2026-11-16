@@ -323,7 +323,7 @@ class AnnouncementProvider(DataProvider, Protocol):
         dual-class issuer's filing once per listed class. `forms` match exactly (`8-K`
         never matches `8-K/A`); `items` match a whole code of the filing's item list.
         Columns: `security_id`, every `filing_events` column, then
-        `FILING_INDEX_ACCEPTED_COLUMN`: the `accepted_at` of `filing_index.first_known`
+        `FILING_INDEX_ACCEPTED_COLUMN`: the `accepted_at` of the filing index's first-known stamp
         for the same `(cik, accession)` at `t`, null when the index has no such row
         known at `t`. A consumer distrusts a row where the two differ (spec item 5)."""
         ...
