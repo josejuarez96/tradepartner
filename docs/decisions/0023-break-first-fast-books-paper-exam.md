@@ -196,7 +196,7 @@ At IR 0.5, (c)'s gain over the current rule of at least 20 pp does not rest on t
   | 40 months | about 1.28 | about 1.39 | about 0.86 |
   | 84 months (if T184h lets a family start in 2017) | about 0.89 | | |
 - **N + k is printed, not a gate. This is a deliberate choice.** As a gate, it would stop any 40-month read from reaching an exam, so the route would have no end. It does not need to gate, because a false pass is controlled where the data is fresh:
-  - The forward exam's months come after the frozen kill line, so "its pass rate is the test's rate under the null, whatever the screen did" (ADR 0016, 2026-11-06). That amendment puts it under 5% across four exams: at most 4.40% at skew −0.85, by its sizing run.
+  - The forward exam's months come after the frozen kill line, so "its pass rate is the test's rate under the null, whatever the screen did" (ADR 0016, 2026-11-06). ADR 0016's sizing puts four noise finalists under 5% at skew −0.85: 4.33% under the 2026-11-06 rule, and 4.9% under the 2026-11-07 group-sequential exam.
   - The four-exam budget caps how many survivors can try.
   - The exam door re-prices each one at the paper basis.
 
