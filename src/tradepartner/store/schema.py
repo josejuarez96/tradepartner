@@ -638,7 +638,17 @@ registry; #83 took version 2 first, so the registry is version 3):
   migration creates the table and changes no row; a read-only version-48
   store opens and simply has no retraction (`store.retracted_rows` reads
   nothing there).
-- **A later DDL change goes to version 50**, with its own migration and a
+- **Version 50** (#3501, T401; data-foundation spec amendment 2026-11-16):
+  additive `security_fence`, the append-only counted exclusion list (one row
+  per fence or lift of a security's closed session window, point in time by
+  `known_at`; `store.fence` reads it), and `owner_decisions.kind` gains
+  `fence_write` (`lab_schema.FENCE_DECISION_KINDS`, the `CHECK` rebuilt by
+  `lab_schema.widen_enum` as version 22 did, every row kept). A non-fact
+  state table, kept out of `TABLE_NAMES` so the look-ahead harness never
+  truncates it: a fence is read at a run's read time, not at a backtest's
+  cutoff, and `store.fence` applies its own `known_at` filter. A read-only
+  version-49 store opens and reads as an empty fence.
+- **A later DDL change goes to version 51**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -974,9 +984,11 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #: - 47 (#2490): nullable `resume_invocations.book_id`.
 #: - 48 (#3076): nullable `classifications.issuer_class`.
 #: - 49 (#3281, T389): additive `retracted_rows` side table.
-#: - A later DDL change goes to version 50, with its own migration and a
+#: - 50 (#3501, T401): additive `security_fence` table and the
+#:   `owner_decisions.kind` value `fence_write`.
+#: - A later DDL change goes to version 51, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 49
+CURRENT_SCHEMA_VERSION = 50
 
 #: The last version without `delisting_reasons` (T326, version 43): the
 #: `snapshot_sightings` version (#2665). A named constant, not
@@ -1008,6 +1020,11 @@ _PRE_ISSUER_CLASS_VERSION = 47
 #: The last version without `retracted_rows` (#3281, T389, version 49): the
 #: `classifications.issuer_class` version. Named, never `CURRENT_SCHEMA_VERSION - 1`.
 _PRE_RETRACTED_ROWS_VERSION = 48
+
+#: The last version without `security_fence` and the `fence_write` decision kind
+#: (#3501, T401, version 50): the `retracted_rows` version. Named, never
+#: `CURRENT_SCHEMA_VERSION - 1`.
+_PRE_FENCE_VERSION = 49
 
 #: Last version without the owner-entered Form 8937 allocation table.
 _PRE_SPINOFF_ALLOCATIONS_VERSION = 38
@@ -1568,6 +1585,35 @@ CREATE TABLE IF NOT EXISTS retracted_rows (
 RETRACTED_ROWS_TABLE_NAMES: tuple[str, ...] = ("retracted_rows",)
 _RETRACTED_ROWS_TABLE_DDL: tuple[str, ...] = (_CREATE_RETRACTED_ROWS,)
 
+# #3501, T401 (data-foundation spec amendment 2026-11-16, item 1): the counted
+# exclusion list. Append-only: a lift is a later row with the same
+# (security_id, from_session, rule) and `action = 'lift'`, never an UPDATE or
+# DELETE. `batch` is the `owner_decisions.decision_id` of the `fence_write` that
+# made the row. `known_at` is the moment of the owner's count.
+_CREATE_SECURITY_FENCE = """
+CREATE TABLE IF NOT EXISTS security_fence (
+    security_id VARCHAR NOT NULL,
+    from_session DATE NOT NULL,
+    to_session DATE NOT NULL,
+    rule VARCHAR NOT NULL,
+    reason VARCHAR NOT NULL,
+    issue BIGINT NOT NULL,
+    action VARCHAR NOT NULL,
+    batch BIGINT NOT NULL,
+    known_at TIMESTAMPTZ NOT NULL,
+    ingested_at TIMESTAMPTZ NOT NULL,
+    CHECK (action IN ('fence', 'lift')),
+    CHECK (from_session <= to_session),
+    CHECK (security_id <> '' AND rule <> '' AND reason <> '' AND issue > 0)
+)
+"""
+
+#: The version-50 state table: in `MASTER_CHECK_TABLE_NAMES` (store inventory), out of
+#: `TABLE_NAMES`, so the look-ahead harness never truncates it (`store.fence` reads it
+#: at a run's read time with its own `known_at` filter).
+FENCE_TABLE_NAMES: tuple[str, ...] = ("security_fence",)
+_FENCE_TABLE_DDL: tuple[str, ...] = (_CREATE_SECURITY_FENCE,)
+
 # Ownership events keep the subject and every reporting owner separate from the
 # issuer-only 8-K table. The identity excludes known_at so a re-read cannot revise it.
 _CREATE_SEC_FILING_EVENTS = f"""
@@ -2013,6 +2059,7 @@ MASTER_CHECK_TABLE_NAMES: tuple[str, ...] = (
     "edgar_filers",
     "edgar_index_files",
     "retracted_rows",  # version 49, ADR 0029: rows a repair moved out of a fact table
+    "security_fence",  # version 50, T401: the counted exclusion list
 )
 _MASTER_UNDERIVED_TABLE_DDL: tuple[str, ...] = (_CREATE_MASTER_UNDERIVED,)
 
@@ -3608,6 +3655,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_RESUME_BOOK_VERSION,
         _PRE_ISSUER_CLASS_VERSION,
         _PRE_RETRACTED_ROWS_VERSION,
+        _PRE_FENCE_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -3657,7 +3705,9 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # and `collect` read; version 47 every read (`classifications_as_of`
         # returns no `issuer_class` column there, which readers take as no tag,
         # #3076); version 48 every read (no `retracted_rows` until 49, #3281:
-        # `store.retracted_rows` finds no table there and reports no retraction).
+        # `store.retracted_rows` finds no table there and reports no retraction);
+        # version 49 every read (no `security_fence` until 50, #3501: `store.fence`
+        # finds no table there and reads an empty fence).
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -4449,6 +4499,19 @@ def _migrate_operations_kinds(conn: duckdb.DuckDBPyConnection) -> None:
     forget_column_types(conn)
 
 
+def _migrate_fence_kind(conn: duckdb.DuckDBPyConnection) -> None:
+    """Version 50 (module docstring, "Schema versions"): widen
+    `owner_decisions.kind` with `lab_schema.FENCE_DECISION_KINDS` by
+    `lab_schema.widen_enum`, as version 22 did (a no-op once present; every row
+    kept in insertion order, byte-identical). Idempotent; runs inside
+    `init_schema`'s transaction on a fresh or migrating writable store.
+    `lab_schema` imports this module, so it is imported here, at call time."""
+    from tradepartner.store import lab_schema
+
+    lab_schema.widen_enum(conn, "owner_decisions", "kind", lab_schema.FENCE_DECISION_KINDS)
+    forget_column_types(conn)
+
+
 def _migrate_fee_activities(conn: duckdb.DuckDBPyConnection) -> None:
     """Version 25 (module docstring, "Schema versions"): the ledger's booked
     `FEE` activities (#1583, T183). Rebuild `adjustments` with its version-25
@@ -4931,6 +4994,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_RESUME_BOOK_VERSION,
         _PRE_ISSUER_CLASS_VERSION,
         _PRE_RETRACTED_ROWS_VERSION,
+        _PRE_FENCE_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -4986,6 +5050,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _DELISTING_REASONS_TABLE_DDL
             + _FILING_INDEX_TABLE_DDL
             + _RETRACTED_ROWS_TABLE_DDL
+            + _FENCE_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)
@@ -5017,6 +5082,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_shakedown_kinds(conn)
         if max_version is None or max_version <= _PRE_OPERATIONS_BOOK_VERSION:
             _migrate_operations_kinds(conn)
+        if max_version is None or max_version <= _PRE_FENCE_VERSION:
+            _migrate_fence_kind(conn)
         if max_version is None or max_version <= _PRE_FEE_ACTIVITIES_VERSION:
             _migrate_fee_activities(conn)
         if max_version is None or max_version <= _PRE_CASH_IN_LIEU_VERSION:

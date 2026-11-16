@@ -507,7 +507,11 @@ def test_migrating_a_version_19_store_keeps_every_row(lab: bool) -> None:
     assert {t: _columns(conn, t) for t in before} == columns_before
     added = ", ".join(
         f"'{k}'"
-        for k in (*lab_schema.SHAKEDOWN_DECISION_KINDS, *lab_schema.OPERATIONS_DECISION_KINDS)
+        for k in (
+            *lab_schema.SHAKEDOWN_DECISION_KINDS,
+            *lab_schema.OPERATIONS_DECISION_KINDS,
+            *lab_schema.FENCE_DECISION_KINDS,
+        )
     )
     assert _kind_check(conn) == check_before.replace("'))));", f"', {added}))));")
     assert _versions(conn) == list(range(19, schema.CURRENT_SCHEMA_VERSION + 1))
@@ -582,9 +586,9 @@ def test_read_only_open_of_a_version_19_store_passes_and_has_no_span(tmp_path: P
 
 def test_a_fresh_store_allows_the_shakedown_kinds_and_the_lab_keeps_them() -> None:
     conn = _fresh_store()
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RETRACTED_ROWS_VERSION + 1 and _versions(
-        conn
-    ) == [schema.CURRENT_SCHEMA_VERSION]
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_FENCE_VERSION + 1 and _versions(conn) == [
+        schema.CURRENT_SCHEMA_VERSION
+    ]
     for decision_id, kind in enumerate(lab_schema.SHAKEDOWN_DECISION_KINDS, start=1):
         conn.execute(
             "INSERT INTO owner_decisions VALUES (?, ?, ?, NULL, NULL, '{}', 'r')",
@@ -637,7 +641,9 @@ def test_migrating_a_version_21_store_keeps_every_row(lab: bool) -> None:
     schema.init_schema(conn)
     assert _rows_but_versions(conn) == before
     assert {t: _columns(conn, t) for t in before} == columns_before
-    assert _kind_check(conn) == check_before.replace("'))));", "', 'operations_book'))));")
+    assert _kind_check(conn) == check_before.replace(
+        "'))));", "', 'operations_book', 'fence_write'))));"
+    )
     assert _versions(conn) == list(range(21, schema.CURRENT_SCHEMA_VERSION + 1))
     assert lab_schema.is_lab_initialised(conn) == lab
     conn.execute(

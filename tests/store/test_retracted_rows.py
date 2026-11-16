@@ -65,7 +65,7 @@ def _as_version_48(conn: duckdb.DuckDBPyConnection) -> None:
 
 
 def test_the_table_is_a_state_table_outside_the_fact_tables() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RETRACTED_ROWS_VERSION + 1 == 49
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_FENCE_VERSION + 1 == 49
     assert "retracted_rows" not in schema.TABLE_NAMES
     assert schema.RETRACTED_ROWS_TABLE_NAMES == ("retracted_rows",)
     conn = duckdb.connect(":memory:")
