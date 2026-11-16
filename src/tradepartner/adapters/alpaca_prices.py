@@ -405,6 +405,7 @@ from tradepartner.store import spinoff_splits as spinoff_split_list
 from tradepartner.store.classify import EQUITY, listing_kind
 from tradepartner.store.delistings import DELISTED
 from tradepartner.store.dividend_reviews import DUPLICATE, ReviewedGroup, reviewed_groups
+from tradepartner.store.master import _norm_title
 from tradepartner.store.reviewed_spinoffs import ReviewedSpinoff, reviewed_spinoffs
 from tradepartner.store.spinoff_splits import SpinoffSplit
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -610,6 +611,7 @@ class ResolverReport:
     symbol_changes_refused: int = 0
     symbol_changes_ended: int = 0
     chain_early_starts: int = 0
+    successor_cut_spans: int = 0
 
     def summary(self) -> str:
         """One line for an `ingestion_runs` message."""
@@ -640,7 +642,8 @@ class ResolverReport:
             f"{self.symbol_changes_ended} of them ending the old ticker (a sibling class "
             "lists the new one), "
             f"{self.symbol_changes_unmatched} matching no listing; "
-            f"{self.chain_early_starts} chained spans started early (rule 9)"
+            f"{self.chain_early_starts} chained spans started early (rule 9); "
+            f"{self.successor_cut_spans} old-id spans ended at a repair successor's start"
         )
 
 
@@ -1258,6 +1261,10 @@ class ListingResolver:
         }
         for spans in self._by_ticker.values():
             spans[:] = [span for span in spans if span not in duplicated]
+        self._successor_cuts = _successor_cuts(listings)
+        successor_cut = self._cut_at_successors(
+            {sid: day for sid, (day, _) in self._successor_cuts.items()}, cut
+        )
         later_class = {
             span
             for spans in self._by_ticker.values()
@@ -1376,6 +1383,7 @@ class ListingResolver:
             same_day_typos=same_day_typos,
             kept_spans=kept_spans,
             successor_duplicates=len(duplicated),
+            successor_cut_spans=successor_cut,
             unreadable=unreadable,
             stopped_spans=stopped_spans,
             accepted_relistings=accepted_spans,
@@ -1562,6 +1570,47 @@ class ListingResolver:
         a ticker it held until another issuer took it, which resolves to it
         no more."""
         return tuple(self._handovers_of.get(security_id, ()))
+
+    def _cut_at_successors(self, cuts: Mapping[str, date], cut: set[TickerSpan]) -> int:
+        """End each old id's assigned equity spans at its repair successor's
+        first listing day (#3474, `_successor_cuts`): a span live on that day
+        ends there and vacates its ticker like a span ended at its own
+        delisting (added to `cut`), and a span starting on or after it holds
+        nothing. From that day the company's bars are the successor's, the
+        ownership `health`'s `old_id_bars_after_successor` reads, so neither
+        an ingest nor `repair.repair_resolution` keeps a bar under the old id
+        through a symbol-change span (VLDXD, GRIF) nothing else ends. Returns
+        the spans changed."""
+        changed = 0
+        for spans in self._by_ticker.values():
+            kept: list[TickerSpan] = []
+            for span in spans:
+                day = cuts.get(span.security_id)
+                if day is None or not (span.end is None or span.end > day):
+                    kept.append(span)
+                    continue
+                changed += 1
+                own = self._by_security[span.security_id]
+                history = self._history[span.security_id]
+                if span.start >= day:  # the successor's sessions only: holds nothing
+                    continue
+                ended = replace(span, end=day)
+                own[own.index(span)] = ended
+                if span in history:
+                    history[history.index(span)] = ended
+                cut.discard(span)
+                cut.add(ended)
+                kept.append(ended)
+            spans[:] = kept
+        return changed
+
+    def successor_from(self, security_id: str, session: date) -> str | None:
+        """The repair successor that owns `security_id`'s bars on `session`
+        (#3474, `_successor_cuts`): its earliest same-class successor when
+        `session` is on or after that successor's first listing day, else
+        `None`."""
+        cut = self._successor_cuts.get(security_id)
+        return cut[1] if cut is not None and session >= cut[0] else None
 
     def fill_resolve(self, ticker: str, session: date) -> str | None:
         """`resolve` for a `--fill-holes` refetch (#1314, rule 8 "Store
@@ -2233,6 +2282,37 @@ def _company(security_id: str) -> str:
 #: A repair successor's id (#820, `store.master`): `<cik>@<valid_from>`,
 #: with `-<n>` when that id was taken.
 _SUCCESSOR_ID = re.compile(r"(\d+)@(\d{4}-\d{2}-\d{2})(?:-(\d+))?")
+
+
+def _successor_cuts(listings: Iterable[Mapping[str, Any]]) -> dict[str, tuple[date, str]]:
+    """Per old id, the first listing day and id of its earliest repair successor
+    (`<cik>@<date>`, #3056) that covers it (#3474): an id of the successor's
+    issuer (`_issuer`) whose first listing row is earlier than the
+    successor's and that shares one of its class titles (`store.master`'s
+    normalised title), exactly the pairs `health`'s
+    `old_id_bars_after_successor` reads (a preferred's id is never cut by the
+    common's successor; on one day, the smallest id). Pure."""
+    first: dict[str, date] = {}
+    titles: dict[str, set[str]] = defaultdict(set)
+    for row in listings:
+        sid = str(row["security_id"])
+        day = row["valid_from"]
+        if sid not in first or day < first[sid]:
+            first[sid] = day
+        title = row.get("class_title")
+        if title and (norm := _norm_title(str(title))):
+            titles[sid].add(norm)
+    by_issuer: dict[str, list[str]] = defaultdict(list)
+    for sid in first:
+        by_issuer[_issuer(sid)].append(sid)
+    out: dict[str, tuple[date, str]] = {}
+    for successor, start in sorted(first.items()):
+        if _SUCCESSOR_ID.fullmatch(successor) is None:
+            continue
+        for old in by_issuer[_issuer(successor)]:
+            if old != successor and first[old] < start and titles[old] & titles[successor]:
+                out[old] = min(out.get(old, (start, successor)), (start, successor))
+    return out
 
 
 def _succeeds(successor: str, security_id: str) -> bool:

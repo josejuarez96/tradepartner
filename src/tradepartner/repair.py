@@ -126,6 +126,7 @@ from tradepartner.adapters.alpaca_prices import (
     ACTIONS_SOURCE,
     BAR_SOURCES,
     ListingResolver,
+    _succeeds,
     alpaca_symbol,
     registrant_evidence,
 )
@@ -390,6 +391,62 @@ def duplicate_bars(
     return out
 
 
+def successor_moves(
+    resolver: ListingResolver,
+    bar_keys: Iterable[Key],
+    tickers: Callable[[str, date], Sequence[str]],
+    holds_bar: Callable[[str, date], bool],
+) -> dict[Key, str]:
+    """The moved bar keys among `bar_keys` whose one receiver is a repair
+    successor of the key's own company (`<cik>@<date>`, #3056) that holds no
+    bar of its own there (#3474): the old id's bar from the successor's
+    start, which the successor lacks (VELO's and REED's recent sessions). A
+    real run copies every revision of such a key to the successor before it
+    retracts it, so the company loses no session; a refetch could put the
+    same bar there, this does it in the same transaction. Returns `{key:
+    successor}`. Pure."""
+    out: dict[Key, str] = {}
+    for sid, day in bar_keys:
+        owners = bar_owners(resolver, tickers(sid, day), day, holds_bar) - {sid}
+        if len(owners) == 1 and _succeeds(owner := next(iter(owners)), sid):
+            out[(sid, day)] = owner
+    return out
+
+
+def _move_bars(
+    conn: duckdb.DuckDBPyConnection, sources: list[str], moves: Mapping[Key, str], at: datetime
+) -> int:
+    """Copy every revision (`sources` only) of each `moves` key to its
+    successor id, the row unchanged but for `security_id` and `ingested_at`
+    (`at`): its `known_at` stays the session close a refetch would stamp.
+    Returns the rows written. Runs on the caller's transaction."""
+    if not moves:
+        return 0
+    conn.execute(
+        "CREATE OR REPLACE TEMP TABLE _move_keys "
+        "(security_id VARCHAR, session DATE, successor VARCHAR)"
+    )
+    try:
+        conn.executemany(
+            "INSERT INTO _move_keys VALUES (?, ?, ?)",
+            [(sid, day, owner) for (sid, day), owner in sorted(moves.items())],
+        )
+        [before] = conn.execute("SELECT count(*) FROM prices_daily").fetchone() or (0,)
+        conn.execute(
+            "INSERT INTO prices_daily (security_id, session, open, high, low, close, volume, "
+            "known_at, ingested_at, source, provenance) "
+            "SELECT k.successor, p.session, p.open, p.high, p.low, p.close, p.volume, "
+            "p.known_at, ?, p.source, p.provenance FROM prices_daily p JOIN _move_keys k "
+            "ON p.security_id = k.security_id AND p.session = k.session "
+            "WHERE p.source IN (SELECT unnest(?))",
+            [at, sources],
+        )
+        [after] = conn.execute("SELECT count(*) FROM prices_daily").fetchone() or (0,)
+    finally:
+        conn.execute("DROP TABLE IF EXISTS _move_keys")
+    return int(after) - int(before)
+
+
 def _duplicate_owner(
     resolver: ListingResolver,
     sid: str,
@@ -560,6 +617,25 @@ def _held_tickers(
     return held
 
 
+def _with_successor_tickers(
+    resolver: ListingResolver, held: Callable[[str, date], Sequence[str]]
+) -> Callable[[str, date], Sequence[str]]:
+    """`held`, plus on a session from an old id's repair successor's start
+    (`ListingResolver.successor_from`, #3474) the tickers that successor
+    trades under that day: the bar is the successor's, so it is the receiver
+    even when the old id carries none of its tickers (its rows withdrawn to
+    the successor, or only a symbol-change ticker such as VLDXD left)."""
+
+    def tickers(security_id: str, day: date) -> Sequence[str]:
+        out = list(held(security_id, day))
+        successor = resolver.successor_from(security_id, day)
+        if successor is not None:
+            out += [t for t in resolver.symbols(successor, day, day) if t not in out]
+        return out
+
+    return tickers
+
+
 @dataclass(frozen=True)
 class ChainLine:
     """A live successor chain the run applied (#821, plan T187b): the
@@ -595,6 +671,9 @@ class RepairResult:
     #: Rows beyond the counted ones that retracting these keys would also move
     #: (`_wider`); a real run refuses on any.
     wider: tuple[str, ...] = ()
+    #: The bar keys a real run copies to their company's repair successor
+    #: before retracting them (#3474, `successor_moves`): key to successor.
+    moves: Mapping[Key, str] = field(default_factory=dict)
 
     @property
     def orphan_keys(self) -> int:
@@ -630,6 +709,12 @@ class RepairResult:
             + (
                 f"; {len(self.duplicates)} duplicate bar keys an owner already holds"
                 if self.duplicates
+                else ""
+            )
+            + (
+                f"; {len(self.moves)} bar keys {'to move' if self.dry_run else 'moved'} "
+                "to a repair successor that lacks them"
+                if self.moves
                 else ""
             )
             + (f"; {len(self.wider)} extra rows held by the same keys" if self.wider else "")
@@ -671,6 +756,16 @@ class RepairResult:
             out.append(
                 f"  DUPLICATE {sid} ({name}): {len(days)} bar keys {min(days)}..{max(days)} "
                 f"duplicate of {owner}"
+            )
+        moved: dict[tuple[str, str], list[date]] = defaultdict(list)
+        for (sid, day), owner in self.moves.items():
+            moved[(sid, owner)].append(day)
+        for sid, owner in sorted(moved):
+            days = moved[(sid, owner)]
+            name = self.names.get(_base_id(sid), "?")
+            out.append(
+                f"  MOVE {sid} ({name}): {len(days)} bar keys {min(days)}..{max(days)} "
+                f"to {owner}, which lacks them"
             )
         out += [f"  WIDER {line}" for line in self.wider]
         for chain in self.chains:
@@ -1119,12 +1214,18 @@ def repair_resolution(
             )
             + _wider_spinoffs(conn, bad_spins)
         )
-        held_tickers = _held_tickers(conn, started)
+        held_tickers = _with_successor_tickers(resolver, _held_tickers(conn, started))
         holds_bar = _holds_bar(conn, bar_sources, found_bars)
         same_bar = _same_bar(conn, bar_sources, settings.store.release_move_price_tolerance)
         orphans = orphan_bars(resolver, found_bars, held_tickers, holds_bar, same_bar)
         duplicates = duplicate_bars(
             resolver, [k for k in found_bars if k not in orphans], held_tickers, holds_bar, same_bar
+        )
+        moves = successor_moves(
+            resolver,
+            [k for k in found_bars if k not in orphans and k not in duplicates],
+            held_tickers,
+            holds_bar,
         )
         names = {
             _base_id(str(sid)): str(name)
@@ -1151,6 +1252,7 @@ def repair_resolution(
             duplicates=duplicates,
             names=names,
             wider=wider,
+            moves=moves,
         )
         if not dry_run:
             if result.orphan_keys != (allow_orphans or 0):
@@ -1174,6 +1276,26 @@ def repair_resolution(
             assert release is not None  # checked above
             why_rule = _resolution_rules(conn, started, settings)
             reason = f"repair-resolution at {started.isoformat()}: the resolver no longer assigns"
+            copied = _move_bars(conn, bar_sources, moves, started)
+            if copied != sum(found.bars[key] for key in moves):  # never a partial move
+                raise RuntimeError(
+                    f"repair copied {copied} bar rows to successors where it counted "
+                    f"{sum(found.bars[key] for key in moves)}; rolled back"
+                )
+            moved_to: dict[str, set[str]] = defaultdict(set)
+            for (sid, _), owner in moves.items():
+                moved_to[sid].add(owner)
+
+            def bar_rule(sid: str, days: Sequence[date]) -> str:
+                text = why_rule("session", sid, days)
+                if sid in moved_to:
+                    count = sum(1 for key in moves if key[0] == sid)
+                    text += (
+                        f"; {count} of these sessions copied first to "
+                        f"{', '.join(sorted(moved_to[sid]))}, which lacked them (#3474)"
+                    )
+                return text
+
             moved = (
                 _delete(
                     conn,
@@ -1183,7 +1305,7 @@ def repair_resolution(
                     found.bars,
                     reason=reason,
                     release=release,
-                    rule=lambda sid, days: why_rule("session", sid, days),
+                    rule=bar_rule,
                 ),
                 _delete(
                     conn,
