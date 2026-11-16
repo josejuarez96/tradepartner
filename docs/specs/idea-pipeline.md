@@ -5,11 +5,11 @@
 This document designs a process and its pilot. It proposes no strategy, builds nothing and reads no return. The owner reviews it and decides the items in [Decisions for the owner](#decisions-for-the-owner).
 
 *Amendment 2026-11-16 (#3496; [ADR 0023's amendment of that date](../decisions/0023-break-first-fast-books-paper-exam.md#amendment-2026-11-16-3496-own-store-read-first-published-evidence-as-the-prior); accepted by the owner's merge).* Own-store read first. Five points change here:
-- **Question 3** is a break-even screen at the band's arrival measure (+8.8 bp per side over $200M today). D9's margin is dropped, because the deciding read charges the harsh cost itself.
+- **Question 3** is a break-even screen at the band's #2667 arrival measure (+8.8 bp per side over $200M today, provisional while it rests on two rebalance days). D9's margin is dropped, because the deciding read charges the harsh cost itself.
 - **A fast look on open data** (requirement 5 (a)) is optional and sets the card's prior and expected size. It kills nothing, and it no longer makes a card a candidate. A candidate counts at its rung-4 verdict, which replaces D2's interim rule and D7.
 - **A store return is read only inside a registered run.** This is D5's narrower option.
-- **Every route read states k and is read at N + k** (D11).
-- **The strict tier's registered store read decides.** It is frozen at 24 bp per side or more, harsh at double that.
+- **Every route read states k and prints the deflated Sharpe at N + k**, with V = max(V, `min_sharpe_variance_annual`, 12/T). An event study records k in its `[multiplicity]` block. For route reads, N + k is printed and does not gate. This replaces requirement 5's promotion-at-N + k and its Šidák `ci_level`, and it decides D11. D2 is decided here as well, before the quant-auditor review that requirement 5 had made it wait for.
+- **The strict tier's registered store read decides.** Its decision cell is at the harsh cost: at least 50 bp per side, twice a base of at least 25 bp. A pass needs delister coverage over its window (4a (f)).
 
 Requirement 8 (confirmation is prospective) is unchanged.
 
