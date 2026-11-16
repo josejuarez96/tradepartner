@@ -250,6 +250,33 @@ def test_a_repaired_identity_stays_out_through_a_backfill(splits: Settings) -> N
     assert _actions(splits) == [(OTHER, "split", "g")]
 
 
+def test_a_dry_run_lists_the_extra_rows_held_by_its_keys(
+    splits: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dry run lists each extra row a retraction would also move, as
+    `repair-resolution` does; a real run refuses on any. No stored split
+    identity reaches the detector today (a row of another source or type makes
+    the entry stale first), so the detector's line is stubbed."""
+    line = (
+        "corporate_actions key ('0000000101', 's1', 'split', 2020-04-01) also holds a "
+        "fixture revision known 2026-11-06 23:00:00+00:00 (ex-date 2020-04-01)"
+    )
+    monkeypatch.setattr(repair, "_wider_split_identities", lambda *a, **k: [line])
+    dry = _retract(splits, dry_run=True)
+    assert dry.wider == (line,)
+    assert dry.lines() == [f"  WIDER {line}"]
+    assert "1 extra rows held by the same keys" in dry.summary()
+    monkeypatch.setattr(repair, "spinoff_splits", lambda: LIST)
+    app = cli.make_app(settings=lambda: splits, clock=lambda: RUN)
+    shown = CliRunner().invoke(app, ["repair-spinoff-splits", "--release", REL, "--dry-run"])
+    assert shown.exit_code == 0, shown.output
+    assert f"  WIDER {line}" in shown.output
+    with pytest.raises(RepairRefused, match="extra rows would be retracted"):
+        _retract(splits, expect=1, release=REL)
+    assert _actions(splits) == ALL
+    assert _rows(splits, "SELECT count(*) FROM retracted_rows") == [(0,)]
+
+
 def test_the_repair_spinoff_splits_command(
     splits: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
