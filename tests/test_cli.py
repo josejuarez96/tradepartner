@@ -3685,6 +3685,28 @@ def test_accept_unreceived_without_a_count_lists_the_keys_and_writes_nothing(
     assert _orphan_rows(settings) == []
 
 
+def test_accept_unreceived_and_coverage_agree_under_the_configured_decimals(
+    tmp_path: Path,
+) -> None:
+    """#3479: a receiver matching only under `store.release_move_price_decimals`
+    (1.00005 cut to 4 decimals) is received for coverage, so accept-unreceived lists
+    no key for it either; both commands report the same set."""
+    settings, _ = _cov_open(tmp_path)
+    _cov_revised_receiver(settings, open_=1.00005, volume=7)
+    checked = _cov_run(settings)
+    assert checked.exit_code == 0, checked.output
+    assert "NOT RECEIVED" not in checked.output
+    listed = _cov_accept(settings)
+    assert "UNRECEIVED" not in listed.output, listed.output
+    assert "release rel: 0 residual unreceived key(s)" in listed.output
+    other, _ = _cov_open(tmp_path / "unit")
+    _cov_revised_receiver(other, open_=1.0001, volume=7)
+    assert "1 of 1 sessions NOT RECEIVED" in _cov_run(other).output
+    unit = _cov_accept(other)
+    assert f"UNRECEIVED A {_COV_DAYS[1].isoformat()}" in unit.output
+    assert "release rel: 1 residual unreceived key(s)" in unit.output
+
+
 def test_accept_unreceived_refuses_a_count_that_is_not_the_key_count(tmp_path: Path) -> None:
     settings, _ = _cov_open(tmp_path)
     _cov_retract_unreceived(settings, _COV_DAYS[:2])
