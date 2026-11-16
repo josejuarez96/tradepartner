@@ -49,6 +49,7 @@ from typing import Any, Final
 import polars as pl
 
 from tradepartner.config import Settings, get_settings
+from tradepartner.config_backtest import DELISTING_POLICIES
 
 #: `kind` (Definitions, Kind). A code constant, pinned by a test; a new value is a
 #: spec amendment (req 2).
@@ -146,7 +147,9 @@ _STUDY_KEYS: Final = frozenset(
 )
 # Optional amendment #2493 mode. Kept outside the frozen required-key set:
 # existing studies remain causal by default and must name an ex-post choice.
-_STUDY_OPTIONAL_KEYS = {"matching"}
+# `delisting_return` (#3498) is optional too: an absent key reads as `none` at the
+# runner and is never written back, so no registered file's hash changes.
+_STUDY_OPTIONAL_KEYS = {"matching", "delisting_return"}
 _KILL_KEYS: Final = frozenset(
     {
         "name",
@@ -254,6 +257,10 @@ def _validate_study(
     configurations = _study_positive_int("study.configurations", study["configurations"], path)
     if "matching" in study:
         _require_enum("study.matching", study["matching"], ("entry_known", "ex_post"), path)
+    if "delisting_return" in study:
+        _require_enum(
+            "study.delisting_return", study["delisting_return"], tuple(DELISTING_POLICIES), path
+        )
     if configurations > budget:
         raise ExperimentFileError(f"{path}: study.configurations exceeds budget.configurations")
     for key in ("groups", "bucket_by", "peer_by", "cluster_by"):

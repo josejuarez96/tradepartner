@@ -45,7 +45,8 @@ The block below is the only part the registry parses (`research/experiment.py`).
   tables inside this same block. Every study key is required, including cost,
   borrow, `z`, and `cluster_by`; `study.configurations` must cover the kill lines
   and fit within `budget.configurations`. Kill readings are `raw`,
-  `beta_adjusted`, `size_tight`, or `size_tight_beta_adjusted`.
+  `beta_adjusted`, `size_tight`, or `size_tight_beta_adjusted`. `delisting_return`
+  is optional (absent reads as `none`); new designs write `failure_v1`.
 
 ```toml experiment
 slug = "<slug>"
@@ -118,6 +119,7 @@ expected_effect = "<words: the prior, at or below the brief's haircuts for retur
 # borrow_bps = [0.0, 30.0]
 # z = 1.645
 # cluster_by = ["month", "quarter"]
+# delisting_return = "failure_v1" # or "severe_v1"; "none" only to reproduce an older run (absent reads as none)
 # [[study.kill]]
 # name = "long"
 # side = "long" # or "short"; selects the net-return formula

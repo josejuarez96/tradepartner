@@ -60,6 +60,32 @@ def test_matching_is_optional_causal_default_and_explicit_ex_post_is_hashed(
         _parse(tmp_path / "invalid", source.replace('matching = "ex_post"', 'matching = "other"'))
 
 
+def test_delisting_return_is_optional_and_absent_is_not_written_back(tmp_path: Path) -> None:
+    """T413 (#3498): absent hashes as before; `none` is a different file; values are enumerated."""
+    source = FIXTURE.read_text()
+    assert "delisting_return" not in source
+    absent = _parse(tmp_path / "absent", source)
+    assert absent.study is not None
+    assert "delisting_return" not in absent.study
+    assert "delisting_return" not in json.loads(absent.params_json)["study"]
+    anchor = 'matching = "ex_post"\n'
+    hashes = {}
+    for value in ("none", "failure_v1", "severe_v1"):
+        parsed = _parse(
+            tmp_path / value, source.replace(anchor, anchor + f'delisting_return = "{value}"\n')
+        )
+        assert parsed.study is not None
+        assert parsed.study["delisting_return"] == value
+        hashes[value] = parsed.params_sha256
+    assert len({*hashes.values(), absent.params_sha256}) == 4
+    for bad in ('"other"', '"FAILURE_V1"', "1", "true"):
+        with pytest.raises(ExperimentFileError, match=r"study\.delisting_return"):
+            _parse(
+                tmp_path / f"bad{abs(hash(bad))}",
+                source.replace(anchor, anchor + f"delisting_return = {bad}\n"),
+            )
+
+
 @pytest.mark.parametrize(
     ("old", "new", "match"),
     [
