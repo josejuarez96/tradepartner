@@ -1038,6 +1038,7 @@ def test_hypotheses_families_default() -> None:
         "combined",
         "filing_delay",
         "spinoff",
+        "irrx",
     ]
 
 
@@ -1523,6 +1524,7 @@ def test_family_parents_derives_without_oracle_at_today_s_values() -> None:
         "combined": "momentum",
         "filing_delay": None,
         "spinoff": None,
+        "irrx": None,
     }
 
 
@@ -1531,6 +1533,7 @@ def test_family_signal_sections_derives_without_oracle_at_today_s_values() -> No
         "momentum": "strategy",
         "profitability": "profitability",
         "combined": "combined",
+        "irrx": "irrx",
     }
 
 
@@ -3937,3 +3940,68 @@ def test_repo_default_settings_still_load() -> None:
 def test_other_counts_refuse_nonsense(section: str, key: str, value: int) -> None:
     with pytest.raises(ValidationError, match=key):
         Settings(_env_file=None, **{section: {key: value}})
+
+
+# --- `irrx` family (backtest spec amendment 2026-11-16, #3504; T414) ---
+
+
+def test_irrx_is_a_root_family() -> None:
+    assert "irrx" in get_args(HypothesisFamily)
+    assert FAMILY_PARENTS["irrx"] is None
+
+
+def test_irrx_defaults() -> None:
+    i = _settings().irrx
+    assert (i.lookback_sessions, i.min_kept_sessions, i.announce_post_sessions) == (21, 15, 2)
+    assert (i.event_form, i.event_item, i.event_coverage_sessions) == ("8-K", "2.02", 126)
+    assert (i.dissemination_cutoff, i.industry_digits, i.min_industry_names) == ("17:30", 2, 5)
+    assert (i.min_dollar_volume, i.adv_sessions, i.min_adv_bars) == (200000000.0, 63, 42)
+    assert i.top_fraction == pytest.approx(0.20)
+    assert i.weighting == "equal"
+    assert i.signal_total_return is True
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"unknown_key": 1},
+        {"top_fraction": float("nan")},
+        {"top_fraction": float("inf")},
+        {"top_fraction": 0.0},
+        {"top_fraction": 1.5},
+        {"min_dollar_volume": float("inf")},
+        {"min_dollar_volume": 0.0},
+        {"weighting": "hold"},
+        {"industry_digits": 4},
+        {"industry_digits": 1},
+        {"lookback_sessions": 0},
+        {"lookback_sessions": 10},  # below min_kept_sessions (15)
+        {"min_adv_bars": 64},  # above adv_sessions (63)
+        {"dissemination_cutoff": "5:30pm"},
+        {"dissemination_cutoff": "24:00"},
+        {"event_form": ""},
+    ],
+)
+def test_irrx_rejects_invalid_values(override: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, irrx=override)
+
+
+def test_irrx_accepts_a_three_digit_industry_and_equal_bounds() -> None:
+    i = Settings(
+        _env_file=None,
+        irrx={"industry_digits": 3, "lookback_sessions": 15, "min_adv_bars": 63},
+    ).irrx
+    assert i.industry_digits == 3
+
+
+def test_irrx_keys_are_not_sweepable() -> None:
+    assert not any(k.startswith("irrx.") for k in _settings().lab.sweepable_keys)
+    assert not any(k.startswith("irrx.") for k in ALLOWED_AXIS_PREFIXES)
+
+
+def test_env_example_names_irrx_keys() -> None:
+    env_example = Path(__file__).resolve().parents[1] / ".env.example"
+    text = env_example.read_text(encoding="utf-8")
+    for name in Settings.model_fields["irrx"].annotation.model_fields:  # type: ignore[union-attr]
+        assert f"IRRX__{name.upper()}=" in text, name

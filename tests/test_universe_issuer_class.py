@@ -123,8 +123,8 @@ def test_the_setting_is_stored_sorted_and_refuses_an_unknown_class() -> None:
         _settings(exclude_issuer_classes=["reit"])
 
 
-def test_the_table_entry_is_last_and_reproduces_the_old_rule() -> None:
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-1:], ((KEY, [], 48),))
+def test_the_table_entry_is_pinned_and_reproduces_the_old_rule() -> None:
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-16:-15], ((KEY, [], 48),))
     assert KEY not in frozen.POST_REGISTRATION_OWN_KEYS  # universe is no family's own
 
 

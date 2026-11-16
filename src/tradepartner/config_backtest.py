@@ -6,6 +6,7 @@ imports only `config_base`, never `tradepartner.config`.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
@@ -23,7 +24,7 @@ from tradepartner.config_base import _PHASE3_MODEL_CONFIG, _ClosedConfig
 # reviewed code change here. `oracle` is refused on the real store (registry, T31b). A
 # test pins `get_args(HypothesisFamily) == tuple(FAMILIES)` (ADR 0014 point 2).
 HypothesisFamily = Literal[
-    "momentum", "oracle", "profitability", "combined", "filing_delay", "spinoff"
+    "momentum", "oracle", "profitability", "combined", "filing_delay", "spinoff", "irrx"
 ]
 
 # Cadence and signal anchor (strategy-lab spec, "Config keys"; ADR 0012, superseding
@@ -176,6 +177,58 @@ class CombinedConfig(BaseModel):
 
     top_fraction: float = Field(default=0.10, gt=0, le=1)
     weighting: Literal["equal"] = "equal"
+
+
+class IrrxConfig(BaseModel):
+    """The `irrx` family's signal keys (backtest spec amendment 2026-11-16, #3504, item
+    11): announcement-adjusted, industry-relative one-month reversal, long/short. Frozen
+    per hypothesis and required in full by a `family = "irrx"` file; no other family's
+    keys are reused.
+
+    Session counts are positive; `min_kept_sessions <= lookback_sessions` and
+    `min_adv_bars <= adv_sessions`. `industry_digits` is 2 or 3. `dissemination_cutoff`
+    is a New York wall time, `HH:MM`. `top_fraction` is a share of scored names in
+    (0, 1]. `weighting` is `equal` only (a signed book refuses `hold` and a band).
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    lookback_sessions: int = Field(default=21, gt=0)
+    min_kept_sessions: int = Field(default=15, gt=0)
+    announce_post_sessions: int = Field(default=2, ge=0)
+    event_form: str = Field(default="8-K", min_length=1)
+    event_item: str = Field(default="2.02", min_length=1)
+    event_coverage_sessions: int = Field(default=126, gt=0)
+    dissemination_cutoff: str = "17:30"
+    industry_digits: Literal[2, 3] = 2
+    min_industry_names: int = Field(default=5, gt=0)
+    min_dollar_volume: float = Field(default=200000000.0, gt=0)
+    adv_sessions: int = Field(default=63, gt=0)
+    min_adv_bars: int = Field(default=42, gt=0)
+    top_fraction: float = Field(default=0.20, gt=0, le=1)
+    weighting: Literal["equal"] = "equal"
+    signal_total_return: bool = True
+
+    @field_validator("dissemination_cutoff")
+    @classmethod
+    def _validate_cutoff(cls, value: str) -> str:
+        if re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", value) is None:
+            raise ValueError(f"dissemination_cutoff must be a wall time HH:MM, got {value!r}")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_windows(self) -> IrrxConfig:
+        if self.min_kept_sessions > self.lookback_sessions:
+            raise ValueError(
+                f"min_kept_sessions ({self.min_kept_sessions}) must not exceed "
+                f"lookback_sessions ({self.lookback_sessions})"
+            )
+        if self.min_adv_bars > self.adv_sessions:
+            raise ValueError(
+                f"min_adv_bars ({self.min_adv_bars}) must not exceed "
+                f"adv_sessions ({self.adv_sessions})"
+            )
+        return self
 
 
 class PortfolioConfig(_ClosedConfig):
@@ -410,6 +463,41 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         paper_ready=False,
         exclusion_reasons=(),
         count_names=(),
+        benchmark=None,
+        sweepable_keys=(),
+    ),
+    "irrx": FamilySpec(
+        # The announcement-adjusted industry-relative one-month reversal (backtest spec
+        # amendment 2026-11-16, #3504, items 6 and 11): a root family with its own signal
+        # section. `engine_ready` stays False until T417 lands the signal; no paper, no
+        # extra benchmark (SPY and MTUM stay mandatory) and no sweepable keys.
+        sections=("irrx",),
+        params_model=IrrxConfig,
+        parent=None,
+        engine_ready=False,
+        paper_ready=False,
+        exclusion_reasons=(
+            "no_sic",
+            "no_events",
+            "stamp",
+            "late_event",
+            "thin_industry",
+            "short_window",
+            "adv",
+            "no_t0_bar",
+        ),
+        count_names=(
+            "n_ranked",
+            "n_excluded_no_sic",
+            "n_excluded_thin_industry",
+            "n_excluded_no_events",
+            "n_excluded_stamp",
+            "n_excluded_late_event",
+            "n_excluded_short_window",
+            "n_excluded_adv",
+            "n_adjusted",
+            "n_dropped_sessions",
+        ),
         benchmark=None,
         sweepable_keys=(),
     ),

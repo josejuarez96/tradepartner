@@ -127,6 +127,24 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     # and is a new fingerprint. A universe key, so a family's rules fix it (`[]` for a
     # family registered before it).
     ("universe.exclude_issuer_classes", [], 48),
+    # T414: the `irrx` family (backtest spec amendment 2026-11-16, #3504, item 11), at the
+    # amendment's values. Its signal section, listed by that family alone, so every key is
+    # inert for the others and is kept whole in an `irrx` canonical set.
+    ("irrx.lookback_sessions", 21, 49),
+    ("irrx.min_kept_sessions", 15, 49),
+    ("irrx.announce_post_sessions", 2, 49),
+    ("irrx.event_form", "8-K", 49),
+    ("irrx.event_item", "2.02", 49),
+    ("irrx.event_coverage_sessions", 126, 49),
+    ("irrx.dissemination_cutoff", "17:30", 49),
+    ("irrx.industry_digits", 2, 49),
+    ("irrx.min_industry_names", 5, 49),
+    ("irrx.min_dollar_volume", 200000000.0, 49),
+    ("irrx.adv_sessions", 63, 49),
+    ("irrx.min_adv_bars", 42, 49),
+    ("irrx.top_fraction", 0.20, 49),
+    ("irrx.weighting", "equal", 49),
+    ("irrx.signal_total_return", True, 49),
 )
 
 #: Keys added to a family's own listed section **after** that family's first
