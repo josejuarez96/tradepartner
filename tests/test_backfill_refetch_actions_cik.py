@@ -158,3 +158,123 @@ def test_a_class_added_later_with_an_identical_event_is_refused_unless_allowed(
     caller's allow entry for the class covers it."""
     refused = _then(settings, [_div(OLD)], [_div(NEW, action_id="d2")])
     assert not refused.ok
+
+
+def _collision_and_new(settings: Settings, **kwargs: Any) -> Any:
+    """OLD holds 0.25 live; the source then answers a duplicate under NEW and a new OLD split."""
+    first = [_div(OLD)]
+    second = [_div(NEW, action_id="d2"), _split(OLD)]
+    return _then(settings, first, second, **kwargs)
+
+
+def test_without_skip_collisions_one_collision_refuses_the_whole_run(settings: Settings) -> None:
+    result = _collision_and_new(settings)  # existing behaviour (#3246), kept (#3484)
+    assert not result.ok and result.skipped == ()
+    assert _count(settings) == 1
+
+
+def test_skip_collisions_writes_the_new_row_and_leaves_the_collision(settings: Settings) -> None:
+    result = _collision_and_new(settings, skip_collisions=True)
+    line = f"collision {NEW} dividend {EX} 0.25 known_at={STAMP}"
+    assert result.ok and result.skipped == (line,) and result.refused == ()
+    assert [r.split()[:2] for r in result.rows] == [["new", OLD]]
+    assert "1 collision(s) skipped" in result.summary()
+    assert _rows(
+        settings, "SELECT security_id, action_type FROM corporate_actions ORDER BY 1, 2"
+    ) == [
+        (OLD, "dividend"),
+        (OLD, "split"),
+    ]
+
+
+def test_skip_collisions_leaves_the_stored_row_and_its_known_at(settings: Settings) -> None:
+    prices = _committed(settings)
+    _open_release(settings)
+    prices.actions = [_div(OLD)]
+    _refetch(settings, prices, since=SINCE, securities=[OLD, NEW])
+    sql = "SELECT security_id, ratio_or_amount, known_at, ingested_at FROM corporate_actions"
+    before = _rows(settings, sql)
+    prices.actions = [_div(NEW, action_id="d2")]
+    result = _refetch(
+        settings,
+        prices,
+        since=SINCE,
+        securities=[OLD, NEW],
+        clock=lambda: AGAIN,
+        skip_collisions=True,
+    )
+    assert result.ok and len(result.skipped) == 1 and result.added == ()
+    assert _rows(settings, sql) == before
+
+
+def test_a_dry_run_with_skip_collisions_lists_what_it_would_skip(settings: Settings) -> None:
+    result = _collision_and_new(settings, skip_collisions=True, dry_run=True)
+    assert len(result.skipped) == 1 and result.refused == ()
+    assert result.added == (("split", 1),)
+    assert _count(settings) == 1
+
+
+def test_skip_collisions_with_an_allow_entry_writes_the_covered_collision(
+    settings: Settings,
+) -> None:
+    result = _collision_and_new(settings, skip_collisions=True, allow_collisions=[(NEW, EX)])
+    assert result.ok and result.skipped == ()
+    assert _count(settings) == 3
+
+
+def test_a_skipped_collision_leaves_no_cancel_of_a_stored_dividend(settings: Settings) -> None:
+    """quant-auditor on #3485: a new id on a stored id's date, paired as the re-date of an
+    id-less key, would cancel that key; skipping the collision must skip that cancel too."""
+    prices = _committed(settings)
+    _open_release(settings)
+    day2 = EX + timedelta(days=1)
+    idless = replace(_div(OLD), source_action_id=None)
+    d1 = replace(_div(OLD, amount=0.30, action_id="d1"), ex_date=day2)
+    prices.actions = [idless, d1]
+    _refetch(settings, prices, since=SINCE, securities=[OLD])
+    sql = (
+        "SELECT source_action_id, ex_date, ratio_or_amount, cancelled FROM corporate_actions "
+        "QUALIFY row_number() OVER (PARTITION BY security_id, coalesce(nullif(source_action_id,''),"
+        " action_type||'|'||CAST(ex_date AS VARCHAR)) ORDER BY ingested_at DESC, known_at DESC)=1 "
+        "ORDER BY 2, 1"
+    )
+    before = _rows(settings, sql)
+    d2 = replace(_div(OLD, amount=0.40, action_id="d2"), ex_date=day2)
+    prices.actions = [d1, d2]
+    result = _refetch(
+        settings,
+        prices,
+        since=SINCE,
+        securities=[OLD],
+        clock=lambda: AGAIN,
+        skip_collisions=True,
+    )
+    assert result.ok
+    assert _rows(settings, sql) == before
+
+
+def test_a_skipped_id_takes_its_earlier_revisions_with_it(settings: Settings) -> None:
+    """quant-auditor on #3485: the source answers an id twice (0.40 on one day, then 0.25 on
+    the stored event's day); skipping the collision must not write the first revision live."""
+    prices = _committed(settings)
+    _open_release(settings)
+    prices.actions = [_div(OLD)]
+    _refetch(settings, prices, since=SINCE, securities=[OLD, NEW])
+    day2 = EX + timedelta(days=1)
+    early = replace(
+        _div(NEW, amount=0.40, action_id="d2"),
+        ex_date=day2,
+        known_at=action_first_seen_known_at(EX) - timedelta(days=1),
+    )
+    late = replace(_div(NEW, action_id="d2"), known_at=action_first_seen_known_at(EX))
+    prices.actions = [early, late]
+    result = _refetch(
+        settings,
+        prices,
+        since=SINCE,
+        securities=[OLD, NEW],
+        clock=lambda: AGAIN,
+        skip_collisions=True,
+    )
+    assert result.ok and len(result.skipped) == 1
+    assert _count(settings) == 1
