@@ -119,7 +119,7 @@ expected_effect = "<words: the prior, at or below the brief's haircuts for retur
 # borrow_bps = [0.0, 30.0]
 # z = 1.645
 # cluster_by = ["month", "quarter"]
-# delisting_return = "failure_v1" # or "severe_v1"; "none" only to reproduce an older run (absent reads as none)
+# delisting_return = "failure_v1" # new designs; or "severe_v1"; "none" reproduces older runs (absent reads as none). The runner refuses anything but none until T412 lands
 # [[study.kill]]
 # name = "long"
 # side = "long" # or "short"; selects the net-return formula

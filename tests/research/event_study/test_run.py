@@ -117,6 +117,20 @@ def test_configuration_overrun_precedes_read(
         run_study(handle(tmp_path), {"configurations": 3, "kill": [{}, {}, {}]}, [])
 
 
+@pytest.mark.parametrize("value", ["failure_v1", "severe_v1"])
+def test_declared_delisting_return_is_refused_until_t412(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """T413 (#3498): a declared but unimplemented delisting policy must not register."""
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("market data read before delisting_return check")
+
+    monkeypatch.setattr("tradepartner.research.event_study.reader.EventStudyReader", forbidden)
+    with pytest.raises(ValueError, match="T412"):
+        run_study(handle(tmp_path), {"delisting_return": value, "configurations": 1}, [])
+
+
 @pytest.mark.parametrize("two_horizons", [False, True], ids=["single-horizon", "short-exit-only"])
 def test_event_stage_delisting_and_causal_matching(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, two_horizons: bool
