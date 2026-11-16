@@ -185,6 +185,82 @@ def test_a_reviewed_distinct_dividend_is_not_refused(settings: Settings) -> None
     assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(2,)]
 
 
+def test_a_recurring_pair_without_a_hand_row_writes(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store import dividend_reviews as dr
+
+    monkeypatch.setattr(dr, "reviewed_groups", lambda: ())
+    monkeypatch.setattr(
+        dr, "recurring_pairs", lambda: (dr.RecurringPair(ACME, EX, 2, "ACME", "pair"),)
+    )
+    result = _collide(settings)
+    assert result.ok and result.refused == ()
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(2,)]
+
+
+def test_a_reviewed_duplicate_overrides_the_recurring_pair(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store import dividend_reviews as dr
+
+    review = dr.ReviewedGroup(
+        ACME, EX, 0.25, "duplicate", "acme-q2-reissued", "ACME", "same payment"
+    )
+    monkeypatch.setattr(dr, "reviewed_groups", lambda: (review,))
+    monkeypatch.setattr(
+        dr, "recurring_pairs", lambda: (dr.RecurringPair(ACME, EX, 2, "ACME", "pair"),)
+    )
+    result = _collide(settings)
+    assert not result.ok and len(result.refused) == 1
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(1,)]
+
+
+@pytest.mark.parametrize("start,size", [(EX + timedelta(days=1), 2), (EX, 3)])
+def test_a_recurring_entry_outside_its_start_or_size_refuses(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch, start: date, size: int
+) -> None:
+    from tradepartner.store import dividend_reviews as dr
+
+    monkeypatch.setattr(dr, "reviewed_groups", lambda: ())
+    monkeypatch.setattr(
+        dr, "recurring_pairs", lambda: (dr.RecurringPair(ACME, start, size, "ACME", "pair"),)
+    )
+    result = _collide(settings)
+    assert not result.ok and len(result.refused) == 1
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(1,)]
+
+
+@pytest.mark.parametrize("extra_amount", [0.25, 0.5])
+def test_a_recurring_pair_does_not_hide_a_third_row_on_the_day(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch, extra_amount: float
+) -> None:
+    from tradepartner.store import dividend_reviews as dr
+
+    monkeypatch.setattr(dr, "reviewed_groups", lambda: ())
+    monkeypatch.setattr(
+        dr, "recurring_pairs", lambda: (dr.RecurringPair(ACME, EX, 2, "ACME", "pair"),)
+    )
+    prices = _committed(settings)
+    _open_release(settings)
+    _refetch(settings, prices, since=SINCE, through=THROUGH, span=True, securities=[ACME])
+    prices.actions = [
+        _dividend(action_id="acme-q2-reissued"),
+        _dividend(amount=extra_amount, action_id="acme-other"),
+    ]
+    result = _refetch(
+        settings,
+        prices,
+        since=SINCE,
+        through=THROUGH,
+        span=True,
+        securities=[ACME],
+        clock=lambda: AGAIN,
+    )
+    assert not result.ok and len(result.refused) == 2
+    assert _rows(settings, "SELECT count(*) FROM corporate_actions") == [(1,)]
+
+
 def test_a_reviewed_distinct_group_does_not_cover_a_third_identity(settings: Settings) -> None:
     from tradepartner.store import dividend_reviews as dr
 
