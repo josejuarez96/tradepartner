@@ -4786,6 +4786,7 @@ def make_app(
                 conn,
                 name,
                 price_tolerance=s.store.release_move_price_tolerance,
+                price_decimals=s.store.release_move_price_decimals,
                 backup_alias="bk",
             )
             keys = [
