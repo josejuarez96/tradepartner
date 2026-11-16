@@ -79,6 +79,14 @@ read like any others, through `adjusted_prices` and `raw_prices` at `t`.
 the step's connection like every other method (backtest spec amendment
 #720, plan T85c).
 
+`filing_events(t, ids, forms=, items=)` (backtest spec amendment 2026-11-16,
+#3504, plan T416) is `store.asof.filing_events_as_of(conn, t, forms, items)` kept
+to `ids`, on the step's connection with the frozen `Settings`: `known_at =
+accepted_at <= t`, one row per `(security_id, accession)`. A last column,
+`index_accepted_at`, is `store.filing_index.first_known`'s `accepted_at` for the
+same `(cik, accession)` at `t` (null when the index has none known), so a consumer
+can distrust a table-versus-index disagreement. Both reads use `known_at <= t`.
+
 `rates(t, series)` is `store.asof.rates_as_of(conn, t, series)` on the step's connection
 (backtest spec amendment #1498, plan T170b): rows with `known_at <= t`, latest revision
 per observation date, unchanged.
@@ -126,6 +134,7 @@ import polars as pl
 from tradepartner import gap as gap_module
 from tradepartner.backtest.provider import (
     DELISTING_REASON_COLUMNS,
+    FILING_INDEX_ACCEPTED_COLUMN,
     LATE_SPLIT_COLUMNS,
     MERGER_EXIT_COLUMNS,
     STATEMENT_FACT_NAMES,
@@ -144,6 +153,7 @@ from tradepartner.store.asof import (
     _latest_as_of,
     adjusted_prices_as_of,
     dropped_dividends_as_of,
+    filing_events_as_of,
     listings_as_of,
     live_actions_as_of,
     live_chains,
@@ -163,6 +173,7 @@ from tradepartner.store.db import StoreLockedError
 from tradepartner.store.delisting_reasons import delisting_reasons_as_of
 from tradepartner.store.delistings import listing_ends_as_of
 from tradepartner.store.dividend_reviews import reviewed_groups
+from tradepartner.store.filing_index import first_known
 from tradepartner.universe import Universe, _split_factors, shares_as_of, universe_as_of
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
@@ -528,6 +539,30 @@ class StoreProvider:
         rows = classifications_as_of(self._at(t), t, wanted)
         known: dict[str, int | None] = dict(rows.select("security_id", "sic").iter_rows())
         return {sid: known.get(sid) for sid in wanted}
+
+    def filing_events(
+        self,
+        t: datetime,
+        ids: Sequence[str],
+        *,
+        forms: Sequence[str],
+        items: Sequence[str],
+    ) -> pl.DataFrame:
+        t, wanted = check_t(t), _ids(ids)
+        conn = self._at(t)
+        events = filing_events_as_of(conn, t, forms, items).filter(
+            pl.col("security_id").is_in(wanted)
+        )
+        stamps = {
+            (row.cik, row.accession): row.accepted_at
+            for row in first_known(conn, t, ciks=events["cik"].unique().to_list())
+        }
+        index_stamp = pl.Series(
+            FILING_INDEX_ACCEPTED_COLUMN,
+            [stamps.get(key) for key in zip(events["cik"], events["accession"], strict=True)],
+            dtype=events.schema["accepted_at"],
+        )
+        return events.with_columns(index_stamp)
 
     def rates(self, t: datetime, series: str) -> pl.DataFrame:
         t = check_t(t)

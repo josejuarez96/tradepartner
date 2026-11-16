@@ -46,6 +46,10 @@ from tradepartner.universe import Universe
 #: family's numerator and denominator (`operating_cash_flow` joins with B3b).
 STATEMENT_FACT_NAMES: Final[tuple[str, ...]] = ("gross_profit", "total_assets")
 
+#: The cross-check column `AnnouncementProvider.filing_events` appends: the filing index's
+#: first-known `accepted_at` for the row's `(cik, accession)` (spec item 5, "Stamps").
+FILING_INDEX_ACCEPTED_COLUMN: Final = "index_accepted_at"
+
 #: `DataProvider.unvalued_spin_offs`'s columns, in order: the parent, the distributed
 #: child, the ex-date and the store's drop reason (spec amendment #1894, item 2).
 UNVALUED_SPIN_OFF_COLUMNS: Final[tuple[str, ...]] = ("security_id", "child", "ex_date", "reason")
@@ -294,4 +298,32 @@ class DataProvider(Protocol):
         absent (no earlier-close fallback) or the deal has no acquirer. Columns
         `MERGER_EXIT_COLUMNS`. Read once per run at the data cutoff, only under a
         delisting failure-return policy other than `none` (plan T328b)."""
+        ...
+
+
+@runtime_checkable
+class AnnouncementProvider(DataProvider, Protocol):
+    """A `DataProvider` that also serves the `irrx` family's announcement read (plan T416).
+
+    A separate protocol, not a `DataProvider` member, because the engine's two wrapper
+    providers (`_SharedReads`, `_Requests` in `engine.py`) implement `DataProvider` and
+    T417 owns that file; T417 forwards `filing_events` through them and folds this method
+    into `DataProvider`."""
+
+    def filing_events(
+        self,
+        t: datetime,
+        ids: Sequence[str],
+        *,
+        forms: Sequence[str],
+        items: Sequence[str],
+    ) -> pl.DataFrame:
+        """`filing_events_as_of(t, forms, items)` kept to `ids`: one row per
+        `(security_id, accession)` known at `t` (`known_at = accepted_at <= t`), a
+        dual-class issuer's filing once per listed class. `forms` match exactly (`8-K`
+        never matches `8-K/A`); `items` match a whole code of the filing's item list.
+        Columns: `security_id`, every `filing_events` column, then
+        `FILING_INDEX_ACCEPTED_COLUMN`: the `accepted_at` of `filing_index.first_known`
+        for the same `(cik, accession)` at `t`, null when the index has no such row
+        known at `t`. A consumer distrusts a row where the two differ (spec item 5)."""
         ...
