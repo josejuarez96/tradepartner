@@ -124,10 +124,10 @@ import duckdb
 import polars as pl
 
 from tradepartner import gap as gap_module
+from tradepartner.backtest.delisting_value import merger_exit_frame
 from tradepartner.backtest.provider import (
     DELISTING_REASON_COLUMNS,
     LATE_SPLIT_COLUMNS,
-    MERGER_EXIT_COLUMNS,
     STATEMENT_FACT_NAMES,
     TURNOVER_BAR_COLUMNS,
     GapReading,
@@ -148,7 +148,6 @@ from tradepartner.store.asof import (
     live_actions_as_of,
     live_chains,
     marking_changed_ids_as_of,
-    mergers_as_of,
     prices_as_of,
     rates_as_of,
     statement_facts_as_of,
@@ -212,9 +211,6 @@ def _successors(chains: Sequence[tuple[str, str]]) -> dict[str, str]:
         out[pred] = current
     return out
 
-
-#: `merger_exits`' join key: the acquirer's id mapped through the chains known at `t`.
-_ACQUIRER_KEY: Final = "_acquirer_key"
 
 #: `late_spin_offs`'s frame while it is read: the child in `security_id` (the action's
 #: own key), the parent re-keyed, so the two children of one parent on one ex-date stay
@@ -540,33 +536,7 @@ class StoreProvider:
 
     def merger_exits(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
-        self._refuse_forks_at(t, wanted)
-        conn = self._at(t)
-        # `mergers_as_of` also keeps rows matched only by their acquirer; drop them.
-        mergers = mergers_as_of(conn, t, wanted).filter(pl.col("security_id").is_in(wanted))
-        # `prices_as_of` keys a chained predecessor's bars under its successor (#821), so
-        # read the acquirer's close under the id the chains known at `t` map it to (#2949).
-        chains = dict(live_chains(conn, t))
-        mergers = mergers.with_columns(
-            pl.col("acquirer_security_id").replace(chains).alias(_ACQUIRER_KEY)
-        )
-        acquirers = sorted(set(mergers[_ACQUIRER_KEY].drop_nulls().to_list()))
-        self._refuse_forks_at(t, [*acquirers, *mergers["acquirer_security_id"].drop_nulls()])
-        # Bound the acquirers' bars to the earliest effective date: only those dates join.
-        first = mergers["effective_date"].min()
-        sessions_from = first if isinstance(first, date) else None
-        closes = prices_as_of(
-            conn, t, acquirers, traded_only=True, sessions_from=sessions_from
-        ).select(
-            pl.col("security_id").alias(_ACQUIRER_KEY),
-            pl.col("session").alias("effective_date"),
-            pl.col("close").alias("acquirer_raw_close"),
-        )
-        return (
-            mergers.join(closes, on=[_ACQUIRER_KEY, "effective_date"], how="left")
-            .select(MERGER_EXIT_COLUMNS)
-            .sort("security_id", "effective_date", "source_action_id")
-        )
+        return merger_exit_frame(self._at(t), t, wanted, self._refuse_forks_at)
 
     def turnover_inputs(
         self, t: datetime, ids: Sequence[str], sessions_from: date

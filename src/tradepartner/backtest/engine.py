@@ -144,6 +144,11 @@ from tradepartner.backtest.costs import (
     buy_notional_after_costs,
     trade_cost,
 )
+from tradepartner.backtest.delisting_value import (
+    delisting_exit_valuation,
+    ended_listings,
+    window_end,
+)
 from tradepartner.backtest.fills import FillResult, apply_trades
 from tradepartner.backtest.metrics import PERCENT_POINTS_PER_UNIT
 from tradepartner.backtest.portfolio import (
@@ -194,8 +199,6 @@ from tradepartner.calendar import (
 )
 from tradepartner.config import Cadence, HypothesisFamily, Settings
 from tradepartner.config_backtest import DELISTING_POLICIES, DelistingPolicy
-from tradepartner.store.delistings import DELISTED
-from tradepartner.store.listing_selection import prefer_current_listing
 from tradepartner.store.registry import EquityRow, RebalanceRow, TrialHandle, WeightRow
 from tradepartner.universe import Universe
 
@@ -598,32 +601,7 @@ def _no_benchmark_members(plan: Plan, benchmarks: Mapping[str, str]) -> Plan:
     return plan
 
 
-#: The listing columns a `DelistingExit` and the reason match read from the current
-#: listing row (`listing_ends_as_of`'s; a fake provider may leave them out).
-_LISTING_EXIT_FIELDS: Final = ("exchange", "delisting_form", "delisting_filed_at")
-
-
-def _ended_listings(listing_ends: pl.DataFrame, session: date) -> dict[str, dict[str, object]]:
-    """Securities whose current listing at the read is `delisted`, each with that row's
-    `end_session`, `exchange`, `delisting_form` and `delisting_filed_at` (None for a
-    column the frame lacks). The current row is chosen as `_ended` documents."""
-    dated = "valid_from" in listing_ends.columns
-    current: dict[str, tuple[date | None, dict[str, object]]] = {}
-    for row in listing_ends.iter_rows(named=True):
-        valid_from = row["valid_from"] if dated else None
-        if valid_from is not None and valid_from > session:
-            continue
-        held = current.get(row["security_id"])
-        if prefer_current_listing(row, held[1] if held is not None else None, session):
-            current[row["security_id"]] = (valid_from, row)
-    return {
-        sid: {
-            "end_session": row["end_session"],
-            **{name: row.get(name) for name in _LISTING_EXIT_FIELDS},
-        }
-        for sid, (_, row) in current.items()
-        if row["status"] == DELISTED
-    }
+_ended_listings = ended_listings
 
 
 def _ended(listing_ends: pl.DataFrame, session: date) -> dict[str, date | None]:
@@ -646,10 +624,6 @@ def _ended(listing_ends: pl.DataFrame, session: date) -> dict[str, date | None]:
     }
 
 
-#: The confirmed-failure reasons a policy shocks (spec amendment #2670, req 2).
-_FAILURE_REASONS: Final = frozenset({"performance_failure", "bankruptcy"})
-_MERGER_REASON: Final = "merger_acquisition"
-_UNKNOWN_REASON: Final = "unknown"
 #: The step counts a policy other than `none` writes on every rebalance row (plan T328c).
 POLICY_COUNT_NAMES: Final = (
     "n_failure_shocks",
@@ -680,11 +654,7 @@ class _ExitContext:
     merger_rows: Mapping[str, Sequence[Mapping[str, object]]] = field(default_factory=dict)
 
 
-def _window_end(first: date, sessions: int) -> date:
-    """The trading session `sessions` after `first` (`first` itself at 0)."""
-    every = all_sessions()
-    at = bisect.bisect_left(every, first)
-    return every[min(at + sessions, len(every) - 1)]
+_window_end = window_end
 
 
 def _policy_value(
@@ -697,8 +667,9 @@ def _policy_value(
 ) -> float:
     """The sale value of `sid`'s delisting exit under `context`'s policy (plan T328c),
     from its marked last-close `value` and its `shares`, counting the outcome in
-    `counts`. Raises for a short exit and for a shock on an exchange outside the
-    version's map (a failed trial, never 0%)."""
+    `counts`. The rule is `delisting_value.delisting_exit_valuation`. Raises for a short
+    exit and for a shock on an exchange outside the version's map (a failed trial, never
+    0%)."""
     terms = context.terms
     assert terms is not None
     if value < 0:
@@ -707,55 +678,21 @@ def _policy_value(
             f"backtest.delisting_failure_return {context.policy!r}; short delisting P&L "
             "stays closed until ADR 0024 consequence 5"
         )
-    listing = context.listings.get(sid, {})
-    key = (listing.get("delisting_form"), listing.get("delisting_filed_at"))
-    matched = [
-        row
-        for row in context.reasons.get(sid, ())
-        if (row["delisting_form"], row["delisting_filed_at"]) == key
-        and row["delisting_exchange"] == listing.get("exchange")
-        and None not in key
-    ]
-    reason = str(matched[0]["reason"]) if len(matched) == 1 else _UNKNOWN_REASON
-    counts["n_reason_conflicts"] += len(matched) > 1
-    counts["n_unknown_exits"] += reason == _UNKNOWN_REASON
-    candidates = (
-        []
-        if final is None
-        else [
-            row
-            for row in context.merger_rows.get(sid, ())
-            if final
-            <= cast(date, row["effective_date"])
-            <= _window_end(final, terms.merger_window_sessions)
-        ]
+    valuation = delisting_exit_valuation(
+        sid,
+        context.listings.get(sid, {}),
+        context.reasons.get(sid, ()),
+        context.merger_rows.get(sid, ()),
+        final,
+        terms,
+        context.policy,
+        counts,
     )
-    merger = candidates[0] if len(candidates) == 1 else None
-    if reason == _MERGER_REASON:
-        cash = cast(float | None, merger["cash_per_share"]) if merger is not None else None
-        ratio = cast(float | None, merger["share_ratio"]) if merger is not None else None
-        close = cast(float | None, merger["acquirer_raw_close"]) if merger is not None else None
-        if merger is None or (ratio is not None and close is None):
-            counts["n_merger_fallbacks"] += 1
-            counts["n_merger_conflicts"] += len(candidates) > 1
-            return value
-        counts["n_merger_consideration"] += 1
-        stock = 0.0 if ratio is None else ratio * cast(float, close)
-        return shares * ((cash or 0.0) + stock)
-    shocked = reason in _FAILURE_REASONS or (
-        terms.shock_unknown and reason == _UNKNOWN_REASON and merger is None
-    )
-    if not shocked:
+    if valuation.per_share is not None:
+        return shares * valuation.per_share
+    if valuation.multiplier == 1.0:
         return value
-    exchange = listing.get("exchange")
-    if exchange not in terms.shocks:
-        raise ValueError(
-            f"{sid}: listing exchange {exchange!r} is outside "
-            f"backtest.delisting_failure_return {context.policy!r}'s exchange map "
-            f"({', '.join(sorted(terms.shocks))}); the policy cannot value this exit"
-        )
-    counts["n_failure_shocks"] += 1
-    return value * (1 + terms.shocks[cast(str, exchange)])
+    return value * valuation.multiplier
 
 
 def _exits(
