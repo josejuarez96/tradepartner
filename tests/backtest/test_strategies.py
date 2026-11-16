@@ -23,8 +23,8 @@ from tradepartner.config import FAMILIES, FamilySpec, Settings
 
 def test_signal_for_keys_equal_the_family_registry() -> None:
     # `filing_delay` (#2353) and `spinoff` (#2399) are experiment-only: registry entries with
-    # no signal.
-    assert set(strategies._SIGNALS) == set(FAMILIES) - {"filing_delay", "spinoff"}
+    # no signal; `irrx` has none until T417 (#3504).
+    assert set(strategies._SIGNALS) == set(FAMILIES) - {"filing_delay", "spinoff", "irrx"}
 
 
 def test_oracle_resolves_to_momentum_s_section() -> None:
@@ -34,7 +34,9 @@ def test_oracle_resolves_to_momentum_s_section() -> None:
     assert FAMILIES["oracle"].sections == ("strategy",)
 
 
-@pytest.mark.parametrize("family", [f for f in FAMILIES if f not in ("filing_delay", "spinoff")])
+@pytest.mark.parametrize(
+    "family", [f for f in FAMILIES if f not in ("filing_delay", "spinoff", "irrx")]
+)
 def test_strategy_record_reasons_counts_and_section_come_from_the_spec(family: str) -> None:
     spec: FamilySpec = FAMILIES[family]  # type: ignore[assignment]
     strategy = strategies.signal_for(family)  # type: ignore[arg-type]
