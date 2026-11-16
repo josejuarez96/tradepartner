@@ -67,6 +67,10 @@ def test_delisting_return_is_optional_and_absent_is_not_written_back(tmp_path: P
     absent = _parse(tmp_path / "absent", source)
     assert absent.study is not None
     assert "delisting_return" not in absent.study
+    # Pinned from main before this change: the key must not move a registered hash.
+    assert (
+        absent.params_sha256 == "41e65b1b61b89655aba8c430bd7e2f8a126af95176ed22e6bc802e7330318be5"
+    )
     assert "delisting_return" not in json.loads(absent.params_json)["study"]
     anchor = 'matching = "ex_post"\n'
     hashes = {}
