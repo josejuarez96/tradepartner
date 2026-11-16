@@ -1671,7 +1671,7 @@ def refetch_actions(
     also a new event that repeats a live one, same ex-date, type and amount
     or ratio, on another id of the same CIK) is
     refused unless its dividend is a `distinct` group of the reviewed list
-    (`store.dividend_reviews`) or its `(security, ex-date)` is in
+    or an accepted recurring pair (`store.dividend_reviews`), or its `(security, ex-date)` is in
     `allow_collisions`: a dry run lists it in `ActionsRefetch.refused`; a
     real run asks every month first (a dry pass, `_refuse_ahead`, #3303) and
     refuses the whole run before writing any month, ending one `failed` run.
@@ -2058,6 +2058,29 @@ def _rows_written(
         """,
         [stamp],
     ).fetchall()
+    from tradepartner.store.asof import live_actions_as_of
+    from tradepartner.store.dividend_reviews import (
+        equal_amount_groups,
+        recurring_pairs,
+        reviewed_groups,
+    )
+
+    # Classify the complete live day after the tentative write. The same
+    # as-of rule used by health checks the size, amount and start date; a
+    # third identity or a different amount cannot inherit a pair's allowance.
+    pair_ids = {entry.security_id for entry in recurring_pairs()}
+    pair_ids.intersection_update(sid for sid, kind, *_ in rows if kind == ActionType.DIVIDEND)
+    recurring_distinct = (
+        {
+            group.key
+            for group in equal_amount_groups(
+                live_actions_as_of(conn, stamp, sorted(pair_ids)), reviewed_groups()
+            )
+            if group.group_class == "accepted"
+        }
+        if pair_ids
+        else set()
+    )
     lines: list[str] = []
     blocked: list[str] = []
     blocked_identities: set[tuple[str, str, date, str]] = set()
@@ -2083,7 +2106,7 @@ def _rows_written(
         covered = (sid, ex) in allow_pairs or (
             # A reviewed group was judged as exactly two identities: a third is not covered.
             kind == ActionType.DIVIDEND
-            and (sid, ex, float(amount)) in distinct
+            and (sid, ex, float(amount)) in (distinct | recurring_distinct)
             and (live <= REVIEWED_IDENTITIES or not same_id)
         )
         if tag == "collision" and not cancelled and not covered:
