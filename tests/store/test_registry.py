@@ -1194,7 +1194,7 @@ def test_every_fact_table_is_classified_for_trial_vintage(
             "sec_filing_events",
             "sec_form4_transactions",
             "snapshot_sightings",  # trials read listings, never raw SEC observations
-            "filing_index",
+            "filing_index",  # conditional too: `_INDEX_STAMP_TABLES`, an irrx-family gate (#3520)
             "filing_index_pending",
             "edgar_filers",
             "edgar_index_files",

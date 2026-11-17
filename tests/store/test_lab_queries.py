@@ -1145,3 +1145,62 @@ def test_every_function_raises_without_the_lab_tables(
         lab_queries.sweep_state(fixture_store, 1)
     with pytest.raises(lab_schema.LabNotInitialised):
         lab_queries.seconds_per_variant_by_cadence(fixture_store, 1)
+
+
+def _insert_index_row(
+    conn: duckdb.DuckDBPyConnection, known_at: datetime, ingested: datetime
+) -> None:
+    insert_row(
+        conn,
+        "filing_index",
+        {
+            "cik": "CIK0000000001",
+            "accession": "0000000001-20-000001",
+            "form": "8-K",
+            "company_name": "Idx Co",
+            "filed_on": known_at.date(),
+            "accepted_at": known_at,
+            "listed_on": known_at.date(),
+            "list_position": None,
+            "known_at": known_at,
+            "ingested_at": ingested,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+
+def test_the_index_stamp_gate_reaches_is_current_and_the_group_check(
+    lab_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3520: `_is_current` and the sweep's `_group_changed` both pass the registration's
+    `index_stamps` to `data_vintage`, so an index row known by the cutoff and ingested
+    after the trial's vintage leaves a plain trial current and unchanged but not the
+    trial of a gated family (the same `momentum` registration, gated by monkeypatch)."""
+    from types import SimpleNamespace
+
+    from tradepartner.backtest import lab
+
+    sweep = _sweep(lab_store, settings, n_variants=1)
+    variant = _variant(lab_store, settings, sweep, 1)
+    vintage = registry.data_vintage(lab_store, _CUTOFF)
+    assert vintage is not None
+    _insert_trial(lab_store, variant.hypothesis_id, data_vintage_value=vintage)
+    trial = lab_queries.counted_trial(lab_store, variant.hypothesis_id, sweep.sweep_id)
+    assert trial is not None
+    _insert_index_row(lab_store, _CUTOFF, vintage + timedelta(days=3))
+
+    def entry(gated: bool) -> SimpleNamespace:
+        gates = registry.VintageGates(index_stamps=gated)
+        handle = SimpleNamespace(trial_id=1, store_max_ingested_at=vintage)
+        return SimpleNamespace(
+            ran=True, cutoff=_CUTOFF, vintage_gates=gates, vintage=vintage, handle=handle
+        )
+
+    assert lab._group_changed(lab_store, [entry(False)]) == {1: False}  # type: ignore[list-item]
+    assert lab._group_changed(lab_store, [entry(True)]) == {1: True}  # type: ignore[list-item]
+    assert lab_queries.is_current(lab_store, trial)
+    monkeypatch.setattr(registry, "INDEX_STAMP_FAMILIES", frozenset({"momentum"}))
+    assert not lab_queries.is_current(lab_store, trial)
