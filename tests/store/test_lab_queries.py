@@ -598,7 +598,10 @@ def test_a_reason_row_by_the_cutoff_makes_only_a_policy_trial_not_current(
     shared: lab_queries.Vintages = {}
     assert lab_queries._is_current(lab_store, plain_trial, _checkout(), shared)
     assert not lab_queries._is_current(lab_store, policy_trial, _checkout(), shared)
-    assert set(shared) == {(_CUTOFF, False, "none"), (_CUTOFF, False, "failure_v1")}
+    assert set(shared) == {
+        (_CUTOFF, False, "none", False),
+        (_CUTOFF, False, "failure_v1", False),
+    }
 
 
 # --- the counting rule, branch by branch ---------------------------------------
