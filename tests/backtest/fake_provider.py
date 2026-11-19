@@ -24,6 +24,12 @@ with an ex-date at or before `t_prev`'s session, as known at `t_prev` and at `t`
 fake's frames are the test's own, so a test that plants a late split also plants the
 adjusted bar revisions that go with it.
 
+The announcement read (T416) works over `filing_event_rows` (`security_id`, `cik`,
+`accession`, `form`, `items`, `accepted_at`, `known_at` and the cross-check column
+`index_accepted_at`, given by the test): the rows with `known_at <= t` for `ids`, `forms`
+matched exactly and `items` as whole codes of the comma-split `items` string, one row per
+`(security_id, accession)`, sorted as `filing_events_as_of` sorts.
+
 The exit-evidence reads (T328b) work over `delisting_reason_rows` (the
 `DELISTING_REASON_COLUMNS`; the latest revision per Form 25 episode known at `t`) and
 `merger_exit_rows` (the `MERGER_EXIT_COLUMNS`, `acquirer_raw_close` given by the test;
@@ -42,6 +48,7 @@ import polars as pl
 
 from tradepartner.backtest.provider import (
     DELISTING_REASON_COLUMNS,
+    FILING_INDEX_ACCEPTED_COLUMN,
     MERGER_EXIT_COLUMNS,
     STATEMENT_FACT_NAMES,
     TURNOVER_BAR_COLUMNS,
@@ -106,6 +113,16 @@ _CLASSIFICATION_SCHEMA: dict[str, Any] = {
 }
 
 
+_FILING_EVENT_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "cik": pl.Utf8,
+    "accession": pl.Utf8,
+    "form": pl.Utf8,
+    "items": pl.Utf8,
+    "accepted_at": pl.Datetime("us", "UTC"),
+    "known_at": pl.Datetime("us", "UTC"),
+    FILING_INDEX_ACCEPTED_COLUMN: pl.Datetime("us", "UTC"),
+}
 _SHARES_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "as_of_date": pl.Date,
@@ -167,6 +184,8 @@ class Call:
     t_prev: datetime | None = None
     sessions_from: date | None = None
     series: str | None = None
+    forms: tuple[str, ...] | None = None
+    items: tuple[str, ...] | None = None
 
 
 def _known(frame: pl.DataFrame, t: datetime) -> pl.DataFrame:
@@ -221,6 +240,9 @@ class FakeProvider:
     )
     classification_rows: pl.DataFrame = field(
         default_factory=lambda: pl.DataFrame(schema=_CLASSIFICATION_SCHEMA)
+    )
+    filing_event_rows: pl.DataFrame = field(
+        default_factory=lambda: pl.DataFrame(schema=_FILING_EVENT_SCHEMA)
     )
     shares_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_SHARES_SCHEMA))
     split_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_SPLIT_SCHEMA))
@@ -411,6 +433,28 @@ class FakeProvider:
         rows = _latest(_for_ids(_known(self.classification_rows, t), ids), ["security_id"])
         known: dict[str, int | None] = dict(rows.select("security_id", "sic").iter_rows())
         return {sid: known.get(sid) for sid in ids}
+
+    def filing_events(
+        self,
+        t: datetime,
+        ids: Sequence[str],
+        *,
+        forms: Sequence[str],
+        items: Sequence[str],
+    ) -> pl.DataFrame:
+        if isinstance(forms, str) or isinstance(items, str):
+            raise TypeError("forms and items are sequences of codes, not a bare string")
+        t = self._record("filing_events", t, ids=ids, forms=tuple(forms), items=tuple(items))
+        if self.filing_event_rows.select(
+            pl.struct("security_id", "accession").is_duplicated().any()
+        ).item():
+            raise ValueError("two filing event rows share one (security_id, accession)")
+        codes = pl.col("items").str.split(",").list.eval(pl.element().str.strip_chars())
+        rows = _for_ids(_known(self.filing_event_rows, t), ids).filter(
+            pl.col("form").is_in(list(forms)),
+            codes.list.set_intersection(list(items)).list.len() > 0,
+        )
+        return rows.sort("known_at", "accession", "security_id")
 
     def rates(self, t: datetime, series: str) -> pl.DataFrame:
         t = self._record("rates", t, series=series)
