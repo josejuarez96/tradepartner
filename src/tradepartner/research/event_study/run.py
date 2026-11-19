@@ -305,7 +305,11 @@ def summarise_study(
         }
         for line in design["kill"]
     }
-    by_side = {str(line["side"]): kills[str(line["name"])] for line in design["kill"]}
+    # A windowed line (`entry_start`) never stands in for its side's full-window line.
+    by_side: dict[str, dict[str, Any]] = {}
+    for line in design["kill"]:
+        if "entry_start" not in line:
+            by_side.setdefault(str(line["side"]), kills[str(line["name"])])
     fallback = {
         "readings": ["raw"],
         "metric": "net_bp",
@@ -344,8 +348,13 @@ def summarise_study(
         side = str(line["side"])
         cost = float(line["cost_bps"])
         borrow = float(line["borrow_bps"])
+        start = str(line.get("entry_start", ""))  # TOML date or its stored ISO text
         selected = [
-            row for row in processed if row["group"] == group and f"spread_{horizon}" in row
+            row
+            for row in processed
+            if row["group"] == group
+            and f"spread_{horizon}" in row
+            and (not start or str(row["entry"]) >= start)
         ]
         readings: dict[str, dict[str, float]] = {}
         for reading in line["readings"]:

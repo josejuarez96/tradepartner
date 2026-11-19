@@ -163,6 +163,10 @@ _KILL_KEYS: Final = frozenset(
         "borrow_bps",
     }
 )
+# Optional per-line entry window (#3503, E1 design item 4): a kill line with
+# `entry_start` judges only events entered on or after that date. Absent, the
+# line reads every event, so files without it parse and hash as before.
+_KILL_OPTIONAL_KEYS: Final = frozenset({"entry_start"})
 _DEFAULT_CI_LEVEL: Final = 0.95
 
 _BLOCK_OPEN: Final = re.compile(r"^```toml experiment[ \t]*$", re.MULTILINE)
@@ -339,10 +343,14 @@ def _validate_study(
     for line in kills:
         if not isinstance(line, dict):
             raise ExperimentFileError(f"{path}: study.kill entries must be tables")
-        if set(line) != _KILL_KEYS:
+        if not _KILL_KEYS <= set(line) <= _KILL_KEYS | _KILL_OPTIONAL_KEYS:
             raise ExperimentFileError(
                 f"{path}: study.kill keys must be exactly {sorted(_KILL_KEYS)}"
+                f" plus optional {sorted(_KILL_OPTIONAL_KEYS)}"
             )
+        start = line.get("entry_start")
+        if start is not None and type(start) is not date:
+            raise ExperimentFileError(f"{path}: study.kill.entry_start must be a TOML date")
         name = _require_str("study.kill.name", line["name"], path)
         _require_enum("study.kill.side", line["side"], ("long", "short"), path)
         if name in names:
