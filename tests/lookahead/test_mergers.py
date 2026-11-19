@@ -88,25 +88,33 @@ _T328B_READERS = {
     Path("backtest/provider.py"): "DataProvider",
     Path("backtest/store_provider.py"): "StoreProvider",
 }
+#: T410 moved the provider's merger-frame construction into one shared function; it is
+#: the only module-level reader, and the only place `mergers_as_of` may be imported.
+_T410_READERS = {Path("backtest/delisting_value.py"): "merger_exit_frame"}
 
 
 def _mergers_reader_violations(source: str, path: Path) -> list[int]:
     """Return lines that name the merger reader or read its table outside T328b."""
     tree = ast.parse(source)
     allowed_class = _T328B_READERS.get(path)
+    allowed_function = _T410_READERS.get(path)
     allowed_methods = {
         id(method)
         for cls in tree.body
         if isinstance(cls, ast.ClassDef) and cls.name == allowed_class
         for method in cls.body
         if isinstance(method, ast.FunctionDef) and method.name == "merger_exits"
+    } | {
+        id(function)
+        for function in tree.body
+        if isinstance(function, ast.FunctionDef) and function.name == allowed_function
     }
     violations: list[int] = []
 
     class ReaderVisitor(ast.NodeVisitor):
         def visit_Module(self, node: ast.Module) -> None:
             body = node.body
-            if path in _T328B_READERS and ast.get_docstring(node):
+            if (path in _T328B_READERS or path in _T410_READERS) and ast.get_docstring(node):
                 body = body[1:]
             for statement in body:
                 self.visit(statement)
@@ -122,7 +130,7 @@ def _mergers_reader_violations(source: str, path: Path) -> list[int]:
             for alias in node.names:
                 if alias.name in {"mergers", "mergers_as_of"}:
                     permitted = (
-                        path == Path("backtest/store_provider.py")
+                        path in _T410_READERS
                         and node.module == "tradepartner.store.asof"
                         and alias.name == "mergers_as_of"
                         and alias.asname is None
@@ -185,6 +193,16 @@ def _mergers_reader_violations(source: str, path: Path) -> list[int]:
             Path("backtest/provider.py"),
         ),
         (
+            "from tradepartner.store.asof import mergers_as_of\n"
+            "def sneak(conn):\n    return mergers_as_of(conn, None)\n",
+            Path("backtest/delisting_value.py"),
+        ),
+        (
+            "def merger_exit_frame(conn):\n    return 1\n"
+            "def sneak(conn):\n    return conn.sql('SELECT * FROM mergers')\n",
+            Path("backtest/delisting_value.py"),
+        ),
+        (
             "def sneak(conn):\n    return conn.sql('SELECT * FROM mergers')\n",
             Path("backtest/store_provider.py"),
         ),
@@ -202,7 +220,7 @@ def test_guard_catches_second_reader(extra: str, path: Path) -> None:
     assert _mergers_reader_violations(extra, path)
 
 
-@pytest.mark.parametrize("path", sorted(_T328B_READERS))
+@pytest.mark.parametrize("path", sorted({*_T328B_READERS, *_T410_READERS}))
 def test_guard_allows_real_provider_method(path: Path) -> None:
     assert _mergers_reader_violations((_SRC / path).read_text(), path) == []
 
