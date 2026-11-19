@@ -42,10 +42,11 @@ The block below is the only part the registry parses (`research/experiment.py`).
 - Keep other fenced blocks out of the parameter block; its first bare ` ``` ` line
   closes it.
 - For a reusable return event study, add `[study]` and one or more `[[study.kill]]`
-  tables inside this same block. Every study key is required, including cost,
+  tables inside this same block. Every study key except `matching` and `delisting_return` is required, including cost,
   borrow, `z`, and `cluster_by`; `study.configurations` must cover the kill lines
   and fit within `budget.configurations`. Kill readings are `raw`,
-  `beta_adjusted`, `size_tight`, or `size_tight_beta_adjusted`.
+  `beta_adjusted`, `size_tight`, or `size_tight_beta_adjusted`. `delisting_return`
+  is optional (absent reads as `none`); new designs write `failure_v1`.
 
 ```toml experiment
 slug = "<slug>"
@@ -118,6 +119,7 @@ expected_effect = "<words: the prior, at or below the brief's haircuts for retur
 # borrow_bps = [0.0, 30.0]
 # z = 1.645
 # cluster_by = ["month", "quarter"]
+# delisting_return = "failure_v1" # new designs; or "severe_v1"; "none" reproduces older runs (absent reads as none). The runner refuses anything but none until T412 lands
 # [[study.kill]]
 # name = "long"
 # side = "long" # or "short"; selects the net-return formula

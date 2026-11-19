@@ -411,6 +411,14 @@ def run_study(
     design: Mapping[str, Any] = study.study if hasattr(study, "study") else study
     if not isinstance(design, Mapping):
         raise ValueError("study must be a parsed [study] table")
+    # T413 (#3498): the policy is declared in the hashed file but not yet applied; a
+    # study must not register under a label the run does not honour. T412 lifts this.
+    delisting = design.get("delisting_return", "none")
+    if delisting != "none":
+        raise ValueError(
+            f"study.delisting_return = {delisting!r} is not implemented yet "
+            "(task T412); only 'none' (or an absent key) can run"
+        )
     n_config = len(design.get("kill", ()))
     if (
         n_config > int(design.get("configurations", 0))
