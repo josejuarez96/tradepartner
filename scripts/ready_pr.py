@@ -150,6 +150,8 @@ QUANT_PREFIXES = (
     "src/tradepartner/research/",
     # store repairs and retractions rewrite stored facts (#3319)
     "src/tradepartner/repair",
+    # the security fence excludes stored securities from runs (#3501)
+    "src/tradepartner/fence",
     "src/tradepartner/retract.py",
     "src/tradepartner/action_retract.py",
     "src/tradepartner/close_gap.py",

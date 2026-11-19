@@ -100,6 +100,12 @@ SHAKEDOWN_DECISION_KINDS: tuple[str, ...] = ("shakedown_span", "shakedown_note")
 #: not, and `apply_lab_schema` widens with it too.
 OPERATIONS_DECISION_KINDS: tuple[str, ...] = ("operations_book",)
 
+#: `owner_decisions.kind` value schema version 50 adds (#3501, T401): the
+#: `fence_write` row `fence add` and `fence lift` append. Not in `LAB_DECISION_KINDS`:
+#: `schema._migrate_fence_kind` widens every store with it by `widen_enum`, lab or not,
+#: and a rebuild keeps it.
+FENCE_DECISION_KINDS: tuple[str, ...] = ("fence_write",)
+
 #: `owner_decisions.kind` values the lab adds (spec, Data / interfaces), then the
 #: two version 18 adds (`RELEASE_DECISION_KINDS`), the two version 20 adds
 #: (`SHAKEDOWN_DECISION_KINDS`) and the one version 22 adds

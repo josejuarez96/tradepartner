@@ -167,6 +167,7 @@ DecisionKind = Literal[
     "shakedown_span",
     "shakedown_note",
     "operations_book",
+    "fence_write",
 ]
 Basis = Literal["raw", "excess_spy"]
 
