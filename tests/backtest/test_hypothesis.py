@@ -50,6 +50,7 @@ FROZEN_SECTIONS = (
     "holdout",
     "metrics",
     "portfolio",
+    "irrx",
 )
 FROZEN_SINGLE_KEYS = ("execution.fill_price", "benchmarks", "alpaca.historical_feed")
 #: T210's post-registration `costs.*` keys (#1792): frozen, never required of a file.
@@ -223,7 +224,7 @@ def test_frozen_set_is_exactly_the_spec_key_list(settings: Settings) -> None:
     # A momentum registration stores no `profitability.*` key (amendment #720, T85) and
     # no `combined.*` key (an unlisted section is inert, ADR 0014 point 2).
     assert set(frozen) == {
-        k for k in _spec_frozen_keys() if not k.startswith(("profitability.", "combined."))
+        k for k in _spec_frozen_keys() if not k.startswith(("profitability.", "combined.", "irrx."))
     }
     assert set(hypothesis.frozen_keys()) == _spec_frozen_keys()
     for key in (
@@ -586,7 +587,7 @@ def test_profitability_file_registers_without_strategy_keys(
     ).fetchone()
     assert stored is not None and '"strategy.' not in stored[0]
     assert set(record.params) == {
-        k for k in _spec_frozen_keys() if not k.startswith(("strategy.", "combined."))
+        k for k in _spec_frozen_keys() if not k.startswith(("strategy.", "combined.", "irrx."))
     }
 
 
@@ -655,7 +656,7 @@ def test_combined_file_names_and_freezes_both_sub_signal_keys(
         if k.startswith(("combined.", "strategy.", "profitability.", "costs."))
     } - frozen.POST_REGISTRATION_OWN_KEYS - LATE_COST_KEYS <= required
     assert required <= set(parsed.file_params)
-    assert frozen.inert_sections("combined") == frozenset()
+    assert frozen.inert_sections("combined") == {"irrx"}  # only the later family's section
     record = _register(conn, COMBINED_FIXTURE, settings)
     assert record.family == "combined"
     assert record.params["combined.top_fraction"] == 0.2

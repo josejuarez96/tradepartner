@@ -71,6 +71,7 @@ from tradepartner.config_backtest import FilingDelayConfig as FilingDelayConfig
 from tradepartner.config_backtest import HoldoutConfig as HoldoutConfig
 from tradepartner.config_backtest import HypothesesConfig as HypothesesConfig
 from tradepartner.config_backtest import HypothesisFamily as HypothesisFamily
+from tradepartner.config_backtest import IrrxConfig as IrrxConfig
 from tradepartner.config_backtest import MetricsConfig as MetricsConfig
 from tradepartner.config_backtest import PortfolioConfig as PortfolioConfig
 from tradepartner.config_backtest import ProfitabilityConfig as ProfitabilityConfig
@@ -1358,6 +1359,7 @@ class Settings(BaseSettings):
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     profitability: ProfitabilityConfig = Field(default_factory=ProfitabilityConfig)
     combined: CombinedConfig = Field(default_factory=CombinedConfig)
+    irrx: IrrxConfig = Field(default_factory=IrrxConfig)
     costs: CostsConfig = Field(default_factory=CostsConfig)
     holdout: HoldoutConfig = Field(default_factory=HoldoutConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)

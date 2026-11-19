@@ -23,6 +23,9 @@ COMBINED_FIXTURE = FIXTURE.with_name("fixture-combined.md")
 H1_FILE = SRC.parents[1] / "docs" / "hypotheses" / "h1-momentum-12-1.md"
 SCHEDULE_KEYS = ("schedule.rebalance_cadence", "schedule.signal_anchor")
 IN_SAMPLE_START = date(2019, 11, 29)
+#: The table without T414's fifteen trailing `irrx.*` rows, so the negative-slice pins of
+#: the entries before them keep reading the same rows.
+_BEFORE_IRRX = frozen.FROZEN_KEY_DEFAULTS[:-15]
 
 
 @dataclass(frozen=True)
@@ -262,7 +265,7 @@ def test_three_section_family_hashes_all_and_has_no_inert_section(
         sweepable_keys=(),
     )
     monkeypatch.setitem(config_module.FAMILIES, "momentum", composed)
-    assert frozen.inert_sections("momentum") == frozenset()
+    assert frozen.inert_sections("momentum") == {"irrx"}  # only the later family's section
     params = {
         "strategy.top_fraction": 0.3,
         "profitability.top_fraction": 0.4,
@@ -993,7 +996,7 @@ def test_cost_term_entries_are_last_and_pinned_by_value() -> None:
     (#1818) takes 29 and lands first; T187's four chain entries and T211c's
     spin-off key follow them."""
     assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:26], COST_ENTRIES)
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:-16], COST_ENTRIES)
+    assert frozen.is_default(_BEFORE_IRRX[23:-16], COST_ENTRIES)
 
 
 def test_post_registration_cost_keys_pinned_and_each_a_costs_table_key() -> None:
@@ -1127,7 +1130,7 @@ def test_the_chain_entries_are_pinned_and_move_no_fingerprint() -> None:
         assert table[key] == (default, version), key
     settings = _defaults_settings()
     keys = CHAIN_KEYS
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-16:-12], CHAIN_ENTRIES)
+    assert frozen.is_default(_BEFORE_IRRX[-16:-12], CHAIN_ENTRIES)
     for family, params in (
         ("momentum", _new_params(settings)),
         ("combined", _combined_params(settings)),
@@ -1152,9 +1155,7 @@ APPLY_SPIN_OFFS_KEY = "adjust.apply_spin_offs"
 def test_apply_spin_offs_entry_is_pinned_by_value() -> None:
     """Appended at version 31 at its default; T238's buffer entry and T219's five
     `portfolio.*` entries follow it."""
-    assert frozen.is_default(
-        frozen.FROZEN_KEY_DEFAULTS[-12:-11], ((APPLY_SPIN_OFFS_KEY, False, 31),)
-    )
+    assert frozen.is_default(_BEFORE_IRRX[-12:-11], ((APPLY_SPIN_OFFS_KEY, False, 31),))
 
 
 def test_post_registration_adjust_keys_pinned_and_each_an_adjust_table_key() -> None:
@@ -1239,7 +1240,7 @@ def test_a_file_naming_true_is_a_new_fingerprint(tmp_path: Path, settings: Setti
 def test_buffer_entry_is_pinned_by_value() -> None:
     """Appended after the spin-off key, at the schema version current when it landed;
     T219's five `portfolio.*` entries follow it."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-11:-10], ((BUFFER_KEY, 0.0, 34),))
+    assert frozen.is_default(_BEFORE_IRRX[-11:-10], ((BUFFER_KEY, 0.0, 34),))
     assert BUFFER_KEY in hypothesis.frozen_keys()
 
 
@@ -1303,7 +1304,7 @@ PORTFOLIO_ENTRIES = (
 def test_portfolio_entries_are_pinned_by_value() -> None:
     """Appended after T238's buffer entry (T221's two borrow entries follow them), at the
     schema version current when they landed, in the spec item 1 order."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-10:-5], PORTFOLIO_ENTRIES)
+    assert frozen.is_default(_BEFORE_IRRX[-10:-5], PORTFOLIO_ENTRIES)
     for key, _default, _version in PORTFOLIO_ENTRIES:
         assert key in hypothesis.frozen_keys()
 
@@ -1383,7 +1384,7 @@ def test_borrow_entries_are_last_and_pinned_by_value() -> None:
     """Appended after T219's `portfolio.*` entries, at the current schema version (T328a's
     entry follows them); both are post-registration cost keys, the headline alone may
     only rise."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-5:-3], BORROW_ENTRIES)
+    assert frozen.is_default(_BEFORE_IRRX[-5:-3], BORROW_ENTRIES)
     for key, _default, _version in BORROW_ENTRIES:
         assert key in hypothesis.frozen_keys()
         assert key in frozen.POST_REGISTRATION_COST_KEYS
@@ -1434,18 +1435,14 @@ DELISTING_POLICY_KEY = "backtest.delisting_failure_return"
 
 def test_delisting_policy_entry_is_last_and_pinned_by_value() -> None:
     """Appended after T221's borrow entries at schema version 45, at `none`."""
-    assert frozen.is_default(
-        frozen.FROZEN_KEY_DEFAULTS[-3:-2], ((DELISTING_POLICY_KEY, "none", 45),)
-    )
+    assert frozen.is_default(_BEFORE_IRRX[-3:-2], ((DELISTING_POLICY_KEY, "none", 45),))
     assert DELISTING_POLICY_KEY in hypothesis.frozen_keys()
 
 
 def test_split_dating_entry_is_last_and_pinned_by_value() -> None:
     """#3055: appended after T328a's entry at schema version 46, at `false` (today's rule);
     #3076's issuer-class entry follows it."""
-    assert frozen.is_default(
-        frozen.FROZEN_KEY_DEFAULTS[-2:-1], (("universe.shares_split_dating", False, 46),)
-    )
+    assert frozen.is_default(_BEFORE_IRRX[-2:-1], (("universe.shares_split_dating", False, 46),))
     assert "universe.shares_split_dating" in hypothesis.frozen_keys()
 
 
@@ -1543,3 +1540,62 @@ def test_live_settings_never_reach_a_registration(tmp_path: Path) -> None:
     )
     params = hypothesis.frozen_params(hypothesis.parse_file(FIXTURE), live)
     assert params[DELISTING_POLICY_KEY] == "none"
+
+
+# --- the `irrx` family (backtest spec amendment 2026-11-16, #3504, T414) --------------
+
+IRRX_DEFAULTS = (
+    ("irrx.lookback_sessions", 21, 49),
+    ("irrx.min_kept_sessions", 15, 49),
+    ("irrx.announce_post_sessions", 2, 49),
+    ("irrx.event_form", "8-K", 49),
+    ("irrx.event_item", "2.02", 49),
+    ("irrx.event_coverage_sessions", 126, 49),
+    ("irrx.dissemination_cutoff", "17:30", 49),
+    ("irrx.industry_digits", 2, 49),
+    ("irrx.min_industry_names", 5, 49),
+    ("irrx.min_dollar_volume", 200000000.0, 49),
+    ("irrx.adv_sessions", 63, 49),
+    ("irrx.min_adv_bars", 42, 49),
+    ("irrx.top_fraction", 0.20, 49),
+    ("irrx.weighting", "equal", 49),
+    ("irrx.signal_total_return", True, 49),
+)
+IRRX_FIXTURE = FIXTURE.with_name("fixture-irrx.md")
+
+
+def test_the_fifteen_irrx_entries_are_last_and_pinned_by_value() -> None:
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-15:], IRRX_DEFAULTS)
+    assert frozen.FAMILY_SIGNAL_SECTIONS["irrx"] == "irrx"
+    assert not any(k.startswith("irrx.") for k, _d, _v in _BEFORE_IRRX)
+
+
+def test_irrx_keys_are_inert_for_every_other_family(settings: Settings) -> None:
+    """An `irrx.*` key is never overlaid, stored or hashed for another family, so no
+    existing canonical set, fingerprint or hash moves."""
+    for family, params in (
+        ("momentum", _new_params(settings)),
+        ("profitability", _prof_params(settings)),
+        ("combined", _combined_params(settings)),
+    ):
+        assert not any(k.startswith("irrx.") for k in frozen.frozen_values(_Record({}, family)))
+        stray = {**params, "irrx.top_fraction": 0.9}
+        assert frozen.canonical_frozen_set(stray, family) == frozen.canonical_frozen_set(
+            params, family
+        )
+        assert frozen.fingerprint(family, stray, IN_SAMPLE_START) == frozen.fingerprint(
+            family, params, IN_SAMPLE_START
+        )
+
+
+def test_irrx_canonical_set_keeps_its_fifteen_keys_and_no_other_signal_section(
+    settings: Settings,
+) -> None:
+    params = hypothesis.frozen_params(hypothesis.parse_file(IRRX_FIXTURE), settings)
+    canonical = frozen.canonical_frozen_set(params, "irrx")
+    assert {k for k in canonical if k.startswith("irrx.")} == {k for k, _d, _v in IRRX_DEFAULTS}
+    assert not any(k.startswith(("strategy.", "profitability.", "combined.")) for k in canonical)
+    moved = {**params, "irrx.top_fraction": 0.3}
+    assert frozen.fingerprint("irrx", moved, IN_SAMPLE_START) != frozen.fingerprint(
+        "irrx", params, IN_SAMPLE_START
+    )
