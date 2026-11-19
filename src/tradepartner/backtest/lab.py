@@ -612,7 +612,7 @@ def _close_group(
 def _group_changed(conn: duckdb.DuckDBPyConnection, opened: list[_Opened]) -> dict[int, bool]:
     """Compare each trial with one live fact scan per cutoff and vintage gate."""
     changed: dict[int, bool] = {}
-    live_vintages: dict[tuple[datetime, bool, str], datetime | None] = {}
+    live_vintages: dict[tuple[datetime, bool, str, bool], datetime | None] = {}
     live_max: datetime | None = None
     max_read = False
     for entry in opened:
@@ -622,10 +622,11 @@ def _group_changed(conn: duckdb.DuckDBPyConnection, opened: list[_Opened]) -> di
             entry.cutoff,
             entry.vintage_gates.spin_offs,
             entry.vintage_gates.delisting_policy,
+            entry.vintage_gates.index_stamps,
         )
         if key not in live_vintages:
             live_vintages[key] = registry.data_vintage(
-                conn, key[0], spin_offs=key[1], delisting_policy=key[2]
+                conn, key[0], spin_offs=key[1], delisting_policy=key[2], index_stamps=key[3]
             )
         changed[entry.handle.trial_id] = live_vintages[key] != entry.vintage
         if entry.vintage is None:

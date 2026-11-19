@@ -1194,7 +1194,7 @@ def test_every_fact_table_is_classified_for_trial_vintage(
             "sec_filing_events",
             "sec_form4_transactions",
             "snapshot_sightings",  # trials read listings, never raw SEC observations
-            "filing_index",
+            "filing_index",  # conditional too: `_INDEX_STAMP_TABLES`, an irrx-family gate (#3520)
             "filing_index_pending",
             "edgar_filers",
             "edgar_index_files",
@@ -2904,3 +2904,104 @@ def test_the_coverage_helpers_read_only(conn: duckdb.DuckDBPyConnection) -> None
     assert registry.release_retractions(conn, "repair-a") == []
     _price(conn, "A", _T0, _T0.replace(hour=13))
     assert registry.ownerless_rows(conn) == {"prices_daily": ["A"]}
+
+
+def _index_row(conn: duckdb.DuckDBPyConnection, known_at: datetime, ingested_at: datetime) -> None:
+    """A `filing_index` row (the first stamp of an accession, or a later revision)."""
+    insert_row(
+        conn,
+        "filing_index",
+        {
+            "cik": "CIK0000000001",
+            "accession": f"0000000001-20-{known_at:%H%M%S}",
+            "form": "8-K",
+            "company_name": "Idx Co",
+            "filed_on": known_at.date(),
+            "accepted_at": known_at,
+            "listed_on": known_at.date(),
+            "list_position": None,
+            "known_at": known_at,
+            "ingested_at": ingested_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+
+def test_an_index_row_moves_the_vintage_only_under_index_stamps(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#3520: a `filing_index` row known by the cutoff moves `data_vintage` only when
+    `index_stamps` is on (from its own `known_at` on: a microsecond before it, nothing
+    moves); at the default `False` the vintage is byte-identical at every cutoff, under
+    either `spin_offs`, so every stored vintage and pinned digest is unchanged."""
+    cutoffs = sorted(
+        {
+            *_fixture_cutoffs(fixture_store),
+            _PIN_KNOWN - timedelta(microseconds=1),
+            _PIN_KNOWN,
+            _PIN_KNOWN + timedelta(microseconds=1),
+        }
+    )
+    before = {
+        (cutoff, flag, stamps): registry.data_vintage(
+            fixture_store, cutoff, spin_offs=flag, index_stamps=stamps
+        )
+        for cutoff in cutoffs
+        for flag in (False, True)
+        for stamps in (False, True)
+    }
+    for cutoff in cutoffs:  # no index row yet: the gate alone moves nothing
+        for flag in (False, True):
+            assert before[cutoff, flag, True] == before[cutoff, flag, False], cutoff
+    _index_row(fixture_store, _PIN_KNOWN, _LATE_INGEST)
+    for cutoff in cutoffs:
+        for flag in (False, True):
+            assert (
+                registry.data_vintage(fixture_store, cutoff, spin_offs=flag)
+                == (before[cutoff, flag, False])
+            ), (cutoff, flag)
+            expected = _LATE_INGEST if cutoff >= _PIN_KNOWN else before[cutoff, flag, True]
+            assert (
+                registry.data_vintage(fixture_store, cutoff, spin_offs=flag, index_stamps=True)
+                == expected
+            ), (cutoff, flag)
+
+
+def test_only_a_filing_event_family_gets_the_index_stamp_gate(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3520: `vintage_gates` turns `index_stamps` on for `irrx` alone; a momentum or
+    profitability registration (every existing one) keeps it off. `irrx` cannot be
+    registered until T414 adds the family, so `profitability` stands in for the gated one."""
+    assert {"irrx"} == registry.INDEX_STAMP_FAMILIES
+    for slug, family in (("h-mom", "momentum"), ("h-prof", "profitability")):
+        assert not registry.vintage_gates(_register(conn, settings, slug, family)).index_stamps
+    monkeypatch.setattr(registry, "INDEX_STAMP_FAMILIES", frozenset({"profitability"}))
+    assert registry.vintage_gates(_register(conn, settings, "h-p2", "profitability")).index_stamps
+    assert not registry.vintage_gates(_register(conn, settings, "h-m2", "momentum")).index_stamps
+
+
+def test_an_index_row_stales_a_filing_event_family_trial_and_leaves_momentum_ok(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3520: `open_trial` reads the vintage under the registration's gates and
+    `_store_changed` reads it back, so an index row known by the cutoff and ingested after
+    the open fails the trial of a gated family (`profitability` stands in for `irrx`,
+    which T414 registers) and leaves a momentum one `ok`; one known after the cutoff
+    fails neither."""
+    monkeypatch.setattr(registry, "INDEX_STAMP_FAMILIES", frozenset({"profitability"}))
+    _register(conn, settings, slug="h-mom")
+    _register(conn, settings, slug="h-prof", family="profitability")
+    _price(conn, "A", _T0.replace(hour=0), _T0.replace(hour=1))
+    plain = _open(conn, settings, tmp_path, slug="h-mom")
+    stamped = _open(conn, settings, tmp_path, slug="h-prof")
+    assert stamped.data_vintage == plain.data_vintage  # no index row yet
+    _index_row(conn, _AFTER_CUTOFF, _AFTER_CUTOFF + timedelta(hours=1))
+    assert not registry._store_changed(conn, stamped, _T0)
+    _index_row(conn, _T0, _T0.replace(hour=14))
+    assert registry._store_changed(conn, stamped, _T0)
+    assert not registry._store_changed(conn, plain, _T0)
