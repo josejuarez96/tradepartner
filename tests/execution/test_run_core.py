@@ -19,6 +19,7 @@ beyond the two smoke cases are T63i's.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -1473,8 +1474,9 @@ def test_a_secret_never_reaches_the_failed_paths_notes(
     env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The `run_failed` alert's own write fails with the secret in its error:
-    the note the failed path adds to the propagating exception, and the
-    result row, name only the error's type (#523)."""
+    the note the failed path adds to the propagating exception keeps the
+    error's message with the secret masked (#3635), and the result row never
+    holds it (#523)."""
     secret = "Ab\\cDef-9876xyz"
     env.settings = Settings(
         _env_file=None, store={"path": env.settings.store.path}, alpaca_paper_api_secret=secret
@@ -1495,7 +1497,11 @@ def test_a_secret_never_reaches_the_failed_paths_notes(
     with pytest.raises(RuntimeError, match="the step failed") as raised:
         env.run(_at(TUE))
     notes = getattr(raised.value, "__notes__", [])
-    assert notes == ["failed path: run_failed alert not written (RuntimeError)"]
+    assert len(notes) == 1
+    assert notes[0].startswith(
+        "failed path: run_failed alert not written (RuntimeError: smtp said "
+    )
+    assert secret not in notes[0]
     (result,) = env.query("SELECT status, message FROM paper_run_results")
     assert result[0] == "failed"
     escaped = repr(secret)[1:-1]
@@ -1617,7 +1623,12 @@ def test_a_pre_run_alert_that_cannot_be_written_is_noted_on_the_error(
     monkeypatch.setattr(run_module._ChunkAlerter, "write", no_alert)
     with pytest.raises(duckdb.IOException) as raised:
         env.run(_at(TUE))
-    assert raised.value.__notes__ == ["failed path: run_failed alert not written (RuntimeError)"]
+    [note] = raised.value.__notes__
+    assert re.fullmatch(
+        r"failed path: run_failed alert not written "
+        r"\(RuntimeError: store down at test_run_core\.py:\d+\)",
+        note,
+    )
 
 
 def test_another_error_before_the_run_row_sends_no_alert(

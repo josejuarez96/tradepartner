@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -15,6 +16,7 @@ from typing import Any, Protocol
 import duckdb
 import polars as pl
 import pytest
+from pydantic import SecretStr
 
 from tradepartner import calendar
 from tradepartner.adapters.broker import (
@@ -812,8 +814,8 @@ def test_a_failed_cancel_and_a_failed_read_each_journal_cancel_failed(
     [(message,)] = _query(
         journal_settings, "SELECT message FROM paper_run_results WHERE run_id = ?", [run.run_id]
     )
-    assert "cancel of tp-a failed" in message
-    assert "halt read of tp-a failed (FakeTransportError: read lost)" in message  # #730
+    assert "cancel of tp-a failed (FakeTransportError: cancel lost at " in message  # #3635
+    assert "halt read of tp-a failed (FakeTransportError: read lost at " in message  # #730
 
 
 def test_a_rejection_verdict_the_halt_read_finds_is_named_in_the_alert(
@@ -1331,8 +1333,41 @@ def test_a_failed_alert_write_is_named_in_the_result_row_and_on_the_fault(
     [(message,)] = _query(
         journal_settings, "SELECT message FROM paper_run_results WHERE run_id = ?", [run.run_id]
     )
-    assert "alert not written (OSError)" in message
-    assert any("alert not written" in note for note in fault.__notes__)
+    assert "alert not written (OSError: alerts table locked" in message
+    assert any(
+        "alert not written (OSError: alerts table locked" in note for note in fault.__notes__
+    )
+
+
+def test_a_failed_cancel_note_keeps_the_scrubbed_message_and_its_place(
+    journal_settings: Settings,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+    open_window: PaperWindowRow,
+    alerter_conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """#3635: a failed halt step's note says what the error said and where it was
+    raised, scrubbed and bounded by `paper.max_fault_note_chars`."""
+    secret = "Ab\\cDef-9876xyz"
+    settings = journal_settings.model_copy(update={"alpaca_paper_api_secret": SecretStr(secret)})
+    run = _run(settings, open_window, fixed_clock())
+    _order(settings, scripted_fake, fixed_clock, run, "tp-a")
+    scripted_fake.script_call_fault(
+        "cancel", RuntimeError(f"503 from broker {secret} " + "x" * 10_000)
+    )
+    gate = _wrapper(settings, scripted_fake, fixed_clock, alerter_conn)
+    fault = LocalFault("original")
+    with pytest.raises(LocalFault):
+        _halt(gate, fault, run)
+    label = "cancel of tp-a failed"
+    [note] = [n for joined in fault.__notes__ for n in joined.split("; ") if label in n]
+    assert "cancel of tp-a failed (RuntimeError: 503 from broker" in note
+    assert re.search(r" at \w+\.py:\d+\)$", note)
+    escaped = repr(secret)[1:-1]
+    for form in (secret, secret.upper(), escaped, escaped.upper()):
+        assert form not in note
+    # label + " (RuntimeError: " + message + " at file.py:line)"
+    assert len(note) <= len(label) + settings.paper.max_fault_note_chars + 60
 
 
 def test_the_precheck_refuses_a_naive_last_ok_ingest(
