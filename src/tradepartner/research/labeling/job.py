@@ -34,7 +34,11 @@ comes back, its `raw_request` and `raw_response` passed through the secret
 substitution of `config.clean_message` at full length (never its truncation or its
 control-character pass). The batch stops on the first reply whose model id differs
 from the one requested (`failed`, `model id mismatch`), after writing that reply's
-record. A timeout after send is recorded `unresolved` / `timeout` and never re-sent.
+record. It also stops on the first reply whose status says the request itself was
+rejected (`models.REJECTED_STATUSES`: 400, 404, 405, 413, 422; `failed`,
+`request rejected: HTTP <status>`), after writing that reply's record, which costs
+nothing: the next call would fail the same way. The drift probe and the reversed pass
+stop the same way. A timeout after send is recorded `unresolved` / `timeout` and never re-sent.
 At the end the records are registered as a `departure-reason-inferences` version; a
 gold split (`dev`, `pilot`) is scored (`scoring`) and its result written -- with the
 Jev-only `arms` key (`gold_metrics`) holding the ladder, E0, the hybrids and the
@@ -52,7 +56,7 @@ is spend the check cannot see. A call's estimate is the characters of the packet
 the instructions and the criteria divided by `chars_per_token`, at the price
 snapshot; each record carries the returned `usage.input_tokens` instead (a timeout,
 which may have been billed, and a 200 whose body lacks the usage keep their estimate;
-any other refusal with no usage costs 0).
+any other refusal with no usage, a rejected request included, costs 0).
 Within a run the sums are carried forward in memory from the files read before the
 first call plus every record this run writes (a record in a later UTC month starts
 that month's sum); `run_batch` holds an exclusive lock
@@ -115,6 +119,7 @@ from tradepartner.research.labeling.questions import (
     OptionSet,
 )
 from tradepartner.research.models import (
+    REJECTED_STATUSES,
     ModelAuthRejected,
     ModelClient,
     ModelDisabled,
@@ -171,6 +176,7 @@ VENDORS: Final = frozenset(ARM_VENDORS.values())
 
 SPEND_CEILING: Final = "spend ceiling"
 MODEL_ID_MISMATCH: Final = "model id mismatch"
+REQUEST_REJECTED: Final = "request rejected"
 DRIFT_NOT_PASSED: Final = "drift probe not passed"
 UNEXPECTED_FILE: Final = "unexpected inference file"
 
@@ -453,7 +459,8 @@ def record_cost(
     Claude: `models.claude_call_cost_usd`, which charges the returned input and output
     tokens at its two prices and, with no returned usage, recomputes the full
     worst-case estimate itself (`estimate` is not used, so a Jev estimate passed in
-    cannot under-charge it)."""
+    cannot under-charge it). On both paths a request the vendor rejected
+    (`models.REJECTED_STATUSES`, no usage) costs nothing."""
     if claude is not None:
         if request is None:
             raise ValueError("a Claude record's cost needs the call's request")
@@ -942,7 +949,8 @@ class _Caller:
 
     def call(self, listing_end_id: str, packet: Packet) -> ModelResponse:
         """Send `packet` after the mid-batch spend check, write its record, and stop
-        the run on a refused key, an invalid reply or a model id mismatch."""
+        the run on a refused key, an invalid reply, a rejected request or a model id
+        mismatch."""
         request = model_request(packet, self.model, self.option_set)
         estimate = estimate_usd(request, self.settings.research.labeling)
         try:
@@ -964,6 +972,8 @@ class _Caller:
         ) as exc:
             raise _Stop(f"{type(exc).__name__}: {redact(str(exc), self.settings)}") from None
         self._write(listing_end_id, packet, response, estimate)
+        if response.http_status in REJECTED_STATUSES:
+            raise _Stop(f"{REQUEST_REJECTED}: HTTP {response.http_status}")
         if response.model_id_returned is not None and response.model_id_returned != request.model:
             raise _Stop(MODEL_ID_MISMATCH)
         return response

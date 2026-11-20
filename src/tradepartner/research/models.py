@@ -25,7 +25,9 @@ This is the one module that names either model vendor's host (through
   the request timeout) or else backing off 1 s, 2 s, 4 s. Anything that fails after
   the request was sent (a read or write timeout, a dropped connection) is never
   re-sent, because it may have been billed: it comes back as `reason = "timeout"`
-  with no answer. A final non-200 comes back as `reason = "refused"` with its status;
+  with no answer. A final non-200 comes back as `reason = "refused"` with its status
+  (for a status in `REJECTED_STATUSES`, 400, 404, 405, 413 or 422, the vendor rejected
+  the request itself, so the job stops the run after that record and it costs nothing);
   401 and 403 raise `ModelAuthRejected` (a bad key fails every call, so the job
   stops); a 200 whose body is not the documented shape raises
   `ModelResponseInvalid`, which carries the call's `refused` record (it may have
@@ -79,6 +81,8 @@ MODEL_ALIASES = frozenset({"jev", "jev-latest", "jev-preview"})
 RETRY_STATUSES = frozenset({429, 529})
 #: Statuses that mean the key was refused.
 AUTH_STATUSES = frozenset({401, 403})
+#: The vendor rejected the request itself; the next call would fail the same way.
+REJECTED_STATUSES = frozenset({400, 404, 405, 413, 422})
 ENDPOINT = "systemone"
 #: What a bearer token may hold: printable ASCII, no space (RFC 6750 `b64token` and more).
 _HEADER_TOKEN = re.compile(r"[\x21-\x7e]+")
@@ -731,8 +735,15 @@ def claude_estimate_usd(request: ModelRequest, config: ResearchClaudeConfig) -> 
 def claude_call_cost_usd(
     request: ModelRequest, response: ModelResponse, config: ResearchClaudeConfig
 ) -> float:
-    """Use billed counts when both arrive; otherwise preserve the full estimate."""
+    """Use billed counts when both arrive; otherwise preserve the full estimate.
+
+    The one no-usage case that costs nothing is a status in `REJECTED_STATUSES`: the
+    vendor rejected the request before running it. A timeout, a 200 without usage and
+    every other final status (a 5xx, a 429) may have been billed and keep the estimate.
+    """
     if response.input_tokens is None or response.output_tokens is None:
+        if response.http_status in REJECTED_STATUSES:
+            return 0.0
         return claude_estimate_usd(request, config)
     return (
         response.input_tokens * config.price_usd_per_million_input_tokens
