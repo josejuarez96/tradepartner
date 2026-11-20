@@ -76,6 +76,12 @@ def _credentials(settings: Settings) -> tuple[str, str]:
     return api_key, api_secret
 
 
+#: The Alpaca statuses worth asking again: rate limit and the transient server
+#: errors. One definition for the order client's retry and the data adapter's
+#: transient test (#3631); it lives here so no data module imports the order client.
+RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+
 class TimeoutAdapter(HTTPAdapter):
     """An `HTTPAdapter` that applies `timeout` to every request sent without one;
     the SDK's session passes none, so without this a request could hang forever."""

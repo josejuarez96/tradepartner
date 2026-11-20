@@ -3548,14 +3548,14 @@ def _transient(exc: BaseException) -> bool:
     import requests
     from alpaca.common.exceptions import APIError
 
-    from tradepartner.adapters.alpaca_trading_raw import _RETRY_STATUS_CODES
+    from tradepartner.adapters.alpaca_raw import RETRY_STATUS_CODES
 
     if isinstance(exc, APIError):
         try:
             status = exc.status_code
         except AttributeError:  # an http error with no response attached
             return False
-        return status is not None and status in _RETRY_STATUS_CODES
+        return status is not None and status in RETRY_STATUS_CODES
     return isinstance(
         exc, (requests.Timeout, requests.ConnectionError, ConnectionError, TimeoutError)
     )
