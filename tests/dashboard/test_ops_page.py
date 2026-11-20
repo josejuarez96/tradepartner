@@ -298,6 +298,7 @@ def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path, now: datetime = _NOW
 def _text(at: AppTest) -> str:
     parts: list[Any] = [m.value for m in at.markdown]
     parts += [c.value for c in at.caption]
+    parts += [t.value for t in at.text]
     parts += [h.value for h in at.header]
     parts += [h.value for h in at.subheader]
     parts += [f"{m.label} {m.value}" for m in at.metric]
@@ -491,6 +492,24 @@ def test_reconciliation_lists_events_not_raw_json(
     assert "Ticker change on BBB: BBB is now BBX" in text
     assert '{"activities"' not in text
     assert any("Raw reconciliation record" in e.label for e in at.expander)
+
+
+def test_reconciliation_event_text_never_renders_as_markdown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#3656: stored reconciliation text can carry broker text, so a link or image
+    in it must show as literal characters."""
+    hostile = "see [here](https://evil.test/x) ![p](https://evil.test/p.png)"
+    payload = json.loads(_RECON_JSON)
+    payload["explained"][0]["explanation"] = hostile
+    monkeypatch.setattr(sys.modules[__name__], "_RECON_JSON", json.dumps(payload))
+    store_path = tmp_path / "ops.duckdb"
+    _seed(store_path)
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    assert not [m.value for m in at.markdown if "evil.test" in str(m.value)]
+    assert not [c.value for c in at.caption if "evil.test" in str(c.value)]
+    assert any(hostile in str(t.value) for t in at.text)
 
 
 def test_reconciliation_events_helper_survives_bad_json() -> None:
