@@ -14,7 +14,7 @@ import pytest
 from conftest import _FIXTURES_UNIVERSE_DIR as FIXTURES_UNIVERSE_DIR
 from conftest import load_chain_overlay, load_universe_fixtures
 
-from lookahead.departures import ALLOWED, DIRECTIONS
+from lookahead.departures import ALLOWED, DIRECTIONS, NOT_EXERCISED
 from lookahead.harness import _FACT_TABLES, TruncatedStore, probe_timestamps
 from tradepartner.config import EventsConfig, Settings
 from tradepartner.store import asof, classify, delisting_reasons, delistings, master, schema
@@ -22,8 +22,7 @@ from tradepartner.store.db import configure_connection
 from tradepartner.universe import Universe, universe_as_of
 
 #: The modules whose public `*_as_of` functions are discovered by introspection (`universe_as_of`
-#: is added by name: `tradepartner.universe` also holds `shares_as_of` helpers that are not reads
-#: of the store's facts at a probe).
+#: is added by name and covers `shares_as_of` and `latest_shares_as_of`, which it calls).
 MODULES = (
     "tradepartner.store.asof",
     "tradepartner.store.master",
@@ -65,7 +64,7 @@ def _adapters() -> dict[str, Read]:
         "marking_changed_ids_as_of": lambda c, t: asof.marking_changed_ids_as_of(
             c, t - timedelta(days=1), t, [_SUCCESSOR]
         ),
-        "price_jumps_as_of": lambda c, t: asof.price_jumps_as_of(c, t),
+        "price_jumps_as_of": lambda c, t: asof.price_jumps_as_of(c, t, settings=_SETTINGS),
         "symbol_changes_as_of": lambda c, t: asof.symbol_changes_as_of(c, t),
         "spinoff_allocations_as_of": lambda c, t: asof.spinoff_allocations_as_of(c, t),
         "mergers_as_of": lambda c, t: asof.mergers_as_of(c, t),
@@ -75,7 +74,7 @@ def _adapters() -> dict[str, Read]:
         "statement_facts_as_of": lambda c, t: asof.statement_facts_as_of(c, t),
         "filing_events_as_of": lambda c, t: asof.filing_events_as_of(c, t),
         "sec_filing_events_as_of": lambda c, t: asof.sec_filing_events_as_of(
-            c, t, ["8-K"], settings=_SETTINGS
+            c, t, ["4"], settings=_SETTINGS
         ),
         "sec_form4_transactions_as_of": lambda c, t: asof.sec_form4_transactions_as_of(
             c, t, settings=_SETTINGS
@@ -143,17 +142,33 @@ def probes_for(conn: duckdb.DuckDBPyConnection) -> list[datetime]:
     )
 
 
-def departing_probes(
+def is_empty(result: Any) -> bool:
+    """Whether a read returned nothing (an empty frame, tuple or pair of them)."""
+    if isinstance(result, pl.DataFrame):
+        return result.is_empty()
+    if isinstance(result, tuple):
+        return all(is_empty(part) for part in result)
+    return not result
+
+
+def walk(
     conn: duckdb.DuckDBPyConnection, truncated: TruncatedStore, name: str
-) -> list[datetime]:
-    """The probes at which `name` differs between the full and the truncated store."""
+) -> tuple[list[datetime], bool]:
+    """The probes where `name` differs full vs truncated, and whether it ever returned rows."""
     read = ADAPTERS[name]
-    return [t for t in probes_for(conn) if not same(read(conn, t), read(truncated.at(t), t))]
+    departing: list[datetime] = []
+    exercised = False
+    for t in probes_for(conn):
+        full = read(conn, t)
+        exercised = exercised or not is_empty(full)
+        if not same(full, read(truncated.at(t), t)):
+            departing.append(t)
+    return departing, exercised
 
 
 @pytest.fixture(scope="module")
-def departures_found() -> dict[str, list[datetime]]:
-    """Per discovered read, the probes where it departs, computed once for the module."""
+def walked() -> dict[str, tuple[list[datetime], bool]]:
+    """Per discovered read, `walk`'s result, computed once for the module."""
     conn = duckdb.connect(":memory:")
     configure_connection(conn)
     schema.init_schema(conn)
@@ -161,10 +176,29 @@ def departures_found() -> dict[str, list[datetime]]:
     load_chain_overlay(conn)
     truncated = TruncatedStore(conn)
     try:
-        return {name: departing_probes(conn, truncated, name) for name in sorted(discover())}
+        return {name: walk(conn, truncated, name) for name in sorted(discover())}
     finally:
         truncated.close()
         conn.close()
+
+
+@pytest.fixture(scope="module")
+def departures_found(
+    walked: dict[str, tuple[list[datetime], bool]],
+) -> dict[str, list[datetime]]:
+    return {name: probes for name, (probes, _exercised) in walked.items()}
+
+
+def test_the_reads_the_fixture_never_exercises_are_exactly_the_listed_ones(
+    walked: dict[str, tuple[list[datetime], bool]],
+) -> None:
+    """Invariance of an always-empty read proves nothing: those reads are named in
+    `NOT_EXERCISED` with the test that guards them, and an entry goes when fixture data arrives."""
+    empty = {name for name, (_probes, exercised) in walked.items() if not exercised}
+    assert empty == set(NOT_EXERCISED), (
+        f"unlisted always-empty reads: {sorted(empty - set(NOT_EXERCISED))}; "
+        f"stale NOT_EXERCISED entries: {sorted(set(NOT_EXERCISED) - empty)}"
+    )
 
 
 def test_every_public_as_of_read_is_listed_or_invariant(
@@ -219,10 +253,19 @@ def test_every_departure_has_a_citation_and_an_allowed_direction() -> None:
         assert departure.condition.strip() and departure.citation.strip(), name
 
 
-def test_a_hides_data_departure_never_reveals_a_later_value(
+def _chained_successors_known_after(conn: duckdb.DuckDBPyConnection, t: datetime) -> set[str]:
+    rows = conn.execute(
+        "SELECT DISTINCT successor_id FROM successor_chains WHERE known_at > ?", [t]
+    ).fetchall()
+    return {str(row[0]) for row in rows}
+
+
+def test_a_hides_data_departure_hides_only_chained_successor_rows(
     departures_found: dict[str, list[datetime]],
 ) -> None:
-    """The full store may show less than the truncated one, never more."""
+    """The full store may show less than the truncated one, never more or different: every
+    full-store row is in the truncated result, and every row only the truncated store has
+    belongs to a successor whose chain is not yet known at `t` (the stated condition)."""
     conn = duckdb.connect(":memory:")
     configure_connection(conn)
     schema.init_schema(conn)
@@ -236,8 +279,14 @@ def test_a_hides_data_departure_never_reveals_a_later_value(
             read = ADAPTERS[name]
             for t in departures_found[name]:
                 full, seen = read(conn, t), read(truncated.at(t), t)
-                if isinstance(full, pl.DataFrame):
-                    assert full.height <= seen.height, (name, t)
+                assert isinstance(full, pl.DataFrame) and isinstance(seen, pl.DataFrame), name
+                revealed = full.join(seen, on=full.columns, how="anti", nulls_equal=True)
+                assert revealed.is_empty(), (name, t, "full store shows rows the truncated lacks")
+                hidden = seen.join(full, on=seen.columns, how="anti", nulls_equal=True)
+                outside = set(hidden["security_id"].to_list()) - _chained_successors_known_after(
+                    conn, t
+                )
+                assert not outside, (name, t, outside)
     finally:
         truncated.close()
         conn.close()

@@ -49,3 +49,16 @@ ALLOWED: dict[str, Departure] = {
     )
     for name in ("prices_as_of", "adjusted_prices_as_of")
 }
+
+
+#: Reads that return nothing at every probe on the chain fixture, so their "invariance" there is
+#: empty == empty. Each names the test that exercises it with data. An entry is removed when
+#: fixture data makes the read return rows (`test_the_reads_the_fixture_never_exercises_...`).
+NOT_EXERCISED: dict[str, str] = {
+    "delisting_reasons_as_of": "tests/lookahead/test_restamp.py",
+    "dropped_dividends_as_of": "tests/lookahead/test_asof_invariance.py",
+    "price_jumps_as_of": "tests/lookahead/test_successor_chains.py",
+    "sec_filing_events_as_of": "tests/lookahead/test_sec_filing_events.py",
+    "sec_form4_transactions_as_of": "tests/lookahead/test_form4_bulk_route.py",
+    "unvalued_spin_offs_as_of": "tests/lookahead/test_spin_off.py",
+}
