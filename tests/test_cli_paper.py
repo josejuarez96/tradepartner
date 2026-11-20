@@ -41,7 +41,7 @@ from tradepartner.execution import run as paper_run
 from tradepartner.execution import shakedown as paper_shakedown
 from tradepartner.execution import slippage as paper_slippage
 from tradepartner.execution.brokers import build_broker
-from tradepartner.execution.lock import run_lock
+from tradepartner.execution.lock import LockHeld, run_lock
 from tradepartner.execution.lots_reconcile import BrokerLotRow
 from tradepartner.execution.wrapper import WRITE_FAILED_EXIT_CODE
 from tradepartner.store import journal, registry, schema
@@ -1245,6 +1245,43 @@ def test_a_broker_that_cannot_be_built_fails_scrubbed(clock: _Clock) -> None:
         assert result.exit_code == 1, (args, result.output)
         assert "RuntimeError" in result.output
         assert scrub_text(result.output, secrets=[ALPACA_KEY, ALPACA_SECRET])[1] == 0
+
+
+def test_a_crash_prints_its_scrubbed_traceback_on_stderr(clock: _Clock) -> None:
+    def _deep() -> None:
+        raise RuntimeError(f"no paper client for key {ALPACA_KEY} / {ALPACA_SECRET}")
+
+    def broken(_settings: Settings, _clock: Any, _book: str) -> FakeBroker:
+        _deep()
+        raise AssertionError("unreachable")
+
+    for args in (
+        ("run",),
+        ("run", "--book", "main"),
+        ("reconcile",),
+        ("stop", "--reason", LONG_REASON),
+    ):
+        result = CliRunner().invoke(cli.make_app(clock=clock, broker=broken), ["paper", *args])
+        assert result.exit_code == 1, (args, result.output)
+        assert "Traceback (most recent call last)" in result.stderr, args
+        assert "in _deep" in result.stderr, args
+        # The first stderr line is unchanged; the traceback comes after it.
+        assert result.stderr.index("failed: RuntimeError") < result.stderr.index("Traceback"), args
+        assert "Traceback" not in result.stdout, args
+        assert scrub_text(result.output, secrets=[ALPACA_KEY, ALPACA_SECRET])[1] == 0, args
+
+
+def test_a_refusal_prints_no_traceback(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    def held(*_args: Any, **_kwargs: Any) -> None:
+        raise LockHeld("another run holds the lock")
+
+    monkeypatch.setattr(cli.reconcile_run, "reconcile_command", held)
+    result = CliRunner().invoke(cli.make_app(clock=clock, broker=factory), ["paper", "reconcile"])
+    assert result.exit_code == cli.PAPER_REFUSAL_EXIT["locked"] == 5, result.output
+    assert "refused: locked" in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 @pytest.mark.usefixtures("started")
