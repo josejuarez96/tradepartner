@@ -2803,6 +2803,55 @@ def test_research_claude_https_and_thinking_validation() -> None:
         assert raised.value.errors()[0]["loc"] == (field,)
 
 
+# --- the model base URLs name their vendor's host only (#3654) ---------------
+
+
+def _other_host_urls(host: str) -> list[str]:
+    return [
+        "https://example.test/v1",
+        f"https://{host}.example.test/v1",
+        f"https://user@{host}/v1",
+        f"https://{host}:8443/v1",
+    ]
+
+
+@pytest.mark.parametrize("url", _other_host_urls("api.typesafe.ai"))
+def test_labeling_api_base_url_refuses_any_host_but_the_vendors(url: str) -> None:
+    """#3654: the labeling key is only ever sent to its vendor: another host, a
+    look-alike suffix, userinfo and a non-443 port are refused at settings load."""
+    with pytest.raises(ValidationError) as raised:
+        Settings(_env_file=None, research={"labeling": {"api_base_url": url}})
+    text = str(raised.value)
+    assert "research.labeling.api_base_url" in text
+    assert url not in text and "example.test" not in text
+
+
+@pytest.mark.parametrize("url", _other_host_urls("api.anthropic.com"))
+def test_claude_api_base_url_refuses_any_host_but_the_vendors(url: str) -> None:
+    with pytest.raises(ValidationError) as raised:
+        Settings(_env_file=None, research={"claude": {"api_base_url": url}})
+    text = str(raised.value)
+    assert "research.claude.api_base_url" in text
+    assert url not in text and "example.test" not in text
+
+
+def test_the_default_model_base_urls_are_accepted() -> None:
+    """The defaults load; the path stays free, the host is compared in lower case and
+    an explicit port 443 is the same server."""
+    Settings(_env_file=None)
+    for url in (
+        "https://api.typesafe.ai/v2",
+        "https://API.TYPESAFE.AI/v1",
+        "https://api.typesafe.ai:443/v1",
+    ):
+        loaded = Settings(_env_file=None, research={"labeling": {"api_base_url": url}})
+        assert loaded.research.labeling.api_base_url == url
+    claude = Settings(
+        _env_file=None, research={"claude": {"api_base_url": "https://API.anthropic.com/"}}
+    )
+    assert claude.research.claude.api_base_url == "https://API.anthropic.com/"
+
+
 # --- the health section's session-hole share (#1575, #1550 part c) ----------
 
 
