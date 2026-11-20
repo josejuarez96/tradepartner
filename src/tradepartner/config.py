@@ -248,6 +248,9 @@ class AlpacaConfig(BaseModel):
     # claim 2b, S1). `alpaca_raw.daily_bars` caps a SIP request's end at now minus this;
     # 0 turns the cap off (a paid SIP subscription).
     sip_delay_minutes: int = Field(default=15, ge=0)
+    #: #3622: seconds per HTTP request of the bars, corporate-actions and assets clients
+    #: (alpaca-py sends none, so a stalled socket would hang the ingest forever).
+    data_request_timeout_seconds: float = Field(default=30.0, gt=0)
     #: #1572 (from #1550): how many XNYS sessions a daily ingest run may fetch that the
     #: store lacks before its expected session, so a day a failed run left out is caught
     #: up by the next one instead of leaving a `prices_daily` hole that empties the
