@@ -448,6 +448,7 @@ import json
 import re
 import subprocess
 import sys
+import traceback
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
@@ -1470,6 +1471,13 @@ def _describe_failure(exc: BaseException, *, scheduled: bool = False) -> str:
     return f"{_describe(exc)}\n{plain.failure_hint(exc, scheduled=scheduled)}"
 
 
+def _echo_traceback(exc: BaseException, settings: Settings) -> None:
+    """Print the scrubbed traceback of a crash to stderr, after its failure line
+    (#3621): the frames, the chain of causes and contexts, and any notes; source
+    lines of code, never locals. Crash sites only; a refusal prints no traceback."""
+    typer.echo(_scrubbed("".join(traceback.format_exception(exc)), settings), err=True)
+
+
 def _echo_scrubbed(text: str, settings: Settings) -> None:
     """Print `text` through the `cli_record` fixture scrub (every lab command's output)."""
     typer.echo(_scrubbed(text, settings))
@@ -2166,7 +2174,9 @@ def _paper_call[T](settings: Settings, call: Callable[[], T]) -> T:
     except window.KillWriteFailed as exc:
         message, code = f"failed: {exc}", WRITE_FAILED_EXIT_CODE
     except Exception as exc:
-        message, code = f"failed: {_describe_failure(exc)}", CRASH_EXIT_CODE
+        failure = _fail(_scrubbed(f"failed: {_describe_failure(exc)}", settings), CRASH_EXIT_CODE)
+        _echo_traceback(exc, settings)
+        raise failure from exc
     raise _fail(_scrubbed(message, settings), code)
 
 
@@ -6410,10 +6420,12 @@ def make_app(
                 )
             except Exception as exc:
                 heartbeat.ping(s, "paper", ok=False)
-                raise _fail(
+                failure = _fail(
                     _scrubbed(f"paper run: failed: {_describe_failure(exc, scheduled=True)}", s),
                     CRASH_EXIT_CODE,
-                ) from exc
+                )
+                _echo_traceback(exc, s)
+                raise failure from exc
             for entry in runs:
                 # The line before books for `paper.book_id` alone; any other book is named.
                 alone = len(runs) == 1 and entry.book_id == s.paper.book_id
@@ -6428,6 +6440,8 @@ def make_app(
                     else:
                         detail = f"failed: {_describe_failure(entry.error, scheduled=True)}"
                     typer.echo(_scrubbed(f"{prefix}: {detail}", s), err=True)
+                    if not isinstance(entry.error, SystemExit):
+                        _echo_traceback(entry.error, s)
                     continue
                 _run_lines(prefix, entry.outcome, s)
             codes = [entry.exit_code for entry in runs]
@@ -6448,10 +6462,12 @@ def make_app(
             raise
         except Exception as exc:
             heartbeat.ping(s, "paper", ok=False)
-            raise _fail(
+            failure = _fail(
                 _scrubbed(f"paper run: failed: {_describe_failure(exc, scheduled=True)}", s),
                 CRASH_EXIT_CODE,
-            ) from exc
+            )
+            _echo_traceback(exc, s)
+            raise failure from exc
         _run_lines("paper run", outcome, s)
         if not outcome.healthy:
             # A `--book` run only ever turns the check red: it cannot see the other
