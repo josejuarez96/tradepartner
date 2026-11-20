@@ -34,6 +34,7 @@ dev = [
     "bt==1.2.3",
     "pytest-xdist>=3.8.0",
     "pytest-timeout>=2.4.0",
+    "pytest-cov>=7.0",
 ]
 
 [build-system]
@@ -58,6 +59,21 @@ files = ["src"]
 [[tool.mypy.overrides]]
 module = ["exchange_calendars.*", "pyarrow.*", "empyrical.*"]
 ignore_missing_imports = true
+
+# #3650: the weekly coverage run (.github/workflows/coverage.yml) measures the package's
+# branches. Deliberately no `--cov` in pytest's addopts: a normal `uv run pytest` and CI
+# stay uninstrumented. `parallel` and `relative_files` let the ten shards' data files
+# (written on different runners) combine into one report.
+[tool.coverage.run]
+branch = true
+source = ["src/tradepartner"]
+relative_files = true
+parallel = true
+patch = ["subprocess"]   # the CLI child-process tests (65 subprocess calls in tests/)
+
+[tool.coverage.report]
+show_missing = false
+skip_empty = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

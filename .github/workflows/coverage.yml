@@ -1,0 +1,108 @@
+name: Coverage
+
+# Weekly branch coverage of src/tradepartner on main (#3650): which code the suite
+# executes, per package, in the job summary. It is a number to read, not a gate: no
+# threshold, no status on any PR, nothing here fails on a low figure. It starts only on
+# the schedule below (the default branch) or by hand (Actions, "Coverage", "Run
+# workflow"), so the per-PR CI in ci.yml stays uninstrumented and no faster or slower.
+# Cost: 10 runners for roughly 25-40 minutes each per run; change the cron to monthly if
+# that is too much.
+on:
+  schedule:
+    - cron: '17 6 * * 0'  # Sundays 06:17 UTC
+  workflow_dispatch:
+
+# Read-only token for every job: the run only reads the repository. Artifacts go through
+# the runner's own artifact service, which needs no repository permission.
+permissions:
+  contents: read
+
+# One run at a time; a run in progress always completes.
+concurrency:
+  group: coverage
+  cancel-in-progress: false
+
+# Same shard count and matrix as ci.yml (tests/test_coverage_workflow.py keeps the two in
+# step): tests/conftest.py buckets the test files across this many shards.
+env:
+  PYTEST_SHARD_COUNT: 10
+
+jobs:
+  coverage-shard:
+    name: coverage-shard (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    # Instrumented code is slower than ci.yml's shards (45 min limit there).
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    env:
+      PYTEST_SHARD_INDEX: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@v4
+      # Restores the uv cache main's CI saved; never saves one itself.
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          save-cache: false
+      - name: Install
+        run: uv sync --locked
+      # `--cov` reads [tool.coverage] in pyproject.toml; pytest-cov combines the xdist
+      # workers' data itself. `--cov-report=` prints no table here (the report job does).
+      # The per-test timeout is raised for this job only. A test that fails only under
+      # instrumentation must not lose the shard's data, so the step never fails the job.
+      - name: Tests with coverage (this shard)
+        continue-on-error: true
+        run: uv run pytest -n auto --dist worksteal --cov --cov-report= -o timeout=3600
+      # pytest-cov leaves the combined `.coverage`; `--append` folds any stray suffixed file
+      # (`parallel = true`, a child process) into it instead of replacing it.
+      - name: One data file for this shard
+        run: |
+          uv run coverage combine --append --keep || true
+          mv .coverage .coverage.shard${{ matrix.shard }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.shard }}
+          path: .coverage.shard${{ matrix.shard }}
+          include-hidden-files: true
+          if-no-files-found: error
+
+  coverage-report:
+    name: coverage-report
+    needs: coverage-shard
+    # Report on whatever the shards delivered, even if some failed or timed out.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          save-cache: false
+      - name: Install
+        run: uv sync --locked
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          merge-multiple: true
+      # The summary's first line says how many shards delivered data, so a partial
+      # report is never read as the whole suite's coverage.
+      - name: Per-package coverage in the job summary
+        run: |
+          delivered=$(find . -maxdepth 1 -name '.coverage.shard*' | wc -l | tr -d ' ')
+          {
+            echo "Coverage data from ${delivered} of ${PYTEST_SHARD_COUNT} shards (branch coverage of src/tradepartner, commit ${GITHUB_SHA})."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          uv run coverage combine
+          uv run coverage json -o coverage.json
+          uv run python scripts/coverage_by_package.py coverage.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-json
+          path: coverage.json
+          if-no-files-found: error
