@@ -1513,8 +1513,11 @@ class Settings(BaseSettings):
                 )
         if env_file is not None:
             source = DotEnvSettingsSource(Settings, env_file=env_file, env_file_encoding="utf-8")
-            for name in sorted(n.upper() for n in source.env_vars):
-                if name.startswith("_"):
+            # A line with no `=` parses as a name with value None: it is not a
+            # setting, and its text may be a pasted secret, so it is never echoed.
+            # Only a plain identifier is ever named in the message.
+            for name in sorted(n.upper() for n, v in source.env_vars.items() if v is not None):
+                if name.startswith("_") or not re.fullmatch(r"[A-Z0-9_]+", name):
                     continue
                 if name in forms:
                     problems.append(

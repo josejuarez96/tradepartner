@@ -4079,3 +4079,12 @@ def test_env_example_loads_cleanly_with_every_line_uncommented(tmp_path: Path) -
     # The example's sample values need not all be valid settings; the rule under test
     # is only that no name in it is refused as misspelt.
     Settings._validate_no_misspelt_env_keys(_env_file(tmp_path, "\n".join(lines) + "\n"))
+
+
+def test_a_pasted_secret_line_without_equals_is_never_echoed(tmp_path: Path) -> None:
+    path = _env_file(tmp_path, "sk-live__abc123secret\nRISK_MAX_GROSS_EXPOSURE=0.4\n")
+    with pytest.raises(ValueError) as exc:
+        Settings(_env_file=path)
+    assert "RISK_MAX_GROSS_EXPOSURE" in str(exc.value)
+    assert "SECRET" not in str(exc.value).upper()
+    Settings(_env_file=_env_file(tmp_path, "sk-live__abc123secret\n"))
