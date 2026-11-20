@@ -463,6 +463,7 @@ _CLI_IMPORT_ROOTS = frozenset(
         "duckdb",
         "httpx",
         "json",
+        "os",  # #3652: `os.umask` in `main`, the one use
         "pathlib",
         "polars",
         "re",
