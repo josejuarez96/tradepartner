@@ -127,7 +127,10 @@ jobs:
       pull-requests: read
       checks: read
     steps:
+      # Full history: the secret scan below reads the commit range, not the tree (#3619).
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       # uv cache keyed on uv.lock (a changed lock misses it). Only main saves it: a `train/**`
       # or PR run only restores, so a batch's code cannot poison main's cache (#582).
       - uses: astral-sh/setup-uv@v6
@@ -137,8 +140,41 @@ jobs:
           save-cache: ${{ github.ref == 'refs/heads/main' }}
       - name: Install
         run: uv sync --locked
+      # #3619: every commit the run brings in is scanned, so a key added in one commit of a
+      # PR and removed in a later one is still caught. A PR scans its range over the base, a
+      # `train/**` push its range over main, a push to main the full history. The binary is
+      # pinned by version and SHA-256 (a changed download fails the step), kept in
+      # $RUNNER_TEMP and never run from the checkout. `--redact` keeps finding text out of
+      # the log. gitleaks exits 1 on a finding, which fails the job. No expression is
+      # interpolated into the script: event values arrive through `env:`.
+      - name: Secret scan (gitleaks, commit range)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          tarball=gitleaks_8.21.2_linux_x64.tar.gz
+          mkdir -p "$RUNNER_TEMP/gitleaks-bin"
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$RUNNER_TEMP/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/$tarball"
+          (cd "$RUNNER_TEMP" && echo "5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba  $tarball" | sha256sum --check)
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/gitleaks-bin" gitleaks
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            "$RUNNER_TEMP/gitleaks-bin"/gitleaks git --redact --no-banner --log-opts="origin/${BASE_REF}..HEAD" .
+          elif [ "$EVENT_NAME" = "push" ] && [ "$REF" = "refs/heads/main" ]; then
+            "$RUNNER_TEMP/gitleaks-bin"/gitleaks git --redact --no-banner .
+          elif [ "$EVENT_NAME" = "push" ]; then
+            "$RUNNER_TEMP/gitleaks-bin"/gitleaks git --redact --no-banner --log-opts="origin/main..HEAD" .
+          else
+            echo "Secret scan: no commit range is defined for event '$EVENT_NAME'" >&2
+            exit 1
+          fi
+      # `gitleaks` is skipped here: the hook scans staged changes only, which a CI checkout
+      # never has, and the step above replaces it in CI (#3619).
       - name: Hygiene (pre-commit hooks)
-        run: SKIP=no-commit-to-branch,ruff-check,ruff-format uv run pre-commit run --all-files
+        run: SKIP=no-commit-to-branch,gitleaks,ruff-check,ruff-format uv run pre-commit run --all-files
       - name: Fragments (STATUS/CHANGELOG entries are well-formed files)
         run: python3 scripts/fragments.py check
       - name: Lint
