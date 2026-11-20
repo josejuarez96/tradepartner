@@ -3004,6 +3004,15 @@ def test_openfigi_defaults_are_disabled_and_bounded() -> None:
     assert OpenfigiConfig(jobs_per_request=100).limits(keyed=False)[2] == 5
 
 
+def test_paper_max_fault_note_chars_default_and_bound() -> None:
+    """#3635: a fault note keeps at most 300 characters of the message by default;
+    the bound is positive and is not frozen at `paper start`."""
+    assert Settings(_env_file=None).paper.max_fault_note_chars == 300
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, paper={"max_fault_note_chars": 0})
+    assert "max_fault_note_chars" not in FROZEN_PAPER_KEYS
+
+
 def test_the_free_disk_floor_is_a_run_time_key_that_cannot_be_negative() -> None:
     """#1758: `paper.min_free_disk_gb` defaults above zero, 0 turns it off, a
     negative value is refused, and it is not frozen at `paper start`."""
