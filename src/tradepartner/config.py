@@ -40,6 +40,7 @@ from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 from typing import Any, Literal, get_args
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
@@ -1165,6 +1166,39 @@ _DEFAULT_EIGHTK_ITEMS = ("3.01", "2.01", "1.03", "5.01", "3.03", "1.01", "8.01")
 _EIGHTK_ITEM = re.compile(r"\d\.\d\d")
 
 
+# Fixed on purpose, not settings: a model key is only ever sent to its vendor
+# (ADR 0013 point 3 (c)), so one wrong or planted env line cannot redirect the key
+# and the filing packets to another server (#3654).
+_LABELING_API_HOSTS = frozenset({"api.typesafe.ai"})
+_CLAUDE_API_HOSTS = frozenset({"api.anthropic.com"})
+
+
+def _require_vendor_url(value: str, hosts: frozenset[str], key: str) -> str:
+    """`value` if it is an https URL of one of `hosts` with no userinfo and no port
+    but 443; `ValueError` naming `key` and the allowed host, never the value."""
+    if not value.startswith("https://"):
+        raise ValueError(f"{key} must be an https URL")
+    try:
+        parts = urlsplit(value)
+        port = parts.port
+    except ValueError:
+        parts, port = None, None
+    if (
+        parts is None
+        or parts.scheme != "https"
+        or (parts.hostname or "").lower() not in hosts
+        or parts.username is not None
+        or parts.password is not None
+        or port not in (None, 443)
+    ):
+        allowed = " or ".join(sorted(hosts))
+        raise ValueError(
+            f"{key} must be an https URL on host {allowed}, with no user name, "
+            "password or other port"
+        )
+    return value
+
+
 class ResearchLabelingConfig(BaseModel):
     """Research labeling, pilot A (docs/specs/research-labeling.md req 7 and the
     amendment 2026-10-06's config table, which drops `estimate_margin` and
@@ -1201,9 +1235,7 @@ class ResearchLabelingConfig(BaseModel):
     @field_validator("api_base_url")
     @classmethod
     def _validate_api_base_url(cls, value: str) -> str:
-        if not value.startswith("https://"):
-            raise ValueError("research.labeling.api_base_url must be an https URL")
-        return value
+        return _require_vendor_url(value, _LABELING_API_HOSTS, "research.labeling.api_base_url")
 
     @field_validator("eightk_items")
     @classmethod
@@ -1239,9 +1271,7 @@ class ResearchClaudeConfig(BaseModel):
     @field_validator("api_base_url")
     @classmethod
     def _validate_api_base_url(cls, value: str) -> str:
-        if not value.startswith("https://"):
-            raise ValueError("research.claude.api_base_url must be an https URL")
-        return value
+        return _require_vendor_url(value, _CLAUDE_API_HOSTS, "research.claude.api_base_url")
 
 
 class ResearchConfig(BaseModel):
