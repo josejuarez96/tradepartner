@@ -181,7 +181,6 @@ from tradepartner.backtest.schedule import (
     read_time,
     rebalance_sessions,
 )
-from tradepartner.backtest.signals import anchor_sessions
 from tradepartner.backtest.strategies import signal_for
 from tradepartner.backtest.valuation import (
     StepFrame,
@@ -2390,19 +2389,16 @@ def _marking_bound(
     stale = sessions[max(0, at - settings.backtest.stale_exit_sessions)]
     bounds = [stale, plan.session]
     bounds.extend(variant.last_stitched[sid] for sid in marked if sid in variant.last_stitched)
-    if family in ("momentum", "combined"):
-        anchors: dict[date, date] = {}
+    anchor = signal_for(family).marking_anchor
+    anchors: dict[date, date] = {}
 
-        def formation(session: date) -> date:
-            if session not in anchors:
-                anchors[session] = anchor_sessions(
-                    session,
-                    settings.strategy.formation_months,
-                    settings.strategy.skip_months,
-                    settings.schedule.signal_anchor,
-                )[0]
-            return anchors[session]
+    def formation(session: date) -> date:
+        assert anchor is not None
+        if session not in anchors:
+            anchors[session] = anchor(settings, session)
+        return anchors[session]
 
+    if anchor is not None:
         bounds.append(formation(plan.session))
     for book in variant.books:
         bounds.extend(book.marked_at.values())
@@ -2412,7 +2408,7 @@ def _marking_bound(
             for holding in book.benchmarks.values()
             if holding.marked_at is not None
         )
-        if family in ("momentum", "combined") and book.held_since:
+        if anchor is not None and book.held_since:
             bounds.append(formation(min(book.held_since.values())))
     return min(bounds)
 
