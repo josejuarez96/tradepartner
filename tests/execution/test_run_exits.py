@@ -316,7 +316,7 @@ def test_an_exit_journaled_as_the_window_closes_waits_for_the_next_run(
 
     def slow(context: run_module.StepContext, **kwargs: object) -> object:
         handed = original(context, **kwargs)  # type: ignore[arg-type]
-        _start, end = run_module.submit_window(env.settings, MAY_3)
+        _start, end = run_module.submit_window(env.settings, MAY_3, env.settings.paper.book_id)
         env.clock.now = end + timedelta(seconds=1)
         return handed
 
