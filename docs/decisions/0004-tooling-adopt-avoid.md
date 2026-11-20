@@ -92,7 +92,7 @@ Phase 3 plan task T30 ([issue #116](https://github.com/josejuarez96/tradepartner
 
 ## Amendment 2026-11-20 (#3686): the engine was extended for shorts
 
-One dated note, asked for by the [backtest spec](../specs/backtest.md)'s open question 24 and its amendment #1872, item 9. It is recorded by the owner's merge of the PR that amends [ADR 0005](0005-objective-benchmark-stop-criteria.md#amendment-2026-11-20-the-yardstick-is-the-net-matched-blend-3686) (decision 8 there).
+One dated note, asked for by the [backtest spec](../specs/backtest.md)'s open question 24 and its amendment #1872, item 9. It is recorded by the owner's merge of the PR that amends [ADR 0005](0005-objective-benchmark-stop-criteria.md#amendment-2026-11-20-the-yardstick-is-the-net-matched-blend-3686) (decision 7 there).
 
 The Consequences above say that if the strategy later needs shorting, "that engine will not be enough and this ADR should be superseded". [ADR 0024](0024-lift-long-only-and-top-1000.md) lifted long-only on 2026-10-19. The engine was then **extended for signed books, not replaced** (backtest plan T219 to T224). The oracle test gained a long/short case: zero costs, fractional shares, gross 1.0, net 0.0, the same lagged signal and the same adjusted frame. Our engine and `bt` agree on equity within the existing tolerance of 1e-9 (`tests/oracle/test_bt_oracle.py`, `test_bt_and_engine_agree_on_a_long_short_book`), and a one-session lag in `bt` fails the comparison. Both tests pass on main at 0c4d7f9f (run 2026-11-20).
 
