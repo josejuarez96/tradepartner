@@ -90,6 +90,7 @@ from tradepartner.execution.lots import (
 from tradepartner.execution.marks import equity_at
 from tradepartner.store import journal
 from tradepartner.store.journal import (
+    TERMINAL_ORDER_STATUSES,
     DecisionRow,
     DisposalRow,
     LotRow,
@@ -100,6 +101,7 @@ from tradepartner.store.journal import (
     PositionDailyRow,
     WashSaleFlagRow,
 )
+from tradepartner.store.journal_enums import OrderEventStatus
 from tradepartner.store.schema import atomic
 
 PriceOf = Callable[[str, date], float | None]
@@ -119,8 +121,7 @@ def filled_outcome_kind(side: str, position_side: str) -> str:
     raise ValueError(f"unknown position intent: {side}/{position_side}")
 
 
-_TERMINAL = frozenset({"filled", "expired", "rejected", "cancelled"})
-_FILLED = "filled"
+_FILLED = OrderEventStatus.FILLED
 _EXIT = "exit"
 _BUY = "buy"
 _SELL = "sell"
@@ -323,7 +324,7 @@ def _price(value: float | None, what: str) -> float | None:
 def _terminal_status(events: Iterable[OrderEventRow]) -> dict[str, str]:
     status: dict[str, str] = {}
     for event in sorted(events, key=lambda e: (e.known_at, e.ingested_at)):
-        if event.status in _TERMINAL:
+        if event.status in TERMINAL_ORDER_STATUSES:
             status.setdefault(event.client_order_id, event.status)
     return status
 

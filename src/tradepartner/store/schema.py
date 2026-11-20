@@ -716,6 +716,7 @@ from typing import Final, TypedDict
 import duckdb
 
 from tradepartner.store.db import configure_connection, forget_column_types, utc_now
+from tradepartner.store.journal_enums import DecisionEventStatus, DecisionKind, OrderEventStatus
 
 _log = logging.getLogger(__name__)
 
@@ -2455,39 +2456,14 @@ JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
     ),
     ("decisions", "side"): SIDES,
     ("decisions", "position_side"): POSITION_SIDES,
-    ("decisions", "decision"): (
-        "trade",
-        "skip_below_minimum",
-        "skip_untradable",
-        "skip_below_one_share",
-        "skip_delisted",
-        "skip_zero",
-        "dust",
-        "override",
-        "forced_exit",
-        "skip_not_borrowable",
-        "skip_short_price",
-        SKIP_RESTRICTED_REASON,
-    ),
+    ("decisions", "decision"): tuple(member.value for member in DecisionKind),
     ("decisions", "reason"): DECISION_REASONS,
-    ("decision_events", "status"): ("skipped", "written_off"),
+    ("decision_events", "status"): tuple(member.value for member in DecisionEventStatus),
     ("decision_events", "reason"): DECISION_EVENT_REASONS,
     ("orders", "phase"): ("sell", "buy", "exit"),
     ("orders", "side"): SIDES,
     ("orders", "position_side"): POSITION_SIDES,
-    ("order_events", "status"): (
-        "pending",
-        "accepted",
-        "replay",
-        "cancel_requested",
-        "cancel_noop",
-        "cancel_failed",
-        "filled",
-        "expired",
-        "rejected",
-        "cancelled",
-        "pending_unresolved",
-    ),
+    ("order_events", "status"): tuple(member.value for member in OrderEventStatus),
     ("order_events", "reason"): ORDER_EVENT_REASONS,
     ("fills", "source"): ("broker_feed", "broker_status"),
     ("fill_cursors", "writer_kind"): ("run", "resume"),
