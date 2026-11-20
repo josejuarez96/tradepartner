@@ -258,3 +258,35 @@ def test_checks_fast_scans_the_commit_range_for_secrets() -> None:
         "run: SKIP=no-commit-to-branch,gitleaks,ruff-check,ruff-format "
         "uv run pre-commit run --all-files"
     ], hygiene
+
+
+WORKFLOWS = CI.parent
+DEPENDABOT = CI.parents[1] / "dependabot.yml"
+AUDIT = WORKFLOWS / "audit.yml"
+
+
+def test_every_job_has_a_timeout() -> None:
+    """#3649: a hung step fails at the job's own limit, not at GitHub's 6 hours, which
+    would hold a runner and block the merge train. The weekly audit job has one too."""
+    text = CI.read_text()
+    jobs = {
+        "scope": _job("scope", "checks-fast"),
+        "checks-fast": _job("checks-fast", "pytest-shard"),
+        "pytest-shard": _job("pytest-shard", "checks"),
+        "checks": _job("checks", "claims"),
+        "claims": text[text.index("\n  claims:\n") :],
+    }
+    missing = [name for name, body in jobs.items() if "timeout-minutes:" not in body]
+    assert not missing, missing
+    assert "timeout-minutes:" in AUDIT.read_text()
+
+
+def test_dependabot_covers_actions_and_uv_weekly_with_a_pr_limit() -> None:
+    """#3649: the actions and the locked packages get one grouped update PR a week each."""
+    assert DEPENDABOT.is_file(), DEPENDABOT
+    text = DEPENDABOT.read_text()
+    assert 'package-ecosystem: "github-actions"' in text
+    assert 'package-ecosystem: "uv"' in text
+    assert text.count('interval: "weekly"') == 2
+    assert text.count("open-pull-requests-limit: 2") == 2
+    assert text.count("groups:") == 2

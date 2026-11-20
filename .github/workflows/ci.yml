@@ -56,6 +56,8 @@ jobs:
   scope:
     if: ${{ !(github.event.action == 'labeled' && github.event.label.name != 'ci:full') }}
     runs-on: ubuntu-latest
+    # #3649: every job is time-boxed, so a hung step fails here, not at GitHub's 6 hours.
+    timeout-minutes: 10
     # Read-only, as checks-fast: `pull-requests` and `checks` (read) let main's tested-tree
     # lookup find the merged PR and its head's check runs (#1192).
     permissions:
@@ -118,6 +120,7 @@ jobs:
   checks-fast:
     if: ${{ !(github.event.action == 'labeled' && github.event.label.name != 'ci:full') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Read-only: a `train/**` push runs batch code with the repository's token, and this job
     # only reads (merge-train spec, CI amendment; req 1 (0) is the first line of defence).
     # `pull-requests` and `checks` (read) let main's tested-tree lookup find the merged PR
@@ -231,6 +234,7 @@ jobs:
     needs: [scope, checks-fast, pytest-shard]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
@@ -272,6 +276,7 @@ jobs:
     # stand in for a real failure on the same head (safety-reviewer, #1753).
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: read
