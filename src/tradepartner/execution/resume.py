@@ -195,6 +195,7 @@ from tradepartner.execution.reconcile_run import (
     command_session,
     confirmed_broker_ids,
     earliest_pending_known_at,
+    fill_read_overlap,
     frozen_risk,
     not_closed_not_received,
     read_confirmed,
@@ -394,6 +395,7 @@ def _settle(
     pending: Sequence[OrderRow],
     clock: Callable[[], datetime],
     stamps: _MonotonicStamps,
+    settings: Settings | None = None,
 ) -> tuple[tuple[str, str], ...]:
     """Acknowledge each `pending` order the broker knows, or cancel it
     `not_received` (module docstring, step 4). An order whose submit reply was
@@ -420,7 +422,9 @@ def _settle(
                 # coid lookup (#3575), so it closes only when absent everywhere.
                 if elsewhere is None:
                     elsewhere = seen_elsewhere(
-                        broker, pending, earliest_pending_known_at(connect, pending)
+                        broker,
+                        pending,
+                        earliest_pending_known_at(connect, pending, fill_read_overlap(settings)),
                     )
                 if coid in elsewhere:
                     raise not_closed_not_received(coid) from None
@@ -819,7 +823,7 @@ def resume(
                     crashed_runs=crashed,
                 )
             acceptance = FillMismatchAcceptance(resume_id, named)
-        settled = _settle(broker, connect, pending, clock, stamps)
+        settled = _settle(broker, connect, pending, clock, stamps, settings)
         session = command_session(now)
         cut = session_close(previous_session(session))
         with connect() as conn:
