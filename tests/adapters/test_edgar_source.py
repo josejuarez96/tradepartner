@@ -4207,6 +4207,66 @@ def test_released_repair_index_frees_the_store_and_reopens_for_the_write(
     source.close()
 
 
+def _repair_index_source(tmp_path: Path) -> tuple[Settings, EdgarFilingSource]:
+    """A seeded store with one listing and a `prefer_stored_index` source."""
+    settings = _seeded_store_settings(tmp_path, CLOCK)
+    conn = duckdb.connect(settings.store.path)
+    stored_index.insert_listings(
+        conn,
+        [
+            stored_index.Listing(
+                APPLE,
+                "0000320193-26-000151",
+                "10-K",
+                "Apple",
+                date(2026, 9, 24),
+                CLOCK - timedelta(days=1),
+                date(2026, 9, 24),
+                True,
+            ),
+        ],
+        CLOCK,
+    )
+    conn.close()
+    return settings, EdgarFilingSource(settings, clock=lambda: CLOCK, prefer_stored_index=True)
+
+
+def test_repair_index_handle_does_not_lock_out_readers_during_the_fetch_pass(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#3626: the repair's stored-index handle is read-only for the fetch
+    pass, so a read-only open (the dashboard, `paper run`, the dry run)
+    succeeds while the handle is still held."""
+    from tradepartner.store.db import open_read_only
+
+    settings, source = _repair_index_source(tmp_path)
+    monkeypatch.setattr(source, "_rows", lambda *_args: pytest.fail("quarter walk"))
+    try:
+        assert [entry.accession for entry in source.filing_index()] == ["0000320193-26-000151"]
+        assert source._owned_index_conn is not None  # the handle is still held
+        with open_read_only(settings) as read:
+            assert read.execute("SELECT count(*) FROM ingestion_runs").fetchone() == (1,)
+    finally:
+        source.close()
+
+
+def test_repair_index_first_open_inside_a_write_chunk_falls_back_to_the_writers_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#3626: a first open made while this process already holds the store
+    read-write (inside a write chunk) takes the writer's mode, not a
+    `StoreLockedError`; the process already holds the lock."""
+    from tradepartner.store.db import open_for_write
+
+    settings, source = _repair_index_source(tmp_path)
+    monkeypatch.setattr(source, "_rows", lambda *_args: pytest.fail("quarter walk"))
+    try:
+        with open_for_write(settings):
+            assert [entry.accession for entry in source.filing_index()] == ["0000320193-26-000151"]
+    finally:
+        source.close()
+
+
 def test_pending_settle_check_uses_first_known_filed_on_quarter(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
