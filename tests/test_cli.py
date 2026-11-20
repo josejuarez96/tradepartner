@@ -54,7 +54,28 @@ def _settings(tmp_path: Path, store: Path | None = None, **overrides: Any) -> Se
     return settings.model_copy(update={"edgar": fast})
 
 
+def _seed_fresh_sources(settings: Settings, clock: Any) -> None:
+    """Give a store with no `ok` EDGAR or FRED run one finished before `clock()`, so
+    `health --check` is not failing on the source staleness (#3553) these tests are not about."""
+    now = clock()
+    with open_for_write(settings) as conn:
+        for source in ("edgar", "fred"):
+            have = conn.execute(
+                "SELECT count(*) FROM ingestion_runs WHERE source = ? AND status = 'ok' "
+                "AND mode = 'session'",
+                [source],
+            ).fetchone()
+            if have is None or have[0]:
+                continue
+            conn.execute(
+                "INSERT INTO ingestion_runs VALUES (?, ?, ?, 'ok', ?, 'session', 0, NULL, NULL)",
+                [f"seed-{source}", now - timedelta(hours=3), now - timedelta(hours=2), source],
+            )
+
+
 def _invoke(settings: Settings, args: Sequence[str], **kwargs: Any) -> Any:  # click.testing.Result
+    if args[:1] == ["health"] and "--check" in args and Path(settings.store.path).exists():
+        _seed_fresh_sources(settings, kwargs.get("clock", lambda: NOW))
     app = cli.make_app(settings=lambda: settings, clock=kwargs.pop("clock", lambda: NOW), **kwargs)
     return CliRunner().invoke(app, list(args))
 
