@@ -513,7 +513,7 @@ from tradepartner.backtest.metrics import METRIC_KEYS
 from tradepartner.backtest.run import RunOutcome, run_hypothesis
 from tradepartner.calendar import is_session as _is_session
 from tradepartner.calendar import session_close as _session_close
-from tradepartner.cli_record import _configured_secrets, scrub_text
+from tradepartner.cli_record import SCRUBBED, _configured_secrets, scrub_text
 from tradepartner.close_gap import close_gaps
 from tradepartner.config import Cadence, Settings, clean_message, get_settings
 from tradepartner.corpus import departure_fetch
@@ -1485,8 +1485,21 @@ def _describe_failure(exc: BaseException, *, scheduled: bool = False) -> str:
 def _echo_traceback(exc: BaseException, settings: Settings) -> None:
     """Print the scrubbed traceback of a crash to stderr, after its failure line
     (#3621): the frames, the chain of causes and contexts, and any notes; source
-    lines of code, never locals. Crash sites only; a refusal prints no traceback."""
-    typer.echo(_scrubbed("".join(traceback.format_exception(exc)), settings), err=True)
+    lines of code, never locals. Crash sites only; a refusal prints no traceback.
+
+    A traceback prints `repr()` text and every chained cause, so on top of the
+    `cli_record` scrub each configured secret is also masked in any case and in
+    its repr-escaped form, as the Alerter does for a delivery error."""
+    text = _scrubbed("".join(traceback.format_exception(exc)), settings)
+    forms = {
+        form
+        for secret in _configured_secrets(settings)
+        for form in (secret, repr(secret)[1:-1])
+        if form
+    }
+    for form in sorted(forms, key=len, reverse=True):
+        text = re.sub(re.escape(form), SCRUBBED, text, flags=re.IGNORECASE)
+    typer.echo(text, err=True)
 
 
 def _echo_scrubbed(text: str, settings: Settings) -> None:

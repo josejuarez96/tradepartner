@@ -1271,6 +1271,28 @@ def test_a_crash_prints_its_scrubbed_traceback_on_stderr(clock: _Clock) -> None:
         assert scrub_text(result.output, secrets=[ALPACA_KEY, ALPACA_SECRET])[1] == 0, args
 
 
+def test_the_traceback_scrub_covers_a_secret_in_any_case_and_repr_escaped(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A traceback prints `repr()` text and every chained cause, so the exact-match
+    scrub is not enough: a secret holding a quote or a backslash is printed escaped,
+    and a library may change its case (safety review of #3621)."""
+    secret = "we'ird\\Secret-" + "v" * 12
+    settings = Settings(_env_file=None, alpaca_api_key=ALPACA_KEY, alpaca_api_secret=secret)
+    try:
+        try:
+            raise ValueError(("login refused", secret))  # the tuple prints the secret's repr
+        except ValueError as inner:
+            raise RuntimeError(f"auth header {secret.upper()}") from inner
+    except RuntimeError as exc:
+        cli._echo_traceback(exc, settings)
+    err = capsys.readouterr().err
+    assert "Traceback (most recent call last)" in err
+    assert "login refused" in err and "auth header" in err
+    for form in (secret, repr(secret)[1:-1], secret.upper()):
+        assert form.lower() not in err.lower(), form
+
+
 def test_a_refusal_prints_no_traceback(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
 ) -> None:
