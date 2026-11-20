@@ -194,9 +194,13 @@ from tradepartner.execution.reconcile_run import (
     StatedBeforeTrueUp,
     command_session,
     confirmed_broker_ids,
+    earliest_pending_known_at,
+    fill_read_overlap,
     frozen_risk,
+    not_closed_not_received,
     read_confirmed,
     reconcile_now,
+    seen_elsewhere,
     verify_frozen_sha256,
 )
 from tradepartner.execution.risk import order_shape_violation
@@ -391,6 +395,7 @@ def _settle(
     pending: Sequence[OrderRow],
     clock: Callable[[], datetime],
     stamps: _MonotonicStamps,
+    settings: Settings | None = None,
 ) -> tuple[tuple[str, str], ...]:
     """Acknowledge each `pending` order the broker knows, or cancel it
     `not_received` (module docstring, step 4). An order whose submit reply was
@@ -402,6 +407,7 @@ def _settle(
     settled: list[tuple[str, str]] = []
     readings: dict[str, Order | None] = {}
     confirmed = confirmed_broker_ids(connect, pending)
+    elsewhere: set[str] | None = None
     for order in pending:
         coid = order.client_order_id
         try:
@@ -409,7 +415,20 @@ def _settle(
         except UnknownOrderError:
             broker_id = confirmed.get(coid)
             # The submit reply confirmed it (#3335): never closed `not_received`.
-            readings[coid] = None if broker_id is None else read_confirmed(broker, coid, broker_id)
+            if broker_id is not None:
+                readings[coid] = read_confirmed(broker, coid, broker_id)
+            else:
+                # No confirmation: the order may still be live behind a lagging
+                # coid lookup (#3575), so it closes only when absent everywhere.
+                if elsewhere is None:
+                    elsewhere = seen_elsewhere(
+                        broker,
+                        pending,
+                        earliest_pending_known_at(connect, pending, fill_read_overlap(settings)),
+                    )
+                if coid in elsewhere:
+                    raise not_closed_not_received(coid) from None
+                readings[coid] = None
         reading = readings[coid]
         if reading is not None and (violation := order_shape_violation(reading)) is not None:
             raise ReconciliationError(
@@ -804,7 +823,7 @@ def resume(
                     crashed_runs=crashed,
                 )
             acceptance = FillMismatchAcceptance(resume_id, named)
-        settled = _settle(broker, connect, pending, clock, stamps)
+        settled = _settle(broker, connect, pending, clock, stamps, settings)
         session = command_session(now)
         cut = session_close(previous_session(session))
         with connect() as conn:
