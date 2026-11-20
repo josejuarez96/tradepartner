@@ -46,6 +46,10 @@ def _handle() -> registry.TrialHandle:
         started_at=datetime(2024, 6, 1, tzinfo=UTC),
         store_max_ingested_at=None,
         database=None,
+        start_session=date(2000, 1, 1),
+        end_session=date(2000, 1, 1),
+        data_cutoff=None,
+        holdout_start=date(2999, 1, 1),
     )
 
 

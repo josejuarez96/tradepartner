@@ -42,6 +42,8 @@ from tradepartner.calendar import previous_session
 from tradepartner.config import Cadence, Settings
 from tradepartner.store import registry
 
+pytestmark = pytest.mark.usefixtures("unbound_handles")
+
 COST_LEVELS = (0.0, 15.0)
 EXTRA_REBALANCES = 5
 WINDOW_START = date(2018, 12, 31)

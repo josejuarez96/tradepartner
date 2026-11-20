@@ -33,6 +33,8 @@ from tradepartner.backtest.schedule import read_time, rebalance_sessions
 from tradepartner.calendar import session_close
 from tradepartner.config import Cadence, Settings
 
+pytestmark = pytest.mark.usefixtures("unbound_handles")
+
 #: When a planted fact becomes known: an hour after close(R_i), inside (t', t].
 AFTER_READ = timedelta(hours=1)
 PLAN_ONLY = ("universe", "survivorship_gap", "static_listing_count")

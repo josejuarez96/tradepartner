@@ -37,6 +37,8 @@ from tradepartner.backtest.portfolio import buffered_targets
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
 from tradepartner.calendar import last_session_of_month
 
+pytestmark = pytest.mark.usefixtures("unbound_handles")
+
 T0, T1, T2, T3 = hand.T0, hand.T1, hand.T2, hand.T3
 JAN_2023 = last_session_of_month(2023, 1)
 DEC_2022 = last_session_of_month(2022, 12)

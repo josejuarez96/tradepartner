@@ -255,13 +255,17 @@ class TrialHandle:
     """Proof that a `trials` row exists. Built only by `open_trial`."""
 
     __slots__ = (
+        "data_cutoff",
         "data_vintage",
         "database",
         "detail_level",
+        "end_session",
         "family",
+        "holdout_start",
         "hypothesis_id",
         "kind",
         "params_sha256",
+        "start_session",
         "started_at",
         "store_max_ingested_at",
         "synthetic",
@@ -279,6 +283,12 @@ class TrialHandle:
     detail_level: DetailLevel
     data_vintage: datetime | None
     database: str | None
+    #: The window, cutoff and holdout bound the `trials` row records (#3533): a run is
+    #: bound to them, so one handle proves this computation is that trial.
+    start_session: date
+    end_session: date
+    data_cutoff: datetime | None
+    holdout_start: date
 
     def __init__(self) -> None:
         raise TypeError("a TrialHandle is issued only by registry.open_trial")
@@ -290,7 +300,15 @@ class TrialHandle:
         return f"TrialHandle(trial_id={self.trial_id}, family={self.family!r}, kind={self.kind!r})"
 
 
+_HANDLE_FIELDS = frozenset(
+    name for name in TrialHandle.__slots__ if name not in {"data_vintage", "database"}
+)
+
+
 def _issue_handle(**values: Any) -> TrialHandle:
+    missing = sorted(_HANDLE_FIELDS - values.keys() - {"detail_level", "store_max_ingested_at"})
+    if missing:
+        raise TypeError(f"a TrialHandle needs {missing}")
     handle = object.__new__(TrialHandle)
     for name, value in values.items():
         object.__setattr__(handle, name, value)
@@ -1105,6 +1123,10 @@ def open_trial(
         detail_level=detail_level,
         data_vintage=vintage,
         database=_database_path(conn),
+        start_session=start_session,
+        end_session=end_session,
+        data_cutoff=data_cutoff,
+        holdout_start=hypothesis.holdout_start,
     )
 
 
