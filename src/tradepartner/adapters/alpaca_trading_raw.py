@@ -45,8 +45,8 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, PositionIntent, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, OrderRequest
 from pydantic import SecretStr
-from requests.adapters import HTTPAdapter
 
+from tradepartner.adapters.alpaca_raw import TimeoutAdapter as _TimeoutAdapter
 from tradepartner.config import MAIN_BOOK_ID, Settings, get_settings, paper_key_variable_names
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -122,21 +122,6 @@ class TradingClientLike(Protocol):
     def get_asset(self, symbol_or_asset_id: str) -> Any: ...
 
     def get(self, path: str, data: dict[str, Any] | str | None = None) -> Any: ...
-
-
-class _TimeoutAdapter(HTTPAdapter):
-    """An `HTTPAdapter` that applies `timeout` to every request sent without one;
-    the SDK's session passes none, so without this a request could hang forever."""
-
-    def __init__(self, timeout: float) -> None:
-        super().__init__()
-        self.timeout = timeout
-
-    def send(self, request: requests.PreparedRequest, **kwargs: Any) -> requests.Response:  # type: ignore[override]
-        """Send with the configured timeout unless the caller set one."""
-        if kwargs.get("timeout") is None:
-            kwargs["timeout"] = self.timeout
-        return super().send(request, **kwargs)
 
 
 def _non_blank(secret: SecretStr | None) -> str | None:
