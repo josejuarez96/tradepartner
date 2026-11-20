@@ -1814,3 +1814,52 @@ unblocks = ["spec:idea-pipeline"]
 what = "Identity repairs keep source observations: a moved-out bar, action or master row is retracted (kept, with reason, release and rule, reversible row by row), every release runs a coverage check, and an independent answer key of about 20 cited security histories judges the resolver."
 why = "The sitting rehearsal deleted 26,889 bar keys on 81 securities that no id receives (APA, MAR, BATRA/K, LLYVA/K) on a ruling that the deleted bars themselves would have contradicted, and Alpaca bars are not in the raw archive (#3275, #3264)."
 unblocks = ["task:T389", "task:T394", "issue:3275"]
+
+[plan.technical-hardening]
+what = "The technical review of 2026-11-20 turned into work: 48 issues that the functional review (#3523) did not cover, eleven of them size-M tasks (T436 to T446), in seven lanes from fixes for the scheduled runs to verbatim splits of the largest modules."
+why = "The safety-critical parts are sound but four files of 5,000 to 8,700 lines, no layering and a 394-CPU-minute suite make every change slower and riskier; this orders the repair so ratchets land before refactors."
+
+[task.T436]
+what = "One contract test suite that runs the same cases against the fake broker and the real Alpaca adapter."
+why = "Nearly every execution test runs on the fake; if it drifts from the real adapter, paper and later live orders behave in ways no test saw."
+unblocks = ["issue:2124"]
+
+[task.T437]
+what = "Ruff starts failing new blind excepts, prints in src and oversized functions; today's 138 offenders are marked and left."
+why = "Nothing stops the largest functions growing; a ratchet holds new code to a limit without a refactor first."
+
+[task.T438]
+what = "A dated run log file: every line with UTC time, command, book and run id, secrets filtered out."
+why = "A failed scheduled run leaves only database rows and an untimed launchd file, so its cause is hard to find the next morning."
+
+[task.T439]
+what = "A public failure-reporting interface on the EDGAR source replaces ingest.py reaching into its private state, with a test capping what is left."
+why = "The fixture sources skip those private paths silently, so tests pass on behaviour the real source does not have."
+
+[task.T440]
+what = "The store's migrations become one ordered list, and migrating is a parameter instead of a module global."
+why = "Each schema version is edited in five places today; one list makes a new migration one entry and a missed step visible."
+
+[task.T441]
+what = "The schema module's enums and table definitions move unchanged to two sibling modules."
+why = "schema.py is 5,047 lines read by 52 modules; smaller files cut the conflicts between unrelated store changes."
+
+[task.T442]
+what = "The one 4,582-line function that builds the CLI is split in place into nine group functions, no command changed."
+why = "cli.py is the most-changed file; one function for 82 commands makes every PR collide and no command testable alone."
+
+[task.T443]
+what = "The CLI starts without importing pandas, the exchange calendars or the Alpaca SDK until a command needs them."
+why = "Every command, the dashboard's kill button included, waits about 2.5 seconds on imports before doing anything."
+
+[task.T444]
+what = "The health module's report types move unchanged to their own module."
+why = "health.py is 4,980 lines that several open tasks edit; the first slice takes the types every reader imports out of the way."
+
+[task.T445]
+what = "Property-based tests for metrics, costs, rounding and split factors, and four functions made to refuse non-finite input."
+why = "The numeric core is tested by examples only, and four functions return NaN or raise on a bad number today."
+
+[task.T446]
+what = "A labeling batch can resume from a failed run, reusing its good answers and paying only for the rest."
+why = "A crash near the end of a batch re-pays for every row today."
