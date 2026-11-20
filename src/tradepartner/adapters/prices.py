@@ -51,7 +51,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from enum import StrEnum
-from typing import overload
+from typing import Protocol, overload
 
 from tradepartner.calendar import next_session, previous_session, session_close
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -525,6 +525,35 @@ def check_request(security_ids: Sequence[str], start: date, end: date) -> list[s
     return list(security_ids)
 
 
+class ActionsReport(Protocol):
+    """What a price source reports about its latest corporate-actions parse,
+    as far as the ingest driver reads it (#3631)."""
+
+    @property
+    def unresolved(self) -> tuple[tuple[str, date], ...]:
+        """`(symbol, ex_date)` of each row that resolved to no security."""
+
+    @property
+    def merger_rows_refused(self) -> tuple[str, ...]:
+        """The merger rows refused, each named."""
+
+    @property
+    def merger_self(self) -> int:
+        """Mergers whose acquirer resolves to the acquiree."""
+
+    @property
+    def merger_unordered(self) -> tuple[str, ...]:
+        """Merger identities left out because two rows share one stamp."""
+
+    @property
+    def unanswered_categories(self) -> tuple[str, ...]:
+        """Categories whose request got no answer (a transient error)."""
+
+    @property
+    def malformed_categories(self) -> tuple[str, ...]:
+        """Categories whose response was malformed and left out."""
+
+
 class PriceSource(abc.ABC):
     """A source of raw daily bars and corporate actions, keyed by
     `security_id` (spec req 6).
@@ -535,7 +564,13 @@ class PriceSource(abc.ABC):
     `known_at`. Every returned record already carries its `known_at` under
     the timing rules in this module. An unknown id raises
     `UnknownSecurityIdError`; an empty `security_ids` returns `[]`.
+
+    `last_actions_report` is the report of the latest `corporate_actions`,
+    `symbol_changes` or `mergers` call, `None` for a source that keeps
+    none; read it before the next call.
     """
+
+    last_actions_report: ActionsReport | None = None
 
     @abc.abstractmethod
     def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:

@@ -480,6 +480,7 @@ from tradepartner.adapters.filings import FilingHeader
 from tradepartner.adapters.form4_bulk_route import RequestBudgetStopped
 from tradepartner.adapters.fred_rates import FredRateSource
 from tradepartner.adapters.prices import (
+    ActionsReport,
     Bar,
     CorporateAction,
     Merger,
@@ -767,8 +768,10 @@ class StorePriceSource(PriceSource):
         """`AlpacaPriceSource.mergers` over the store's listings (#1762)."""
         return self._source().mergers(start, end)
 
+    # Read-only on purpose: the report always comes from the inner source,
+    # so the base's writable attribute is narrowed to a property (#3631).
     @property
-    def last_actions_report(self) -> Any:
+    def last_actions_report(self) -> ActionsReport | None:  # type: ignore[override]
         """The inner source's latest actions report, `None` before a fetch."""
         return None if self._inner is None else self._inner.last_actions_report
 
