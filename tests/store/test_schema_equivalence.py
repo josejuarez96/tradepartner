@@ -45,7 +45,7 @@ _SHAPE_QUERIES: dict[str, str] = {
     ),
 }
 
-# A fresh store never gets the eight lab tables (#FOLLOWUP-1): `init_schema` calls
+# A fresh store never gets the eight lab tables (#3672): `init_schema` calls
 # `_migrate_lab` only for a store that recorded a pre-lab version.
 
 _LAB_TABLE_COLUMNS: list[Row] = [
@@ -205,7 +205,7 @@ _LAB_TABLE_CONSTRAINTS: list[Row] = [
     ("sweeps", "PRIMARY KEY", "PRIMARY KEY(sweep_id)"),
 ]
 
-# Same cause (#FOLLOWUP-1): without the lab migration `trial_results.status` lacks
+# Same cause (#3672): without the lab migration `trial_results.status` lacks
 # `refused_variant` and `owner_decisions.kind` lacks `promotion` and `sweep_retired`.
 
 _PRE_LAB_ENUM_CHECKS: list[Row] = [
@@ -239,7 +239,7 @@ _LAB_ENUM_CHECKS: list[Row] = [
 ]
 
 # With the lab schema applied to the fresh store, the `owner_decisions.kind` CHECK
-# lists the same values in a different order (#FOLLOWUP-2): same set, different text.
+# lists the same values in a different order (#3673): same set, different text.
 
 _CHECK_ORDER_FRESH: list[Row] = [
     (
