@@ -107,6 +107,8 @@ from tradepartner.store import registry
 from tradepartner.store.asof import prices_as_of
 from tradepartner.store.db import insert_row
 
+pytestmark = pytest.mark.usefixtures("unbound_handles")
+
 #: The fixture's bars run 2017-01-03 through 2020-06-30 (fixture README).
 FIXTURE_START = date(2017, 1, 3)
 FIXTURE_END = date(2020, 6, 30)

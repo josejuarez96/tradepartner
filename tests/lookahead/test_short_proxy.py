@@ -18,6 +18,8 @@ from backtest.test_engine_short_plan import (
 from tradepartner.backtest import engine
 from tradepartner.calendar import session_close
 
+pytestmark = pytest.mark.usefixtures("unbound_handles")
+
 
 def test_late_raw_bar_revision_does_not_change_proxy_or_targets(
     monkeypatch: pytest.MonkeyPatch,

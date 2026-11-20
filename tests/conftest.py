@@ -820,3 +820,16 @@ def open_paper_window(settings: Settings, started_at: datetime, *, window_id: in
                 "ingested_at": started_at,
             },
         )
+
+
+@pytest.fixture(scope="module")
+def unbound_handles() -> Iterator[None]:
+    """Skip the engine's handle binding (#3533) for a module that reruns one trial over
+    other windows or params as scaffolding (lookahead truncations, delay runs). Module
+    scope, so module-scoped fixtures that run the engine see it too. The refusals
+    themselves are tested in `backtest/test_engine_handle_binding.py`."""
+    from tradepartner.backtest import engine
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(engine, "_check_handle_binding", lambda *args, **kwargs: None)
+        yield

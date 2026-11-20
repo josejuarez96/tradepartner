@@ -24,6 +24,7 @@ from tradepartner.backtest import engine
 from tradepartner.backtest.costs import Commissions, trade_cost
 from tradepartner.backtest.engine import STRATEGY_SERIES, BacktestResult, run
 from tradepartner.backtest.fills import apply_trades
+from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
 from tradepartner.backtest.signals import momentum_12_1
 from tradepartner.backtest.store_provider import StoreProvider
@@ -58,6 +59,10 @@ def _handle(trial_id: int = 1, *, family: HypothesisFamily = "momentum") -> regi
         started_at=datetime(2024, 6, 1, tzinfo=UTC),
         store_max_ingested_at=None,
         database=None,
+        start_session=date(2000, 1, 1),
+        end_session=date(2000, 1, 1),
+        data_cutoff=None,
+        holdout_start=date(2999, 1, 1),
     )
 
 
@@ -973,7 +978,7 @@ class TestSpinOffs:
             title=slug,
             doc_path=f"docs/hypotheses/{slug}.md",
             doc_sha256="0" * 64,
-            params={"costs.per_side_bps": 0.0},
+            params=frozen_params_of(settings, family="momentum"),
             in_sample_start=TestSpinOffs.LATE_START,
             holdout_start=date(2020, 1, 1),
             holdout_end=date(2021, 12, 31),
@@ -1020,12 +1025,14 @@ class TestSpinOffs:
             strategy={"top_fraction": 1.0},
             costs={"per_side_bps": 0.0},
             schedule={"rebalance_cadence": "daily"},
+            holdout={"start": date(2020, 1, 1), "end": date(2021, 12, 31)},
         )
         on = Settings(
             _env_file=None,
             strategy={"top_fraction": 1.0},
             costs={"per_side_bps": 0.0},
             schedule={"rebalance_cadence": "daily"},
+            holdout={"start": date(2020, 1, 1), "end": date(2021, 12, 31)},
             adjust={"apply_spin_offs": True},
         )
         plain = _fixture_conn()
@@ -1714,6 +1721,7 @@ def test_a_run_at_cadence_on_the_fixture_store_completes(
         _env_file=None,
         strategy={"top_fraction": 0.5},
         schedule={"rebalance_cadence": cadence},
+        holdout={"start": date(2023, 1, 1), "end": date(2025, 12, 31)},
     )
     hypothesis = registry.register_hypothesis(
         fixture_store,
@@ -1722,7 +1730,7 @@ def test_a_run_at_cadence_on_the_fixture_store_completes(
         title=f"engine at {cadence}",
         doc_path=f"docs/hypotheses/h-{cadence}.md",
         doc_sha256="0" * 64,
-        params={"costs.per_side_bps": 15.0, "schedule.rebalance_cadence": cadence},
+        params=frozen_params_of(settings, family="momentum"),
         in_sample_start=start,
         holdout_start=date(2023, 1, 1),
         holdout_end=date(2025, 12, 31),

@@ -150,6 +150,7 @@ from tradepartner.backtest.delisting_value import (
     window_end,
 )
 from tradepartner.backtest.fills import FillResult, apply_trades
+from tradepartner.backtest.hypothesis import frozen_hash_matches
 from tradepartner.backtest.metrics import PERCENT_POINTS_PER_UNIT
 from tradepartner.backtest.portfolio import (
     _equal_weight,
@@ -1951,8 +1952,54 @@ class _Variant:
         return self.handle.trial_id
 
 
+#: Handles a run has consumed, keyed `(database, trial_id, started_at)`: one handle drives
+#: one run (#3533), so a trial cannot be recomputed under other params or dates.
+_CONSUMED_HANDLES: set[tuple[str | None, int, datetime]] = set()
+
+
+def _handle_key(handle: TrialHandle) -> tuple[str | None, int, datetime]:
+    return (handle.database, handle.trial_id, handle.started_at)
+
+
+def release_handle(handle: TrialHandle) -> None:
+    """Forget that `handle` ran, for a replay that recomputes a stored trial (#3533)."""
+    _CONSUMED_HANDLES.discard(_handle_key(handle))
+
+
+def _check_handle_binding(
+    variants: Sequence[tuple[Settings, TrialHandle]], start: date, end: date
+) -> None:
+    """Refuse a handle this computation is not the trial of (#3533): another window,
+    params that do not hash to the registration, an in-sample run reaching the holdout,
+    or a handle already used."""
+    for params, handle in variants:
+        if (start, end) != (handle.start_session, handle.end_session):
+            raise ValueError(
+                f"refused_handle: trial {handle.trial_id} was opened for "
+                f"[{handle.start_session}, {handle.end_session}], not [{start}, {end}]"
+            )
+        if not frozen_hash_matches(params, handle.params_sha256, family=handle.family):
+            raise ValueError(
+                f"refused_handle: the params do not hash to trial {handle.trial_id}'s "
+                f"registered {handle.params_sha256}"
+            )
+        if handle.kind == "in_sample" and end >= handle.holdout_start:
+            raise ValueError(
+                f"refused_handle: in-sample trial {handle.trial_id} ends {end}, on or after "
+                f"its holdout start {handle.holdout_start}"
+            )
+        if _handle_key(handle) in _CONSUMED_HANDLES:
+            raise ValueError(
+                f"refused_handle: trial {handle.trial_id} was already run; open a new trial"
+            )
+
+
 def _check_variants(
-    variants: Sequence[tuple[Settings, TrialHandle]], cost_levels: Sequence[float], provider: object
+    variants: Sequence[tuple[Settings, TrialHandle]],
+    cost_levels: Sequence[float],
+    provider: object,
+    start: date,
+    end: date,
 ) -> list[float]:
     """Every refusal before any read; the checked cost levels."""
     if not variants:
@@ -1964,6 +2011,7 @@ def _check_variants(
     ids = [handle.trial_id for _, handle in variants]
     if len(set(ids)) != len(ids):
         raise ValueError(f"each variant needs its own trial, got trial ids {ids}")
+    _check_handle_binding(variants, start, end)
     for params, _ in variants:
         cash_rate = params.backtest.cash_rate
         if cash_rate == "store":
@@ -2093,11 +2141,12 @@ def run_many(
     `()` (#1448: a summary-level sweep writes neither). Nothing else changes.
     """
     signal_for(family)
-    levels = _check_variants(variants, cost_levels, provider)
+    levels = _check_variants(variants, cost_levels, provider, start, end)
     cadence = variants[0][0].schedule.rebalance_cadence
     sessions = rebalance_sessions(start, end, cadence)
     if len(sessions) < 2:
         raise ValueError(f"need at least two rebalance sessions in [{start}, {end}]")
+    _CONSUMED_HANDLES.update(_handle_key(handle) for _, handle in variants)
 
     out = RunManyResults()
     group = [
