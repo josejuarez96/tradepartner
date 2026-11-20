@@ -510,12 +510,13 @@ from tradepartner.adapters.alpaca_prices import (
     same_alpaca_symbol,
 )
 from tradepartner.adapters.edgar import REASON_8K_ITEMS, eightk_item_codes
+from tradepartner.adapters.edgar_clock import EDGAR_FILING_DATE_CUTOFF as EDGAR_FILING_DATE_CUTOFF
+from tradepartner.adapters.edgar_clock import clock_suspect as clock_suspect
 from tradepartner.adapters.prices import announcement_date_known_at, spinoff_known_at_floor
 from tradepartner.adapters.rates import rate_known_at
 from tradepartner.backfill import BACKFILL
 from tradepartner.calendar import (
     all_sessions,
-    is_session,
     last_completed_session,
     last_session_of_month,
     previous_session,
@@ -785,11 +786,6 @@ INTEGRITY_RULES: tuple[str, ...] = (
     CHAIN_PREDECESSOR_NO_BAR_AFTER_HANDOVER,
 )
 
-#: EDGAR's filing-date rule: a submission accepted on a business day after
-#: 17:30 New York is dated the next business day, one before it that day
-#: (#1358, "The clock"; T164's count found the cutoff holds for 8-Ks). A
-#: rule of the source, not a tunable threshold.
-EDGAR_FILING_DATE_CUTOFF = time(17, 30)
 _NEW_YORK = ZoneInfo("America/New_York")
 
 _FACT_TABLES: tuple[str, ...] = tuple(TABLE_PROVENANCE_VALUES)
@@ -3003,20 +2999,6 @@ def filing_event_counts(message: str | None) -> dict[str, int]:
     if not message:
         return {}
     return {name: int(n) for name, n in _EVENT_COUNT.findall(message)}
-
-
-def clock_suspect(accepted_at: datetime, filed: date) -> bool:
-    """The clock detector (#1358, "The clock"): whether a stamp fits only a
-    moved clock, given the submissions payload's filing date. Early: accepted
-    on a session before `EDGAR_FILING_DATE_CUTOFF` New York and dated a later
-    day. Late: accepted on a New York date after its filing date. A health
-    finding, never a repair; it catches only the moves that cross the
-    filing-date rule."""
-    local = ensure_tz_aware_utc(accepted_at, field_name="accepted_at").astimezone(_NEW_YORK)
-    day = local.date()
-    if day > filed:
-        return True
-    return is_session(day) and local.time() < EDGAR_FILING_DATE_CUTOFF and filed > day
 
 
 def _filing_events_report(

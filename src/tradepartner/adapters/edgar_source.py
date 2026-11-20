@@ -357,6 +357,7 @@ from tradepartner.adapters.edgar import (
     parse_statement_facts,
     sgml_acceptance,
 )
+from tradepartner.adapters.edgar_clock import EDGAR_FILING_DATE_CUTOFF, clock_suspect
 from tradepartner.adapters.edgar_validation import PARSE_ERRORS, ValidationFailures
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
@@ -379,7 +380,6 @@ from tradepartner.adapters.form4_route import Quarter as IndexQuarter
 from tradepartner.adapters.index_reconcile import FileRow, StoredRow, reconcile_quarter
 from tradepartner.calendar import is_session, next_session
 from tradepartner.config import Settings, clean_message
-from tradepartner.health import EDGAR_FILING_DATE_CUTOFF, clock_suspect
 from tradepartner.store import filing_index as stored_index
 from tradepartner.store.db import StoreLockedError, _is_lock_error, configure_connection
 from tradepartner.store.filing_index import FilingRow
