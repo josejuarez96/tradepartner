@@ -101,7 +101,6 @@ def live(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Settings:
     (root / ".env").write_text("STORE__PATH=data/live.duckdb\n")
     monkeypatch.setattr(book_actions, "PROJECT_ROOT", root)
     monkeypatch.delenv("STORE__PATH", raising=False)
-    monkeypatch.delenv("TRADEPARTNER_ENV_FILE", raising=False)
     return Settings(_env_file=None, store={"path": str(root / "data" / "live.duckdb")})
 
 
