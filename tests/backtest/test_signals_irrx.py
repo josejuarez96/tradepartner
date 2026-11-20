@@ -323,6 +323,9 @@ def test_every_exclusion_has_its_reason_and_never_scores() -> None:
     assert sig.counts["n_excluded_thin_industry"] == 1
     assert sig.counts["n_excluded_adv"] == 1
     assert sig.counts["n_ranked"] == len(sig.scores)
+    # A2's three sessions plus EXACT's session T (s0 = T, accepted at the cutoff, not late)
+    assert sig.counts["n_adjusted"] == 2
+    assert sig.counts["n_dropped_sessions"] == 4
     accounted = set(sig.scores) | {s for names in ex.values() for s in names}
     assert accounted == set(growth)
 
@@ -406,6 +409,97 @@ def test_scores_ordered_and_counts_keys() -> None:
 def test_cutoff_fixture_is_the_new_york_wall_time() -> None:
     cutoff = time.fromisoformat(CFG.dissemination_cutoff)
     assert _ny(2021, 12, 30, 17, 30).astimezone(NY).time() == cutoff
+
+
+def _after_t(frame: pl.DataFrame) -> pl.DataFrame:
+    return frame.with_columns(known_at=pl.lit(T + timedelta(seconds=1)).dt.replace_time_zone("UTC"))
+
+
+def test_rule0_bars_known_after_t_are_ignored_adjusted_and_raw() -> None:
+    base = _call(GROWTH, _fixture_events())
+    # Z1 is a benchmark-eligible industry-20 name whose every bar is stamped after t: a
+    # vendor correction not yet known. Without the guard it enters A1's industry mean.
+    z1 = _after_t(_bars({"Z1": [1.30] * 5}))
+    # a second, later-known bar for A1 on T with a different close
+    dup = _after_t(_bars({"A1": [1.0] * 5})).filter(pl.col("session") == T_DAY)
+    sig = _call(
+        GROWTH,
+        [*_fixture_events(), *_old_events(["Z1"])],
+        adjusted=pl.concat([_bars(GROWTH), z1, dup]),
+        ids=[*GROWTH, "Z1"],
+        sics={**SIC, "Z1": 2050},
+    )
+    assert sig.scores == base.scores
+    assert "Z1" in sig.exclusions["short_window"]
+    # raw: a thin-volume name whose later-known bars would lift its dollar volume
+    thin = _bars({"V": [1.0] * 5}, raw=True).with_columns(volume=pl.lit(5_000.0))
+    rich = _after_t(_bars({"V": [1.0] * 5}, raw=True)).with_columns(volume=pl.lit(10_000_000.0))
+    growth = {**GROWTH, "V": [1.0] * 5}
+    sig = _call(
+        growth,
+        [*_fixture_events(), *_old_events(["V"])],
+        sics={**SIC, "V": 2060},
+        raw=pl.concat([_bars(GROWTH, raw=True), thin, rich]),
+    )
+    assert sig.exclusions["adv"] == ("V",)
+
+
+def test_frames_without_known_at_raise() -> None:
+    with pytest.raises(ValueError, match="known_at"):
+        _call(GROWTH, _fixture_events(), adjusted=_bars(GROWTH).drop("known_at"))
+    with pytest.raises(ValueError, match="known_at"):
+        _call(GROWTH, _fixture_events(), raw=_bars(GROWTH, raw=True).drop("known_at"))
+
+
+def test_name_with_no_returns_in_a_thin_industry_is_thin_industry() -> None:
+    growth = {**GROWTH, "N": [1.0] * 5}
+    adjusted = _bars(growth).filter(pl.col("security_id") != "N")
+    sig = _call(
+        growth,
+        [*_fixture_events(), *_old_events(["N"])],
+        sics={**SIC, "N": 7000},
+        adjusted=adjusted,
+    )
+    assert sig.exclusions["thin_industry"] == ("N",)
+    assert sig.exclusions["short_window"] == ()
+
+
+def test_returns_only_on_the_industrys_thin_sessions_is_short_window() -> None:
+    growth = {**GROWTH, "P": [1.0] * 5, "Q": [1.0] * 5, "R": [1.0] * 5}
+    day30, day29 = date(2021, 12, 30), date(2021, 12, 29)
+    sid, session = pl.col("security_id"), pl.col("session")
+    # Q and R have no bar on 12-30, so P's industry has no contributor on 12-30; P has
+    # bars only on 12-29 and 12-30, so its one return (12-30) falls on that thin session
+    # while the industry is valid on 12-27 to 12-29.
+    adjusted = _bars(growth).filter(
+        ~(sid.is_in(["Q", "R"]) & (session == day30))
+        & ~((sid == "P") & (session != day30) & (session != day29))
+    )
+    sig = _call(
+        growth,
+        [*_fixture_events(), *_old_events(["P", "Q", "R"])],
+        sics={**SIC, "P": 6001, "Q": 6002, "R": 6003},
+        adjusted=adjusted,
+    )
+    assert sig.exclusions["short_window"] == ("P",)
+    assert "P" not in sig.exclusions["thin_industry"]  # (Q and R are thin: one peer each)
+
+
+def test_old_bad_stamp_outside_every_window_does_not_exclude() -> None:
+    base = _call(GROWTH, _fixture_events())
+    # 2021-03-01 is before the coverage window and its dropped sessions miss the formation
+    # window: its stamp cannot matter.
+    old_bad = _event("A1", _ny(2021, 3, 1, 8, 0), index=_ny(2021, 3, 1, 9, 0))
+    sig = _call(GROWTH, [*_fixture_events(), old_bad])
+    assert sig.scores == base.scores
+    assert sig.exclusions["stamp"] == ()
+
+
+def test_null_items_is_not_an_event() -> None:
+    ev = [*_old_events(list(GROWTH)), _event("A2", _ny(2021, 12, 28, 10, 0))]
+    ev[-1]["items"] = None
+    sig = _call(GROWTH, ev)
+    assert sig.counts["n_adjusted"] == 0
 
 
 def test_module_has_no_numeric_literal_and_no_io_import() -> None:

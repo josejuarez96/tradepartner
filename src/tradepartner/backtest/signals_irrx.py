@@ -53,7 +53,8 @@ IRRX_EXCLUSIONS: tuple[IrrxExclusion, ...] = (
     "short_window",
     "adv",
 )
-_BAR_COLUMNS = ("security_id", "session", "close")
+_BAR_COLUMNS = ("security_id", "session", "close", "known_at")
+_BAR_VALUES = ("security_id", "session", "close")
 _EVENT_COLUMNS = ("security_id", "form", "items", "accepted_at", "index_accepted_at")
 
 
@@ -100,7 +101,8 @@ def _walk_back(end: date, count: int, calendar: IrrxCalendar) -> list[date]:
 
 def _industry(sic: int, industry_digits: int, sic_digits: int) -> int:
     """The first `industry_digits` digits of the `sic_digits`-digit form (SIC 100 is
-    industry 01, not 10), as an int."""
+    industry 01, not 10), as an int. A negative or too long code raises `ValueError`:
+    a malformed SIC fails the rebalance loudly rather than excluding the name."""
     text = str(sic).zfill(sic_digits)
     if sic < 0 or len(text) > sic_digits:
         raise ValueError(f"SIC {sic} is not a {sic_digits}-digit code")
@@ -113,10 +115,7 @@ def _visible(
     missing = [c for c in columns if c not in frame.columns]
     if missing:
         raise ValueError(f"frame lacks columns {missing}")
-    visible = frame.filter(pl.col("session") <= t_day)
-    if "known_at" in frame.columns:
-        visible = visible.filter(pl.col("known_at") <= t)
-    return visible
+    return frame.filter(pl.col("session") <= t_day, pl.col("known_at") <= t)
 
 
 def _growth(adjusted: pl.DataFrame, calendar: IrrxCalendar) -> dict[str, dict[date, float]]:
@@ -125,7 +124,7 @@ def _growth(adjusted: pl.DataFrame, calendar: IrrxCalendar) -> dict[str, dict[da
     if adjusted.select(pl.struct("security_id", "session").is_duplicated().any()).item():
         raise ValueError("adjusted frame has a duplicate (security_id, session) bar")
     closes: dict[tuple[str, date], float] = {}
-    for sid, session, close in adjusted.select(_BAR_COLUMNS).iter_rows():
+    for sid, session, close in adjusted.select(_BAR_VALUES).iter_rows():
         if close is None or not (math.isfinite(close) and close > 0):
             raise ValueError(f"close for {sid} on {session} must be positive and finite: {close}")
         closes[(sid, session)] = close
@@ -160,7 +159,7 @@ def _events_by_name(
     for sid, form, items, accepted_at, index_stamp in events.select(_EVENT_COLUMNS).iter_rows():
         if form != config.event_form:
             continue
-        if config.event_item not in [code.strip() for code in items.split(",")]:
+        if items is None or config.event_item not in [c.strip() for c in items.split(",")]:
             continue
         accepted = ensure_tz_aware_utc(accepted_at, field_name="accepted_at")
         if accepted > t:  # rule 0: not known at t
@@ -288,21 +287,17 @@ def irrx_reversal(
             valid = False
             for s in window:
                 own = returns[sid].get(s)
-                if own is None:
-                    continue
                 total, count = totals.get((industry[sid], s), (0.0, 0))
-                if sid in benchmark and s not in dropped[sid]:
+                if own is not None and sid in benchmark and s not in dropped[sid]:
                     total, count = total - own, count - 1
                 if count < config.min_industry_names:
                     continue
-                valid = True
-                if s in dropped[sid]:
+                valid = True  # item 4: the industry return exists on s, own return or not
+                if own is None or s in dropped[sid]:
                     continue
                 own_growth.append(own)
                 peer_growth.append(total / count)
-            if not returns[sid]:  # no usable return panel: not a benchmark member either
-                excluded["short_window"].append(sid)
-            elif not valid:
+            if not valid:
                 excluded["thin_industry"].append(sid)
             elif len(own_growth) < config.min_kept_sessions:
                 excluded["short_window"].append(sid)
@@ -339,7 +334,7 @@ def _adv_ok(
     """Item 3's scored-set test: median raw close times volume over the traded bars in
     the `irrx.adv_sessions` window, with at least `irrx.min_adv_bars` bars."""
     values: dict[str, list[float]] = defaultdict(list)
-    for sid, session, close, volume in raw.select(*_BAR_COLUMNS, "volume").iter_rows():
+    for sid, session, close, volume in raw.select(*_BAR_VALUES, "volume").iter_rows():
         if sid in universe and session in days and volume is not None and volume > 0:
             values[sid].append(close * volume)
     return {
