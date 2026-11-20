@@ -1,0 +1,29 @@
+name: audit
+
+# Weekly audit of `uv.lock` against known vulnerabilities (#3649). Its own workflow, not a
+# job in ci.yml: the required `checks` must never go red because an advisory was published.
+# A failed run emails the owner; it blocks no merge. A finding gets a follow-up issue and,
+# until that lands, an `--ignore <id>` here with a comment naming the issue.
+on:
+  schedule:
+    - cron: "17 6 * * 1"   # Mondays 06:17 UTC
+  workflow_dispatch:
+  pull_request:
+    paths: [uv.lock]
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+      - name: Audit the lock (OSV)
+        run: uv audit --locked
