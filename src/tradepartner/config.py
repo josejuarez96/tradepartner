@@ -1498,7 +1498,7 @@ class Settings(BaseSettings):
         self._validate_no_misspelt_env_keys(kwargs.get("_env_file"))
 
     @staticmethod
-    def _validate_no_misspelt_env_keys(env_file: object) -> None:
+    def _validate_no_misspelt_env_keys(env_file: Path | str | None) -> None:
         """Refuse env names that misspell a nested setting (#3589). Names only,
         never values (same reason as the notes above). `.env.example`-only names
         (`ANTHROPIC_API_KEY`, ...) match no nested form and still load."""
