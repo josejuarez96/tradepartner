@@ -68,6 +68,8 @@ Surfaces and close-out
 - [x] **T114 (owner): Measurement run and the first sweep on the real store.** (#1295; the sweep `momentum-topfrac-cadence` ran 2026-10-10: sweep run 4, trials 11-16 all `ok`, none promoted (#1416, #1352); no `lab.*` figures issue: the lab is paused by ADR 0023 D5 and the first rung-4 sweep (T165e) re-measures; ticked 2026-10-18, #1754) · Files: this plan · Depends on: T111, T113
 - [x] **T115: Agent and runbook docs.** (#1243, PR #1245) · Files: `.claude/agents/backtest-runner.md`, `docs/ways-of-working/agents.md`, `docs/runbooks/scheduling.md` · Depends on: T107
 
+- [ ] **T431: Reuse the step universe across a sweep run's read groups (#3570).** (size M; class A; code review 2026-11-20, tracker #3523) · Files: `src/tradepartner/backtest/lab.py`, `src/tradepartner/backtest/store_provider.py`, `tests/backtest/test_lab.py`, `changelog.d/<issue>-universe-cache.md` · Tests: the counting test; `test_cached_and_uncached_sweeps_write_identical_rows` (`trial_metrics`, `trial_equity`, `trial_rebalances` equal row for row, cache forced off vs on); `test_an_ingest_between_groups_rebuilds_the_universe`; `test_a_store_changed_group_never_feeds_the_cache`; no look-ahead: `tests/lookahead/` unchanged plus a case where a fact with `known_at` between two `t`s is not seen at the earlier `t` through the cache; `uv run pytest tests/backtest/test_lab.py tests/backtest/test_engine_many.py tests/lookahead` · Depends on: #3567 (edits `lab.py`), #3343 (an open size-M perf issue with no plan task) and T430 (#3562), the last two for `store_provider.py` order only; not enforced by `team.py` for the issues · Review: quant-auditor.
+
 ## Chains (for team claims)
 
 | Chain | Tasks | Starts when |
