@@ -31,6 +31,14 @@ After EDGAR recovers, ingest tries missing bars for eligible new names on recent
 1. **The main checkout is on `main` and clean.** The job runs whatever code is checked out there, and `uv run` syncs the environment to `uv.lock` on each run. After `git pull`, the next scheduled run uses the new code.
 2. **The repo is not in a TCC-protected folder** (see TCC below). `~/Projects/tradepartner` is fine; `~/Documents`, `~/Desktop`, `~/Downloads`, iCloud Drive and external volumes are not.
 3. **`.env` holds the data keys** (`ALPACA_API_KEY`, `ALPACA_API_SECRET`, `SEC_EDGAR_USER_AGENT`) and is readable only by you (`chmod 600 .env`). The settings loader reads `.env` from the project root, not from the working directory, so launchd needs nothing extra for it. Never put a secret in the plist: plists are plain text and get copied into backups.
+   **Once, for a store made before #3652:** the `tradepartner` command now creates every new file and directory readable only by you (umask `077`), but it never changes the mode of one that already exists. Tighten the old ones by hand, from the project root (the paths are the defaults of `store.path`, `research.data_dir`, `edgar.cache_dir`; use your own values if you changed them, and do the same for the `TRADEPARTNER_RAW_ARCHIVE` folder if you set one):
+   ```bash
+   cd ~/Projects/tradepartner
+   chmod 700 data                                   # the directory holding the store (store.path's parent)
+   chmod 600 data/tradepartner.duckdb*              # the store, its .wal, and its backups (<store>.bak-* and their manifests, written beside it)
+   chmod -R go-rwx data/research data/edgar_cache   # the research records (research.data_dir) and the EDGAR cache: directories 700, files 600
+   ```
+   Copies already made by iCloud or Time Machine keep the permissions they were made with; these commands do not reach them.
 4. **A manual run works from a fresh shell:**
    ```bash
    cd ~/Projects/tradepartner

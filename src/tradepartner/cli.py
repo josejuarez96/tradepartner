@@ -445,6 +445,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import re
 import subprocess
 import sys
@@ -7326,8 +7327,22 @@ def make_app(
     return app
 
 
+#: The umask `main` sets (#3652): owner-only. A fixed security default, not a tunable,
+#: so it is not a config value: the store, its backups, the raw archive and the
+#: research records hold positions, orders and broker account data.
+_PRIVATE_UMASK = 0o077
+
+
 def main() -> None:
-    """Console-script entry point (`[project.scripts] tradepartner`)."""
+    """Console-script entry point (`[project.scripts] tradepartner`).
+
+    Sets the process umask to `_PRIVATE_UMASK` first (#3652): every file and
+    directory this process creates is owner-only (`0600`, `0700`). Files and
+    directories that already exist keep their mode; nothing is re-moded. Child
+    processes (the dashboard and its children, the scheduled jobs' children)
+    inherit the umask. Only here: `make_app` and the import leave it alone.
+    """
+    os.umask(_PRIVATE_UMASK)
     make_app()()
 
 
