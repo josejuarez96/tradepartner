@@ -4572,6 +4572,51 @@ def test_run_messages_are_redacted_cleaned_and_capped(
         assert len(message) == 200
 
 
+# --- #3631: the merger report is a typed attribute; a permanent error fails --
+
+
+def test_fetch_prices_reads_the_merger_report_without_getattr(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `PriceSource` that never sets `last_actions_report` hands the driver
+    the class default, `None`."""
+    from tradepartner import ingest as ingest_module
+
+    seen: list[object] = []
+    count = ingest_module._count_merger_report
+
+    def spy(stats: dict[str, int], report: Any) -> None:
+        seen.append(report)
+        count(stats, report)
+
+    monkeypatch.setattr(ingest_module, "_count_merger_report", spy)
+    prices = _Prices()
+    assert "last_actions_report" not in vars(prices)
+    result = _run(settings, prices)
+    assert result.ok, result.runs
+    assert seen == [None]
+
+
+def test_a_permanent_error_on_the_merger_request_fails_the_alpaca_chunk(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """A 403 from the merger request is not tolerated: the alpaca chunk's
+    run row is `failed` and names the `APIError`."""
+    import requests
+    from alpaca.common.exceptions import APIError
+
+    class Refused(_Prices):
+        def mergers(self, start: date, end: date) -> list[Any]:
+            response = requests.Response()
+            response.status_code = 403
+            raise APIError('{"message": "forbidden"}', requests.HTTPError(response=response))
+
+    result = _run(settings, Refused())
+    assert result.runs[-1].status == FAILED
+    assert "APIError" in result.runs[-1].message
+    assert read("SELECT status FROM ingestion_runs WHERE source = 'alpaca'") == [(FAILED,)]
+
+
 # --- #573: a failed run row names where the error was raised --------------
 
 

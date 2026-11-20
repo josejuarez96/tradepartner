@@ -3540,13 +3540,25 @@ def _default_fetch_mergers(start: date, end: date, *, settings: Settings) -> Map
     )
 
 
-def _transport_errors() -> tuple[type[BaseException], ...]:
-    """The errors a request to Alpaca raises on the wire (#1676): a network
-    failure (`requests.RequestException`, an `OSError`) or an API refusal."""
+def _transient(exc: BaseException) -> bool:
+    """Whether an error on a request to Alpaca is worth asking again (#1676,
+    #3631): a timeout, a dropped connection, or an API answer with a retry
+    status (429, 5xx). An API refusal with any other status (401, 403, 422),
+    one with no status, and any other local `OSError` are permanent."""
     import requests
     from alpaca.common.exceptions import APIError
 
-    return (requests.RequestException, APIError, OSError)
+    from tradepartner.adapters.alpaca_trading_raw import _RETRY_STATUS_CODES
+
+    if isinstance(exc, APIError):
+        try:
+            status = exc.status_code
+        except AttributeError:  # an http error with no response attached
+            return False
+        return status is not None and status in _RETRY_STATUS_CODES
+    return isinstance(
+        exc, (requests.Timeout, requests.ConnectionError, ConnectionError, TimeoutError)
+    )
 
 
 class AlpacaPriceSource(PriceSource):
@@ -4119,11 +4131,15 @@ class AlpacaPriceSource(PriceSource):
                 (), (), (), malformed_categories=("name_changes",)
             )
             return []
-        except _transport_errors():
-            # #1676: a network or API error on this request is tolerated the
-            # same way: the day's prices land, a warning is counted, and the
-            # window (`ingest._fetch_prices`: from one lag before the month)
-            # asks again next run, so no unanswered day is skipped.
+        except Exception as exc:
+            # #1676: a transient network or API error on this request is
+            # tolerated the same way: the day's prices land, a warning is
+            # counted, and the window (`ingest._fetch_prices`: from one lag
+            # before the month) asks again next run, so no unanswered day is
+            # skipped. #3631: a permanent one (a refused key, a request built
+            # wrong, a local OSError) fails the chunk instead.
+            if not _transient(exc):
+                raise
             self.last_actions_report = ActionsParse(
                 (), (), (), unanswered_categories=("name_changes",)
             )
@@ -4137,9 +4153,10 @@ class AlpacaPriceSource(PriceSource):
         delisted before Alpaca processes its record and a per-symbol request
         would almost never ask for it. Only rows whose acquiree (and, for a
         stock kind, acquirer) resolve are returned; the rest are on
-        `last_actions_report`. A malformed response or a transport error is
-        counted there and returns nothing, as for name changes (#1506,
-        #1676); the next run's range still covers the days."""
+        `last_actions_report`. A malformed response or a transient transport
+        error is counted there and returns nothing, as for name changes
+        (#1506, #1676); the next run's range still covers the days. A
+        permanent error raises (#3631)."""
         self.last_actions_report = None
         check_request([], start, end)
         try:
@@ -4156,7 +4173,9 @@ class AlpacaPriceSource(PriceSource):
                 (), (), (), malformed_categories=tuple(_MERGER_CATEGORIES)
             )
             return []
-        except _transport_errors():
+        except Exception as exc:
+            if not _transient(exc):  # #3631: only a transient error is tolerated
+                raise
             self.last_actions_report = ActionsParse(
                 (), (), (), unanswered_categories=tuple(_MERGER_CATEGORIES)
             )

@@ -326,6 +326,7 @@ from tradepartner.adapters.form4_route import (
 from tradepartner.adapters.openfigi import FigiType, parse_mapping
 from tradepartner.adapters.openfigi_raw import map_tickers
 from tradepartner.adapters.prices import (
+    ActionsReport,
     ActionType,
     Bar,
     CorporateAction,
@@ -6762,7 +6763,7 @@ class _PriceFetch:
     actions: tuple[CorporateAction, ...]
     symbol_changes: tuple[SymbolChange, ...]
     mergers: tuple[Merger, ...]
-    merger_report: Any
+    merger_report: ActionsReport | None
     action_window: tuple[date, date]
     covered: tuple[date, date]
     ingested_at: datetime
@@ -6888,7 +6889,7 @@ def _fetch_prices(
     # processes its record and so is absent from `every`. Identity makes the
     # overlap with earlier runs add nothing.
     mergers = prices.mergers(session - lag, session)
-    merger_report = getattr(prices, "last_actions_report", None)
+    merger_report = prices.last_actions_report
     merger_summary = prices.resolution_summary()
     have = {bar.security_id for bar in bars if bar.session == session}
     try:
@@ -8005,7 +8006,7 @@ def _add_mergers(
     return added
 
 
-def _count_merger_report(stats: dict[str, int], report: Any) -> None:
+def _count_merger_report(stats: dict[str, int], report: ActionsReport | None) -> None:
     """Add the merger parse's own counts (refused, unresolved, same-company,
     ambiguous stamps) to the run's `stats`; `report` is the source's
     `ActionsParse`, `None` when the source keeps none."""
