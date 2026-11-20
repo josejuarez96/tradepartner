@@ -168,7 +168,7 @@ def _press(at: AppTest, key: str) -> AppTest:
     ],
 )
 def test_server_options(address: object, stats: object, ok: bool) -> None:
-    passed, message = review_page.server_options_ok(address, stats)
+    passed, message = review_page.server_options_ok(address, stats, ["localhost"])
     assert passed is ok
     assert bool(message) is not ok
 
