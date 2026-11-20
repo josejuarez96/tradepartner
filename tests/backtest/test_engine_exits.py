@@ -848,16 +848,85 @@ class TestDelistingPolicy:
             ("merger_exits", self.CUTOFF, ("X",)),
         ]
 
-    def test_a_short_delisting_exit_is_refused(self) -> None:
+    def _short_value(
+        self,
+        listing: dict[str, object],
+        reasons: Sequence[dict[str, object]] = (),
+        mergers: Sequence[dict[str, object]] = (),
+        policy: str = "failure_v1",
+        value: float = -100.0,
+    ) -> tuple[float, dict[str, int]]:
         context = engine._ExitContext(
             read_time=self.DECIDING,
-            listings={"X": {"exchange": "NYSE"}},
-            policy="failure_v1",
-            terms=engine.DELISTING_POLICIES["failure_v1"],
+            listings={"X": listing},
+            policy=policy,
+            terms=engine.DELISTING_POLICIES[policy],
+            reasons={"X": reasons},
+            merger_rows={"X": mergers},
         )
         counts = dict.fromkeys(engine.POLICY_COUNT_NAMES, 0)
-        with pytest.raises(ValueError, match="refused_delisting_short"):
-            engine._policy_value("X", -100.0, 1.0, self.END, context, counts)
+        counts["n_short_failure_uncredited"] = 0
+        # 10 shares at a raw close of 10.
+        return engine._policy_value("X", value, 10.0, 10.0, self.END, context, counts), counts
+
+    _LISTING: ClassVar[dict[str, object]] = {
+        "exchange": "NASDAQ",
+        "delisting_form": FORM,
+        "delisting_filed_at": FILED,
+    }
+
+    @staticmethod
+    def _reason(reason: str) -> dict[str, object]:
+        return {
+            "delisting_form": FORM,
+            "delisting_filed_at": FILED,
+            "delisting_exchange": "NASDAQ",
+            "reason": reason,
+        }
+
+    def test_a_short_failure_exit_is_covered_at_the_last_close_and_counted(self) -> None:
+        value, counts = self._short_value(self._LISTING, [self._reason("bankruptcy")])
+        assert value == -100.0
+        assert counts["n_short_failure_uncredited"] == 1
+        assert counts["n_failure_shocks"] == 1
+
+    def test_a_short_exit_with_no_failure_is_the_last_close_and_not_counted(self) -> None:
+        value, counts = self._short_value(self._LISTING, [self._reason("voluntary_other")])
+        assert value == -100.0
+        assert counts["n_short_failure_uncredited"] == 0
+
+    def test_a_short_merger_cover_is_max_of_consideration_and_last_close(self) -> None:
+        reasons = [self._reason("merger_acquisition")]
+        above = {
+            "effective_date": self.END,
+            "cash_per_share": 12.0,
+            "share_ratio": None,
+            "acquirer_raw_close": None,
+        }
+        value, counts = self._short_value(self._LISTING, reasons, [above])
+        assert value == pytest.approx(-120.0)
+        assert counts["n_short_failure_uncredited"] == 0
+        assert counts["n_merger_consideration"] == 1
+        under = {**above, "cash_per_share": 6.0}
+        value, counts = self._short_value(self._LISTING, reasons, [under])
+        assert value == -100.0
+        assert counts["n_short_failure_uncredited"] == 1
+
+    def test_a_short_merger_fallback_is_the_last_close(self) -> None:
+        value, counts = self._short_value(self._LISTING, [self._reason("merger_acquisition")])
+        assert value == -100.0
+        assert counts["n_merger_fallbacks"] == 1
+
+    def test_a_short_on_an_unmapped_exchange_still_raises_and_counts_nothing(self) -> None:
+        odd = {**self._LISTING, "exchange": "OTC"}
+        reasons = [{**self._reason("bankruptcy"), "delisting_exchange": "OTC"}]
+        with pytest.raises(ValueError, match="outside"):
+            self._short_value(odd, reasons)
+
+    def test_a_long_exit_is_unchanged_by_the_short_branch(self) -> None:
+        value, counts = self._short_value(self._LISTING, [self._reason("bankruptcy")], value=100.0)
+        assert value == pytest.approx(55.0)
+        assert counts["n_short_failure_uncredited"] == 0
 
     def test_a_transfer_is_never_shocked(self) -> None:
         provider = self._provider(

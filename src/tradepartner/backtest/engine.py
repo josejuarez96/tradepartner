@@ -147,6 +147,8 @@ from tradepartner.backtest.costs import (
 from tradepartner.backtest.delisting_value import (
     delisting_exit_valuation,
     ended_listings,
+    short_cover_factor,
+    short_gain_withheld,
     window_end,
 )
 from tradepartner.backtest.fills import FillResult, apply_trades
@@ -633,6 +635,11 @@ POLICY_COUNT_NAMES: Final = (
     "n_reason_conflicts",
     "n_unknown_exits",
 )
+#: A signed book's policy count (backtest spec amendment #3504, item 10): the short exits
+#: whose failure shock or take-under gain was not credited. Written beside
+#: `POLICY_COUNT_NAMES`, on a `long_short` book only, so a long-only run's rows are
+#: unchanged.
+SHORT_UNCREDITED_COUNT: Final = "n_short_failure_uncredited"
 
 
 @dataclass(frozen=True)
@@ -661,23 +668,21 @@ def _policy_value(
     sid: str,
     value: float,
     shares: float,
+    raw_close: float,
     final: date | None,
     context: _ExitContext,
     counts: dict[str, int],
 ) -> float:
     """The sale value of `sid`'s delisting exit under `context`'s policy (plan T328c),
     from its marked last-close `value` and its `shares`, counting the outcome in
-    `counts`. The rule is `delisting_value.delisting_exit_valuation`. Raises for a short
-    exit and for a shock on an exchange outside the version's map (a failed trial, never
-    0%)."""
+    `counts`. The rule is `delisting_value.delisting_exit_valuation`. A short (negative
+    `value`) is covered at `max(f, 1)` times its marked value, `f` being the rule's factor
+    on `raw_close` (spec amendment #3504, item 10): no failure gain is credited, a merger
+    consideration only when above the last close, and an uncredited gain is counted in
+    `SHORT_UNCREDITED_COUNT`. Raises for a shock on an exchange outside the version's map
+    (a failed trial, never 0%), a short's included."""
     terms = context.terms
     assert terms is not None
-    if value < 0:
-        raise ValueError(
-            f"refused_delisting_short: {sid} is a short delisting exit under "
-            f"backtest.delisting_failure_return {context.policy!r}; short delisting P&L "
-            "stays closed until ADR 0024 consequence 5"
-        )
     valuation = delisting_exit_valuation(
         sid,
         context.listings.get(sid, {}),
@@ -688,6 +693,11 @@ def _policy_value(
         context.policy,
         counts,
     )
+    if value < 0:
+        counts[SHORT_UNCREDITED_COUNT] += short_gain_withheld(valuation, raw_close)
+        if valuation.per_share is not None and valuation.per_share > raw_close:
+            return -shares * valuation.per_share
+        return value * short_cover_factor(valuation, raw_close)
     if valuation.per_share is not None:
         return shares * valuation.per_share
     if valuation.multiplier == 1.0:
@@ -721,6 +731,8 @@ def _exits(
     commissions = Commissions.from_config(params.costs)
     applied = context is not None and context.terms is not None
     counts = dict.fromkeys(POLICY_COUNT_NAMES, 0) if applied else None
+    if counts is not None and params.portfolio.side == "long_short":
+        counts[SHORT_UNCREDITED_COUNT] = 0
     exits: list[_Exit] = []
     for sid in sorted(positions):
         last = last_bars.get(sid)
@@ -741,7 +753,9 @@ def _exits(
         shares = abs(value) / raw_close
         if counts is not None and not stale:
             # The policy's sale value; ordinary fill costs on it, the shares unchanged.
-            value = _policy_value(sid, value, shares, final, cast(_ExitContext, context), counts)
+            value = _policy_value(
+                sid, value, shares, raw_close, final, cast(_ExitContext, context), counts
+            )
         notional = abs(value)
         cost = trade_cost(
             notional,

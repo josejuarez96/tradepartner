@@ -123,6 +123,29 @@ def test_a_reason_row_for_another_exchange_or_filing_does_not_match() -> None:
     assert valuation == dv.ExitValuation() and counts["n_unknown_exits"] == 1
 
 
+def test_a_short_cover_never_credits_a_gain() -> None:
+    """A short's cover factor is `max(f, 1)` (backtest spec #3504, item 10)."""
+    shock, _ = _value([_reason("bankruptcy")], [])
+    assert dv.delisting_exit_factor(shock, 10.0) == pytest.approx(0.45)
+    assert dv.short_cover_factor(shock, 10.0) == 1.0
+    assert dv.short_gain_withheld(shock, 10.0)
+    plain, _ = _value([_reason("voluntary_other")], [])
+    assert dv.short_cover_factor(plain, 10.0) == 1.0
+    assert not dv.short_gain_withheld(plain, 10.0)
+
+
+def test_a_short_merger_cover_is_the_consideration_only_above_the_last_close() -> None:
+    reasons = [_reason("merger_acquisition")]
+    above, _ = _value(reasons, [_merger(12.0, None, None)])
+    assert dv.short_cover_factor(above, 10.0) == pytest.approx(1.2)
+    assert not dv.short_gain_withheld(above, 10.0)
+    under, _ = _value(reasons, [_merger(8.0, None, None)])
+    assert dv.short_cover_factor(under, 10.0) == 1.0
+    assert dv.short_gain_withheld(under, 10.0)
+    mixed, _ = _value(reasons, [_merger(2.0, 0.5, 30.0)])
+    assert dv.short_cover_factor(mixed, 10.0) == pytest.approx(1.7)
+
+
 def test_a_missing_exchange_in_the_shock_map_raises() -> None:
     odd = {**LISTING, "exchange": "OTC"}
     with pytest.raises(ValueError, match=r"X: listing exchange 'OTC' is outside.*'p'"):

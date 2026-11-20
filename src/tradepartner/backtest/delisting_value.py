@@ -170,6 +170,22 @@ def delisting_exit_factor(valuation: ExitValuation, raw_close: float) -> float:
     return valuation.multiplier
 
 
+def short_cover_factor(valuation: ExitValuation, raw_close: float) -> float:
+    """The factor on a short's marked last-close value: `max(f, 1)`, `f` being
+    `delisting_exit_factor`. A failure shock or a take-under would be a gain to a short,
+    which a backtest cannot bank on a cover not executable at the last close, so it
+    credits nothing; a merger consideration above the last close is paid (backtest spec
+    amendment #3504, item 10; ADR 0024 consequence 5). Only the engine's short branch
+    calls it: the event-study caller of the shared rule is unchanged."""
+    return max(delisting_exit_factor(valuation, raw_close), 1.0)
+
+
+def short_gain_withheld(valuation: ExitValuation, raw_close: float) -> bool:
+    """Whether a short's cover factor was lifted to 1: the exit's factor is below 1, a
+    gain `short_cover_factor` did not credit (`n_short_failure_uncredited`)."""
+    return delisting_exit_factor(valuation, raw_close) < 1.0
+
+
 def merger_exit_frame(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
@@ -213,5 +229,7 @@ __all__ = [
     "delisting_exit_valuation",
     "ended_listings",
     "merger_exit_frame",
+    "short_cover_factor",
+    "short_gain_withheld",
     "window_end",
 ]
