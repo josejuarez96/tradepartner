@@ -38,6 +38,7 @@ import os
 import re
 from collections.abc import Callable
 from datetime import date
+from functools import cache
 from pathlib import Path
 from typing import Any, Literal, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -55,7 +56,7 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, DotEnvSettingsSource, SettingsConfigDict
 
 from tradepartner.config_backtest import _HYPOTHESIS_FAMILIES as _HYPOTHESIS_FAMILIES
 from tradepartner.config_backtest import ENGINE_FAMILIES as ENGINE_FAMILIES
@@ -1329,6 +1330,38 @@ class RawArchiveConfig(_ClosedConfig):
         return value
 
 
+def _nested_paths(model: type[BaseModel], prefix: tuple[str, ...]) -> list[tuple[str, ...]]:
+    """Every dotted field path under `model`, as tuples, recursing through nested models."""
+    paths: list[tuple[str, ...]] = []
+    for name, field in model.model_fields.items():
+        path = (*prefix, name)
+        paths.append(path)
+        annotation = field.annotation
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            paths.extend(_nested_paths(annotation, path))
+    return paths
+
+
+@cache
+def _misspelt_key_forms() -> dict[str, str]:
+    """Map each upper-cased single-underscore spelling of a nested setting to its
+    correct `__` form (#3589): `RISK_MAX_GROSS_EXPOSURE` -> `RISK__MAX_GROSS_EXPOSURE`.
+
+    `Settings` ignores unknown env names, so such a typo would silently leave the
+    default in force (and `risk` is frozen into the paper window). A form equal to a
+    top-level field name is dropped: that name is legitimate.
+    """
+    top = {name.upper() for name in Settings.model_fields}
+    forms: dict[str, str] = {}
+    for path in _nested_paths(Settings, ()):
+        if len(path) < 2:
+            continue
+        wrong = "_".join(path).upper()
+        if wrong not in top:
+            forms[wrong] = "__".join(path).upper()
+    return forms
+
+
 class Settings(BaseSettings):
     """Root application settings, loaded from env vars and an optional `.env`."""
 
@@ -1461,6 +1494,42 @@ class Settings(BaseSettings):
         self._validate_check_only_symbols()
         # And again (T277): the kill wait needs `store` and `ui` together.
         self._validate_kill_wait()
+        # And again (#3589): a misspelt nested env name is otherwise ignored.
+        self._validate_no_misspelt_env_keys(kwargs.get("_env_file"))
+
+    @staticmethod
+    def _validate_no_misspelt_env_keys(env_file: Path | str | None) -> None:
+        """Refuse env names that misspell a nested setting (#3589). Names only,
+        never values (same reason as the notes above). `.env.example`-only names
+        (`ANTHROPIC_API_KEY`, ...) match no nested form and still load."""
+        forms = _misspelt_key_forms()
+        sections = sorted(name.upper() for name in Settings.model_fields)
+        problems: list[str] = []
+        for name in sorted(os.environ):
+            if name.upper() in forms:
+                problems.append(
+                    f"{name} in the process environment matches no setting; "
+                    f"did you mean {forms[name.upper()]}?"
+                )
+        if env_file is not None:
+            source = DotEnvSettingsSource(Settings, env_file=env_file, env_file_encoding="utf-8")
+            # A line with no `=` parses as a name with value None: it is not a
+            # setting, and its text may be a pasted secret, so it is never echoed.
+            # Only a plain identifier is ever named in the message.
+            for name in sorted(n.upper() for n, v in source.env_vars.items() if v is not None):
+                if name.startswith("_") or not re.fullmatch(r"[A-Z0-9_]+", name):
+                    continue
+                if name in forms:
+                    problems.append(
+                        f"{name} in the env file matches no setting; did you mean {forms[name]}?"
+                    )
+                elif "__" in name and name.split("__", 1)[0].lower() not in Settings.model_fields:
+                    problems.append(
+                        f"{name} in the env file matches no setting; its first part must "
+                        f"be one of {', '.join(sections)}"
+                    )
+        if problems:
+            raise ValueError("; ".join(problems))
 
     def _validate_kill_wait(self) -> None:
         """A set `ui.kill_wait_seconds` must exceed `paper kill`'s worst-case store
