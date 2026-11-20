@@ -239,6 +239,18 @@ _HEAVY_TEST_FILE_WEIGHTS: dict[str, float] = {
 }
 _DEFAULT_TEST_FILE_WEIGHT = 14.0
 
+# The speed tier (#3647): a unit at or above this weight is marked `slow` at collection
+# (`pytest_itemcollected`), so `uv run pytest -m "not slow"` is the quick part of the
+# suite. This one constant decides the tier; there is no second list of slow files.
+# Measured on main 0c4d7f9f (2026-11-20), this table against `pytest --collect-only -q`
+# (19,214 tests, an estimated 23,625 CPU-s):
+#
+#   threshold (s)           slow units  slow tests  fast tests      fast share of CPU-s
+#   60 (every listed unit)  105         8,107       11,107 (58%)    5,278 (22%)
+#   100                     64          5,049       14,165 (74%)    8,466 (36%)
+#   200                     22          1,901       17,313 (90%)    14,198 (60%)
+_SLOW_UNIT_WEIGHT_S = 60.0
+
 # Files bucketed by individual test (nodeid) rather than as a whole file — see the
 # comment on `_HEAVY_TEST_FILE_WEIGHTS` above. Keep this list short: splitting a file
 # that *does* share an expensive module/session fixture across its tests would make
@@ -303,6 +315,22 @@ def _shard_unit(item: pytest.Item, rootdir: Path) -> str:
     """This item's bucketing key: its file, or its own nodeid for `_SPLIT_BY_TEST`."""
     rel = item.path.relative_to(rootdir).as_posix()
     return item.nodeid if rel in _SPLIT_BY_TEST else rel
+
+
+def is_slow_unit(unit: str) -> bool:
+    """Whether a shard unit (a file, or a `_SPLIT_BY_TEST` node id) is in the slow tier."""
+    return _HEAVY_TEST_FILE_WEIGHTS.get(unit, _DEFAULT_TEST_FILE_WEIGHT) >= _SLOW_UNIT_WEIGHT_S
+
+
+def pytest_itemcollected(item: pytest.Item) -> None:
+    """Mark every item of a heavy shard unit `slow` (#3647).
+
+    This hook, not `pytest_collection_modifyitems`: it runs as each item is collected,
+    before pytest's own `-m` deselection, so `-m "not slow"` sees the mark. The shard
+    bucketing is untouched.
+    """
+    if is_slow_unit(_shard_unit(item, item.config.rootpath)):
+        item.add_marker(pytest.mark.slow)
 
 
 def _order_shard_items(items: list[pytest.Item], rootdir: Path) -> None:

@@ -14,6 +14,8 @@ uv sync                    # creates .venv, installs deps
 uv run pre-commit install  # git hooks: block commit/push to main, secret scan, lint
 uv run pytest
 ```
+`uv run pytest -m "not slow"` is the fast tier: about 11,100 tests and 22% of the suite's CPU time (measured 2026-11-20).
+CI and `ready_pr.py` still run everything.
 
 ## Where things live
 | Path | What |
