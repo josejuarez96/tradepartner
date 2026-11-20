@@ -47,8 +47,8 @@ import pandas as pd
 import streamlit as st
 
 from tradepartner.config import Settings
-from tradepartner.dashboard import book_actions, ops_page, theme
-from tradepartner.execution import book_holdings, book_stats, book_view, home_view, ops
+from tradepartner.dashboard import book_actions, home_view, ops_page, theme
+from tradepartner.execution import book_holdings, book_stats, book_view, ops
 from tradepartner.execution.marks import UnreadableMarkError
 from tradepartner.store.journal import JournalNotInitialised
 from tradepartner.store.schema import SchemaVersionError
