@@ -43,7 +43,16 @@ class Timeout:
     """A scripted timeout after send: no answer, never re-sent."""
 
 
-Step = Answer | Timeout
+@dataclass(frozen=True)
+class Rejected:
+    """A scripted final status that rejects the request itself (HTTP 400 by default):
+    no answer and no usage."""
+
+    status: int = 400
+    body: str = '{"error": "bad request"}'
+
+
+Step = Answer | Timeout | Rejected
 
 
 class ScriptedModelClient:
@@ -74,6 +83,15 @@ class ScriptedModelClient:
                 raw_request=raw_request,
                 http_status=None,
                 raw_response="",
+                attempts=1,
+                latency_ms=0,
+            )
+        if isinstance(step, Rejected):
+            return make_response(
+                request,
+                raw_request=raw_request,
+                http_status=step.status,
+                raw_response=step.body,
                 attempts=1,
                 latency_ms=0,
             )
