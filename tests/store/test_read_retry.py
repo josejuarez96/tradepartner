@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import subprocess
 import sys
-import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -29,7 +28,8 @@ _HOLDER = (
 
 @contextmanager
 def writer_held(path: str, seconds: float) -> Iterator[None]:
-    """Another process holds the store's writer lock for `seconds`."""
+    """Another process holds the store's writer lock for up to `seconds`; the
+    holder is stopped when the block ends, so no test waits out the rest."""
     proc = subprocess.Popen(
         [sys.executable, "-c", _HOLDER, path, str(seconds)], stdout=subprocess.PIPE, text=True
     )
@@ -38,7 +38,24 @@ def writer_held(path: str, seconds: float) -> Iterator[None]:
         assert proc.stdout.readline().strip() == "held"
         yield
     finally:
+        proc.terminate()
         proc.wait(timeout=30)
+
+
+class _FakeTime:
+    """A clock that only moves when `sleep` is called, and records each sleep:
+    the lock conflict stays real, only the waiting is simulated (#3661)."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
 
 
 def _settings(path: Path, retry_seconds: int) -> Settings:
@@ -47,11 +64,14 @@ def _settings(path: Path, retry_seconds: int) -> Settings:
 
 def test_a_plain_read_only_open_still_fails_at_once(fixture_store_path: Path) -> None:
     settings = _settings(fixture_store_path, 30)
-    with writer_held(str(fixture_store_path), 1.0):
-        started = time.monotonic()
-        with pytest.raises(StoreLockedError), open_read_only(settings):
-            pass
-        assert time.monotonic() - started < 0.9
+    fake = _FakeTime()
+    with (
+        writer_held(str(fixture_store_path), 1.0),
+        pytest.raises(StoreLockedError),
+        open_read_only(settings, clock=fake.clock, sleep=fake.sleep),
+    ):
+        pass
+    assert fake.sleeps == []
 
 
 def test_a_retrying_open_waits_for_the_writer_to_let_go(fixture_store_path: Path) -> None:
@@ -61,15 +81,32 @@ def test_a_retrying_open_waits_for_the_writer_to_let_go(fixture_store_path: Path
 
 
 def test_a_retrying_open_gives_up_after_lock_retry_seconds(fixture_store_path: Path) -> None:
+    """The backoff doubles from the initial delay up to the cap, and the last
+    sleep is cut to what is left: the open never sleeps past the deadline."""
     settings = _settings(fixture_store_path, 1)
-    with writer_held(str(fixture_store_path), 3.0):
-        started = time.monotonic()
-        with (
-            pytest.raises(StoreLockedError, match="within 1s"),
-            open_read_only(settings, retry=True),
-        ):
-            pass
-        assert 0.9 <= time.monotonic() - started < 2.5
+    fake = _FakeTime()
+    with (
+        writer_held(str(fixture_store_path), 3.0),
+        pytest.raises(StoreLockedError, match="within 1s"),
+        open_read_only(settings, retry=True, clock=fake.clock, sleep=fake.sleep),
+    ):
+        pass
+    store = settings.store
+    assert fake.sleeps[0] == store.lock_retry_initial_delay_seconds
+    assert all(
+        later == pytest.approx(min(2 * earlier, store.lock_retry_max_delay_seconds))
+        for earlier, later in zip(fake.sleeps, fake.sleeps[1:-1], strict=False)
+    )
+    assert sum(fake.sleeps) == pytest.approx(store.lock_retry_seconds)
+
+
+def test_the_default_clock_is_the_real_one(fixture_store_path: Path) -> None:
+    """With no `clock` or `sleep` argument both opens work on a free store."""
+    settings = _settings(fixture_store_path, 20)
+    with open_read_only(settings) as conn:
+        assert conn.execute("SELECT 1").fetchone() == (1,)
+    with open_for_write(settings) as conn:
+        assert conn.execute("SELECT 1").fetchone() == (1,)
 
 
 def test_on_wait_fires_once_on_the_first_retry_of_either_open(fixture_store_path: Path) -> None:
