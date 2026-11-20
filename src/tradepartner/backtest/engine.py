@@ -150,7 +150,6 @@ from tradepartner.backtest.delisting_value import (
     window_end,
 )
 from tradepartner.backtest.fills import FillResult, apply_trades
-from tradepartner.backtest.hypothesis import frozen_hash_matches
 from tradepartner.backtest.metrics import PERCENT_POINTS_PER_UNIT
 from tradepartner.backtest.portfolio import (
     _equal_weight,
@@ -1972,6 +1971,10 @@ def _check_handle_binding(
     """Refuse a handle this computation is not the trial of (#3533): another window,
     params that do not hash to the registration, an in-sample run reaching the holdout,
     or a handle already used."""
+    # Imported here: `hypothesis` pulls the lab registry, which the execution window
+    # (that imports this module for `plan`) must not load.
+    from tradepartner.backtest.hypothesis import frozen_hash_matches
+
     for params, handle in variants:
         if (start, end) != (handle.start_session, handle.end_session):
             raise ValueError(
