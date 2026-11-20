@@ -100,6 +100,7 @@ def test_store_defaults() -> None:
     assert s.store.lock_retry_seconds == 60
     assert s.store.pre_migration_backups_to_keep == 2
     assert s.store.backup_disk_margin_bytes == 1_000_000_000
+    assert s.store.orphan_backup_min_age_hours == 24
 
 
 def test_pre_migration_backup_config_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -111,6 +112,8 @@ def test_pre_migration_backup_config_bounds(monkeypatch: pytest.MonkeyPatch) -> 
         Settings(_env_file=None, store={"pre_migration_backups_to_keep": 0})
     with pytest.raises(ValidationError):
         Settings(_env_file=None, store={"backup_disk_margin_bytes": -1})
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, store={"orphan_backup_min_age_hours": 0})
 
 
 def test_calendar_defaults() -> None:
