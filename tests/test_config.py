@@ -3004,6 +3004,21 @@ def test_openfigi_defaults_are_disabled_and_bounded() -> None:
     assert OpenfigiConfig(jobs_per_request=100).limits(keyed=False)[2] == 5
 
 
+def test_paper_run_lock_retry_defaults_and_bounds() -> None:
+    """#3640: the run lock is retried for 0.25 s every 0.05 s by default; a zero wait
+    is allowed (refuse at once), a zero poll is not, and neither key is frozen."""
+    paper = Settings(_env_file=None).paper
+    assert paper.run_lock_retry_seconds == pytest.approx(0.25)
+    assert paper.run_lock_poll_seconds == pytest.approx(0.05)
+    zero = Settings(_env_file=None, paper={"run_lock_retry_seconds": 0})
+    assert zero.paper.run_lock_retry_seconds == 0
+    for bad in ({"run_lock_retry_seconds": -0.1}, {"run_lock_poll_seconds": 0}):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, paper=bad)
+    assert "run_lock_retry_seconds" not in FROZEN_PAPER_KEYS
+    assert "run_lock_poll_seconds" not in FROZEN_PAPER_KEYS
+
+
 def test_the_free_disk_floor_is_a_run_time_key_that_cannot_be_negative() -> None:
     """#1758: `paper.min_free_disk_gb` defaults above zero, 0 turns it off, a
     negative value is refused, and it is not frozen at `paper start`."""

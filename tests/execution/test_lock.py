@@ -5,6 +5,7 @@ book's lock is another file."""
 
 from __future__ import annotations
 
+import fcntl
 import os
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from tradepartner.config import Settings
+from tradepartner.execution import lock as lock_module
 from tradepartner.execution.lock import (
     LockHeld,
     _flock,
@@ -122,6 +124,82 @@ def test_another_process_holding_it_refuses_this_one_and_names_its_pid(
         pass
 
 
+def test_a_probe_holding_the_shared_lock_for_an_instant_does_not_refuse_the_run(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3640: a reader's `is_held` probe holds a shared lock for an instant; the run
+    tries again within `paper.run_lock_retry_seconds` instead of exiting `locked`."""
+    path = lock_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+    probe = os.open(path, os.O_RDONLY)
+    fcntl.flock(probe, fcntl.LOCK_SH | fcntl.LOCK_NB)  # what `_held` holds for an instant
+    slept: list[float] = []
+
+    def release(seconds: float) -> None:
+        slept.append(seconds)
+        fcntl.flock(probe, fcntl.LOCK_UN)
+
+    monkeypatch.setattr(lock_module, "_sleep", release)
+    try:
+        with run_lock(settings):
+            pass
+    finally:
+        os.close(probe)
+    assert slept == [settings.paper.run_lock_poll_seconds]
+
+
+class _FakeClock:
+    """A monotonic clock that only `sleep` moves."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def test_a_real_holder_still_refuses_within_the_configured_wait(
+    settings: Settings, holder: subprocess.Popen[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeClock()
+    monkeypatch.setattr(lock_module, "_sleep", fake.sleep)
+    monkeypatch.setattr(lock_module, "_monotonic", fake.monotonic)
+    with pytest.raises(LockHeld, match=f"pid {holder.pid}"), run_lock(settings):
+        pass
+    assert fake.sleeps  # it did try again
+    assert fake.now - 1000.0 <= settings.paper.run_lock_retry_seconds + 1e-9
+
+
+def test_a_zero_wait_refuses_at_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`paper.run_lock_retry_seconds = 0` is the old rule: no retry, no sleep."""
+    settings = Settings(
+        _env_file=None,
+        store={"path": str(tmp_path / "test_store.duckdb")},
+        paper={"run_lock_retry_seconds": 0},
+    )
+    path = lock_path(settings)
+    path.touch()
+    probe = os.open(path, os.O_RDONLY)
+    fcntl.flock(probe, fcntl.LOCK_SH | fcntl.LOCK_NB)
+
+    def never(_seconds: float) -> None:
+        raise AssertionError("slept with a zero wait")
+
+    monkeypatch.setattr(lock_module, "_sleep", never)
+    try:
+        with pytest.raises(LockHeld), run_lock(settings):
+            pass
+    finally:
+        fcntl.flock(probe, fcntl.LOCK_UN)
+        os.close(probe)
+
+
 def test_is_held_sees_another_process(settings: Settings, holder: subprocess.Popen[str]) -> None:
     assert is_held(settings)
 
@@ -173,14 +251,14 @@ def test_main_also_holds_the_pre_book_lock_across_the_upgrade(settings: Settings
     """A process on the old code holds `<store.path>.paper.lock`: `main`'s run lock
     is refused and `main` reads as held, while `b` is unaffected; and `main`'s
     holder takes the old file too, so old code is refused while new code runs."""
-    with _flock(legacy_lock_path(settings)):
+    with _flock(legacy_lock_path(settings), 0.0, 1.0):
         assert is_held(settings, "main")
         assert not is_held(settings, "b")
         with pytest.raises(LockHeld, match=r"\.paper\.lock"), run_lock(settings):
             pass
         with run_lock(settings, "b"):
             pass
-    with run_lock(settings), pytest.raises(LockHeld), _flock(legacy_lock_path(settings)):
+    with run_lock(settings), pytest.raises(LockHeld), _flock(legacy_lock_path(settings), 0.0, 1.0):
         pass
     assert legacy_lock_path(settings) == Path(f"{settings.store.path}.paper.lock")
     assert not is_held(settings)
