@@ -23,6 +23,8 @@ STORE_PATH=$(uv run python -c "from tradepartner.config import get_settings; pri
 lsof "$STORE_PATH" || echo "nothing has the store open"
 ```
 
+Do not `export STORE_PATH`: the settings loader refuses an environment name that misspells `STORE__PATH` (#3589).
+
 If `git status` lists files or the branch is not `main`, stop and ask Claude. If `lsof` lists a process (a `sweep run`, a backfill, the dashboard, a job), wait for it to finish or close it, then run the last line again.
 
 **2. See what is coming, and whether the store layout changes.**

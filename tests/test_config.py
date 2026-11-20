@@ -4005,3 +4005,77 @@ def test_env_example_names_irrx_keys() -> None:
     text = env_example.read_text(encoding="utf-8")
     for name in Settings.model_fields["irrx"].annotation.model_fields:  # type: ignore[union-attr]
         assert f"IRRX__{name.upper()}=" in text, name
+
+
+# --- #3589: env names that misspell a nested setting are refused ---------------------
+
+
+def _env_file(tmp_path: Path, text: str) -> Path:
+    path = tmp_path / "t.env"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_single_underscore_spelling_of_a_nested_key_is_refused(tmp_path: Path) -> None:
+    path = _env_file(tmp_path, "RISK_MAX_GROSS_EXPOSURE=0.4\n")
+    with pytest.raises(ValueError) as exc:
+        Settings(_env_file=path)
+    message = str(exc.value)
+    assert "RISK_MAX_GROSS_EXPOSURE" in message
+    assert "RISK__MAX_GROSS_EXPOSURE" in message
+    assert "0.4" not in message
+
+
+def test_unknown_section_in_a_dotenv_key_is_refused(tmp_path: Path) -> None:
+    path = _env_file(tmp_path, "RISKS__MAX_GROSS_EXPOSURE=0.3\n")
+    with pytest.raises(ValueError) as exc:
+        Settings(_env_file=path)
+    assert "RISKS__MAX_GROSS_EXPOSURE" in str(exc.value)
+    assert "0.3" not in str(exc.value)
+
+
+def test_misspelt_key_in_process_environment_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RISK_MAX_GROSS_EXPOSURE", "0.4")
+    with pytest.raises(ValueError) as exc:
+        Settings(_env_file=None)
+    assert "RISK__MAX_GROSS_EXPOSURE" in str(exc.value)
+    assert "0.4" not in str(exc.value)
+
+
+def test_every_offending_key_is_named(tmp_path: Path) -> None:
+    path = _env_file(tmp_path, "RISK_MAX_GROSS_EXPOSURE=0.4\nSTORE_PATH=/x/secret\n")
+    with pytest.raises(ValueError) as exc:
+        Settings(_env_file=path)
+    message = str(exc.value)
+    assert "RISK_MAX_GROSS_EXPOSURE" in message
+    assert "STORE__PATH" in message
+    assert "/x/secret" not in message
+
+
+def test_legitimate_names_that_are_not_settings_fields_still_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _env_file(
+        tmp_path,
+        "ANTHROPIC_API_KEY=k\nALPACA_SANDBOX_API_KEY=k\nALPACA_SANDBOX_API_SECRET=s\n"
+        "TRADEPARTNER_INVOKED_BY=scheduler\nALPACA_PAPER_BOOKS__DAILY__API_KEY=k\n"
+        "ALPACA_PAPER_BOOKS__DAILY__API_SECRET=s\n",
+    )
+    monkeypatch.setenv("__CF_USER_TEXT_ENCODING", "0x1F5:0x0:0x0")
+    assert Settings(_env_file=path).alpaca_paper_books["daily"] is not None
+
+
+def test_env_example_loads_cleanly_with_every_line_uncommented(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    lines = []
+    for raw in (root / ".env.example").read_text(encoding="utf-8").splitlines():
+        body = raw.lstrip("# ").strip()
+        name = body.split("=", 1)[0]
+        if "=" in body and name and name == name.upper() and " " not in name:
+            lines.append(body)
+    assert any(line.startswith("STORE__") for line in lines)
+    # The example's sample values need not all be valid settings; the rule under test
+    # is only that no name in it is refused as misspelt.
+    Settings._validate_no_misspelt_env_keys(_env_file(tmp_path, "\n".join(lines) + "\n"))
