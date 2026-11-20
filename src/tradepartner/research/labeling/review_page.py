@@ -112,16 +112,35 @@ class PageRefused(ValueError):
 # --- pure parts -------------------------------------------------------------------
 
 
-def server_options_ok(address: object, gather_usage_stats: object) -> tuple[bool, str]:
-    """Whether the running Streamlit options satisfy ADR 0011 point 3 and, if not, a
-    message naming what to fix (the check `dashboard.app.render_app` makes)."""
-    if address in ALLOWED_SERVER_ADDRESSES and gather_usage_stats is False:
+def _allowed_hosts_ok(allowed_hosts: object) -> bool:
+    """True only for a non-empty list of loopback names (an empty list accepts any
+    Host, so a DNS-rebound name would reach the writes; #3588)."""
+    return (
+        isinstance(allowed_hosts, list | tuple)
+        and len(allowed_hosts) > 0
+        and all(isinstance(h, str) and h.lower() in ALLOWED_SERVER_ADDRESSES for h in allowed_hosts)
+    )
+
+
+def server_options_ok(
+    address: object, gather_usage_stats: object, allowed_hosts: object
+) -> tuple[bool, str]:
+    """Whether the running Streamlit options satisfy ADR 0011 point 3 and pin the Host
+    allow-list to loopback and, if not, a message naming what to fix (the check
+    `dashboard.app.render_app` makes)."""
+    if (
+        address in ALLOWED_SERVER_ADDRESSES
+        and gather_usage_stats is False
+        and _allowed_hosts_ok(allowed_hosts)
+    ):
         return True, ""
     return False, (
-        f"Refusing to render: server.address is {address!r} and "
-        f"browser.gatherUsageStats is {gather_usage_stats!r}. ADR 0011 requires "
-        f"server.address to be one of {sorted(ALLOWED_SERVER_ADDRESSES)} and "
-        "browser.gatherUsageStats to be false, so this page, which shows filings and "
+        f"Refusing to render: server.address is {address!r}, "
+        f"browser.gatherUsageStats is {gather_usage_stats!r} and "
+        f"server.allowedHosts is {allowed_hosts!r}. ADR 0011 requires "
+        f"server.address to be one of {sorted(ALLOWED_SERVER_ADDRESSES)}, "
+        "browser.gatherUsageStats to be false and server.allowedHosts to list only "
+        f"{sorted(ALLOWED_SERVER_ADDRESSES)}, so this page, which shows filings and "
         "writes labels, is never reachable from another machine. Start it through "
         "`tradepartner research gold` or `tradepartner research review` (or fix "
         "`.streamlit/config.toml`, STREAMLIT_SERVER_ADDRESS or --server.address) and reload."
@@ -703,7 +722,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     st.set_page_config(page_title="TradePartner review", layout="centered")
     ok, message = server_options_ok(
-        st.get_option("server.address"), st.get_option("browser.gatherUsageStats")
+        st.get_option("server.address"),
+        st.get_option("browser.gatherUsageStats"),
+        st.get_option("server.allowedHosts"),
     )
     if not ok:
         st.error(message)

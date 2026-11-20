@@ -2,7 +2,9 @@
 
 Not a `conftest.py`: a second conftest would shadow `tests/conftest.py` for the
 `from conftest import ...` lines these tests use. Each dashboard test module imports
-`nav_calls_fixture` (autouse, registered as `nav_calls`) from here.
+`nav_calls_fixture` (autouse, registered as `nav_calls`) from here. The fixture also
+sets the loopback `server.allowedHosts` a `tradepartner dashboard` launch passes, which
+`.streamlit/config.toml` lacks and the shell now refuses to render without (#3588).
 
 The shell's pages sit in a top navigation (`st.navigation(position="top")`), and
 `streamlit.testing.v1.AppTest` cannot click a top-nav item or `switch_page` to a
@@ -19,11 +21,13 @@ so a loaded CI shard cannot fail a correct page on Streamlit's 3 s default (#319
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 import streamlit as st
+from streamlit import config
 from streamlit.testing.v1 import AppTest
 
 NavCall = tuple[dict[str, list[Any]], dict[str, Any]]
@@ -44,10 +48,12 @@ def app_test(path: str | Path) -> AppTest:
 
 
 @pytest.fixture(autouse=True, name="nav_calls")
-def nav_calls_fixture(monkeypatch: pytest.MonkeyPatch) -> list[NavCall]:
+def nav_calls_fixture(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[NavCall]]:
     """Wrap `st.navigation` for the test and return the calls made to it."""
     calls: list[NavCall] = []
     real_navigation = st.navigation
+    hosts_before = config.get_option("server.allowedHosts")
+    config.set_option("server.allowedHosts", ["localhost"])
 
     class _Chosen:
         def __init__(self, target: Any) -> None:
@@ -64,7 +70,8 @@ def nav_calls_fixture(monkeypatch: pytest.MonkeyPatch) -> list[NavCall]:
         return _Chosen(target)
 
     monkeypatch.setattr(st, "navigation", _spy)
-    return calls
+    yield calls
+    config.set_option("server.allowedHosts", hosts_before)
 
 
 def nav_titles(calls: list[NavCall]) -> list[str]:

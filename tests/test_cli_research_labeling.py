@@ -270,7 +270,7 @@ def _store_digest(s: Settings) -> str:
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()
 
 
-def _page_args(argv: list[str]) -> tuple[dict[str, str], list[str]]:
+def _page_args(argv: list[str]) -> tuple[list[tuple[str, str]], list[str]]:
     """The Streamlit flags before `--` and the page's own arguments after it, asserted
     as `tradepartner dashboard`'s test does."""
     assert argv[1:4] == ["-m", "streamlit", "run"]
@@ -278,12 +278,18 @@ def _page_args(argv: list[str]) -> tuple[dict[str, str], list[str]]:
     assert page == cli.REVIEW_PAGE and page.is_file()
     assert page.name == "review_page.py" and page.parent.name == "labeling"
     split = argv.index("--")
-    flags = dict(zip(argv[5:split:2], argv[6:split:2], strict=True))
+    flags = list(zip(argv[5:split:2], argv[6:split:2], strict=True))
     return flags, argv[split + 1 :]
 
 
-def _assert_localhost(flags: Mapping[str, str]) -> None:
-    assert flags == {"--server.address": "localhost", "--browser.gatherUsageStats": "false"}
+def _assert_localhost(flags: Sequence[tuple[str, str]]) -> None:
+    assert flags == [
+        ("--server.address", "localhost"),
+        ("--browser.gatherUsageStats", "false"),
+        ("--server.allowedHosts", "localhost"),
+        ("--server.allowedHosts", "127.0.0.1"),
+        ("--client.showErrorDetails", "none"),
+    ]
 
 
 def _assert_no_content(output: str, ids: Sequence[str]) -> None:

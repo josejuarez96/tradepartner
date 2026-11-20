@@ -1,6 +1,6 @@
 """Override page (Phase 4 T69b, spec req 9; ADR 0011 Decision 2; ADR 0008 point 4).
 
-The dashboard's **only write**: a form whose submit appends one `overrides`
+The dashboard's **one in-process write**: a form whose submit appends one `overrides`
 row through T64b's `execution.window.override`, the same writer `paper
 override` uses. The page never opens a write connection itself and never
 restates the writer's checks (kind and fields, `no_window`, the trimmed
@@ -275,7 +275,7 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
 
     st.header("Override")
     st.caption(
-        "The dashboard's only write: one logged override with a reason, consumed by "
+        "The dashboard's one in-process write: a logged override with a reason, consumed by "
         "the run that plans the rebalance it names (the kill switch takes neither a "
         "session nor a name). The reason must meet the window's frozen minimum length "
         "once trimmed."

@@ -24,6 +24,7 @@ from typing import Any
 import duckdb
 import pytest
 import streamlit as st
+from streamlit import config as st_config
 from streamlit.testing.v1 import AppTest
 
 from research.labeling.test_gold import (
@@ -105,6 +106,16 @@ def _app(
     at.run()
     assert not at.exception, at.exception
     return at
+
+
+@pytest.fixture(autouse=True)
+def _loopback_allowed_hosts() -> Iterator[None]:
+    """`.streamlit/config.toml` has no Host allow-list; the page refuses without one,
+    so set what `tradepartner research review` passes (#3588)."""
+    before = st_config.get_option("server.allowedHosts")
+    st_config.set_option("server.allowedHosts", ["localhost"])
+    yield
+    st_config.set_option("server.allowedHosts", before)
 
 
 def _gold_app(
@@ -219,6 +230,30 @@ def test_refuses_off_localhost_through_the_real_script(
     assert not at.exception
     assert any("refusing to render" in str(e.value).lower() for e in at.error)
     assert not at.button
+
+
+@pytest.mark.parametrize("hosts", [[], ["*"], ["evil.example"], ["localhost", "*"]])
+def test_refuses_without_loopback_allowed_hosts(
+    monkeypatch: pytest.MonkeyPatch,
+    gold_session: gold.GoldSession,
+    stops: list[int],
+    hosts: list[str],
+) -> None:
+    real = st.get_option
+    monkeypatch.setattr(
+        st, "get_option", lambda key: hosts if key == "server.allowedHosts" else real(key)
+    )
+    at = _gold_app(monkeypatch, gold_session, stops)
+    assert any("server.allowedHosts" in str(e.value) for e in at.error)
+    assert not at.button
+
+
+@pytest.mark.parametrize(
+    ("hosts", "expected"),
+    [(["localhost"], True), (["localhost", "127.0.0.1"], True), ([], False), (["*"], False)],
+)
+def test_server_options_ok_allow_list(hosts: list[str], expected: bool) -> None:
+    assert review_page.server_options_ok("localhost", False, hosts)[0] is expected
 
 
 def test_refuses_with_usage_stats_on(
