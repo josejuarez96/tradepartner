@@ -60,6 +60,7 @@ from execution.test_run_trade import (
 )
 from tradepartner.adapters.broker import (
     Asset,
+    Fill,
     Order,
     OrderRequest,
     OrderStatus,
@@ -1696,6 +1697,31 @@ def test_an_unresolved_order_whose_coid_lookup_lags_but_is_filled_is_not_closed_
     with pytest.raises(ReconciliationError, match="at the broker"):
         settle_pending_unresolved(env.fake, env.connect, env.clock, [row])
     assert _events(env, coid) == [("pending", None), ("pending_unresolved", None)]
+
+
+def test_the_fill_read_starts_one_overlap_before_the_pending_stamp(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3575: the broker filters fills on its own clock, so the read starts
+    `paper.fill_read_overlap_seconds` before our `pending` stamp."""
+    coid, row = _unconfirmed_unresolved_buy(env)
+    _lagging(env, monkeypatch, coid)
+    (pending_at,) = env.query(
+        "SELECT known_at FROM order_events WHERE client_order_id = ? AND status = 'pending'",
+        [coid],
+    )[0]
+    asked: list[datetime | None] = []
+    real = env.fake.fills
+
+    def fills(since: datetime | None = None) -> list[Fill]:
+        asked.append(since)
+        return real(since)
+
+    monkeypatch.setattr(env.fake, "fills", fills)
+    with pytest.raises(ReconciliationError):
+        settle_pending_unresolved(env.fake, env.connect, env.clock, [row], env.settings)
+    overlap = timedelta(seconds=env.settings.paper.fill_read_overlap_seconds)
+    assert asked == [pending_at - overlap]
 
 
 def test_a_failed_open_orders_read_fails_closed_and_writes_nothing(
