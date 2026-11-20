@@ -1780,9 +1780,11 @@ def test_dashboard_launches_streamlit_on_the_app_bound_to_localhost(tmp_path: Pa
     app_path = Path(argv[4])
     assert app_path.name == "app.py" and app_path.parent.name == "dashboard"
     assert app_path.is_file()
-    flags = dict(zip(argv[5::2], argv[6::2], strict=True))
-    assert flags["--server.address"] == "localhost"
-    assert flags["--browser.gatherUsageStats"] == "false"
+    pairs = list(zip(argv[5::2], argv[6::2], strict=True))
+    assert dict(pairs)["--server.address"] == "localhost"
+    assert dict(pairs)["--browser.gatherUsageStats"] == "false"
+    assert [v for k, v in pairs if k == "--server.allowedHosts"] == ["localhost", "127.0.0.1"]
+    assert ("--client.showErrorDetails", "none") in pairs
 
 
 def test_dashboard_exit_code_is_streamlits(tmp_path: Path) -> None:

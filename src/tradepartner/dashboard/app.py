@@ -229,20 +229,40 @@ _DETAIL_PAGES: dict[str, _PageRenderer] = {
 }
 
 
-def _server_options_ok(address: str | None, gather_usage_stats: bool | None) -> tuple[bool, str]:
-    """Whether the *running* Streamlit options satisfy ADR 0011 point 3, and if
-    not, a message naming what to fix. Pure, so the refusal is testable without
-    a Streamlit script run (module docstring)."""
-    if address in _ALLOWED_SERVER_ADDRESSES and gather_usage_stats is False:
+def _allowed_hosts_ok(allowed_hosts: object) -> bool:
+    """True only for a non-empty list of loopback names (an empty list accepts any
+    Host, so a DNS-rebound name would reach the writes; #3588)."""
+    return (
+        isinstance(allowed_hosts, list | tuple)
+        and len(allowed_hosts) > 0
+        and all(
+            isinstance(h, str) and h.lower() in _ALLOWED_SERVER_ADDRESSES for h in allowed_hosts
+        )
+    )
+
+
+def _server_options_ok(
+    address: str | None, gather_usage_stats: bool | None, allowed_hosts: object
+) -> tuple[bool, str]:
+    """Whether the *running* Streamlit options satisfy ADR 0011 point 3 and pin the
+    Host allow-list to loopback, and if not, a message naming what to fix. Pure, so
+    the refusal is testable without a Streamlit script run (module docstring)."""
+    if (
+        address in _ALLOWED_SERVER_ADDRESSES
+        and gather_usage_stats is False
+        and _allowed_hosts_ok(allowed_hosts)
+    ):
         return True, ""
     return False, (
-        f"Refusing to render: server.address is {address!r} and "
-        f"browser.gatherUsageStats is {gather_usage_stats!r}. ADR 0011 requires "
-        f"server.address to be one of {sorted(_ALLOWED_SERVER_ADDRESSES)} and "
-        "browser.gatherUsageStats to be false, so the dashboard's one write "
-        "(the override form) is never reachable from another machine. Fix "
-        "`.streamlit/config.toml` (or an overriding STREAMLIT_SERVER_ADDRESS / "
-        "--server.address) and reload."
+        f"Refusing to render: server.address is {address!r}, "
+        f"browser.gatherUsageStats is {gather_usage_stats!r} and "
+        f"server.allowedHosts is {allowed_hosts!r}. ADR 0011 requires "
+        f"server.address to be one of {sorted(_ALLOWED_SERVER_ADDRESSES)}, "
+        "browser.gatherUsageStats to be false and server.allowedHosts to list only "
+        f"{sorted(_ALLOWED_SERVER_ADDRESSES)}, so the dashboard's writes (the "
+        "override form, Stop this book now, Lab Run and Lab Register) are never "
+        "reachable from another machine or a rebound hostname. Start it through "
+        "`tradepartner dashboard` and reload."
     )
 
 
@@ -281,7 +301,9 @@ def render_app(settings: Settings | None = None) -> None:
     st.title("TradePartner")
 
     ok, message = _server_options_ok(
-        st.get_option("server.address"), st.get_option("browser.gatherUsageStats")
+        st.get_option("server.address"),
+        st.get_option("browser.gatherUsageStats"),
+        st.get_option("server.allowedHosts"),
     )
     if not ok:
         st.error(message)
