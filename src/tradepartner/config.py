@@ -900,6 +900,10 @@ class PaperConfig(BaseModel):
     `run_failed` alert and no kill switch. 0 turns the check off. Run-time, not frozen.
     `max_fault_note_chars` (#3635) bounds the scrubbed exception message a halt-path or
     failed-path note keeps (`execution.plain.fault_note`). Run-time, not frozen.
+    `run_lock_retry_seconds` (#3640) is how long `execution.lock.run_lock` keeps trying
+    a refused run lock, every `run_lock_poll_seconds`: the wait covers a reader's
+    `is_held` probe, which holds a shared lock for an instant; 0 restores the
+    refuse-at-once rule. Both run-time, not frozen.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -930,6 +934,8 @@ class PaperConfig(BaseModel):
     max_universe_drop_fraction: float = Field(default=0.5, ge=0, le=1)
     min_free_disk_gb: float = Field(default=5.0, ge=0)
     max_fault_note_chars: int = Field(default=300, gt=0)
+    run_lock_retry_seconds: float = Field(default=0.25, ge=0)
+    run_lock_poll_seconds: float = Field(default=0.05, gt=0)
     #: `paper status` reads the slippage line over only the newest
     #: `status_slippage_sessions` order sessions of the window (#1741): the line is
     #: a diagnostic, and one `prices_as_of` read per session would otherwise grow
