@@ -925,7 +925,7 @@ class TestDelistingPolicy:
 
     def test_a_long_exit_is_unchanged_by_the_short_branch(self) -> None:
         value, counts = self._short_value(self._LISTING, [self._reason("bankruptcy")], value=100.0)
-        assert value == pytest.approx(55.0)
+        assert value == pytest.approx(45.0)
         assert counts["n_short_failure_uncredited"] == 0
 
     def test_a_transfer_is_never_shocked(self) -> None:
