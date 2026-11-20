@@ -147,7 +147,7 @@ def test_dollar_volume_paper_and_backtest_rows_agree_on_both_sides_of_snapshot(
             hypothesis_id=env.hypothesis_id,
             kind="tracking",
             start_session=date(2020, 5, 29),
-            end_session=date(2020, 6, 30),
+            end_session=date(2020, 7, 31),
             data_cutoff=read_time(date(2020, 6, 30), "month_end"),
             synthetic=False,
             run_by="test",
