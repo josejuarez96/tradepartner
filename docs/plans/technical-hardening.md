@@ -1,6 +1,6 @@
 # Plan: Technical hardening (review of 2026-11-20)
 
-**Spec:** none. Every item here is size S or M, so the spec-lite is each issue's own body (Why, Confirm first, Change, Tests, Acceptance, Out of scope), as development-process "Right-size the ceremony" allows. No ADR is written here; the six choices that would need one are filed as owner decisions below · **Status:** Draft · **Issue:** #3618 (tracker) · **Source:** the technical review of 2026-11-20 (nine reviewers, main `0c4d7f9f`), the engineering-health companion to the functional review of the same night (#3523).
+**Spec:** none. Every item here is size S or M, so the spec-lite is each issue's own body (Why, Confirm first, Change, Tests, Acceptance, Out of scope), as development-process "Right-size the ceremony" allows. No ADR is written here; the six choices that would need one are filed as owner decisions below · **Status:** Approved (owner, 2026-11-20, in the build session; the five parked tasks stay parked on their own notes) · **Issue:** #3618 (tracker) · **Source:** the technical review of 2026-11-20 (nine reviewers, main `0c4d7f9f`), the engineering-health companion to the functional review of the same night (#3523).
 
 ## Approach (short)
 
