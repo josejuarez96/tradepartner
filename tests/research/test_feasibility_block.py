@@ -179,23 +179,29 @@ def test_module_reads_no_clock_store_or_config() -> None:
         assert needle not in source
 
 
-def test_event_power_line_carries_s_g_hand_formula_ceiling_and_bounds() -> None:
+def test_event_power_line_carries_s_g_proved_bound_and_the_approximate_hand_figure() -> None:
     block = fb.render_block(_parse(VALID), _counts())
     assert "S 300 sessions, G 5 quarters" in block  # 2018Q1 to 2019Q1
     eff = _effective(3.5, 4)
     by_hand = shape.effective_count_by_hand(4, eff.same_date_factor, 20, 300)
-    ceiling = shape.effective_count_ceiling(20, 300)
-    bound = shape.effective_count_same_session_bound(20, 300)
-    assert (
-        f"by hand 1 / (B/N + 0.05 x h/S) = {by_hand:.1f}; ceiling {ceiling:.1f}; "
-        f"same-session bound {bound:.1f}"
-    ) in block
+    bound = shape.effective_count_default_bound(20, 300)
+    assert f"proved bound {bound:.1f}; by hand (approximate) {by_hand:.1f}" in block
     assert "bounds rho 0 7.0, rho 1 1.8" in block
+    assert "ceiling" not in block and "same-session" not in block
+
+
+def test_a_long_hold_against_a_short_window_does_not_raise() -> None:
+    design = _parse(VALID.replace("hold_sessions = 20", "hold_sessions = 200"))
+    counts = fb.FeasibilityCounts(**{**_counts().__dict__, "window_sessions": 60})
+    block = fb.render_block(design, counts)
+    assert "proved bound" in block
+    assert fb.render_block(design, counts) == block
 
 
 def test_a_cited_rho_prints_no_default_hand_formula() -> None:
     design = _parse('rho = 0.3\nrho_source = "a paper"\n' + VALID)
-    assert "by hand" not in fb.render_block(design, _counts())
+    block = fb.render_block(design, _counts())
+    assert "by hand" not in block and "proved bound" not in block
 
 
 def test_trial_shape_prints_the_irrx_pass_chance_with_its_borrow() -> None:

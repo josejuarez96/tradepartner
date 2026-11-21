@@ -208,16 +208,12 @@ def _shape_lines(design: FeasibilityDesign, n_eff_by_band: dict[int | None, floa
 
 
 def _hand_line(design: FeasibilityDesign, eff: EffectiveCount, window_sessions: int) -> str:
-    """The default's hand formula, its ceiling and its tighter same-session bound."""
+    """Under the default rule only: the proved upper bound, and the approximate by-hand figure."""
     rho = shape.DEFAULT_CROSS_ISSUER_RHO
     hold = design.hold_sessions
     by_hand = shape.effective_count_by_hand(eff.n, eff.same_date_factor, hold, window_sessions, rho)
-    ceiling = shape.effective_count_ceiling(hold, window_sessions, rho)
-    bound = shape.effective_count_same_session_bound(hold, window_sessions, rho)
-    return (
-        f"    by hand 1 / (B/N + {rho:g} x h/S) = {by_hand:.1f}; "
-        f"ceiling {ceiling:.1f}; same-session bound {bound:.1f}"
-    )
+    bound = shape.effective_count_default_bound(hold, window_sessions, rho)
+    return f"    proved bound {bound:.1f}; by hand (approximate) {by_hand:.1f}"
 
 
 def _rule_text(design: FeasibilityDesign) -> str:
