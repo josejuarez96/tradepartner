@@ -24,7 +24,7 @@ import polars as pl
 import pytest
 from pydantic import SecretStr
 
-from research.fake_model_client import Answer, ScriptedModelClient, Step, Timeout
+from research.fake_model_client import Answer, Rejected, ScriptedModelClient, Step, Timeout
 from tradepartner.config import Settings
 from tradepartner.research import DatasetChanged, RunHandle, datafiles
 from tradepartner.research.experiment import ParsedExperiment
@@ -549,6 +549,36 @@ def test_a_model_id_mismatch_stops_after_writing_its_record(world: World) -> Non
     assert len(client.requests) == 1
 
 
+def test_a_rejected_request_stops_the_batch_after_its_record_and_costs_nothing(
+    world: World,
+) -> None:
+    """#3660: HTTP 400 means the request itself is wrong, so the next call would fail
+    the same way; the run ends `failed` after that one record, which costs nothing."""
+    gold_id = world.gold(_dev(3), _pilot(1))
+    client = ScriptedModelClient([Rejected(), Answer(MERGER), Answer(MERGER)])
+    result = world.run(client, gold_id, "dev")
+    assert (result.outcome, result.message) == ("failed", "request rejected: HTTP 400")
+    assert len(client.requests) == 1
+    (record,) = _records(world.settings, result.run_id)
+    assert (record["http_status"], record["reason"]) == (400, "refused")
+    assert record["cost_usd"] == 0.0
+    assert world.result(result.run_id)["outcome"] == "failed"
+
+
+def test_a_final_429_is_recorded_and_the_batch_continues(world: World) -> None:
+    """#3660 pin: 429 is not a rejected request, so a final one is recorded and the
+    next row is still called."""
+    gold_id = world.gold(_dev(2), _pilot(1))
+    client = ScriptedModelClient([Answer(MERGER, rate_limits=3), Answer(MERGER)])
+    result = world.run(client, gold_id, "dev")
+    assert result.outcome == "ok"
+    records = _records(world.settings, result.run_id)
+    assert [r["listing_end_id"] for r in records] == ["D00", "D01"]
+    assert (records[0]["http_status"], records[0]["reason"]) == (429, "refused")
+    assert records[1]["reason"] == "ok"
+    assert len(client.requests) == 2
+
+
 def test_a_429_retry_is_recorded_with_two_attempts(world: World) -> None:
     gold_id = world.gold(_dev(1), _pilot(1))
     result = world.run(ScriptedModelClient([Answer(MERGER, rate_limits=1)]), gold_id, "dev")
@@ -788,6 +818,34 @@ def test_two_drift_flips_close_the_batch_before_its_first_call(world: World) -> 
     drift = world.result(drift_run[0])
     assert (drift["outcome"], drift["verdict"]) == ("ok", "fail")
     assert drift["primary_value"] == pytest.approx(0.10)
+
+
+def test_a_rejected_drift_call_closes_the_batch_before_its_first_call(world: World) -> None:
+    """#3660: the drift probe goes through the same caller, so a rejected request
+    stops it after one call and the batch never starts."""
+    gold_id, baseline_run, frame_id = _drift_world(world)
+    drift_client = ScriptedModelClient([Rejected(status=422), *_drift_answers(0)])
+    batch_client = ScriptedModelClient([Answer(MERGER)] * 3)
+    result = world.run(
+        _factory(drift_client, batch_client),
+        frame_id,
+        "full",
+        slug="departure-reason-batches",
+        drift=job.DriftProbe(dataset_id=gold_id, baseline_run_id=baseline_run),
+    )
+    assert (result.outcome, result.message) == ("failed", "drift probe not passed")
+    assert batch_client.requests == [] and len(drift_client.requests) == 1
+    assert _records(world.settings, result.run_id) == []
+    assert not datafiles.shortlist_path(world.settings, result.run_id).exists()
+    drift_run = world.conn.execute(
+        "SELECT max(run_id) FROM research_runs r JOIN research_registrations g "
+        "USING (registration_id) WHERE g.slug = 'departure-reason-drift'"
+    ).fetchone()
+    assert drift_run is not None
+    drift = world.result(drift_run[0])
+    assert (drift["outcome"], drift["message"]) == ("failed", "request rejected: HTTP 422")
+    (record,) = _records(world.settings, drift_run[0])
+    assert (record["http_status"], record["cost_usd"]) == (422, 0.0)
 
 
 def test_one_drift_flip_passes_and_the_batch_is_left_unfinished(world: World) -> None:
