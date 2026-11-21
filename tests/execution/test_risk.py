@@ -675,6 +675,16 @@ def test_rounding_is_never_up(quantity: float, decimals: int, expected: float) -
     assert round_down(quantity, decimals) <= quantity
 
 
+@pytest.mark.parametrize(("quantity", "decimals"), [(1e27, 2), (0.30000000000000004, 30)])
+def test_round_down_refuses_more_digits_than_decimal_carries(
+    quantity: float, decimals: int
+) -> None:
+    """#3655: both raised `decimal.InvalidOperation`, not the `ValueError` every other
+    bad input raises here; a caller's `except ValueError` would have missed it."""
+    with pytest.raises(ValueError, match="cannot be rounded"):
+        round_down(quantity, decimals)
+
+
 def test_round_down_refuses_negative_decimals() -> None:
     with pytest.raises(ValueError, match="decimals"):
         round_down(1.0, -1)
