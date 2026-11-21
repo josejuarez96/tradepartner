@@ -97,6 +97,7 @@ def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path, now: datetime = T) -
 def _text(at: AppTest) -> str:
     parts: list[Any] = [m.value for m in at.markdown]
     parts += [c.value for c in at.caption]
+    parts += [t.value for t in at.text]
     parts += [h.value for h in at.subheader]
     parts += [f"{m.label} {m.value}" for m in at.metric]
     parts += [e.value for kind in (at.info, at.warning, at.error, at.success) for e in kind]
@@ -370,6 +371,17 @@ def test_render_shows_the_delisting_reasons_card(
         assert line.strip() in text, line
     frames = {tuple(df.value.columns) for df in at.dataframe}
     assert block.unknown.is_empty() or tuple(block.unknown.columns) in frames
+
+
+def test_delisting_reason_lines_render_as_plain_text(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    """#3656: the block's lines are indented plain text, never markdown."""
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    prefix = "delisting reasons:"
+    assert any(line.startswith(prefix) for t in at.text for line in str(t.value).splitlines())
+    assert not [m.value for m in at.markdown if prefix in str(m.value)]
 
 
 def test_render_marks_a_stale_store(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> None:
