@@ -1392,7 +1392,7 @@ class BatchResult:
     unresolved_share: float | None = None
 
 
-def run_batch(
+def run_batch(  # noqa: PLR0913
     conn: duckdb.DuckDBPyConnection,
     settings: Settings,
     client_factory: ClientFactory,

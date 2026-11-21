@@ -224,7 +224,7 @@ class _Journal:
         )
         return decision_id
 
-    def order(
+    def order(  # noqa: PLR0913
         self,
         coid: str,
         decision_id: int,

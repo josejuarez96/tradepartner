@@ -175,7 +175,7 @@ class Rig:
         rows[wrong_line].update(wrong or {})
         return rows
 
-    def form4_run(
+    def form4_run(  # noqa: PLR0913
         self,
         *,
         run_id: str = "run-1",

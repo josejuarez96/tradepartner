@@ -1205,7 +1205,7 @@ def _is_exchange_name_format(element: Any) -> bool:
 
 
 @_fail_closed
-def parse_cover_page(
+def parse_cover_page(  # noqa: C901
     document: bytes,
     *,
     accession: str,
@@ -2103,7 +2103,7 @@ def _fsn_class_member(
 
 
 @_fail_closed
-def _parse_one_fsn_filing(
+def _parse_one_fsn_filing(  # noqa: C901, PLR0912
     accession: str,
     sub_row: Mapping[str, str],
     num_rows: Sequence[Mapping[str, str]],

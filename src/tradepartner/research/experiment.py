@@ -243,7 +243,7 @@ def _study_positive_int(key: str, value: object, path: Path) -> int:
     return result
 
 
-def _validate_study(
+def _validate_study(  # noqa: C901, PLR0912
     study: object, path: Path, budget: int, ci_level: float, inference: str
 ) -> dict[str, Any]:
     if not isinstance(study, dict):
@@ -528,7 +528,7 @@ def _load_claims(claims_path: Path) -> dict[str, str]:
     return grades
 
 
-def parse_experiment_file(
+def parse_experiment_file(  # noqa: C901, PLR0912, PLR0915
     path: Path,
     experiments_dir: Path,
     *,

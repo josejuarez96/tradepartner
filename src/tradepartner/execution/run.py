@@ -1154,7 +1154,7 @@ def _pre_run_failed(
             clock_fault=clock_fault,
             book_id=book,
         )
-    except Exception as alert_error:
+    except Exception as alert_error:  # noqa: BLE001
         problem = fault_note(
             "run_failed alert not written",
             alert_error,
@@ -1240,7 +1240,7 @@ def _run_rank(conn: duckdb.DuckDBPyConnection, book: str) -> int:
         if window is None:
             return _UNREADABLE_RANK
         return _CADENCE_RUN_RANK[window_cadence(conn, window)]
-    except Exception:  # any read error: the book's own run fails closed on it
+    except Exception:  # any read error: the book's own run fails closed on it  # noqa: BLE001
         return _UNREADABLE_RANK
 
 
@@ -1275,7 +1275,7 @@ def every_book_run(
         except SystemExit as exc:
             code = exc.code if isinstance(exc.code, int) and exc.code else CRASH_EXIT_CODE
             results.append(BookRun(book, _CRASHED, error=exc, exit_code=code))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             results.append(BookRun(book, _CRASHED, error=exc, exit_code=CRASH_EXIT_CODE))
         else:
             results.append(BookRun(book, outcome.status, outcome, exit_code=outcome.exit_code))
@@ -1501,7 +1501,7 @@ class _Run:
                 clock_fault=clock_fault,
                 book_id=self.window.book_id,
             )
-        except Exception as alert_error:
+        except Exception as alert_error:  # noqa: BLE001
             problems.append(self._fault_note("run_failed alert not written", alert_error))
         try:
             finished, clock_fault = self._stamp(clock_fault)
@@ -1519,7 +1519,7 @@ class _Run:
                         ingested_at=finished,
                     ),
                 )
-        except Exception as write_error:
+        except Exception as write_error:  # noqa: BLE001
             problems.append(self._fault_note("result row not written", write_error))
         if problems:
             exc.add_note(self.alerter.scrub("failed path: " + "; ".join(problems)))

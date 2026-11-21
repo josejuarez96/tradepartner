@@ -381,7 +381,7 @@ def _sell_skip(
     return None
 
 
-def sell_orders(
+def sell_orders(  # noqa: PLR0913
     decisions: Sequence[DecisionRow],
     states: Mapping[int, DecisionState],
     ledger: Ledger,

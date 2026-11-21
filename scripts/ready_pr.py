@@ -870,7 +870,7 @@ def targeted_tests(
 # ── the flow ────────────────────────────────────────────────────────────────────
 
 
-def ready(
+def ready(  # noqa: C901, PLR0912, PLR0915
     r: Runner,
     number: int,
     *,

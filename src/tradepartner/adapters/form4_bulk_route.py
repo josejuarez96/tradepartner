@@ -364,7 +364,7 @@ class BulkRouteResult:
         return f"Form 4 bulk: {self.requests} requests, {self.remaining} remaining; {figures}"
 
 
-def run_form4_bulk_route(
+def run_form4_bulk_route(  # noqa: C901, PLR0912, PLR0913, PLR0915
     accessions: Iterable[Form4IndexRow],
     *,
     quarters: Mapping[Quarter, InsiderBulk | None],

@@ -4700,7 +4700,7 @@ def _migrate_not_computable(conn: duckdb.DuckDBPyConnection) -> None:
     )
 
 
-def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
+def init_schema(conn: duckdb.DuckDBPyConnection) -> None:  # noqa: C901, PLR0912
     """Create every store table if it does not already exist, migrating a
     version-2 to 44 store to version 45.
 

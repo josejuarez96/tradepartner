@@ -1004,7 +1004,7 @@ def trial_snapshot(
     )
 
 
-def open_trial(
+def open_trial(  # noqa: PLR0913
     conn: duckdb.DuckDBPyConnection,
     *,
     hypothesis_id: int,

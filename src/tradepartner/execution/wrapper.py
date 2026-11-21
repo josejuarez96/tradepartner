@@ -1382,7 +1382,7 @@ class RiskGatedBroker:
                 total += Decimal(repr(float(order.notional)))
         return total
 
-    def _gate(
+    def _gate(  # noqa: PLR0913
         self,
         run: PaperRunRow,
         book: _Book,
@@ -1659,7 +1659,7 @@ class RiskGatedBroker:
                 row = conn.execute(
                     "SELECT book_id FROM paper_windows WHERE window_id = ?", [run.window_id]
                 ).fetchone()
-        except Exception:
+        except Exception:  # noqa: BLE001
             return None
         if row is None:
             return None
@@ -2266,7 +2266,7 @@ class RiskGatedBroker:
 
         try:
             requested = self._acknowledged_open(run)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             requested = []
             notes.append(self._fault_note("open orders not read, no cancel attempted", exc))
         cancelled = [order for order in requested if self._cancel(order, stamp, notes)]
@@ -2279,7 +2279,7 @@ class RiskGatedBroker:
         owed = list(dict.fromkeys(self._unsent))
         try:
             self.alert_unsent(run)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             notes.extend([self._fault_note("skipped alert not written", exc), *owed])
         message = self._scrub("; ".join([headline, *dict.fromkeys(notes)]))
         alert_kind = _STALE_DATA if stale else _alert_kind(fault)
@@ -2292,7 +2292,7 @@ class RiskGatedBroker:
                 clock_fault=stamp.fault,
                 book_id=self._run_book(run),
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             notes.append(self._fault_note("alert not written", exc))
             message = self._scrub("; ".join([headline, *dict.fromkeys(notes)]))
         finished = stamp()
@@ -2311,7 +2311,7 @@ class RiskGatedBroker:
                         ingested_at=finished,
                     ),
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             notes.append(self._fault_note("result row not written", exc))
         if notes:
             fault.add_note(self._scrub("halt path: " + "; ".join(dict.fromkeys(notes))))
@@ -2333,7 +2333,7 @@ class RiskGatedBroker:
             return False
         try:
             self._broker.cancel(coid)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             if classify(Broker.cancel.__name__, exc) is Verdict.ALLOWED:
                 self._event(coid, _CANCEL_NOOP, stamp, notes)
             else:
@@ -2368,7 +2368,7 @@ class RiskGatedBroker:
                 self._settings.paper.max_fill_price_deviation,
                 bar_sessions.__getitem__,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             # A halt still reads back fills when its reference-price read fails.
             notes.append(self._fault_note(f"halt read of {coid} has no price band", exc))
         try:
@@ -2414,7 +2414,7 @@ class RiskGatedBroker:
                 self._event(coid, _CANCEL_FAILED, stamp, notes)
             notes.append(self._fault_note(f"halt read of {coid} failed", exc))
             return
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self._event(coid, _CANCEL_FAILED, stamp, notes)
             # The message is kept (scrubbed): a refusal such as #650's names
             # the timestamps that explain it (#730).
@@ -2441,7 +2441,7 @@ class RiskGatedBroker:
                         ingested_at=now,
                     ),
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             notes.append(self._fault_note(f"{status} of {coid} not journaled", exc))
             return False
         return True

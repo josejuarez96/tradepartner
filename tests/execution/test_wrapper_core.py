@@ -285,7 +285,7 @@ def _halt(gate: RiskGatedBroker, fault: Exception, run: PaperRunRow, **kwargs: A
     """Raise `fault` and take the halt path from its `except`, as the run does."""
     try:
         raise fault
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         gate.halt(exc, run, **kwargs)
 
 
@@ -1722,7 +1722,7 @@ def test_a_book_mismatch_refusal_never_takes_the_other_book_s_halt_path(
     with pytest.raises(BookMismatchError, match="not this wrapper's 'b'"):
         try:
             _execute(gate, env, [_decision(env, A, "buy", notional=300.0)])
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             gate.halt(exc, env.run)
 
     assert _query(env.settings, "SELECT COUNT(*) FROM kill_switch") == [(0,)]

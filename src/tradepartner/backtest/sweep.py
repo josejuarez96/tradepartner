@@ -396,7 +396,7 @@ def _lattice_index(value: float, step: float) -> int | None:
     return k if abs(value - k * step) <= _LATTICE_TOLERANCE * step else None
 
 
-def parse_sweep_file(path: Path, settings: Settings | None = None) -> SweepFile:
+def parse_sweep_file(path: Path, settings: Settings | None = None) -> SweepFile:  # noqa: C901, PLR0912
     """Parse a sweep file and apply every file-level refusal of req 1.
 
     `settings` supplies `lab.sweepable_keys`, `lab.axis_lattice` and
@@ -961,7 +961,7 @@ def _existing_registration(
     )
 
 
-def register(
+def register(  # noqa: C901, PLR0912
     conn: duckdb.DuckDBPyConnection,
     file: Path,
     settings: Settings | None = None,

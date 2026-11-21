@@ -863,7 +863,7 @@ def rates_seeded(settings: Settings) -> bool:
     return set(settings.rates.series) <= {str(row[0]) for row in rows}
 
 
-def ingest_session(
+def ingest_session(  # noqa: C901, PLR0912, PLR0913
     settings: Settings,
     *,
     prices: PriceSource,
@@ -1427,12 +1427,12 @@ def _run_source(
     except _Stale as exc:
         run = outcome(STALE, 0, str(exc))
         return run if dry_run else _record_only(settings, run_id, now, clock, run, mode)
-    except Exception as exc:  # any source or parse failure halts with a run row
+    except Exception as exc:  # any source or parse failure halts with a run row  # noqa: BLE001
         if recover is not None:
             try:
                 if recovered := recover(exc):
                     return recovered
-            except Exception as recovery_exc:
+            except Exception as recovery_exc:  # noqa: BLE001
                 exc = recovery_exc
         message = _with_frames(f"{type(exc).__name__}: {exc}", exc, settings)
         run = outcome(FAILED, 0, message)
@@ -1441,7 +1441,7 @@ def _run_source(
     if after_commit is not None:
         try:
             after_commit()
-        except Exception as exc:  # never rewrites the already-committed run row
+        except Exception as exc:  # never rewrites the already-committed run row  # noqa: BLE001
             message = _clean(f"{run.message}; after_commit: {type(exc).__name__}: {exc}", settings)
             run = SourceRun(run.source, run.status, run.rows_added, run.chunk_cursor, message)
     return run
@@ -2169,7 +2169,7 @@ def _prepare_index(
     return replace(batch, provenance=provenance)
 
 
-def _propose_index(
+def _propose_index(  # noqa: C901, PLR0912, PLR0915
     settings: Settings,
     source: FilingSource,
     now: datetime,
@@ -4059,7 +4059,7 @@ def _write_form4_bulk(
         source.form4_xml_keeper = previous
 
 
-def _form4_bulk(
+def _form4_bulk(  # noqa: C901, PLR0912, PLR0915
     conn: duckdb.DuckDBPyConnection,
     settings: Settings,
     source: EdgarFilingSource,
@@ -5415,7 +5415,7 @@ def _crosses(change: ManifestRow, instants: Sequence[datetime]) -> bool:
     )
 
 
-def restamp_from_manifest(
+def restamp_from_manifest(  # noqa: C901, PLR0912
     conn: duckdb.DuckDBPyConnection,
     changes: Sequence[ManifestRow],
     *,
@@ -6423,7 +6423,7 @@ def _title_letter(title: str) -> str | None:
     return (match.group(1) or match.group(2)).upper() if match else None
 
 
-def fact_rows(
+def fact_rows(  # noqa: C901
     records: Iterable[FactRecord],
     master: MasterBuild,
     classes: ClassificationBuild,
@@ -6770,7 +6770,7 @@ class _PriceFetch:
     message: str
 
 
-def _fetch_prices(
+def _fetch_prices(  # noqa: PLR0915
     settings: Settings,
     prices: PriceSource,
     now: datetime,
@@ -6814,7 +6814,7 @@ def _fetch_prices(
                         conn, settings, read_at, session, set(missed)
                     )
                 scan_note = ""
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 edgar_gaps, expired_gaps = {}, []
                 scan_note = f"edgar-gap scan skipped: {type(exc).__name__}"
         else:
@@ -6846,7 +6846,7 @@ def _fetch_prices(
     for day, names in edgar_gaps.items():
         try:
             day_bars = prices.bars(sorted(names), day, day)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             gap_notes.append(f"edgar-gap backfill skipped {day.isoformat()}: {type(exc).__name__}")
             continue
         gap_bars.extend(bar for bar in day_bars if bar.session == day and bar.security_id in names)
@@ -7664,7 +7664,7 @@ def _replay_actions(
     return [*actions, *extra], wide
 
 
-def _add_actions(
+def _add_actions(  # noqa: C901, PLR0912
     conn: duckdb.DuckDBPyConnection,
     actions: Sequence[CorporateAction],
     window: tuple[date, date],
@@ -8652,7 +8652,7 @@ def import_assets(
         pass
     except StoreLockedError as exc:
         runs.append(SourceRun(ASSETS_SOURCE, LOCKED, 0, "", str(exc)))
-    except Exception as exc:  # one file failed to apply: its run row, then stop
+    except Exception as exc:  # one file failed to apply: its run row, then stop  # noqa: BLE001
         cursor = "" if current is None else current.fetch_finished_utc.isoformat()
         name = "" if current is None else f"{current.path.name}: "
         message = _with_frames(f"{name}{type(exc).__name__}: {exc}", exc, settings)

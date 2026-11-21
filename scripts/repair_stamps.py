@@ -722,7 +722,7 @@ class Journal:
                     return _Fetched()  # a rate-limit block: asked in turn through `get`
                 stop.set()
                 return _Fetched(error=exc)
-            except BaseException as exc:  # handed to the calling thread
+            except BaseException as exc:  # handed to the calling thread  # noqa: BLE001
                 stop.set()
                 return _Fetched(error=exc)
             finally:
@@ -762,7 +762,7 @@ class Journal:
                     else:
                         try:
                             ask_here(key)
-                        except BaseException as exc:
+                        except BaseException as exc:  # noqa: BLE001
                             failure = exc
                             stop.set()
             finally:
@@ -872,7 +872,7 @@ def _budgeted(journal: Journal, keys: Sequence[Key], step: str) -> Sequence[Key]
     return keys
 
 
-def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
+def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:  # noqa: C901, PLR0912, PLR0915
     """Steps 1 to 5 with requests through ``journal``. Raises `RepairStop`
     when the audit stop rule fires or a step does not fit under the cap."""
     rows: dict[Key, ManifestRow] = dict(plan.step1)

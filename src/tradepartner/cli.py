@@ -1710,7 +1710,7 @@ def _close_study_failed(settings: Settings, handle: RunHandle, message: str) -> 
             research.close_run(conn, handle, "failed", message)
     except research.RunAlreadyClosed:
         return f"run {handle.run_id}: already has its result row"
-    except Exception as exc:  # the run stays unfinished: say so, never hide it
+    except Exception as exc:  # the run stays unfinished: say so, never hide it  # noqa: BLE001
         return (
             f"run {handle.run_id}: could not be closed ({type(exc).__name__}: {exc}); it is "
             "unfinished, close it with `experiment abandon`"
@@ -1795,7 +1795,7 @@ def _experiment_study(settings: Settings, run_id: int, *, real: Settings | None 
                 secondary=result.secondary,
                 exploratory=result.exploratory,
             )
-    except BaseException as exc:  # any exception closes the run failed (#2440)
+    except BaseException as exc:  # any exception closes the run failed (#2440)  # noqa: BLE001
         message = _study_scrubbed(f"{type(exc).__name__}: {exc}", settings)
         _echo_scrubbed(
             _study_scrubbed(
@@ -2780,7 +2780,7 @@ class _Edges:
     icloud: archive_cmd.IcloudFactory
 
 
-def _register_data(app: typer.Typer, edges: _Edges) -> None:
+def _register_data(app: typer.Typer, edges: _Edges) -> None:  # noqa: C901, PLR0915
     """Ingest, backfill, repair, refetch, spinoff and retract commands."""
     settings, clock, edgar_client, price_source, rate_source, assets_source = (
         edges.settings,
@@ -2792,7 +2792,7 @@ def _register_data(app: typer.Typer, edges: _Edges) -> None:
     )
 
     @app.command()
-    def ingest(
+    def ingest(  # noqa: C901, PLR0912, PLR0913, PLR0915
         source: Annotated[
             str,
             typer.Option(
@@ -4371,7 +4371,7 @@ def _register_reports(app: typer.Typer, edges: _Edges) -> None:
         typer.echo(f"exported {len(tables)} tables to {out_dir}")
 
 
-def _register_backtest(app: typer.Typer, edges: _Edges) -> None:
+def _register_backtest(app: typer.Typer, edges: _Edges) -> None:  # noqa: C901, PLR0915
     """`backtest`, `hypothesis register`, `trials` and `trial-reproduce`."""
     settings = edges.settings
 
@@ -4441,7 +4441,7 @@ def _register_backtest(app: typer.Typer, edges: _Edges) -> None:
             # Raised before a trial is opened (unknown slug, stored parameters that
             # fail their hash, a frozen window that cannot be resolved): a refusal.
             raise _fail(_scrubbed(f"{type(exc).__name__}: {exc}", s), USAGE_ERROR) from None
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             raise _fail(_scrubbed(f"{type(exc).__name__}: {exc}", s), ExitCode.FAILED) from None
         with open_read_only(s) as conn:
             _print_trial(conn, outcome, s)
@@ -4598,7 +4598,7 @@ def _register_backtest(app: typer.Typer, edges: _Edges) -> None:
         typer.echo(f"reproduced: all {result.compared} base-level strategy metrics are equal")
 
 
-def _register_decisions(app: typer.Typer, edges: _Edges) -> None:
+def _register_decisions(app: typer.Typer, edges: _Edges) -> None:  # noqa: C901, PLR0915
     """The `decision` commands, `decision data-release` among them."""
     settings = edges.settings
 
@@ -5047,7 +5047,7 @@ def _register_decisions(app: typer.Typer, edges: _Edges) -> None:
         typer.echo(f"decision {decision_id}: shakedown_note for alert {alert}")
 
 
-def _register_lab(app: typer.Typer, edges: _Edges) -> None:
+def _register_lab(app: typer.Typer, edges: _Edges) -> None:  # noqa: C901, PLR0915
     """`sweep`, `lab status`, `experiment`, `experiments`, `exposure record` and `exposures`."""
     settings, clock, sweep_clock = edges.settings, edges.clock, edges.sweep_clock
 
@@ -5135,7 +5135,7 @@ def _register_lab(app: typer.Typer, edges: _Edges) -> None:
             raise _fail(_scrubbed(f"store busy: {exc}", s), ExitCode.FAILED) from None
         except (LabNotInitialised, *_SWEEP_RUN_REFUSALS) as exc:
             raise _lab_fail(exc, s) from None
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             # Raised after the run opened: its rows so far stay recorded (the run's
             # row is closed incomplete), so this is a failure, not a refusal.
             message = f"sweep run failed (rows written so far stay recorded): {_describe(exc)}"
@@ -5452,7 +5452,7 @@ def _register_lab(app: typer.Typer, edges: _Edges) -> None:
     app.add_typer(exposure_app, name="exposure")
 
     @exposure_app.command("record")
-    def exposure_record(
+    def exposure_record(  # noqa: PLR0913
         candidate: Annotated[str, typer.Option(help="the candidate ref, e.g. #2689")],
         source: Annotated[str, typer.Option(help="store or open_data")],
         kill_line_url: Annotated[str, typer.Option(help="the frozen kill line's URL")],
@@ -5765,7 +5765,7 @@ def _register_store(app: typer.Typer, edges: _Edges) -> None:
             _echo_scrubbed(line, s)
 
 
-def _register_research(app: typer.Typer, edges: _Edges) -> None:
+def _register_research(app: typer.Typer, edges: _Edges) -> None:  # noqa: C901, PLR0915
     """`dataset register`, `corpus fetch` and the `research` commands."""
     settings, clock, edgar_client, launcher, model_client = (
         edges.settings,
@@ -6187,7 +6187,7 @@ def _register_research(app: typer.Typer, edges: _Edges) -> None:
             raise _refusal(exc, s) from None
 
     @research_app.command("label")
-    def research_label(
+    def research_label(  # noqa: C901, PLR0912, PLR0913
         slug: Annotated[str, typer.Argument(help="the registered experiment slug")],
         dataset: Annotated[int, typer.Option(help="the dataset version id to bind")],
         split: Annotated[str, typer.Option(help="the split to bind")],
@@ -6322,7 +6322,7 @@ def _register_research(app: typer.Typer, edges: _Edges) -> None:
                         limit=limit,
                         run_by=_REGISTERED_BY,
                     )
-                except (Exception, KeyboardInterrupt) as exc:
+                except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001
                     # The job already committed each run row before calls. Close a
                     # run left open by Ctrl-C or another failure, then commit that
                     # close on exit from open_for_write. run_batch usually returns
@@ -6336,7 +6336,7 @@ def _register_research(app: typer.Typer, edges: _Edges) -> None:
                         raise
         except StoreLockedError as exc:
             raise _fail(_scrubbed(f"store busy: {exc}", s), ExitCode.FAILED) from None
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             raise _fail(_scrubbed(f"failed: {_describe(exc)}", s), ExitCode.FAILED) from None
         if failure is not None:
             if isinstance(failure, KeyboardInterrupt):
@@ -6377,7 +6377,7 @@ def _register_research(app: typer.Typer, edges: _Edges) -> None:
         raise typer.Exit(ExitCode.FAILED if result.outcome == "failed" else USAGE_ERROR)
 
 
-def _register_paper(app: typer.Typer, edges: _Edges) -> None:
+def _register_paper(app: typer.Typer, edges: _Edges) -> None:  # noqa: C901, PLR0915
     """The `paper` commands."""
     settings, clock, broker, parse_export = (
         edges.settings,
@@ -7085,7 +7085,7 @@ def _register_paper(app: typer.Typer, edges: _Edges) -> None:
             )
             try:
                 broker_value = broker(s, clock, data.book_id).account().short_market_value
-            except Exception:
+            except Exception:  # noqa: BLE001
                 broker_value = None  # diagnostics still print when the broker is unavailable
             return broker_value, ledger_value
 

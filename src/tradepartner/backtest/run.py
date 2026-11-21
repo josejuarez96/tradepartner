@@ -392,7 +392,7 @@ def _trial_note(frozen: Mapping[str, Any], note: str | None) -> str | None:
     return "; ".join(part for part in (tag, note) if part) or None
 
 
-def run_hypothesis(
+def run_hypothesis(  # noqa: PLR0913
     slug: str,
     start: date | None,
     end: date | None,
@@ -603,7 +603,7 @@ def run_hypothesis(
                 results = with_exit_coverage(results, base_level, counts)
         with open_for_write(store) as conn:
             status = write_results(conn, handle, results, params)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         error = "".join(traceback.format_exception(exc))
         return _close(store, handle, "failed", f"{type(exc).__name__}: {exc}", error)
     if status == "ok":

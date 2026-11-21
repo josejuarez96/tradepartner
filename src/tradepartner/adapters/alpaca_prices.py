@@ -1094,7 +1094,7 @@ class ListingResolver:
         for listed in self._alias_changes.values():
             listed.sort()
 
-    def _build(
+    def _build(  # noqa: C901, PLR0912, PLR0915
         self,
         listings: list[Mapping[str, Any]],
         evidence: RegistrantEvidence | None,
@@ -3050,7 +3050,7 @@ def _parse_mergers(
 
 
 @_fail_closed
-def parse_corporate_actions(
+def parse_corporate_actions(  # noqa: C901, PLR0912, PLR0915
     payload: Mapping[str, Any],
     resolve: Resolve,
     lead: Resolve | None = None,
