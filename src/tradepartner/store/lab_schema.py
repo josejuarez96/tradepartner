@@ -117,6 +117,21 @@ LAB_DECISION_KINDS: tuple[str, ...] = (
 )
 
 
+#: Every `owner_decisions.kind` value in the order a store that migrated through
+#: the lab migration (version 16) lists them in its `CHECK`: the Phase 3 three
+#: (`schema._CREATE_OWNER_DECISIONS`), then `LAB_DECISION_KINDS`. `apply_lab_schema`
+#: writes the `CHECK` in this order whenever it rebuilds the table, so a store
+#: that gets the lab after a later version's kinds (a store created without it at
+#: version 16 to 49, repaired by version 50) holds the same `CHECK` text as a
+#: migrated one and as a fresh one (#3673).
+OWNER_DECISION_KINDS: tuple[str, ...] = (
+    "gap_signoff",
+    "gap_override",
+    "holdout_spend",
+    *LAB_DECISION_KINDS,
+)
+
+
 def _enum_check(column: str, values: tuple[str, ...]) -> str:
     allowed = ", ".join(f"'{value}'" for value in values)
     return f"CHECK ({column} IN ({allowed}))"
@@ -288,6 +303,12 @@ _WIDENED_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
     ("owner_decisions", "kind"): LAB_DECISION_KINDS,
 }
 
+#: The order `apply_lab_schema` writes a widened enumeration in, where one is
+#: fixed (`OWNER_DECISION_KINDS`); the others are appended to.
+_ENUM_ORDER: dict[tuple[str, str], tuple[str, ...]] = {
+    ("owner_decisions", "kind"): OWNER_DECISION_KINDS,
+}
+
 
 def _table_exists(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
     (count,) = conn.execute(  # type: ignore[misc]
@@ -388,12 +409,21 @@ def _current_enum(conn: duckdb.DuckDBPyConnection, table: str, column: str) -> t
 
 
 def widen_enum(
-    conn: duckdb.DuckDBPyConnection, table: str, column: str, added: tuple[str, ...]
+    conn: duckdb.DuckDBPyConnection,
+    table: str,
+    column: str,
+    added: tuple[str, ...],
+    *,
+    order: tuple[str, ...] | None = None,
 ) -> None:
     """Rebuild `table` with `added` appended to its `column IN (...)` `CHECK`,
     by the staging pattern of schema version 2, every row copied in insertion
     order and every column kept as the live DDL has it. A no-op when every
-    value in `added` is already allowed. Runs inside the caller's transaction."""
+    value in `added` is already allowed, whatever order the `CHECK` lists them
+    in: an existing store's `CHECK` text is never rewritten for its order. With
+    `order`, a rebuild lists the values in that order instead of appending,
+    when `order` names every one of them (a store holding a value `order` does
+    not know keeps the appended form). Runs inside the caller's transaction."""
     constraint_text, values = _current_enum(conn, table, column)
     current = tuple(re.findall(r"'([^']*)'", values))
     missing = tuple(value for value in added if value not in current)
@@ -410,8 +440,10 @@ def widen_enum(
         raise SchemaVersionError(
             f"{table}'s DDL is not in the shape the lab schema rebuilds: {live_ddl!r}"
         )
-    appended = ", ".join(f"'{value}'" for value in missing)
-    widened = f"CHECK(({column} IN ({values}, {appended})))"
+    allowed = (*current, *missing)
+    if order is not None and set(allowed) <= set(order):
+        allowed = tuple(value for value in order if value in allowed)
+    widened = f"CHECK(({column} IN ({', '.join(repr(value) for value in allowed)})))"
     staging_ddl = f"CREATE TABLE {staging}(" + live_ddl[len(head) :].replace(
         constraint_text, widened, 1
     )
@@ -427,7 +459,9 @@ def apply_lab_schema(conn: duckdb.DuckDBPyConnection) -> None:
     `sweep_retired`, version 18's `data_release` and `development_boundary` and
     version 20's `shakedown_span` and `shakedown_note` and version 22's
     `operations_book` where a store lacks them)
-    by the staging rebuild, every row kept byte-identical (module docstring).
+    by the staging rebuild, every row kept byte-identical (module docstring);
+    a rebuilt `owner_decisions.kind` `CHECK` lists `OWNER_DECISION_KINDS` in
+    that order (#3673).
     Needs a store `init_schema` has created (the registry tables must exist).
     Idempotent: a second call changes nothing. One transaction (the caller's if
     open). Writes no `schema_version` row; `schema._migrate_lab` calls it for a
@@ -436,5 +470,5 @@ def apply_lab_schema(conn: duckdb.DuckDBPyConnection) -> None:
         for ddl in _LAB_TABLE_DDL:
             conn.execute(ddl)
         for (table, column), added in _WIDENED_ENUMS.items():
-            widen_enum(conn, table, column, added)
+            widen_enum(conn, table, column, added, order=_ENUM_ORDER.get((table, column)))
     forget_column_types(conn)

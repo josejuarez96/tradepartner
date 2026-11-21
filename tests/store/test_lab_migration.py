@@ -452,6 +452,13 @@ def test_a_version_49_store_created_without_the_lab_gains_it(tmp_path: Path) -> 
             _, values = lab_schema._current_enum(conn, table, column)
             assert all(f"'{value}'" in values for value in added)
 
+        # #3673: the repaired store's DDL is a fresh store's, CHECK text included.
+        fresh = duckdb.connect(":memory:")
+        schema.init_schema(fresh)
+        ddl = "SELECT table_name, sql FROM duckdb_tables() ORDER BY 1"
+        assert conn.execute(ddl).fetchall() == fresh.execute(ddl).fetchall()
+        fresh.close()
+
         # Idempotent: a second open changes nothing at all.
         every = _snapshot(conn, _tables(conn))
         schema.init_schema(conn)
