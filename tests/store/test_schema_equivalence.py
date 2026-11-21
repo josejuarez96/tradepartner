@@ -1,10 +1,10 @@
 """#3624: a store created fresh by `init_schema` has the same shape as one
 migrated from an old version: every column (name, order, type, nullability,
 default), every constraint (CHECK text included) and every index (SQL
-included). Since #3672 nothing differs (`KNOWN_DIFFERENCES` is empty). A
-store created without the lab at version 16 to 49 and repaired by version 50
-still differs in one CHECK's text, pinned in `KNOWN_DIFFERENCES_WITH_LAB`, so
-a new difference fails and a fixed one fails too.
+included). Since #3672 nothing differs (`KNOWN_DIFFERENCES` is empty), and
+since #3673 nor does a store created without the lab at version 16 to 49 and
+repaired by version 50 (`KNOWN_DIFFERENCES_WITH_LAB` is empty), so any new
+difference fails.
 
 The old stores are built from today's DDL constants (no stored old-version
 file exists under `tests/`), so this proves the migration path converges, not
@@ -12,7 +12,6 @@ that a real 2026-09 store file does."""
 
 from __future__ import annotations
 
-import re
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
@@ -47,40 +46,14 @@ _SHAPE_QUERIES: dict[str, str] = {
     ),
 }
 
-# A store created fresh at schema version 16 to 49 had no lab schema (#3672);
-# version 50 gives it one on migration. Its `owner_decisions.kind` CHECK then
-# lists the same values as a store that migrated through version 16, in a
-# different order (#3673): same set, different text.
-
-_CHECK_ORDER_REPAIRED: list[Row] = [
-    (
-        "owner_decisions",
-        "CHECK",
-        "CHECK((kind IN ('gap_signoff', 'gap_override', 'holdout_spend', 'data_release', "
-        "'development_boundary', 'shakedown_span', 'shakedown_note', 'operations_book', "
-        "'promotion', 'sweep_retired')))",
-    ),
-]
-
-_CHECK_ORDER_MIGRATED: list[Row] = [
-    (
-        "owner_decisions",
-        "CHECK",
-        "CHECK((kind IN ('gap_signoff', 'gap_override', 'holdout_spend', 'promotion', "
-        "'sweep_retired', 'data_release', 'development_boundary', 'shakedown_span', "
-        "'shakedown_note', 'operations_book')))",
-    ),
-]
-
 #: Fresh against migrated: nothing differs since #3672 (a fresh store gets the
 #: lab schema at the step a migrating one does).
 KNOWN_DIFFERENCES: Diff = {}
 
-#: A version-49 store created without the lab and repaired by version 50
-#: (`fresh_only` is the repaired store's side) against a migrated one.
-KNOWN_DIFFERENCES_WITH_LAB: Diff = {
-    "constraints": {"fresh_only": _CHECK_ORDER_REPAIRED, "migrated_only": _CHECK_ORDER_MIGRATED},
-}
+#: A version-49 store created without the lab schema and repaired by version 50,
+#: against a migrated one: nothing differs since #3673 (the repair writes the
+#: `owner_decisions.kind` CHECK in the migrated store's order).
+KNOWN_DIFFERENCES_WITH_LAB: Diff = {}
 
 
 def _shape(conn: duckdb.DuckDBPyConnection) -> Shape:
@@ -158,14 +131,6 @@ def test_a_fresh_store_has_the_shape_of_a_migrated_one(tmp_path: Path, builder: 
         migrated.close()
 
 
-def _in_list_values(constraint_text: object) -> set[str]:
-    """The quoted values of the `IN (...)` list in a CHECK's text."""
-    assert isinstance(constraint_text, str)
-    match = re.search(r"IN \((.*?)\)", constraint_text)
-    assert match is not None, constraint_text
-    return set(re.findall(r"'([^']*)'", match.group(1)))
-
-
 def _repaired() -> duckdb.DuckDBPyConnection:
     """A store as `init_schema` created it fresh at version 49 (no lab schema,
     `strip_lab`), then migrated to the current version, which repairs it."""
@@ -180,21 +145,14 @@ def _repaired() -> duckdb.DuckDBPyConnection:
 
 
 @pytest.mark.parametrize("builder", list(_BUILDERS))
-def test_a_repaired_store_differs_from_a_migrated_one_only_in_check_order(
-    tmp_path: Path, builder: str
-) -> None:
+def test_a_repaired_store_has_the_shape_of_a_migrated_one(tmp_path: Path, builder: str) -> None:
     repaired = _repaired()
     migrated = _migrated(tmp_path, builder)
     try:
-        diff = _diff(_shape(repaired), _shape(migrated))
+        assert _diff(_shape(repaired), _shape(migrated)) == KNOWN_DIFFERENCES_WITH_LAB
     finally:
         repaired.close()
         migrated.close()
-    assert diff == KNOWN_DIFFERENCES_WITH_LAB
-    (repaired_row,) = diff["constraints"]["fresh_only"]
-    (migrated_row,) = diff["constraints"]["migrated_only"]
-    assert repaired_row[:2] == migrated_row[:2] == ("owner_decisions", "CHECK")
-    assert _in_list_values(repaired_row[2]) == _in_list_values(migrated_row[2])
 
 
 def test_the_comparison_sees_a_planted_difference(tmp_path: Path) -> None:
@@ -225,19 +183,19 @@ def test_the_comparison_sees_a_planted_check_change(tmp_path: Path) -> None:
     assert ("planted", "CHECK", "CHECK((x > 1))") in diff["constraints"]["migrated_only"]
 
 
-def test_a_removed_baseline_row_no_longer_matches(tmp_path: Path) -> None:
-    """A stale baseline fails its test: with any one row dropped from
-    `KNOWN_DIFFERENCES_WITH_LAB`, today's diff no longer equals it."""
-    repaired = _repaired()
-    migrated = _migrated(tmp_path, "v4")
+def test_the_comparison_sees_a_reordered_check(tmp_path: Path) -> None:
+    """The same set in another order is a difference (#3673): CHECK text is compared,
+    not the set of values."""
+    fresh = _fresh()
+    other = _fresh()
     try:
-        diff = _diff(_shape(repaired), _shape(migrated))
+        fresh.execute("CREATE TABLE planted (x VARCHAR CHECK (x IN ('a', 'b')))")
+        other.execute("CREATE TABLE planted (x VARCHAR CHECK (x IN ('b', 'a')))")
+        diff = _diff(_shape(fresh), _shape(other))
     finally:
-        repaired.close()
-        migrated.close()
-    for kind, sides in KNOWN_DIFFERENCES_WITH_LAB.items():
-        for side, rows in sides.items():
-            for index in range(len(rows)):
-                pruned = {k: dict(v) for k, v in KNOWN_DIFFERENCES_WITH_LAB.items()}
-                pruned[kind][side] = rows[:index] + rows[index + 1 :]
-                assert diff != pruned, (kind, side, rows[index])
+        fresh.close()
+        other.close()
+    assert diff["constraints"]["fresh_only"] == [("planted", "CHECK", "CHECK((x IN ('a', 'b')))")]
+    assert diff["constraints"]["migrated_only"] == [
+        ("planted", "CHECK", "CHECK((x IN ('b', 'a')))")
+    ]

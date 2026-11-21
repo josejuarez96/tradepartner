@@ -503,10 +503,18 @@ def _rows_of(
     return {t: _rows_in_order(conn, t) for t in before}
 
 
-def _repair_kinds(lab: bool) -> tuple[str, ...]:
-    """The kinds version 50 adds to a store created without the lab (#3672), at
-    the lab step, so before any later version's kinds."""
-    return () if lab else ("promotion", "sweep_retired")
+def _check_after(check_before: str, lab: bool, later: tuple[str, ...]) -> str:
+    """`owner_decisions`' DDL after migrating. A store that had the lab keeps its
+    `CHECK` and gains `later` at its end. One created without it is rebuilt by
+    version 50 (#3672) with the lab's two kinds in their place after the Phase 3
+    three (`OWNER_DECISION_KINDS`' order, #3673), before `later` is appended: the
+    whole list in the migrated store's order."""
+    if lab:
+        added = ", ".join(f"'{k}'" for k in later)
+        return check_before.replace("'))));", f"', {added}))));")
+    kinds = ", ".join(f"'{k}'" for k in lab_schema.OWNER_DECISION_KINDS)
+    head, _, _ = check_before.partition("CHECK((kind IN (")
+    return f"{head}CHECK((kind IN ({kinds}))));"
 
 
 def _assert_lab_after_migration(
@@ -538,15 +546,8 @@ def test_migrating_a_version_19_store_keeps_every_row(lab: bool) -> None:
     schema.init_schema(conn)
     assert _rows_of(conn, before) == before
     assert {t: _columns(conn, t) for t in before} == columns_before
-    added = ", ".join(
-        f"'{k}'"
-        for k in (
-            *_repair_kinds(lab),
-            *lab_schema.SHAKEDOWN_DECISION_KINDS,
-            *lab_schema.OPERATIONS_DECISION_KINDS,
-        )
-    )
-    assert _kind_check(conn) == check_before.replace("'))));", f"', {added}))));")
+    later = (*lab_schema.SHAKEDOWN_DECISION_KINDS, *lab_schema.OPERATIONS_DECISION_KINDS)
+    assert _kind_check(conn) == _check_after(check_before, lab, later)
     assert _versions(conn) == list(range(19, schema.CURRENT_SCHEMA_VERSION + 1))
     _assert_lab_after_migration(conn, before, lab)
     for decision_id, kind in enumerate(lab_schema.SHAKEDOWN_DECISION_KINDS, start=20):
@@ -674,8 +675,7 @@ def test_migrating_a_version_21_store_keeps_every_row(lab: bool) -> None:
     schema.init_schema(conn)
     assert _rows_of(conn, before) == before
     assert {t: _columns(conn, t) for t in before} == columns_before
-    added = ", ".join(f"'{k}'" for k in (*_repair_kinds(lab), "operations_book"))
-    assert _kind_check(conn) == check_before.replace("'))));", f"', {added}))));")
+    assert _kind_check(conn) == _check_after(check_before, lab, ("operations_book",))
     assert _versions(conn) == list(range(21, schema.CURRENT_SCHEMA_VERSION + 1))
     _assert_lab_after_migration(conn, before, lab)
     conn.execute(
@@ -746,6 +746,26 @@ def test_a_fresh_store_allows_the_operations_kind_and_the_lab_keeps_it() -> None
     assert "'operations_book'" in values
     assert lab_schema.LAB_DECISION_KINDS[-1:] == lab_schema.OPERATIONS_DECISION_KINDS
     assert [r[2] for r in _rows_in_order(conn, "owner_decisions")] == ["operations_book"]
+
+
+def test_apply_writes_the_decision_kinds_in_the_migrated_stores_order() -> None:
+    """#3673: a store that gets the lab after the later versions' kinds lists
+    `OWNER_DECISION_KINDS` in that order, as a store that migrated through
+    version 16 does; a `CHECK` that already allows every kind is never rewritten
+    for its order."""
+    expected = ", ".join(f"'{k}'" for k in lab_schema.OWNER_DECISION_KINDS)
+    conn = _fresh_store()
+    _, before = lab_schema._current_enum(conn, "owner_decisions", "kind")
+    assert before.endswith("'operations_book'") and "'promotion'" not in before
+    lab_schema.apply_lab_schema(conn)
+    assert lab_schema._current_enum(conn, "owner_decisions", "kind")[1] == expected
+
+    appended = _fresh_store()
+    lab_schema.widen_enum(appended, "owner_decisions", "kind", ("promotion", "sweep_retired"))
+    _, held = lab_schema._current_enum(appended, "owner_decisions", "kind")
+    assert held == f"{before}, 'promotion', 'sweep_retired'" != expected
+    lab_schema.apply_lab_schema(appended)
+    assert lab_schema._current_enum(appended, "owner_decisions", "kind")[1] == held
 
 
 # --- is_lab_initialised, LabNotInitialised -------------------------------------
