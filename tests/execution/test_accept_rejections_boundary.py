@@ -468,6 +468,7 @@ _CLI_IMPORT_ROOTS = frozenset(
         "re",
         "subprocess",
         "sys",
+        "traceback",  # #3621: `format_exception`, for a crash's scrubbed frames on stderr
         "tradepartner",
         "typer",
         "types",
