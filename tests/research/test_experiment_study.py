@@ -91,7 +91,7 @@ def test_delisting_return_is_optional_and_absent_is_not_written_back(tmp_path: P
 
 
 def test_se_method_is_optional_and_absent_is_not_written_back(tmp_path: Path) -> None:
-    """#3679: absent hashes as before; an explicit value hashes differently; values are enumerated."""
+    """#3679: absent hashes as before; an explicit value differs; values are enumerated."""
     source = FIXTURE.read_text()
     assert "se_method" not in source
     absent = _parse(tmp_path / "absent", source)

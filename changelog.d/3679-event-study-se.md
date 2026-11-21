@@ -1,3 +1,3 @@
-- Event-study SE: Bartlett kernel option added (default flat HH unchanged); null calibration measured, not yet adopted (#3679 open: overlap design off nominal)
-### Added
-- Optional Bartlett (Newey-West) kernel for the event-study overlap SE and null-calibration tests; no registered study changes (#3679)
+- Event-study SE: [study].se_method (hansen_hodrick default; quarter_cluster_t for new designs: quarter-of-entry cluster, CR1, t(G-1), z_eq vs floor); past studies unchanged
+### Fixed
+- New event studies can use a calendar-quarter cluster SE with a t(G-1) reference (null size .05 to .07 where the flat Hansen-Hodrick SE gave .08 and sometimes NaN); an absent key keeps the old statistic (#3679)
