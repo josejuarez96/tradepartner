@@ -19,7 +19,7 @@ So a P&L objective would be unmeasurable, and a benchmark-beating objective woul
 
 ## Decision
 
-**Primary objective, ranked:** (1) learn to make disciplined, evidence-based decisions, demonstrated by process metrics; (2) calibration, once anything in the system emits probabilities; (3) beating a benchmark, explicitly optional and not a criterion for any phase exit.
+**Primary objective, ranked:** (1) learn to make disciplined, evidence-based decisions, demonstrated by process metrics; (2) calibration, once anything in the system emits probabilities; (3) beating a benchmark, explicitly optional and not a criterion for any phase exit. *(Amended 2026-11-21, #3695, a decision put to the owner with three options: under the recommended one the ranking stands, and objective 3, applied to one strategy book, reads "earn more than the book's yardstick, with positive alpha", never "end with more than buy-and-hold SPY"; the owner holds the market outside the system, [amendment below](#amendment-2026-11-21-what-a-strategy-book-is-for-core-and-satellite-3695).)*
 
 **Benchmarks:** SPY and MTUM, both total return (dividends reinvested), computed inside the system from the same `PriceSource` and with the same cost model as the strategy. They are measured against, never targeted. A backtest or paper result is reported only alongside both. *(Amended 2026-11-20, #3686: the series a book's excess is judged over is its **yardstick**, the net-matched blend of SPY and T-bills for a book with a short leg. It is SPY for every long-only book, so nothing changes there, and SPY and MTUM are still reported beside every result, [amendment below](#amendment-2026-11-20-the-yardstick-is-the-net-matched-blend-3686).)*
 
@@ -108,3 +108,171 @@ Each non-excluded month's absolute residual must be at most the window's frozen 
 7. **Record on [ADR 0004](0004-tooling-adopt-avoid.md) that the engine was extended for shorts** and checked by the `bt` long/short case? *Recommend yes. It is the note open question 24 asked for.*
 
 **Not recorded by the merge** (the backtest spec's open questions, each with options and a recommendation): 48, how a long/short finalist's forward exam reads its yardstick; 49, whether `sweep promote` enforces the alpha test in code; 50, a significance bar for the alpha test.
+
+## Amendment 2026-11-21: what a strategy book is for, core and satellite (#3695)
+
+*A decision for the owner, drafted on his word of 2026-11-21 (#3695). **He has not chosen an option.** Merging the PR records option (b), the recommended one, and the numbered decisions at the end, unless the owner says otherwise on the PR. One line back ("a", "b" or "c") is enough. This amendment is stacked on the [amendment of 2026-11-20](#amendment-2026-11-20-the-yardstick-is-the-net-matched-blend-3686) (#3686, PR #3690) and merges after it. Docs only: no code, no store read, no return read, no trial.*
+
+### The choice, in two minutes
+
+You asked on 2026-11-21 whether the strategy is too narrow. One part of the answer is a choice only you can make: **what counts as a win for a strategy book?**
+
+- **(a) Keep "beat SPY in return".** A long-only book wins only if it ends with more money than buy-and-hold SPY. Nothing changes. The records below say the odds of that are close to zero without leverage, and this option writes that down.
+- **(b) Core and satellite (recommended).** You hold the market yourself, outside this system. That is the core. A strategy book is a small side bet beside it, the satellite. It wins if it earns more than its own fair yardstick, and the extra is not just market exposure. **A book can win while making less than SPY.**
+- **(c) A risk-adjusted goal for the whole account.** The system is judged on return per unit of risk against SPY or a 60/40 mix. This changes what the account is for, and it needs a new exam design and a new ADR.
+
+**Four things to know before you say (b).**
+1. **It will not find a strategy by itself.** The pipeline review (PR #3692) puts the objective at 5% of the reason nothing has passed. It says of the long-only books that were read: "A matched yardstick would not have made any of them an edge." By its table, one idea of 37 (B2) was stopped by the objective alone.
+2. **A win under (b) does not mean you are richer than if the money had stayed in SPY.** Each dollar in a market-neutral satellite is a dollar that does not earn the equity premium. At a net edge of 2 to 4% a year, the satellite is expected to make about $2 to $4 a year **less** per $100 than SPY, and $200 to $400 less per $10,000 ([arithmetic below](#dollars)). What a win means is that the book earned something the market did not hand it.
+3. **It takes back your "no" on #659, for satellite books only.** On 2026-10-03 you said a higher Sharpe at a lower return is not acceptable. Under (b), a lower return than SPY is acceptable for a book whose yardstick is not SPY. A higher Sharpe alone is still never a pass.
+4. **It comes after 37 failed ideas.** Changing what a win is after the results are in is what this ADR's reversibility clause warns about. The limits on that are [stated below](#reversibility-and-the-clause-on-changing-the-objective-after-results).
+
+**What the merge changes on the day: words, not rules.** No book is read differently the day this merges. Every long-only book stays on SPY, as the 2026-11-20 amendment's rule 1 says. The rule changes that would give (b) teeth are two open questions, **O1 and O2 below**. They are yours, and this merge does not record them.
+
+*Words used.* The **core** is whatever the owner holds of the broad market, outside this system. The system does not hold it, size it, measure it or advise on it, and the repository has no record of it. A **satellite** is one strategy book inside the system: a paper book, or the one live book of about $100. A book's **yardstick** is as the 2026-11-20 amendment defines it. **Alpha** is the part of a book's return that its market exposure does not explain (`alpha_spy_annual` in the store). **IR** (information ratio) is a book's yearly excess return over its yardstick divided by how much that excess bounces around.
+
+### Context: what the records show
+
+- **The written objective and the practised rule disagree.** The Decision above ranks "beating a benchmark" third, "explicitly optional and not a criterion for any phase exit". Yet rung 4 kills on "net excess CAGR over SPY < 0" ([ADR 0023](0023-break-first-fast-books-paper-exam.md), line 40), and the forward return exam reads monthly returns "minus the total return of the benchmark the finalist's file froze" ([ADR 0016](0016-development-boundary-and-forward-exams.md), amendment 2026-11-06, decision 2). The pipeline review lists this as item 17 of its table of rules that disagree (PR #3692, section 5).
+- **The #659 decision misquotes this ADR.** It parks B2 because a higher Sharpe at a lower return "is NOT an acceptable objective under ADR 0005, whose objective is return against the benchmark" (#659, 2026-10-03; [hypothesis backlog](../research/hypothesis-backlog.md), B2). This ADR's objective is process first. The owner's "no" was his to give. The reason written beside it is not what this ADR says.
+- **37 named ideas in eight weeks; six return reads on our own store; all six failed** (PR #3692, finding 1). None had the shape the gates can pass (finding 2).
+- **No ETF-level rule has credible evidence of beating buy-and-hold SPY in return**, net of costs and taxes. "Only leverage ... can lift the expected return above SPY's, and that adds market exposure rather than edge" (PR #3682, Answer, points 1 and 2). The charter allows no leverage.
+- **Small-account structural trades are worth a few hundred dollars a year at $10,000 and cannot be run at the broker** (PR #3678, Answer: about $300 to $1,400 gross for odd-lot tenders at a $0-fee broker; $100 per voluntary action at Alpaca).
+- **No filing event and no price event clears the passable shape** (PRs #3693 and #3691, Answers). The nearest filing miss, cash merger arbitrage, has "the wrong yardstick under line 40": "a cash-like book cannot beat SPY in a rising market" (PR #3693, point 4).
+- **Rung 4 is a cost test, not an evidence test**, and the two queued candidates could not pass it (PR #3683, findings 1, 3 and 4). The evidence test is the forward exam.
+- **The exam is the tight gate, and no option here loosens it.** Its bounds are t ≥ 4.762 / 3.367 / 2.750 at 12 / 24 / 36 months (ADR 0016, amendment 2026-11-07). With t ≈ IR × √years, that is a realised net IR of about 4.8 / 2.4 / 1.6. The ETF report's figures check out against the ADR's own: 4.762 / √1, 3.367 / √2 and 2.750 / √3 are 4.76, 2.38 and 1.59, and the ADR gives 1.60 as the IR that passes half the time.
+- **Market-neutral books already have their yardstick.** The 2026-11-20 amendment moved a long/short book to the net-matched blend, T-bills at net 0, and left every long-only book on SPY. Its rule 9 says the objective is unchanged. This amendment is where the objective is looked at.
+
+### The three options, and what each changes
+
+| Where | (a) Keep "beat SPY in return" | (b) Core and satellite | (c) Risk-adjusted, whole account |
+|---|---|---|---|
+| The ranking in the Decision above | Unchanged. A sentence is added saying what the evidence shows about objective 3. | Unchanged. Objective 3, applied to one book, reads "earn more than the book's yardstick, with positive alpha". It stays optional. | Objective 3 is rewritten as a risk-adjusted goal against SPY or 60/40. The Consequences above call a change of this kind "a new ADR and a much longer time horizon". |
+| Yardstick (2026-11-20 amendment) | As that amendment leaves it. Read literally, "every book" would also undo it for long/short books; the owner would say so on PR #3690. | As that amendment leaves it. Whether a long-only book with less than full market exposure moves off SPY is **O1**, not recorded. | Replaced by a risk-matched comparison for every book. |
+| Tracking check (success criterion 1) | Unchanged | Unchanged. It compares a paper book with its own backtest, never with a benchmark. | Unchanged |
+| ADR 0023, line 40 (rung 4) | As amended 2026-11-20 | As amended 2026-11-20. No new text. A change would follow O1 only. | The excess-CAGR test and `dsr_excess` are replaced by a risk-adjusted statistic. A new dated amendment. |
+| ADR 0016, forward return exam | Unchanged | Bounds, looks, budget, skew guard and both legs unchanged. How the exam reads a yardstick other than SPY is the backtest spec's question 48 and **O2**. ADR 0016 is not edited. | A new test statistic. The sizing runs behind the bounds are for a mean excess return, so the false-pass rate would have to be calibrated again before any exam starts. |
+| Phase 6 stop criteria (Live amendment, 2026-10-18) | Unchanged | Unchanged. None of them reads SPY: the paper stops, the risk rules, the tracking stop against the book's own backtest, six rebalances then a retro. The $100 live book is the satellite. | "Whole account" means either the $100, where nothing changes, or the owner's holdings, which the charter does not let the system manage. The second is a charter amendment. |
+| #659 and B2 | Stand as decided | The "no" is lifted for a book whose yardstick is not SPY. B2's yardstick is SPY until O1 is answered, so **B2 stays parked**, and the evidence against it stands whatever the yardstick. | Reversed outright. B2's reason for parking is gone, though its evidence grade is not. |
+| Charter | Unchanged | Unchanged. Purpose, scope, the $100 cap, no leverage, no options. | Purpose and the live-capital line would need an ADR. |
+
+**Which killed or parked ideas could come back.** **None is un-retired by this merge, under any option.** A returning idea is a new registration with a new identity. It starts at the first step of the route (ADR 0023 as amended 2026-11-16, rung 1's screen included), its kill line is frozen before any read, and its trials count.
+- **(a): none.**
+- **(b) as merged: none.** Market-neutral ideas got their read from the 2026-11-20 amendment, not from this one, and the two the project holds died on other grounds: the long/short momentum spike on its own spread rule, and `irrx` on cost (PR #3683, finding 3).
+- **(b) with O1 answered for an exposure-matched yardstick:** B2 (trend filter); cash merger arbitrage (card IC-B3); market volatility targeting (PR #3682). Each arrives with a weak prior. B2's best out-of-sample result is about +0.3 pp a year over a volatility-matched mix, an IR of about 0.04 to 0.2 (PR #3682, point 4 and the exam section). Merger arbitrage earns about 100 bp per deal over T-bills against about 176 bp needed, with losses that cluster in crashes (PRs #3693 and #3678).
+- **(c):** the same three, plus any rule whose only claim is a smoother ride.
+- **Not candidates under any option:** H1, B3, B10 and candidate 5. They were fully invested long-only books, SPY was their fair yardstick, and they lost to it (PR #3692, section 6 (e)). Nor the ideas killed on published evidence, on event counts or on cost. Nor covered calls: the charter's scope says "no options trading".
+
+### Dollars
+
+*Assumption, not evidence:* a satellite that passes earns a **net alpha of 2 to 4% a year** over its yardstick, after costs and before tax. That is generous. PR #3683 says a survivor of the exam "needs an edge three times the size of anything in the register".
+
+| Account | Satellite sleeve | Net alpha at 2 to 4% a year | Against the same dollars left in SPY (market-neutral satellite, equity premium taken as 6% a year) |
+|---|---|---|---|
+| $100 (the charter's cap) | $100 | **$2 to $4 a year** | $2 to $4 a year **less** |
+| $10,000 (needs a charter amendment) | all of it | **$200 to $400 a year** | $200 to $400 a year **less** |
+| $10,000 | a 20% sleeve, $2,000 | **$40 to $80 a year** | $40 to $80 a year **less** |
+
+- **The last column is the honest cost of (b).** A market-neutral satellite earns the T-bill rate plus its alpha. The same dollars in SPY are expected to earn the T-bill rate plus the equity premium. The premium is taken here as 6% a year (the figure PR #3682 uses; [beyond long-only](../research/2026-10-10-beyond-long-only.md) says 7 to 10). So the satellite adds expected dollars only if its alpha is above the premium it gives up, or if the money would otherwise sit in cash. What it adds otherwise is a return that does not move with the market. That is a risk benefit, and it is the kind of trade #659 said no to.
+- **Taxes.** At a 24% marginal rate on short-term gains (PR #3682's assumption), $2 to $4 becomes about $1.50 to $3, and $200 to $400 about $150 to $300.
+- **A retail short book earns nothing on its short proceeds** (beyond long-only, point 3), and still has to beat the T-bill.
+- **Under (a)** the same 2 to 4% would sit on top of SPY: $2 to $4, or $200 to $400, **more** than the index. No candidate in the records has a positive expected excess over SPY.
+- **Under (c)** the best out-of-sample figure for the trend filter is about +0.3 pp a year over a volatility-matched mix (PR #3682): about $0.30 a year at $100 and $30 at $10,000, at a lower return than SPY.
+
+### How long an exam would take
+
+The exam's rule is the same under (a) and (b): looks at 12, 24 and 36 months, the bounds above, and a window that reaches month 36 without a pass is a failed exam (ADR 0016, amendment 2026-11-07). So **the longest an exam can run is 36 months, and the question is how often a real edge passes.** With t ≈ IR × √years, the chance that the first leg alone reaches 2.750 at month 36 is (our arithmetic, a t distribution with 35 degrees of freedom; an upper bound, since the second leg and the futility stops only lower it):
+
+| Realised net IR against the yardstick | 0 (noise) | 0.25 | 0.5 | 0.8 | 1.0 | 1.6 |
+|---|---|---|---|---|---|---|
+| Passes by month 36, about | at most 1.25% (the ADR's calibrated size) | 1.4% | 3.8% | 10% | 17% | 52% |
+| Years of months for an even chance at t = 2.75 | never | 121 | 30 | 12 | 7.6 | 3.0 |
+
+- An alpha of 2 to 4% a year on a book whose excess moves 8% a year (the tracking error ADR 0016's sizing runs assume) is an IR of 0.25 to 0.5. **Such a book passes about 1 to 4% of the time. At IR 0.25 a real pass is about as likely as a lucky one.**
+- ADR 0016's own simulation agrees: a net IR 0.5 slow book passes 0.84% of exams at the 60 bp paper cost, and a four-exam programme of such books reaches a live order 12.1% of the time at 24 bp.
+- **(b) does not shorten the exam or raise these odds.** It changes one thing: for a low-beta book, the first leg stops being impossible by construction. A cash-like book measured against SPY is expected to lose by about the equity premium every year, whatever its edge.
+- **Under (c)** no exam exists. The plausible IR of a trend or volatility rule against a risk-matched mix is 0.04 to 0.2. At 0.2, t = 2 takes about 100 years (PR #3682).
+
+### False-pass exposure
+
+- **(a): as today.** At most 1.25% per exam and 4.9% for four, inside the skew guard (ADR 0016, amendment 2026-11-07). Rung 4 passes a low-turnover long-only book with no edge 39 to 45% of the time (PR #3683, finding 7); the exam is the control.
+- **(b) as merged: the same.** No rule moves.
+- **(b) with O1 answered:** the exam's size is unchanged if its bounds and budget are. Three risks are new, and each has a guard to be specified before a first read, never after:
+  1. **Beta paid as edge.** A yardstick that understates a book's market exposure pays it for a rising market. The guards are a frozen exposure with a band on the held figure, the alpha sign check, and the exam's second leg.
+  2. **A lower bar at rung 4 fills exam slots.** Rung 4 is a sign test at N = 1. A T-bill-like bar is lower in level than SPY, so more no-edge books pass it, and each started exam uses one of four slots for up to 36 months. This sits beside #3571, #3572 and the backtest spec's question 50, which this amendment does not answer.
+  3. **Skew.** Cash-like books lose in clusters. The exam's stated rate holds only for a skew no lower than −0.85, and `paper start` refuses a finalist below it. Some satellites will not be able to take the exam.
+- **(c): unknown.** Sharpe and drawdown comparisons are noisier than a mean, and they rest on a handful of bad markets ("about four in 80 years for US trend", PR #3682). No false-pass rate can be stated until a new sizing run exists.
+
+### Recommendation: (b), with its limits stated
+
+The drafting brief gave three reasons for (b). Each was checked against the documents.
+1. **"(b) lines the rules up with the stated objective."** Holds. The Decision above ranks process first and benchmark-beating optional, and the charter's Purpose says "Beating the market is a separate, harder, optional goal". (b) changes no ranking. It says what "beating a benchmark" means for one book, and it removes the misquote that B2's parking rests on.
+2. **"The evidence says (a) has near-zero odds without leverage."** Holds, with a caveat. No candidate in the records has a positive expected excess over SPY, and the exam needs a realised IR near 1.6. The caveat: **the exam is just as hard under (b).** (b) removes a handicap for low-beta books. It does not make a confirmed win likely.
+3. **"(c) is a bigger decision than the system needs."** Holds. (c) needs a new exam statistic with no calibrated false-pass rate, a new ADR by this record's own Consequences, and, if "whole account" means the owner's holdings, a charter amendment.
+
+**Where the documents do not support the case as it was put to the owner.** He was told the binding narrowness is the definition of a win. The pipeline review weights the objective at 5%, behind the sources (35%), the gates and cost basis (25%), the market (20%) and throughput (15%). (b) is still the best supported of the three options. But it is the smallest of the five causes, and after the 2026-11-20 amendment most of what it could fix is already fixed. **If the owner would rather not open O1, (a) and (b) differ only in words**, and choosing (a) with the evidence written down is a sound choice too.
+
+### Consequences
+
+- **Good:** the rules and the stated objective say the same thing. B2's parking reason is corrected. A low-beta long-only idea has a route to a fair read, through O1. The owner has in writing what a win would and would not be worth.
+- **Bad:** it is a change to the meaning of a win, made after results. It fixes the smallest cause. It may read as progress when the binding problems (sources, the cost basis, the exam's power) are untouched.
+- **Accepted, if the owner merges:** a satellite may pass while trailing SPY, as the 2026-11-20 amendment already accepts for a neutral book. A passed satellite at $100 is worth a few dollars a year. The system does not know whether the owner holds a core; if he does not, a market-neutral book is simply a lower-return account.
+- **Revisit if:** the owner wants the system to judge his whole account (that is (c), by a new ADR); live capital rises above the charter's $100; or O1 is answered and a first exposure-matched book is registered.
+
+### Reversibility, and the clause on changing the objective after results
+
+The Consequences above say: "Any amendment must cite results that were not the reason for the change."
+- **This amendment was prompted by results.** The owner's question followed 37 failed ideas. That is said here so that nobody reads it otherwise.
+- **The reasons it rests on are older than those results.** The ranking is this ADR's own text of 2026-09-24. That a low-beta book trails SPY by construction is in the beyond long-only report of 2026-10-10 ("In plain words", point 4). The trend-timing review is dated 2026-09-25.
+- **It flatters no result.** No past trial is re-scored, no kill is re-read, no idea is un-retired, and no bound, budget or cost cell moves.
+- **Cheap to reverse today:** no book has been read under (b), and none will be until O1 is answered. After a first satellite is registered against a yardstick other than SPY, a change back needs evidence that is not that book's result.
+
+### What this does not change
+
+- **The charter's purpose and this ADR's ranking.** Process first, calibration second, beating a benchmark optional and never a phase-exit criterion.
+- **Point-in-time data and no look-ahead.** Every stored fact keeps its `known_at`, and delisted names stay in.
+- **Every run is counted.** The engine cannot run without a trial ID. N never resets. A returning idea's trials count.
+- **Kill lines are frozen before a read.** A yardstick, an exposure and a band are fixed at registration, never after a result.
+- **The holdout rules** (ADR 0016): the development boundary, one spend, frozen finalists, no holdout read without the explicit flag.
+- **The forward return exam:** its looks, bounds, futility and void rules, skew guard, one exam per family and the four-exam budget. ADR 0016 is not edited by this PR.
+- **Code computes numbers, and an LLM never places an order.**
+- **The stop criteria above:** time (the six-month continue-or-stop rule), spend, live capital of about $100 never topped up without a charter amendment, integrity, and the Live amendment of 2026-10-18.
+- **Scope:** no leverage, no options, live long-only on the cash account (ADR 0024).
+- **SPY and MTUM are reported beside every result**, for every book.
+- **The 2026-11-20 amendment,** every rule of it, and the backtest spec's open questions 46 to 50.
+- **The open decisions #3571 and #3572.**
+- **Past trials, kills and parkings.** B2 stays parked.
+
+### What would follow
+
+Nothing is built for this merge. The work below exists only if the owner answers the open questions, and none of it is written here: no spec text, no plan task.
+- **If O1 is answered for an exposure-matched yardstick:** a backtest spec amendment (a frozen exposure key for a long-only book, the blended series between the two ends that the spec's question 47 defers, the registration, report and promotion refusals extended, a band on the held exposure), with dated markers on the 2026-11-20 amendment's rule 1 and on the strategy-lab spec's requirement 4. Our estimate: three to five class-A tasks after T436 to T439, one of them size M for the blended series.
+- **If O2 is answered:** dated markers on ADR 0016 and one paper-plan task, as the spec's question 48 already says, widened from long/short books to every book whose yardstick is not SPY. T440's refusal is lifted in the same task.
+- **Small either way:** one line in the hypothesis template and on the idea card naming the book's yardstick and its expected alpha, and the yardstick shown beside SPY and MTUM on the Books page. Size S each.
+- **Under (a):** nothing. **Under (c):** a new ADR, a sizing run for a new exam statistic, and amendments to ADR 0016, ADR 0023 and possibly the charter, before any build.
+
+### Open questions (the owner's; not recorded by the merge)
+
+- **O1. The yardstick of a long-only book that holds less than full market exposure** (a trend-filtered SPY book, a cash-heavy event book, a merger-arbitrage book). The 2026-11-20 amendment's rule 1 keeps it on SPY "whatever its gross exposure". Options:
+  - (i) Leave it. Every long-only book is judged on SPY. Then (b) changes nothing for any long-only book, the live book included.
+  - (ii) An exposure-matched blend, frozen before any read: the registration fixes the book's market exposure m, by design or from data before the test window only, and the yardstick is m × SPY + (1 − m) × T-bill, with a band on the held exposure and the alpha sign check. This extends the 2026-11-20 amendment's rule 2 to long-only books and amends its rule 1.
+  - (iii) A beta-matched yardstick on the measured beta. The 2026-11-20 amendment's decision 1 rejects it, because the bar would move with the result.
+  - (iv) Keep SPY as the yardstick and let alpha decide, with a significance bar. This is the backtest spec's question 50 and #3572 under another name.
+
+  *Recommendation: (ii), decided after PR #3690 has merged, together with question 48, since it is the same mechanism. Note one limit. A fully invested book of low-beta stocks, merger arbitrage for one, has a dollar exposure of 1 and a beta near 0, so its frozen m is a claim about beta. The band must then be on the measured beta, and the owner should see that spelled out before he agrees.*
+- **O2. How the forward exam reads a satellite's yardstick.** The backtest spec's question 48 asks this for a long/short finalist and recommends reading the first leg over the yardstick and regressing the second on SPY's return over the T-bill. If O1 is answered with (ii), the same question covers long-only satellites. It changes how ADR 0016's rule is applied, so it needs dated markers there and the owner's word. *Recommendation: answer it with question 48, once, for every book whose yardstick is not SPY.* Until then no exam window starts for such a book.
+- **O3. Should rung 4 ask a satellite for more than a sign?** With a lower bar, more no-edge books reach the exam door. This is #3571, #3572 and question 50. It is named here so the owner decides them knowing (b) raises their weight. No recommendation is added to theirs.
+
+### Decisions this merge records
+
+Unless the owner says otherwise on the PR:
+1. **Option (b).** A strategy book is a satellite. Its job is a net return above its yardstick that is not market beta. The core is the owner's, outside the system, and the system does not manage or measure it.
+2. **The ranking in the Decision above stands.** Objective 3 stays optional and is never a phase-exit criterion. Applied to one book it reads "earn more than the book's yardstick, with positive alpha", not "end with more than buy-and-hold SPY".
+3. **What the evidence says is on the record:** no idea in the project's records has a positive expected excess over SPY in return, and the system is not expected to beat SPY. Under objective 1 that is not a failure.
+4. **#659 is narrowed.** A return below SPY's is acceptable for a book whose yardstick is not SPY, when it beats that yardstick with positive alpha. A higher Sharpe alone is never a pass. For a book whose yardstick is SPY, #659 stands.
+5. **B2 stays parked.** Its yardstick is SPY until O1 is answered. Its parking no longer rests on the sentence "whose objective is return against the benchmark". It rests on the owner's "no" and on the trend-timing evidence.
+6. **No idea is un-retired.** A returning idea is a new registration from the first step of the route, with its kill line frozen first and its trials counted.
+7. **No rule a book is read by changes:** not the yardstick rules of 2026-11-20, not line 40, not the forward exam, not the stop criteria, not the charter.
+8. **O1, O2 and O3 are open, and they are the owner's.**
+
+**If the owner says (a):** decisions 1, 2, 4 and 5 are dropped; 3, 6 and 7 are recorded; #659 stands as written. **If he says (c):** nothing here is recorded except 6, and a new ADR is drafted for his word before any rule moves.
