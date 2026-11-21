@@ -39,7 +39,7 @@ from tradepartner.calendar import (
     previous_session,
     session_close,
 )
-from tradepartner.research.event_study.run import entry_session
+from tradepartner.research.event_study.run import ET, entry_session
 from tradepartner.research.feasibility_block import (
     BandTotal,
     CountCell,
@@ -60,13 +60,13 @@ _BARS_SQL = (
 )
 _HAS_BARS_SQL = (
     "SELECT DISTINCT security_id FROM prices_daily "
-    "WHERE list_contains(?, security_id) AND session <= ? AND known_at <= ?"
+    "WHERE list_contains(?, security_id) AND session >= ? AND session <= ? AND known_at <= ?"
 )
 _SECURITIES_SQL = "SELECT security_id, cik FROM securities WHERE known_at <= ?"
 _DELISTINGS_SQL = (
     "SELECT DISTINCT security_id FROM ("
     "SELECT security_id, effective_on, row_number() OVER "
-    "(PARTITION BY security_id, filed_at ORDER BY known_at DESC) AS n "
+    "(PARTITION BY security_id, form, class_title, exchange, filed_at ORDER BY known_at DESC) AS n "
     "FROM delistings WHERE known_at <= ?) WHERE n = 1 AND effective_on >= ? AND effective_on <= ?"
 )
 _INGEST_SQL = (
@@ -102,12 +102,22 @@ def read_store_facts(conn: duckdb.DuckDBPyConnection) -> StoreFacts:
     )
 
 
-#: What identifies one filed fact across its revisions (the first-known row is the event).
-_IDENTITY: dict[str, tuple[str, ...]] = {
-    "form4": ("accession", "line_no"),
-    "statement_fact": ("cik", "fact_name", "period_start", "period_end", "filing_accession"),
-    "form25": ("security_id", "filed_at"),
-    "corporate_action": ("security_id", "action_type", "ex_date"),
+#: A fact's identity: the table's own natural key without `known_at`, as `store/schema.py`
+#: states it (form4 UNIQUE (accession, filer_cik, line_no); statement_facts UNIQUE (cik,
+#: fact_name, period_end, period_days); delistings UNIQUE (security_id, form, class_title,
+#: exchange, filed_at, known_at); corporate_actions the `corporate_actions_identity` index,
+#: which is `(security_id, source_action_id)` when the source gives an id and else the
+#: type and ex-date). Each key with `known_at` is unique, so ordering by `known_at` has no
+#: tie and no result depends on insert order. T453's `SourceSpec` is where these belong.
+_IDENTITY: dict[str, str] = {
+    "form4": "accession, filer_cik, line_no",
+    "statement_fact": "cik, fact_name, period_end, period_days",
+    "form25": "security_id, form, class_title, exchange, filed_at",
+    "corporate_action": (
+        "security_id, source_action_id, "
+        "CASE WHEN source_action_id = '' THEN action_type END, "
+        "CASE WHEN source_action_id = '' THEN ex_date END"
+    ),
 }
 
 
@@ -120,7 +130,7 @@ def _event_rows(
     (`SourceSpec`'s rule), so the filter and the window test the first-known row.
     """
     spec = design.spec
-    identity = ", ".join(_IDENTITY[design.source])
+    identity = _IDENTITY[design.source]
     clauses = [f"{spec.issuer_column} IS NOT NULL", "known_at >= ?"]
     params: list[object] = [cut, start]
     for column, values in design.filters:
@@ -184,7 +194,7 @@ def count_feasibility(
     if last < design.window_start:
         raise FeasibilityRefused("the window holds no session of the trading calendar")
     cut = session_close(last)
-    start = datetime.combine(design.window_start, time(0), tzinfo=UTC)
+    start = datetime.combine(design.window_start, time(0), tzinfo=ET)
     calendar = all_sessions()
     index = {session: i for i, session in enumerate(calendar)}
     first_index = next(i for i, s in enumerate(calendar) if s >= design.window_start)
@@ -281,7 +291,7 @@ def count_feasibility(
         cells=tuple(cells),
         totals=tuple(totals),
         events_hold_past_window=sum(
-            1 for _, entry in events if entry + design.hold_sessions > last_index
+            1 for _, entry in events if entry + design.hold_sessions - 1 > last_index
         ),
         window_sessions=last_index - first_index + 1,
         coverage=_coverage(conn, cut, design, last, {i for i, _ in events}, cik_of),
@@ -304,7 +314,10 @@ def _coverage(
         ).fetchall()
     ]
     with_bars = (
-        {str(r[0]) for r in conn.execute(_HAS_BARS_SQL, [ended, last, cut]).fetchall()}
+        {
+            str(r[0])
+            for r in conn.execute(_HAS_BARS_SQL, [ended, design.window_start, last, cut]).fetchall()
+        }
         if ended
         else set()
     )
