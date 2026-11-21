@@ -5,7 +5,8 @@ split in place, inside `cli.py`, into nine `_register_<group>(app, edges)`
 functions; `make_app` builds the app and the edges and calls them in order.
 
 - `test_the_command_tree_is_pinned` is the golden: every command's path and
-  parameters, in registration order (which is the help order), compared with
+  parameters (names, arity, type, default, env var and choices), in registration
+  order (which is the help order), compared with
   `tests/fixtures/cli_tree.json`. No help text and no panel name is recorded,
   so rewording a command does not move it. `CLI_TREE_UPDATE=1` rewrites it.
 - `test_make_app_only_delegates` and `test_each_group_reads_only_its_edges`
@@ -60,6 +61,18 @@ def _parameter(param: Any) -> dict[str, Any]:
     }
     if param.param_type_name == "option":
         record["is_flag"] = param.is_flag
+    # The value a command gets when the caller says nothing, and where else it can
+    # come from: a changed default, a new env var or a changed choice list moves the
+    # golden (safety review of #3648). A default built at call time is recorded as such.
+    default = param.default
+    if callable(default):
+        record["default"] = "<built at call time>"
+    elif default is None or isinstance(default, (bool, int, float, str)):
+        record["default"] = default
+    else:
+        record["default"] = repr(default)
+    record["envvar"] = param.envvar
+    record["choices"] = list(getattr(param.type, "choices", None) or [])
     return record
 
 
@@ -91,7 +104,8 @@ def test_the_command_tree_is_pinned() -> None:
         GOLDEN.write_text(tree, encoding="utf-8")
     assert tree == GOLDEN.read_text(encoding="utf-8"), (
         f"the command tree differs from {GOLDEN.relative_to(ROOT)}: a command, option or "
-        f"argument was added, removed, renamed or reordered. If that is intended, rerun "
+        f"argument was added, removed, renamed or reordered, or a default, env var or "
+        f"choice list changed. If that is intended, rerun "
         f"with {UPDATE_VARIABLE}=1 to rewrite the file and commit it."
     )
 
