@@ -5,13 +5,21 @@
 This document designs a process and its pilot. It proposes no strategy, builds nothing and reads no return. The owner reviews it and decides the items in [Decisions for the owner](#decisions-for-the-owner).
 
 *Amendment 2026-11-16 (#3496; [ADR 0023's amendment of that date](../decisions/0023-break-first-fast-books-paper-exam.md#amendment-2026-11-16-3496-own-store-read-first-published-evidence-as-the-prior); accepted by the owner's merge).* Own-store read first. Five points change here:
-- **Question 3** is a break-even screen at the band's #2667 arrival measure (+8.8 bp per side over $200M today, provisional while it rests on two rebalance days). D9's margin is dropped, because the deciding read charges the harsh cost itself.
+- **Question 3** is a break-even screen at the band's #2667 arrival measure (+8.8 bp per side over $200M today, provisional while it rests on two rebalance days). D9's margin is dropped, because the deciding read charges the harsh cost itself. *(Amended 2026-11-21, #3702: question 3 is the Shape block's cost line, read at the decision cost; see the amendment below.)*
 - **A fast look on open data** (requirement 5 (a)) is optional and sets the card's prior and expected size. It kills nothing, and it no longer makes a card a candidate. A candidate counts at its rung-4 verdict, which replaces D2's interim rule and D7.
 - **A store return is read only inside a registered run.** This is D5's narrower option.
 - **Every route read states k and prints the deflated Sharpe at N + k**, with V = max(V, `min_sharpe_variance_annual`, 12/T). An event study records k in its `[multiplicity]` block. For route reads, N + k is printed and does not gate. This replaces requirement 5's promotion-at-N + k and its Šidák `ci_level`, and it decides D11. D2 is decided here as well, before the quant-auditor review that requirement 5 had made it wait for.
 - **The strict tier's registered store read decides.** Its decision cell is at the harsh cost: at least 50 bp per side, twice a base of at least 25 bp. A pass needs delister coverage over its window (4a (f)).
 
 Requirement 8 (confirmation is prospective) is unchanged.
+
+*Amendment 2026-11-21 (#3702; the owner's "Go with your recommendations" of that date on recommendations 1 and 5 of the pipeline review, PR #3692, built on the pass arithmetic of PR #3683; in force on the owner's merge).* The passable shape goes on the card. Four points change here. The text is the [amendment at the end](#amendment-2026-11-21-3702-the-passable-shape-on-the-card):
+- **A Shape block comes first on every new card.** It states turnover, gross effect, the round trip at the decision cost, their ratio, the effective count and the pass chance, from one closed form.
+- **Question 3 becomes the block's cost line.** It reads the break-even against the cost the idea will be decided at (the harsh cell, 50 bp per side today), not the arrival measure. The arrival measure and the paper basis are printed beside it.
+- **Question 7 becomes the block's power line.** Power is read at the idea's own expected effect, not at t = 1.0 on a floor.
+- **A counts-only feasibility command** is specified in the [research-registry spec](research-registry.md) and planned (T441 to T444). It is not built here.
+
+No rule about look-ahead, counting, frozen kill lines or the holdout changes. No past card or idea is re-scored.
 
 ## Problem & why now
 
@@ -72,13 +80,13 @@ A cheap, no-return screen. Answering takes about an hour. Every question is answ
 
 1. **Why might this return persist?** One of: an inefficiency someone keeps losing to (a forced or price-insensitive flow; a behaviour with a named reason it persists); a risk premium someone pays to have borne (named: what loss are we being paid to carry, and when does it arrive); a constraint on the natural holder (capacity, horizon, mandate, career). Two sources of return are allowed, not one: a premium is a reason as good as a loser. "The market under-reacts" alone is not an answer. Most of the candidates tested so far had none, which is the point.
 2. **Can TradePartner capture it at its size and execution, after cost?** Capacity (does the trade exist at $100 to $100k without moving the price), holding period (does it fit a patient account, or does it need speed), execution (does it need an order type, bar or quote we do not have, which is question 6), and the cost arithmetic of question 3. The card need not show that a professional is absent; it must show that the return survives our cost at our size, which is the test that killed the past eight. Fitting the books' current shape is not by itself a reason to reject; needing scale or data we cannot get is.
-3. **What does it cost at our size, and does the edge clear it with margin?** Holding period, one-sided turnover, round-trip cost for the names it trades, against the plausible gross effect after the publication haircut (QI-2, applied once; a post-2005 figure such as G2-S10 is already haircut). The arithmetic is [ADR 0023 rung 1](../decisions/0023-break-first-fast-books-paper-exam.md) (needed edge = 2 × one-sided turnover × cost per side) and stage 4a (d) (plausible effect above 60 bp round trip), unchanged. The cost per side is the figure measured for the card's liquidity band under the [2026-10-30 rung-1 rule](../decisions/0023-break-first-fast-books-paper-exam.md#amendment-2026-10-30-2667-one-rung-1-cost-rule) (arrival, equal-weighted, in band, rebalance days), with the figure against the open beside it as that rule requires. Today only one band is measured: names over $200M, **+8.8 bp per side against arrival** (the governing figure; the amendment makes arrival mandatory) **and +24.2 bp against the open on that band** ([fill-cost note](../research/2026-10-30-paper-fill-cost-arrival.md), rung-1 table, two rebalance days, paper simulator); both go on the card. Below $200M nothing is measured under the rule; the note's other +24.2 bp (all orders, all bands, against arrival) mixes bands and understates the cost of smaller names, so a card there writes `cost: unmeasured (<band>)`, and if its verdict turns on that cost it is `blocked: cost measurement (<band>)`, which the tally shows like any other missing capability. The margin the card must show above break-even is [decision D9](#decisions-for-the-owner).
+3. **What does it cost at our size, and does the edge clear it with margin?** Holding period, one-sided turnover, round-trip cost for the names it trades, against the plausible gross effect after the publication haircut (QI-2, applied once; a post-2005 figure such as G2-S10 is already haircut). The arithmetic is [ADR 0023 rung 1](../decisions/0023-break-first-fast-books-paper-exam.md) (needed edge = 2 × one-sided turnover × cost per side) and stage 4a (d) (plausible effect above 60 bp round trip), unchanged. The cost per side is the figure measured for the card's liquidity band under the [2026-10-30 rung-1 rule](../decisions/0023-break-first-fast-books-paper-exam.md#amendment-2026-10-30-2667-one-rung-1-cost-rule) (arrival, equal-weighted, in band, rebalance days), with the figure against the open beside it as that rule requires. Today only one band is measured: names over $200M, **+8.8 bp per side against arrival** (the governing figure; the amendment makes arrival mandatory) **and +24.2 bp against the open on that band** ([fill-cost note](../research/2026-10-30-paper-fill-cost-arrival.md), rung-1 table, two rebalance days, paper simulator); both go on the card. Below $200M nothing is measured under the rule; the note's other +24.2 bp (all orders, all bands, against arrival) mixes bands and understates the cost of smaller names, so a card there writes `cost: unmeasured (<band>)`, and if its verdict turns on that cost it is `blocked: cost measurement (<band>)`, which the tally shows like any other missing capability. The margin the card must show above break-even is [decision D9](#decisions-for-the-owner). *(Amended 2026-11-21, #3702: for a card written from that date this question is the Shape block's cost line, read once at the decision cost. A card that fails it is `rejected: shape`. The band rule for an unmeasured cost stands, as the [amendment](#amendment-2026-11-21-3702-the-passable-shape-on-the-card) restates it.)*
 4. **Is the data there, point-in-time?** The causal timestamp is held as `known_at`; the event count per year is known or countable without returns; delisted names in the window are covered; how long a history it needs (2016+ is held; older is bought). This is stage 4a (a), (b), (f), answered before an experiment file, not instead of 4a.
 5. **What has already been tried?** The nearest retired, parked or deferred item, by mechanism, with its ledger row and exposure records, and the related published mechanisms from source A, and what is genuinely new. A second look at a killed mechanism is allowed and must say so (the [earnings-family design](../research/2026-11-02-earnings-event-family-design.md) is the model: "this is B9 again, with four changes, and must be disclosed as one"). A mechanism whose 2020-and-later catalogue window was read for XFIN or the composite says so here.
 6. **Which capabilities does it need?** From a fixed vocabulary ([Data / interfaces](#data--interfaces)), each marked `held`, `self-imposed gap`, `charter (ADR)` or `external limit`. **The filter does not reject a card for a self-imposed gap.** Daily bars only, market DAY orders only, long-only in practice, a $200M liquidity floor: these are design choices we made, not facts about the broker. A card that needs one of those is verdict `blocked: <capability>` and feeds the tally. A capability the charter rules out (options, crypto, live shorts on the cash account, the $100 live cap) is `charter (ADR)`: the card is kept as `blocked` and the tally shows it, but only an ADR can unblock it. Genuinely external limits (price history starts 2016 unless bought; no futures at the broker) may reject. The card also records whether the **capabilities we hold suffice** for a first test, even if the trade itself would need more.
-7. **Is a kill decidable?** The cheap screen of 4a (c): the effective number of independent events at which t reaches 1.0 at the plausible effect, n = (sd / effect)², with the effect and its dispersion taken from the published source or the register's claim, never from held returns. t = 1.0 is a screen, not evidence. Too few events is `deferred: power`, because a kill would say nothing.
+7. **Is a kill decidable?** The cheap screen of 4a (c): the effective number of independent events at which t reaches 1.0 at the plausible effect, n = (sd / effect)², with the effect and its dispersion taken from the published source or the register's claim, never from held returns. t = 1.0 is a screen, not evidence. Too few events is `deferred: power`, because a kill would say nothing. *(Amended 2026-11-21, #3702: for a card written from that date this question is the Shape block's power line: the chance of a pass at the idea's own expected effect, net of the decision cost. `deferred: power` stays.)*
 
-**Admitted and the verdicts.** A card that answers questions 1 to 5 and 7 is **admitted**, whatever its capabilities. Its verdict is `admit` (every capability needed for a first test is held; goes to the fast tier) or `blocked: <capability>` (a good card waiting on a build or an ADR; counted in the tally). The other verdicts are `deferred: <reason>` (data or power; re-enters when the reason is removed) and `rejected: <question n>` (stays on file, one line, as part of the denominator). "Admitted" below means `admit` plus `blocked`. The card also records `killable without a return read: yes | no`, which the pilot reports. The owner may overrule any verdict; the overrule is written on the card.
+**Admitted and the verdicts.** A card that answers questions 1 to 5 and 7 is **admitted**, whatever its capabilities. Its verdict is `admit` (every capability needed for a first test is held; goes to the fast tier) or `blocked: <capability>` (a good card waiting on a build or an ADR; counted in the tally). The other verdicts are `deferred: <reason>` (data or power; re-enters when the reason is removed) and `rejected: <question n>` (stays on file, one line, as part of the denominator). "Admitted" below means `admit` plus `blocked`. The card also records `killable without a return read: yes | no`, which the pilot reports. The owner may overrule any verdict; the overrule is written on the card. *(Amended 2026-11-21, #3702: a new card fills in the Shape block before question 1. `rejected: shape` joins the verdicts and replaces `rejected: question 3` for new cards. A card is admitted when its Shape block passes and it answers questions 1, 2, 4, 5 and 6.)*
 
 ### 4. The stages of evidence, and what each can establish
 
@@ -88,7 +96,7 @@ Every candidate moves through the same stages in order. The table says what each
 |---|---|---|---|---|
 | 1 Economic mechanism | The card: why the return might persist, who or what pays it, at what cost to us | That the idea is coherent and worth a cheap test | Anything about returns; mechanism stories do not predict survival (CLZ, [discovery §B3](../research/2026-10-19-strategy-discovery.md#b3-what-mechanism-first-admission-buys-and-what-it-does-not)) | A card; a ledger row at question 3 |
 | 2 Non-return test | Rung 2-O: the mechanism's fundamental or behavioural consequence on held facts, an `economic` run | That the stated mechanism is not false in our data | That the effect is priced or tradable | A registered run, no cost to N; **it is a test and carries multiple-testing risk**: every such run is a look, recorded on the card and carried forward under requirement 5 |
-| 3 Feasibility and power screen | Stage 4a (a) to (f): timestamp, counts, power at t = 1.0, cost, matched benchmark, delisted coverage | Whether a kill would mean anything | Any effect; t = 1.0 is a screen, not evidence | The ledger's `feasibility` cell |
+| 3 Feasibility and power screen | Stage 4a (a) to (f): timestamp, counts, power at t = 1.0 *(from 2026-11-21, #3702: power at the idea's own effect, and cost at the decision cost, both read from the card's Shape block)*, cost, matched benchmark, delisted coverage | Whether a kill would mean anything | Any effect; t = 1.0 is a screen, not evidence | The ledger's `feasibility` cell |
 | 4 Exploratory return result | The fast look: one declared read, one number, pass or kill | A kill; or that the idea is worth a controlled test | A positive result of any kind; it is the first look at a return and is the most p-hackable step | An exposure record (open data or store), or a `return` run in N |
 | 5 Controlled return experiment | The strict tier: a registered run or counted trial, frozen kill line, harsh settings, placebos, the deflated bar | A pre-registered pass or kill on development data | Out-of-sample performance; forty months can only kill | A trial or run in the family's N, the DSR at the declared count |
 | 5b Pre-exam check (weaker; **not available today**) | A read of stored, unqueried sessions between 2026-10-01 and the card's freeze timestamp, under the frozen kill line | **A kill only.** A candidate that fails here is retired | **Never a confirmation.** The data was stored but the people proposing the idea lived through those months (requirement 8); a pass here is recorded and changes nothing. **ADR 0016 point 2 refuses it:** those sessions are the family's dead months, read by no run of its own; only a no-family scratch read could reach them, which D5 forbids. It runs only if the owner amends point 2 (D10); the pilot does not run it | If ever run: a registered run, in N, its window ending at the freeze |
@@ -190,6 +198,8 @@ fast look:           declared <series, construction, window, kill line; comment 
 review:              <reviewer's findings, one line>   ·   ledger: <row id>   ·   strict tier: <issue # or ->
 ```
 
+*(Amended 2026-11-21, #3702: a card written from that date starts with the Shape block of the [amendment](#amendment-2026-11-21-3702-the-passable-shape-on-the-card), which replaces lines 3 and 7. The eleven pilot cards keep the shape above.)*
+
 **The capability vocabulary** (the owner's list of 2026-11-02; extend by editing the header):
 
 | Capability | Values | Status today |
@@ -265,3 +275,134 @@ Each with a recommendation. One line back on any of them is enough. D2 and D8 ar
 2. Does the owner want cards for ideas the filter rejects at question 1 kept in the file for the denominator (the draft says yes, as one line each), or only counted on the batch row?
 3. Should an `UNVERIFIED` practitioner card (source E, after the pilot) be allowed a fast look on open data before any graded source backs it? Not needed for the pilot.
 4. The shape of the freeze refusal (work item 8): the freeze timestamp is the kill line's `created_at`, which `exposure record` already takes as `kill_line_posted_at`; `experiment open` has no freeze field today, though the registration's optional `hypothesis_ref` can already name the card; the task line decides whether the registration carries the freeze beside it, or an `owner_decisions` row of a new kind does. The refusal is required; only its shape is open.
+
+## Amendment 2026-11-21 (#3702): the passable shape on the card
+
+*For the owner's word on this class-B PR. It carries out recommendations 1 and 5 of the pipeline review (PR #3692), on the owner's instruction of 2026-11-21: "Go with your recommendations." The arithmetic is the pass arithmetic's (PR #3683). Docs only: no code, no store read, no return read. No past card or idea is re-scored. The choices it had to make are listed at the end; merging the PR records the recommended answer to each unless the owner says otherwise on the PR.*
+
+**Why.** None of 37 ideas had the passable shape when it entered, and no document stated that shape (PR #3692). The card asked for break-even at the 8.8 bp arrival measure. The deciding read charges 50 bp per side. So the weakest cost test ran first: IRRX cleared it, got a spec and nine plan tasks, and was then stopped by arithmetic whose inputs were already in the repo.
+
+**Words.** The **decision cost** `c` is the cost per side that the idea's rung-4 read will charge: the harsh cell of [ADR 0023's 2026-11-16 amendment](../decisions/0023-break-first-fast-books-paper-exam.md#amendment-2026-11-16-3496-own-store-read-first-published-evidence-as-the-prior), item 2. Today it is 50 bp. The **round trip** `R` is `2 × c` for one event. For a monthly book it is the monthly cost drag, `2 × one-sided turnover per month × c`, plus borrow on a short leg. **Gross** `g` is the plausible effect per event or per month, in bp, after the publication haircut (QI-2) applied once, as question 3 already required.
+
+### A. The Shape block
+
+A card written from this date starts with these five lines, before question 1:
+
+```
+shape:         <event, hold <h> sessions | trial, <cadence>>; band <band>; decision cost <c> bp per side (ADR 0023 harsh cell)
+  cost:        turnover <x>/yr one-sided; gross <g> bp per <event | month> (<source>; QI-2 <applied once | post-publication figure>); round trip <R> bp; ratio g/R <r> against 2   ·   beside it: <r> at arrival, <r> at the paper basis
+  power:       event: raw <n>/yr over <years>, ÷ clustering <B>, ÷ overlap <O>, n_eff <n> against n_min <n>   |   trial: <T> months, net IR <x> against <bar>
+  pass chance: <p>% = Φ(<z>); sd <value> (<source; never held returns>); rule <floor F, t floor | line 40 with SR* <value>>
+  result:      pass | rejected: shape | deferred: power | blocked: cost measurement (<band>)
+```
+
+The rest of the card is as before, without lines 3 and 7: questions 1, 2, 4, 5 and 6, then `verdict`, `frozen`, `looks`, `fast look` and `review`. Question 4 keeps the timestamp, delister coverage and history; its events-per-year figure moves to the power line.
+
+1. **It comes first and it is arithmetic.** About ten minutes. It opens no store and reads no return.
+2. **The cost line.** `ratio = g / R` at the decision cost. The line to clear is **2**. A card under 2 is `rejected: shape`. Its numbers stay on the card and it gets its ledger row (rule L1). Nothing else is done for it: no other question, no counts run, no spec, no plan, no build. The same ratio at the band's #2667 arrival measure and at the latest paper basis is printed beside it. Neither decides at the card. The paper basis still decides at the exam door (ADR 0023, #3143 items 3 and 4), and a card that clears 2 at the decision cost clears break-even there for as long as the paper basis is under twice the decision cost (60 against 100 today).
+3. **A band with no cost measure.** Under the floor reading (decision 1 below) the harsh cell is at least 50 bp per side whatever the band, and it was set from the over-$200M figure. So a card in an unmeasured band is first read at 50 bp. If it fails there it is `rejected: shape`: a higher cost can only make it worse. If it clears there it is `blocked: cost measurement (<band>)`, as today, and gets no build until the band is measured.
+4. **The power line.** One line replaces question 7 and stage 4a (c). It asks for the chance of a pass at the idea's **own** expected effect, net of the decision cost, from the closed form in section B. A card under **80%** is `deferred: power`, as today: it costs a ledger row and re-enters when the reason is removed (more history, an ingest, a longer window). For an event idea the same test is `n_eff ≥ n_min`. The effect and its dispersion come from a published source or a register claim, never from held returns, as question 7 already required. The corrections that turn raw events into `n_eff` are those of stage 4a (c): divide by the same-date clustering factor, and by hold over spacing when holds overlap. Each is written on the line.
+5. **The pass chance.** It is written out with its `z`. It ranks proposals ([research program](../ways-of-working/research-program.md#3-hypothesis-backlog) stage 3). It is an upper bound: one reading, no rung 5, no exam door, no forward exam. It is not evidence. A low-turnover book with no edge at all passes rung 4 about 39 to 45% of the time (PR #3683).
+
+### B. The closed form
+
+`Φ` is the standard normal distribution function. A few values: Φ(−2) = 2%, Φ(−1) = 16%, Φ(0) = 50%, Φ(0.5) = 69%, Φ(0.84) = 80%, Φ(1) = 84%, Φ(1.28) = 90%, Φ(2) = 98%.
+
+**An event idea** (a registered event study; hold `h` sessions):
+
+- `net = g − R`, with `R = 2 × c`.
+- `SE = sd / √n_eff`. `sd` is the per-event standard deviation of the matched spread over the hold, in bp.
+- `bar = max(F, t_f × SE)`. `F` and `t_f` are the net floor and the t floor that the idea's experiment file will freeze.
+- **`P(pass) = Φ((net − bar) / SE)`.**
+- The smallest count for 80%: `SE_max = min(net / (t_f + 0.84), (net − F) / 0.84)` and `n_min = (sd / SE_max)²`. If `net ≤ F`, no count reaches 80%.
+
+**A trial** (a monthly book over `T` month-ends):
+
+- `net = g − R`, in bp per month on the book's equity, with `R = 2 × turnover per month × c`, plus borrow.
+- `σ` is the monthly standard deviation of the book's excess return over its yardstick, in bp.
+- `b = SR* × σ / √12`. SR\* is the family's annual deflated-Sharpe bar. **For a new root family it is 0 today**, so `b = 0`.
+- **`P(pass) = Φ((net − b) × √T / σ)`.** The same thing in information-ratio terms: `net IR = net × √12 / σ` and `P = Φ((net IR − SR*) × √(T / 12))`.
+- 80% needs `net IR ≥ SR* + 0.84 / √years`: 0.46 on 40 months and 0.32 on 84 months when SR\* is 0.
+
+**Defaults when the card has no better source** (PR #3683's assumptions, each UNGRADED; a card that uses one says so):
+
+| Input | Default | From |
+|---|---|---|
+| `F`, `t_f` | +30 bp net and t ≥ 1.0 | the E1 design's rule, the only event rule written for this route |
+| `sd`, event | 1,500 bp at a 60-session hold, scaled by √(h / 60): 866 bp at 20 sessions | the E1 design's figure |
+| `σ`, long/short 50/50 book | 140 bp a month | derived from claim SH-4 |
+| `σ`, long-only book against SPY | 8% a year (231 bp a month) | Audit B's noise model and B3's measured 8.6% |
+
+### C. Where 2, 255 and 765 come from
+
+They are worked values of section B, not constants. With today's inputs (`c` = 50, so `R` = 100; `F` = 30; `t_f` = 1.0; power 80%):
+
+| Ratio g / R | Gross, bp | `n_min`, 20-session hold | `n_min`, 60-session hold |
+|---:|---:|---:|---:|
+| 1.3 or less | 130 or less | none: net is at or under the floor | none |
+| 1.5 | 150 | 1,330 | 3,985 |
+| **2** | **200** | **255** | **765** |
+| 3 | 300 | 65 | 195 |
+
+- **Why 2.** Raw events run 2 to 4 times `n_eff` (PR #3683). At a ratio of 1.5 an idea needs 2,700 to 5,300 raw events in one band for a 20-session hold, and three times that at 60 sessions. At 2 it needs 500 to 1,000. So 2 is the smallest round ratio at which a few hundred independent events are enough. It is a default chosen from that table, not a law.
+- **Why 255 and 765.** At a ratio of exactly 2 the t floor binds: `n_min = ((1 + 0.84) × sd / (g − R))²`. That is (1.84 × 866 / 100)² = 254.4 and (1.84 × 1,500 / 100)² = 763.1. PR #3683 prints 255 and 765.
+- **They move.** If the decision cost, the pass rule or the `sd` default moves, this table is recomputed and re-dated, and open cards are re-read at the new figures (arithmetic on the card, as requirement 8 already says of a new cost figure). A lower cost does not lower the counts by itself. At `c` = 25, a ratio of 2 is 100 bp gross and 50 bp net, which needs 1,330 effective events at 20 sessions. What a lower cost does is let a smaller gross clear the cost line.
+
+### D. A worked example: IRRX
+
+An illustration of the arithmetic, from PR #3683's figures. IRRX's record stands as it is (the owner's stop, #3684).
+
+```
+shape:         trial, month_end; band over $200M; decision cost 50 bp per side
+  cost:        turnover 12/yr one-sided (1.0 a month, the spec's assumption); gross 29 bp per month on the 50/50 book (SH-4, published 0.58%/month of spread); round trip 2 × 1.0 × 50 = 100 bp per month (+1.25 borrow); ratio 29 / 100 = 0.29 against 2   ·   beside it: 1.65 at arrival (17.6 bp), 0.24 at the paper basis (120 bp)
+  power:       trial: 84 months, net IR (29 − 101.25) × √12 / 140 = −1.79 against 0.32
+  pass chance: 0.0001% = Φ(−4.73), from (29 − 101.25) × √84 / 140; σ 140 bp a month (SH-4, derived); rule line 40 with SR* 0
+  result:      rejected: shape
+```
+
+The old screen read the same idea at the arrival measure, where its break-even of 14.5 bp per side clears 8.8 bp. The new line reads it at the cost it would be decided at, and it stops on the card. For contrast, an event idea at exactly the line: gross 200 bp, 20-session hold, `n_eff` 255 gives `SE` = 866 / √255 = 54.2, `bar` = 54.2, and `P` = Φ((100 − 54.2) / 54.2) = Φ(0.84) = 80%.
+
+### E. What it replaces
+
+| | Before | After |
+|---|---|---|
+| Lines an author answers on the card | 7 questions | 6: the Shape block and questions 1, 2, 4, 5, 6 |
+| Times the break-even is asked before the read | 3 (question 3, stage 4a (d), the rung-1 screen), at 8.8 bp | 1 (the cost line), at the decision cost |
+| Times power is asked | 2 (question 7, stage 4a (c)), at t = 1.0 on the gross effect | 1 (the power line), at the idea's own net effect |
+| Stage 4a items answered apart from the card | 6: (a) to (f) | 4: (a), (b), (e), (f). Items (c) and (d) read the card's two lines |
+| Route steps before rung 4 (ADR 0023's order) | 3: card and 4a, rung 3, the rung-1 screen | 2: card and 4a, rung 3 |
+| Answers before a read, in all | 7 + 6 + 1 = 14 | 6 + 4 = 10 |
+
+The counts-only feasibility command ([research-registry spec](research-registry.md), amendment of this date; plan tasks T441 to T444) will produce 4a (a), (b) and (f) and the power line's `n_eff` in one read-only call on a store copy. From the day its command merges, it runs before any spec, plan or experiment file is drafted for an event idea. It moves an existing gate earlier and adds none.
+
+### F. What does not change
+
+- **No look-ahead rule.** Requirement 8 and the development boundary stand. The Shape block reads no store row.
+- **No counting rule.** N, k, the ledger's rules L1 to L5, the exposure records and the search limit's definition of a candidate stand. A `rejected: shape` card is a rung-1 screen kill: it gets a ledger row and does not count as a candidate, as ADR 0023's 2026-11-16 amendment already says of a screen kill.
+- **No frozen-kill-line rule.** The kill line is still posted on the idea's issue before any return is read, and it still pins one decision cell. The Shape block is not a kill line and freezes nothing.
+- **No holdout rule.** Nothing here reads, spends or moves a holdout or a dead month.
+- **The deciding read, the exam door and the forward exam** are as ADR 0023 and ADR 0016 have them.
+- **The pilot's eleven cards, the backlog and every past verdict** stay as written.
+
+### G. What it assumes, and what would change it
+
+- **#3571 (should a new root family start with SR\* = 0?).** The trial form above uses today's rule, `b = 0`. If option 1 lands (a root family's mark seeded from the programme count k), `b` is no longer 0. At SR\* near 1.2 to 1.28 on a 40-month window, the 80% line moves from a net IR of 0.46 to about 1.7. The form stays; `b` changes; every trial card's pass chance is recomputed. The event form is untouched, because an event study's rule is its experiment file's, but the counted trial that follows an event-study pass meets the same bar. Not decided here.
+- **#3572 (which deflated Sharpe the kill rules read).** If rung 4 gains a t floor on the net mean, a trial's bar becomes `max(b, t_f × σ / √T)`, the event form's shape. Not decided here.
+- **#3574 (a scores family, or event studies first).** The block serves both kinds of read and assumes neither option.
+- **PR #3690 (the yardstick is the net-matched blend).** The trial form reads the excess over "the yardstick", whichever it is, and `σ` is that excess's deviation. For a long/short book PR #3690 adds conditions to a pass. They can only lower the chance, so the form stays an upper bound. Its open questions are not decided here.
+- **PR #3698 (the objective).** By its own words it changes no gate and no pass chance. Nothing here depends on its answer.
+
+### H. Decisions this merge records
+
+Merging the PR records the recommended answer to each unless the owner says otherwise on the PR.
+
+1. **The cost a card is screened at is the decision cost**: the harsh cell, 50 bp per side today. Until the owner decides otherwise it is read as a **floor**, `max(50 bp, 2 × the band's base)`, so a lower re-measured base does not lower it. *Recommended as the working reading: it is the text as written and the stricter one. Whether the cell should instead be twice a re-measured band base (PR #3683's ambiguity 4; PR #3692's recommendation 3) is his separate call. The card follows whichever he chooses, with no further edit.*
+2. **The cost line is 2 and it rejects.** A card between 1 and 2 is `rejected: shape` even where a very large count would reach 80% (1,330 effective events at 1.5). *Recommended. The alternative is to let the power line decide alone above 1. The owner may overrule any verdict on the card, as today.*
+3. **2, 255 and 765 are defaults that follow the decision cost and the pass rule**, recomputed by a dated note when either moves. They are not constants. *Recommended.*
+4. **The power line is 80% at the idea's own effect, for events and trials alike.** For a trial that is a net IR of 0.46 on 40 months. It defers a slow book with a smaller expected edge, although rung 4 would pass it more often than not. *Recommended, because a no-edge book passes 39 to 45% of the time, so a chance near 60% says little. The alternative is 50%: 75 and 225 events at a ratio of 2, and any positive net IR for a trial.*
+5. **The defaults of section B** (E1's +30 bp and t ≥ 1.0; the three dispersions) are used when a card has no better source, and are UNGRADED. *Recommended.*
+6. **An unmeasured band** is read at 50 bp first: a fail is `rejected: shape`, a clear is `blocked: cost measurement`. *Recommended. Today such a card is blocked whenever its verdict turns on the unmeasured cost, including a card that could not pass at 50 bp.*
+7. **The paper basis is printed on the card and does not gate there.** The exam door is unchanged. *Recommended.*
+8. **The pass chance ranks proposals and does not gate beyond the power line.** The owner still sets the backlog's order. Existing entries are not re-ranked or back-filled. *Recommended.*
+9. **A counts run is a ledger entry, not a look in k and not a trial in N.** This is what requirement 5 ("looks that touch no return do not add to k"), the research-registry spec's definition of a desk read and the owner's word on the B7 recount already imply. It is written down so that nobody has to infer it. *Recommended.*
+10. **The feasibility command is specified in the research-registry spec and planned as T441 to T444.** No task is claimable before this PR merges. *Recommended.*

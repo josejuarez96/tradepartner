@@ -54,6 +54,27 @@ The owner's list of 2026-11-02 (spec, "Data / interfaces"); extend by editing th
 
 ## Card shape
 
+**Cards written from 2026-11-21 (#3702; [spec amendment](../specs/idea-pipeline.md#amendment-2026-11-21-3702-the-passable-shape-on-the-card)).** The Shape block comes first and replaces lines 3 and 7. Its closed form, defaults and worked example are in the spec amendment, sections B to D. A card under 2 on the cost line is `rejected: shape` and nothing more is done for it. The cards below were written before this date; they keep the earlier shape and are not re-scored.
+
+```
+### <id>  <one-line mechanism>
+source: B|C|A|D|E (<batch row date>)   ·   written: <date>   ·   by: owner | agent | workflow <id>
+shape:         <event, hold <h> sessions | trial, <cadence>>; band <band>; decision cost <c> bp per side (ADR 0023 harsh cell)
+  cost:        turnover <x>/yr one-sided; gross <g> bp per <event | month> (<source>; QI-2 <applied once | post-publication figure>); round trip <R> bp; ratio g/R <r> against 2   ·   beside it: <r> at arrival, <r> at the paper basis
+  power:       event: raw <n>/yr over <years>, ÷ clustering <B>, ÷ overlap <O>, n_eff <n> against n_min <n>   |   trial: <T> months, net IR <x> against <bar>
+  pass chance: <p>% = Φ(<z>); sd <value> (<source; never held returns>); rule <floor F, t floor | line 40 with SR* <value>>
+  result:      pass | rejected: shape | deferred: power | blocked: cost measurement (<band>)
+1 persists because:  inefficiency <who keeps losing, why> | premium <what loss we are paid to carry, when it arrives> | constraint <on whom>
+2 capture:           capacity at $100-$100k <yes/no, why>; hold <n> sessions fits patience <yes/no>; execution needed <held | q6>
+4 data:              timestamp <field>; delisted coverage <ok | thin>; history <2016+ | pre-2016>
+5 tried before:      <ledger id, exposure ids, related published mechanisms, windows already seen, or none>; what is new
+6 capabilities:      <list from the vocabulary, each held | self-imposed | charter (ADR) | external>; held suffice for a first test: yes | no
+verdict:             admit | blocked: <capability> | deferred: <reason> | rejected: shape | rejected: <question>   ·   killable without a return read: yes | no
+frozen, looks, fast look, review: as in the earlier shape below
+```
+
+**Cards written before 2026-11-21** (the pilot's eleven):
+
 ```
 ### <id>  <one-line mechanism>
 source: B|C|A|D|E (<batch row date>)   ·   written: <date>   ·   by: owner | agent | workflow <id>

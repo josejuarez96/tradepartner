@@ -214,6 +214,60 @@ I searched `docs/research/` for earlier probe desk reads that read returns (ever
 
 **Decided, owner, 2026-10-31 ("go with recs", PR #2727):** every recommendation above is accepted. 1: (a), `open_data` records do not raise N. 2: (b) for family holdouts: a `store` record that overlaps one is a spend, unioned into `family_holdout_spends`, requires `--holdout-reason`, and leaves `family_exposure_count`; ADR 0016's exam interval is flagged only; an `open_data` overlap (CBOperProf's) is (ii), a disclosure shown on the page. 3: one record per launch (candidate 5 is N +2). 4: (b), an unverified record behind `--probe-unavailable --reason`, for `open_data` records only. 5: no backfill of reads before 2026-10-30. 6: no withdraw path in v1.
 
+**Amendment 2026-11-21 (#3702; the owner's "Go with your recommendations" of that date on the pipeline review, PR #3692, recommendation 5): a counts-only feasibility command.** Specified here and planned as T441 to T444 ([plan](../plans/research-registry.md)). Nothing is built by this amendment. It adds no table, no run kind and no count, and it relaxes nothing.
+
+*Why.* Stage 4a (a), (b), (c) and (f) of the [research program](../ways-of-working/research-program.md#4a-feasibility-check-before-an-experiment-file) are read-only counts. Twice they were made after the work they should have stopped: B7's 13-task plan merged before the recount that struck eleven of its tasks (T342), and IRRX's build was ordered ahead of its counts (PR #3692). Each recount so far was a one-off script outside the repo, with its own guards. One command with fixed guards, run first, replaces them.
+
+*Why in this spec.* This spec already says what is and is not a return read (the 2026-10-31 amendment's "desk read"), it holds the event-study runner whose entry rule and overlap functions the command reuses, and its plan holds T342, the recount this command makes general. The idea-pipeline spec designs the card and its pilot and lists "no script" among its work.
+
+*What it is.* `tradepartner feasibility --store <path> --design <file>`. One call. It reads a copy of the store, read-only, and prints one block of text. It is **not** a research run: no registration, no `RunHandle`, no dataset, no result row.
+
+*When it runs.* After the idea's card has cleared the Shape block's cost line ([idea pipeline](idea-pipeline.md#amendment-2026-11-21-3702-the-passable-shape-on-the-card)), and **before any spec amendment, plan task, experiment file or hypothesis file is drafted for the idea**. From the day T444 merges, a spec or plan PR for an event idea links the block. Who runs it does not change: the owner, or an agent at his word, on a copy of his store, as T342 was run.
+
+*The design file.* A small TOML file, written before the run and kept with the idea's card. The block prints its SHA-256. Its keys, and nothing else:
+
+| Key | Meaning |
+|---|---|
+| `source` | One of four held tables that carry a `known_at`: `form4` (`sec_form4_transactions`), `statement_fact` (`statement_facts`), `form25` (`delistings`), `corporate_action` (`corporate_actions`). The list is closed. The 8-K items table joins it only by a later dated amendment, after the guard of #1382 is lifted; until then `tests/store/test_schema.py::test_no_trial_path_reads_filing_events` fails any module under `research/` that names it |
+| `filter` | Equality or membership tests on that table's own filed columns (for example `transaction_code = "P"`, `is_officer = true`). No expression, no SQL, no column of another table |
+| `entry` | One of the event-study runner's entry rules. An event's time is its row's `known_at`. Rows of one issuer that share an entry session are one event |
+| `window.start`, `window.end` | The count window. Its end may not be after the development boundary |
+| `hold_sessions` | The stated hold, in sessions of the trading calendar |
+| `band.lookback_sessions`, `band.edges` | The liquidity bands: the median of raw `close × volume` over that many sessions before the entry session, cut at those edges. The card's bands are 20 sessions and $200M, $50M. They are design keys, not constants in code |
+| `rho` | The assumed correlation between two different issuers' spreads over a fully shared hold. An assumption stated by the author: the command cannot estimate it, because it reads no return |
+| `[shape]` (optional) | `gross_bp`, `sd_bp`, `decision_cost_bps`, `floor_bp`, `t_floor`, copied from the card. When present the block also prints the card's power line and pass chance from the closed form |
+
+*The block.* Plain text on standard output, the same bytes for the same design and the same copy:
+
+1. **Header.** The design's SHA-256; the store file's path, size and modification time; its schema version and newest `ingestion_runs` row; the development boundary read from the copy; the window.
+2. **(a) Timestamp.** Rows matched; rows left out because their `known_at` is after the close of the window's last session; events with no entry session inside the window.
+3. **(b) Counts.** Per year and per band, and a "no bar" row: raw events, distinct entry sessions, distinct issuers. Then the totals per band.
+4. **Effective count**, per band, for the stated hold. With `N` events, `o_ij` the share of the hold that events `i` and `j` have in common (0 when their holds do not overlap), and `w_ij = 1` when `i = j`, `o_ij` for two events of one issuer, `rho × o_ij` otherwise: **`n_eff = N² / Σ_i Σ_j w_ij`**. The block prints it at the design's `rho` and at the bounds `rho = 0` and `rho = 1`. It also prints the two factors the card's power line names: the same-date clustering factor `B = N / Σ_d [m_d / (1 + (m_d − 1) × rho)]` over entry sessions `d` with `m_d` events each (the idea cards' formula), and the overlap factor `O = (N / B) / n_eff`, so that `n_eff = N ÷ B ÷ O`. One issuer's 60-session holds spaced 20 sessions apart give `N / 3`, as stage 4a (c) says.
+5. **(f) Delister coverage.** Of the issuers whose listing ended inside the window: how many have bars. Of the events whose issuer's listing ended before the hold's last session: how many have a bar on the entry session and on the last listed session. Listing ends are read as known at the close of the window's last session.
+6. **Shape lines**, when `[shape]` is present: `n_min`, the power line and the pass chance.
+7. **One ledger line**: `feasibility: (a) <…>; (b) <…>; n_eff <…> at rho <…>; (f) <…>`, ready for the idea's row in the ladder ledger.
+
+*Hard rules, each a test.*
+
+- [ ] **Read-only.** Given any call, when it opens the store, then every connection is opened read-only (the test wraps the open, as the event-study reader's test does), and the store file's SHA-256 is the same before and after.
+- [ ] **A copy, never the owner's store.** `--store` is required and has no default. Given a `--store` path that is the same file as `settings.store.path` under `registry.is_real_store` (file identity, so a hard link, a symlink, a relative path or a case variant is still the real store), when the command starts, then it exits 2 before any query and prints only the refusal. That is the rule the registry already uses to tell the real store from any other file; the command reuses it and adds none. Its limit is stated in the block's header: the rule tells the configured store from every other file, and cannot tell a copy from some other live store, so the header prints the file's path, size, modification time and newest ingest for the reader to check.
+- [ ] **Levels only, from five columns.** Given the command's source, when a test collects every SQL string and column read of `prices_daily`, then only `security_id`, `session`, `close`, `volume` and `known_at` are named: no `open`, `high` or `low`, and no adjusted bar. Given a fixture store whose `open`, `high` and `low` are overwritten, the block is byte-identical.
+- [ ] **No return and no price change.** Given a fixture store in which the (`close`, `volume`) pairs are permuted among the sessions of each band lookback window, when the command runs, then the block is byte-identical. A difference or a ratio of closes across sessions could not survive that permutation; a median of `close × volume` does. This is the read the 2026-11-02 data-edge census made, and what the 2026-10-31 amendment excludes from a desk read ("prices only for universe, liquidity or coverage counts").
+- [ ] **Nothing after the development boundary.** Given a design whose `window.end` is after the copy's development boundary, or a copy with no boundary row, when the command starts, then it exits 2 before any event or price read. Given rows added to a fixture store with a `known_at` or a session after the close of the window's last session, the block is byte-identical (the look-ahead test, under `tests/lookahead/`). The band lookback and the hold never read a session after the window's end; an event whose hold would run past it is counted and flagged, and its exit is not read.
+- [ ] **No store row and no registry.** Given any call, then no table's row count changes, the module does not import `tradepartner.store.research` and names no research table (the existing isolation scan covers it), and the only output is the block on standard output. No file is written.
+- [ ] **A closed design.** Given a design with an unknown key, a source outside the four, a filter on a column that is not one of that source's filed columns, or no `rho`, band or hold, when the command starts, then it exits 2 before any read and names the key.
+- [ ] **Counts are right.** Given the fixture store, the per-year and per-band counts, `B`, `n_eff` at the three values of `rho`, and the two coverage counts equal hand-computed values, including: several events on one session; one issuer with overlapping holds; an issuer with no bar; a delisted issuer with and without bars; a row first known after the window's end.
+- [ ] **The trading calendar.** Entry sessions and holds are counted in sessions of the calendar, never in weekdays.
+
+*How it is counted.* A counts run reads no return. It is not a desk read under the 2026-10-31 amendment, writes no exposure record, and adds nothing to any family's N or to k ([idea pipeline](idea-pipeline.md) requirement 5: "looks that touch no return do not add to k"; the owner's word of 2026-10-31 on the B7 recount: N not charged, "no run was opened and no return was read"). It **is** recorded: the block goes on the idea's ladder-ledger row, and every block produced for an idea is kept, including those of a design later changed, so the number of designs counted stays visible. The idea-pipeline amendment of this date records this as its decision 9.
+
+*Not changed.* Registrations, runs, budgets, N, exposures, holdout and sealed-split rules, the development boundary, and the rule that the registry itself reads no market data. The event-study runner still reads through its own reader inside a registered run. A counts block is not a pre-registration and freezes nothing: the kill line is still posted before any return is read.
+
+*Open questions (not guessed).*
+
+1. **A standing word for counts runs.** Today each run on a copy of the owner's store needs his word (T342). Options: (a) as today; (b) a standing word for this command only, once T444 has merged and he has run it once. Recommendation: (a) until he has seen one block; then his call.
+2. **The effective-count form.** The pairwise form above reduces to the cards' same-date formula and to stage 4a (c)'s hold-over-spacing example, but it is this amendment's choice, and `rho` is an author's assumption. The quant-auditor says at T441 whether the form or the printed bounds should change.
+
 ## Acceptance criteria (testable)
 
 Schema and append-only
