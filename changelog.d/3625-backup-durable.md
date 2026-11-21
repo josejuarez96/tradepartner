@@ -1,0 +1,3 @@
+- #3625: the store backup is fsynced, hashed (SHA-256 in its manifest) and opened once read-only; a crashed pre-migration copy is swept after store.orphan_backup_min_age_hours (24).
+### Changed
+- `store backup` and the pre-migration backup now fsync the copy, its WAL, the manifest and the directory, record `store_sha256` / `wal_sha256` in the manifest, and open the copy read-only once before calling it a backup. A run that dies leaves a partial manifest naming its files; the retention sweep removes a crashed pre-migration copy once it is older than `store.orphan_backup_min_age_hours` (default 24) (#3625).
