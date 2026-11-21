@@ -6,6 +6,14 @@ import math
 from collections import Counter, defaultdict
 from collections.abc import Hashable, Sequence
 from datetime import date, timedelta
+from typing import Final
+
+#: Standard-error kernels for overlapping holds. ``hansen_hodrick`` is the flat
+#: kernel every study registered before #3679 ran under (its variance can come
+#: out negative); ``bartlett`` is the Newey-West triangular kernel, positive
+#: semi-definite by construction, which a new registration gets.
+SE_KERNELS: Final = ("hansen_hodrick", "bartlett")
+DEFAULT_SE_KERNEL: Final = "hansen_hodrick"
 
 
 def cluster_stats(values: Sequence[float], clusters: Sequence[Hashable]) -> dict[str, float]:
@@ -41,16 +49,26 @@ def kish_clusters(clusters: Sequence[Hashable]) -> float:
 
 
 def overlap_cluster_stats(
-    values: Sequence[float], ordered_clusters: Sequence[int], *, max_lag_sessions: int
+    values: Sequence[float],
+    ordered_clusters: Sequence[int],
+    *,
+    max_lag_sessions: int,
+    kernel: str = DEFAULT_SE_KERNEL,
 ) -> dict[str, float]:
     """Cluster by entry cohort and include covariance from overlapping holds.
 
     ``max_lag_sessions`` is the largest entry-session distance at which two
     holds can overlap. The flat lag kernel is the Hansen-Hodrick
     estimator for a known holding horizon, with no small-sample correction.
+    ``kernel="bartlett"`` (#3679) weights the cohort cross-products by
+    ``1 - d / (max_lag_sessions + 1)`` at entry distance ``d``, the Newey-West
+    estimator: its variance cannot be negative. The default keeps the flat
+    kernel byte for byte, so a study registered under it reproduces.
     """
     if len(values) != len(ordered_clusters) or max_lag_sessions < 0:
         raise ValueError("invalid cohort series or overlap lag")
+    if kernel not in SE_KERNELS:
+        raise ValueError(f"unknown standard-error kernel {kernel!r}")
     base = cluster_stats(values, ordered_clusters)
     if len(values) < 2:
         return base
@@ -67,7 +85,8 @@ def overlap_cluster_stats(
             b = ordered[j]
             if b - a > max_lag_sessions:
                 break
-            variance += 2 * sums[a] * sums[b]
+            weight = 1.0 if kernel == "hansen_hodrick" else 1.0 - (b - a) / (max_lag_sessions + 1)
+            variance += 2 * weight * sums[a] * sums[b]
     se = math.sqrt(variance) / len(values) if variance > 0 else math.nan
     return {**base, "se": se, "t": mean / se if se > 0 else math.nan}
 
@@ -98,11 +117,14 @@ def overlap_result_interval(
     *,
     max_lag_sessions: int,
     z: float = 1.96,
+    kernel: str = DEFAULT_SE_KERNEL,
 ) -> dict[str, float]:
     """Report the same verdict fields with known overlapping-cohort covariance."""
     if not math.isfinite(z) or z <= 0:
         raise ValueError("z must be finite and positive")
-    stats = overlap_cluster_stats(values, ordered_clusters, max_lag_sessions=max_lag_sessions)
+    stats = overlap_cluster_stats(
+        values, ordered_clusters, max_lag_sessions=max_lag_sessions, kernel=kernel
+    )
     mean, se = stats["mean"], stats["se"]
     return {
         "effect": mean,
