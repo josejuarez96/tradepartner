@@ -1,4 +1,4 @@
-"""Synthetic, file-backed store for the feasibility command (T442, #3742; used by T443, T444).
+"""Synthetic, file-backed store for the feasibility command (T453, #3742; used by T454, T455).
 
 `build_feasibility_store(path)` builds a small DuckDB file, closes it and returns a
 `FeasibilityStore` that names every planted case. It is deterministic (no clock, no
