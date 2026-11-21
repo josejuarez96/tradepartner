@@ -305,8 +305,10 @@ def effective_count_by_hand(
 ) -> float:
     """Hand estimate ``n_eff ~ 1 / (B/N + rho * h / S)`` for ``S`` sessions in the window.
 
-    An approximation of the exact default for events spread across the window; it
-    never exceeds :func:`effective_count_ceiling`.
+    An approximation, not a bound: it can sit a few percent off the exact default
+    count in either direction (the proved bound is
+    :func:`effective_count_default_bound`). It is the hand formula for events spread
+    across the window.
     """
     _require_positive("n", n)
     _require_positive("same_date_factor", same_date_factor)
@@ -315,29 +317,46 @@ def effective_count_by_hand(
     return 1.0 / (same_date_factor / n + rho * hold_sessions / window_sessions)
 
 
+def effective_count_default_bound(
+    hold_sessions: int,
+    window_sessions: int,
+    rho: float = DEFAULT_CROSS_ISSUER_RHO,
+) -> float:
+    """Proved upper bound ``1 / ((1 - rho)/S + rho*h/(S + h - 1))`` on the default ``n_eff``.
+
+    Valid only under the DEFAULT rule (``w = 1`` on a shared session, ``rho * o_ij``
+    across sessions, with this same ``rho``); it does NOT bound ``n_eff`` under a cited
+    ``rho``, where a same-session pair weighs ``rho`` and ``n_eff`` can reach N.
+    ``S`` is the number of sessions the entries span.
+
+    Derivation (quant-auditor, PR #3745): with ``o(d, d') = #{t : d, d' in [t-h+1, t]} / h``,
+    the weight sum is at least ``(1 - rho) * sum m_d^2 + (rho/h) * sum_t c_t^2``, where
+    ``c_t`` counts events whose hold covers session t. By Cauchy-Schwarz
+    ``sum m_d^2 >= N^2/S``, and ``sum_t c_t = h*N`` over at most ``S + h - 1`` sessions
+    gives ``sum_t c_t^2 >= h^2 N^2/(S + h - 1)``. Divide ``N^2`` by the sum. Exact at
+    hold 1; 517.8 on 1,000 one-a-day events with hold 20 (exact 514.6).
+    """
+    _require_positive("hold_sessions", hold_sessions)
+    _require_positive("window_sessions", window_sessions)
+    s, h = window_sessions, hold_sessions
+    return 1.0 / ((1.0 - rho) / s + rho * h / (s + h - 1))
+
+
 def effective_count_ceiling(
     hold_sessions: int,
     window_sessions: int,
     rho: float = DEFAULT_CROSS_ISSUER_RHO,
 ) -> float:
-    """Ceiling ``S / (rho * h)`` that ``n_eff`` approaches as N grows (needs ``rho > 0``)."""
-    _require_positive("hold_sessions", hold_sessions)
-    _require_positive("window_sessions", window_sessions)
-    _require_positive("rho", rho)
-    return window_sessions / (rho * hold_sessions)
+    """Large-window approximation ``S / (rho * h)`` of :func:`effective_count_default_bound`.
 
-
-def effective_count_same_session_bound(
-    hold_sessions: int,
-    window_sessions: int,
-    rho: float = DEFAULT_CROSS_ISSUER_RHO,
-) -> float:
-    """Tighter bound ``S / (1 + rho * h)`` on the default ``n_eff``.
-
-    Events on one entry session are one cluster, so ``N / B <= S``; the default
-    ``n_eff`` is then at most ``S / (1 + rho * h)``, below :func:`effective_count_ceiling`
-    (which assumes ``B`` can reach 0).
+    It is at least the proved bound, and so a valid ceiling, only while
+    ``(1 - rho) * (S + h - 1) >= rho * h * (h - 1)``; outside that region (a hold long
+    against the window) it raises ``ValueError``: use the proved bound there.
     """
     _require_positive("hold_sessions", hold_sessions)
     _require_positive("window_sessions", window_sessions)
-    return window_sessions / (1.0 + rho * hold_sessions)
+    _require_positive("rho", rho)
+    h, s = hold_sessions, window_sessions
+    if (1.0 - rho) * (s + h - 1) < rho * h * (h - 1):
+        raise ValueError("hold is too long for the window: use effective_count_default_bound")
+    return s / (rho * h)
