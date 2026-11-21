@@ -1,0 +1,52 @@
+# #3636: `.execute(...)` / `.executemany(...)` call sites per file under src/tradepartner/
+# outside store/, counted by tests/test_sql_boundary.py. One line per file: <count> <path>,
+# the path relative to src/tradepartner/. The numbers only go down: a new query goes in a
+# function under src/tradepartner/store/. To lower a line after removing a site (or to move
+# sites between files without raising the total), run `uv run python tests/test_sql_boundary.py`
+# and commit the result in the same PR.
+2 action_retract.py
+6 adapters/edgar_source.py
+19 backfill.py
+5 backtest/hypothesis.py
+2 backtest/index_check_store.py
+2 backtest/lab.py
+5 backtest/promotion.py
+5 backtest/run.py
+1 backtest/store_provider.py
+5 backtest/sweep.py
+11 backtest/sweep_report.py
+13 cli.py
+2 dashboard/app.py
+1 dashboard/backtest_page.py
+3 dashboard/header.py
+1 dashboard/health_page.py
+2 dashboard/lab_page.py
+2 dashboard/lab_verdict.py
+2 dashboard/research_page.py
+4 dashboard/trials_page.py
+1 execution/alerts.py
+3 execution/blotter.py
+1 execution/book_view.py
+4 execution/check.py
+5 execution/collect.py
+18 execution/ops.py
+5 execution/outcomes.py
+1 execution/reconcile_run.py
+6 execution/report.py
+3 execution/run.py
+17 execution/shakedown.py
+2 execution/slippage.py
+2 execution/switch.py
+9 execution/window.py
+2 execution/wrapper.py
+1 gap.py
+46 health.py
+115 ingest.py
+41 repair.py
+7 repair_form4_multi_owner.py
+6 repair_form4_roles.py
+6 repair_form4_titles.py
+1 repair_restore.py
+3 research/labeling/job.py
+1 retract.py
+7 universe.py
