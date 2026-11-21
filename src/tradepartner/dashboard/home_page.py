@@ -163,7 +163,9 @@ def _card(conn: duckdb.DuckDBPyConnection, settings: Settings, card: BookCard) -
             _pill(card.pill)
         st.caption(card.strategy)
         if card.last_run_message:
-            st.caption(f"Last run: {card.last_run_message}")
+            # stored text that can carry an exception's or a vendor's words: plain
+            # text, never markdown (#3674)
+            st.text(f"Last run: {card.last_run_message}")
         if card.unreadable:
             st.caption("Some records for this book could not be read; its numbers may be missing.")
         if card.session is None or card.equity is None:

@@ -40,6 +40,7 @@ _APP_PATH = str(
 _SESSION = date(2026, 10, 2)
 _B, _D1, _D2 = date(2026, 9, 30), date(2026, 10, 1), _SESSION
 _AT = datetime(2026, 10, 2, 22, 30, tzinfo=UTC)  # 6:30 PM ET
+_HOSTILE = "see [here](https://evil.test/x) ![p](https://evil.test/p.png)"
 
 _QUIET = HomeView(
     status=StatusLine(
@@ -138,7 +139,15 @@ def _text(at: AppTest) -> str:
         for child in getattr(node, "children", {}).values():
             if child.type == "metric":
                 parts.append(f"{child.label} {child.value}")
-            elif child.type in ("markdown", "caption", "subheader", "header", "code", "warning"):
+            elif child.type in (
+                "markdown",
+                "caption",
+                "text",
+                "subheader",
+                "header",
+                "code",
+                "warning",
+            ):
                 parts.append(str(child.value))
             elif child.type == "page_link":
                 parts.append(str(child.proto.label))
@@ -202,6 +211,18 @@ def test_home_page_shows_owner_note_and_omits_empty_run_message(
     assert "Last run: check fill" in _text(at)
     at = _app(monkeypatch, tmp_path, replace(_QUIET, books=(replace(card, last_run_message=None),)))
     assert "Last run:" not in _text(at)
+
+
+def test_the_stored_run_message_is_drawn_as_plain_text_not_markdown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A stored run message can carry an exception's or a vendor's words, so a link
+    or an image in it must never reach a markdown renderer (#3674)."""
+    card = replace(_QUIET.books[0], last_run_message=_HOSTILE)
+    at = _app(monkeypatch, tmp_path, replace(_QUIET, books=(card,)))
+    rendered = [str(e.value) for e in (*at.markdown, *at.caption)]
+    assert not [value for value in rendered if "evil.test" in value]
+    assert f"Last run: {_HOSTILE}" in [t.value for t in at.text]
 
 
 def test_loud_page_shows_each_item_in_orange_with_its_command_as_copyable_text(
