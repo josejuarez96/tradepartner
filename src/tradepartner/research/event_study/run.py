@@ -525,7 +525,19 @@ def run_study(
         if not eligible:
             drop(group, "no_mcap")
             continue
-        mcap = float(str(eligible[-1]["value"])) * float(prior_raw["close"])
+        latest = eligible[-1]
+        latest_date = latest["as_of_date"]
+        assert isinstance(latest_date, date)  # `eligible` holds dated facts only
+        # Universe rule 8 (#3681): the raw close is post-split, so a share count dated
+        # before a split is carried over the splits known at the read time.
+        shares = float(str(latest["value"])) * reader.split_factor(
+            sid,
+            known_at,
+            as_of=latest_date,
+            through=prior,
+            facts_read=str(design["facts_read"]),
+        )
+        mcap = shares * float(prior_raw["close"])
         beta = _beta(
             sid,
             entry_i,

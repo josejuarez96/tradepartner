@@ -16,6 +16,12 @@ from tradepartner.research.event_study.stats import (
 )
 
 BPS = 10_000
+#: The design's reading names for the summary's `badj`, `sz` and `szb` readings.
+_REGISTERED_READINGS = {
+    "beta_adjusted": "badj",
+    "size_tight": "sz",
+    "size_tight_beta_adjusted": "szb",
+}
 
 
 def _mean_bp(values: Sequence[float]) -> float:
@@ -212,8 +218,12 @@ def summarise(
             if name == "raw"
             else f"{long_group}_{main_h}_{name}_gross_bp"
         )
+        key_source = "spread" if name == "raw" else f"spread_{name}"
         long_readings[name] = {
             "gross_spread_bp": float(sec[gross_key]),
+            "net_bp": _mean_bp(
+                [net_long(float(row[f"{key_source}_{main_h}"]), primary_cost) for row in long_rows]
+            ),
         }
         if name == "raw":
             short_net_bp = _mean_bp(
@@ -260,6 +270,10 @@ def summarise(
             reading["calibrated_t"] = interval["t"]
             for kind in ("min", "event_date", "month", "quarter"):
                 reading[f"t_{kind}"] = interval["t"]
+    # A registered line names its readings as the design does (#3681).
+    for registered, short_name in _REGISTERED_READINGS.items():
+        long_readings[registered] = long_readings[short_name]
+        short_readings[registered] = short_readings[short_name]
     long_kill = evaluate_kill(kill_lines["long"], long_readings)
     short_kill = evaluate_kill(kill_lines["short"], short_readings)
     sec["kill_long"] = float(long_kill["killed"])
