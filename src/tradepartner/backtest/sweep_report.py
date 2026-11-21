@@ -67,6 +67,7 @@ from tradepartner.backtest import results
 from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.metrics import (
     deflated_sharpe,
+    dsr_basis_label,
     expected_max_sharpe,
     probabilistic_sharpe,
 )
@@ -193,6 +194,9 @@ class VariantRow:
     #: `trial_rebalance_counts`; None for a trial written before T329 or no trial.
     exit_coverage_exits: int | None = None
     exit_coverage_unknown: int | None = None
+    #: `psr` when fewer than two pairs left `dsr_excess` undeflated (#3571), else `dsr`;
+    #: None with no trial. Printed as `metrics.dsr_basis_label`.
+    dsr_basis: str | None = None
 
     @property
     def exit_coverage_unknown_share(self) -> float | None:
@@ -579,15 +583,17 @@ def _row(
     coverage = coverage or {}
     trial = state.trial
     dsr: float | None = None
+    dsr_basis: str | None = None
     if trial is not None and metrics is not None:
         ppy = int(_number(metrics, "periods_per_year", trial.trial_id))
-        dsr = deflated_sharpe(
+        deflated = deflated_sharpe(
             metrics,
             "excess_spy",
             n_trials=family_n,
             pair_sharpes=pair_sharpes,
             periods_per_year=ppy,
-        ).dsr
+        )
+        dsr, dsr_basis = deflated.dsr, deflated.dsr_basis
     shown = metrics if metrics is not None else {}
     return VariantRow(
         variant_index=state.variant.variant_index,
@@ -607,6 +613,7 @@ def _row(
         message=state.message,
         exit_coverage_exits=coverage.get("n_exit_coverage_exits"),
         exit_coverage_unknown=coverage.get("n_exit_coverage_unknown"),
+        dsr_basis=dsr_basis,
     )
 
 
@@ -668,6 +675,15 @@ def _verdicts(
         promote_at_least_met=dsr >= sweep.promote_at_least,
         retire_below_met=_selection(argmax, sweep.selection_statistic) < sweep.retire_below,
     )
+
+
+def _dsr_cell(row: VariantRow, family_n: int) -> str:
+    """The `dsr_excess` cell: the number, and for a `psr` basis its honest name
+    (#3571): nothing was deflated, so it is a PSR at N = `family_n`."""
+    shown = _fmt(row.dsr_excess)
+    if row.dsr_basis != "psr":
+        return shown
+    return f"{shown} {dsr_basis_label(row.dsr_basis, family_n)}"
 
 
 def _sr_star(n: int, variance: float | None) -> float | None:
@@ -948,7 +964,8 @@ def format_report(report: SweepReport) -> str:
             f"{row.signal_anchor}  {row.status}"
             + (f" ({row.message})" if row.message else "")
             + f"  {_pct(row.excess_cagr_spy)}  {_fmt(row.sharpe_annual_excess_spy)}  "
-            f"{_fmt(row.dsr_excess)}  {_pct(row.cost_drag)}  {_fmt(row.turnover_annual)}  "
+            f"{_dsr_cell(row, report.family_n)}  {_pct(row.cost_drag)}  "
+            f"{_fmt(row.turnover_annual)}  "
             f"{_pct(row.max_drawdown)}  {'-' if row.red_flag is None else row.red_flag}  "
             f"{_coverage(row)}  {_pct(row.exit_coverage_unknown_share)}"
         )
@@ -975,7 +992,8 @@ def format_report(report: SweepReport) -> str:
             f"argmax: {v.argmax.slug} (index {v.argmax.variant_index}, "
             f"{report.selection_statistic} {_fmt(best)})",
             f"promote_at_least {report.promote_at_least}: "
-            f"{'met' if v.promote_at_least_met else 'not met'} (dsr_excess "
+            f"{'met' if v.promote_at_least_met else 'not met'} ("
+            f"{'dsr_excess' if v.sr_star_high_water_annual > 0 else 'PSR (undeflated, N = 1)'} "
             f"{_fmt(v.dsr_excess_at_high_water)} at the SR* high-water mark "
             f"{_fmt(v.sr_star_high_water_annual)})",
             f"retire_below {report.retire_below}: {'met' if v.retire_below_met else 'not met'}",

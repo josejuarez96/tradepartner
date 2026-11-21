@@ -1111,3 +1111,29 @@ def test_each_grid_row_shows_its_unknown_delisting_exits_and_share(
     assert by_slug[records[1].slug].endswith("  0/0  -")
     assert by_slug[records[2].slug].endswith("  -  -")
     assert by_slug[records[3].slug].endswith("  -  -")
+
+
+def test_the_report_cell_names_an_undeflated_psr_and_leaves_a_deflated_one_alone() -> None:
+    """#3571, option 2: a `psr`-basis `dsr_excess` cell says what it is; the number is
+    unchanged; a deflated one prints as before."""
+    base = sweep_report.VariantRow(
+        variant_index=1,
+        slug="x",
+        varied={},
+        cadence="month_end",
+        signal_anchor="month_end",
+        status="counted",
+        trial_id=1,
+        excess_cagr_spy=None,
+        sharpe_annual_excess_spy=None,
+        dsr_excess=0.52,
+        cost_drag=None,
+        turnover_annual=None,
+        max_drawdown=None,
+        red_flag=None,
+        message=None,
+        dsr_basis="psr",
+    )
+    psr = sweep_report._dsr_cell(base, 1)
+    assert psr == f"{sweep_report._fmt(0.52)} PSR (undeflated, N = 1)"
+    assert sweep_report._dsr_cell(replace(base, dsr_basis="dsr"), 5) == sweep_report._fmt(0.52)

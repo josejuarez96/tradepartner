@@ -627,6 +627,28 @@ def first_session(conn: duckdb.DuckDBPyConnection) -> date | None:
     return session if isinstance(session, date) else None
 
 
+def window_periods(in_sample_start: date, holdout_start: date) -> int:
+    """T: the XNYS month-end periods of a family window (`in_sample_start` up to the
+    day before `holdout_start`), at least 1. Inherited from #3127: a trial whose own
+    read ends earlier (development boundary, late anchor) has fewer periods, so its
+    true null V is a little larger and the floor a little lenient."""
+    sessions = rebalance_sessions(in_sample_start, holdout_start - timedelta(days=1), "month_end")
+    return max(len(sessions) - 1, 1)
+
+
+def window_v_floor(
+    in_sample_start: date, holdout_start: date, min_sharpe_variance_annual: float
+) -> float:
+    """The V floor of a family window: the larger of `min_sharpe_variance_annual`
+    and the null variance of an annual Sharpe over the window, ppy / T with ppy = 12
+    and T = `window_periods`. `family_v_floor` reads it from a stored rules row; a new
+    family's first registration reads it before any row exists (`root_family_seed`)."""
+    return max(
+        min_sharpe_variance_annual,
+        MONTHS_PER_YEAR / window_periods(in_sample_start, holdout_start),
+    )
+
+
 def family_v_floor(rules: FamilyRules) -> float:
     """The V that stands in for an undefined V (fewer than two pairs; strategy-lab
     spec, amendment 2026-11-06, #3127): the larger of the stored
@@ -634,11 +656,28 @@ def family_v_floor(rules: FamilyRules) -> float:
     family window, ppy / T with ppy = 12 and T the window's XNYS month-end periods
     (40 for momentum's 2020-08-31 .. 2023-12-29, so 0.30). A defined V keeps the
     stored floor (`floored_variance`)."""
-    sessions = rebalance_sessions(
-        rules.in_sample_start, rules.holdout_start - timedelta(days=1), "month_end"
+    return window_v_floor(
+        rules.in_sample_start, rules.holdout_start, rules.min_sharpe_variance_annual
     )
-    periods = max(len(sessions) - 1, 1)
-    return max(rules.min_sharpe_variance_annual, MONTHS_PER_YEAR / periods)
+
+
+def root_family_seed(
+    min_t: float,
+    in_sample_start: date,
+    holdout_start: date,
+    min_sharpe_variance_annual: float,
+) -> float:
+    """The `sr_star_seed_annual` of a root family (strategy-lab spec, amendment
+    2026-11-21, #3571): `min_t * sqrt(V)`, V the window's floor (`window_v_floor`),
+    the annual Sharpe whose t over the window equals `min_t` (for V = 12 / T,
+    SR * sqrt(T / 12) = min_t). An annual Sharpe on no basis: it enters the
+    high-water mark as a number. `min_t` is `lab.root_family_min_t`, read once at the
+    family's first registration. Refuses a `min_t` that is not positive."""
+    if not min_t > 0:
+        raise LabRegistryError(f"root_family_min_t must be positive, got {min_t}")
+    return min_t * math.sqrt(
+        window_v_floor(in_sample_start, holdout_start, min_sharpe_variance_annual)
+    )
 
 
 def floored_variance(rules: FamilyRules, variance: float | None) -> float:

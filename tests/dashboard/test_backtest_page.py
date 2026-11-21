@@ -488,7 +488,8 @@ def test_render_family_with_no_holdout_spend(
     assert not at.exception
     assert "holdout not spent in family `momentum`" in _text(at).lower()
     dsr = next(df.value for df in at.dataframe if "today DSR" in df.value.columns)
-    assert list(dsr["today label"]) == ["psr", "psr"]
+    # #3571: a `psr` basis prints as what it is (labels only; the stored key stays `psr`).
+    assert list(dsr["today label"]) == ["PSR (undeflated, N = 1)"] * 2
 
 
 def test_render_refused_trial_shows_state_and_message(

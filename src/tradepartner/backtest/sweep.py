@@ -891,13 +891,16 @@ def _anchor_refusal(file: SweepFile, variant: Variant, first_session: date | Non
 
 
 def _new_family_seed(
-    conn: duckdb.DuckDBPyConnection, file: SweepFile, path: Path
+    conn: duckdb.DuckDBPyConnection, file: SweepFile, path: Path, settings: Settings
 ) -> tuple[str | None, float | None]:
     """The lineage refusals of a new family's first registration, before any row is
     written, and its `(parent_family, sr_star_seed_annual)`: the parent from
     `config.FAMILY_PARENTS` (read at call time) and, for a child, the parent's SR*
     high-water mark today (N from `results.family_n`, V on the excess basis from
-    `registry.family_sharpes`, floored by the parent's rules); a root's seed is None."""
+    `registry.family_sharpes`, floored by the parent's rules); a root's seed is its t
+    floor (#3571): `lab_registry.root_family_seed` of the live `lab.root_family_min_t`
+    and the file's window, which `write_family_rules` stores, so a later config change
+    never moves it. The oracle family, a synthetic fixture family, seeds None."""
     parents: dict[str, str | None] = {
         str(family): parent for family, parent in config.FAMILY_PARENTS.items()
     }
@@ -924,7 +927,14 @@ def _new_family_seed(
                 f"family {other!r}'s [{start}, {end}]"
             )
     if parent is None:
-        return None, None
+        if file.family == registry.ORACLE_FAMILY:
+            return None, None
+        return None, lab_registry.root_family_seed(
+            settings.lab.root_family_min_t,
+            file.in_sample_start,
+            file.holdout_start,
+            settings.lab.min_sharpe_variance_annual,
+        )
     parent_rules = lab_registry.family_rules(conn, parent)
     if parent_rules is None:
         raise NewFamilyError(
@@ -1056,7 +1066,7 @@ def register(
                 f"{file}: family {parsed.family!r} has registered hypotheses but no family "
                 "rules; the lab migration writes them"
             )
-        new_family = _new_family_seed(conn, parsed, file)
+        new_family = _new_family_seed(conn, parsed, file, settings)
     else:
         broken = sorted(
             {d for v in variants for d in _rule_differences(parsed, v.frozen_set, rules)}
