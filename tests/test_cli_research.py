@@ -19,6 +19,8 @@ import json
 import os
 import shutil
 import signal
+import subprocess
+import sys
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
@@ -30,12 +32,14 @@ import duckdb
 import polars as pl
 import pytest
 import typer
+from fixtures.research import feasibility_store as fx
 from typer.testing import CliRunner
 
 from tradepartner import cli
 from tradepartner.calendar import all_sessions
 from tradepartner.cli_record import scrub_text
 from tradepartner.config import Settings, get_settings
+from tradepartner.dashboard import book_actions
 from tradepartner.research import _issue_run_handle
 from tradepartner.research.event_study.run import run_study
 from tradepartner.research.experiment import hash_file, parse_experiment_file
@@ -1309,7 +1313,10 @@ def test_no_forbidden_flag_or_subcommand_exists() -> None:
         for param in command.params:
             opts = set(getattr(param, "opts", ())) | set(getattr(param, "secondary_opts", ()))
             assert "--synthetic" not in opts, path
-            assert not any("store" in opt for opt in opts), path
+            # The one command that names a store path is `feasibility` (T455): its
+            # `--store` is a copy's path, refused when it is the configured store.
+            allowed = {"--store"} if path == ("feasibility",) else set()
+            assert {opt for opt in opts if "store" in opt} <= allowed, path
 
 
 @pytest.mark.parametrize(
@@ -1570,3 +1577,394 @@ def test_store_busy_exception_text_is_echoed_scrubbed(
     out = _cli("exposures")  # _cli asserts no secret survives
     assert out.exit_code == 1, out.output
     assert "store busy: held by" in out.output and "<scrubbed>" in out.output, out.output
+
+
+# --- feasibility (T455, #3744): the counts-only command ---------------------------------
+
+FEASIBILITY_DESIGN = FIXTURES / "research" / "feasibility" / "form4.toml"
+
+
+def _sha(path: Path) -> str:
+    return sha256(path.read_bytes()).hexdigest()
+
+
+class _Never(Exception):
+    """Raised by a stub that a refused call must never reach."""
+
+
+@pytest.fixture
+def copy_store(tmp_path: Path) -> Path:
+    """A fixture store copy (never a real store) and its sidecar-free directory."""
+    directory = tmp_path / "copies"
+    directory.mkdir()
+    return fx.build_feasibility_store(directory / "copy.duckdb").path
+
+
+@pytest.fixture
+def design(tmp_path: Path) -> Path:
+    path = tmp_path / "design.toml"
+    shutil.copy(FEASIBILITY_DESIGN, path)
+    return path
+
+
+@pytest.fixture
+def no_connection(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replace every way to open a store; a call is recorded and raises."""
+    calls: list[str] = []
+
+    def never(*_: Any, **__: Any) -> Any:
+        calls.append("connect")
+        raise _Never("a connection was opened")
+
+    monkeypatch.setattr(cli, "open_read_only", never)
+    monkeypatch.setattr(duckdb, "connect", never)
+    return calls
+
+
+def _feasibility(store: Path | str, design_file: Path | str) -> Out:
+    return _cli("feasibility", "--store", str(store), "--design", str(design_file))
+
+
+def _only_a_refusal(out: Out) -> None:
+    assert out.exit_code == 2, out.output
+    assert out.stdout == "", out.stdout
+    assert len(out.output.strip().splitlines()) == 1, out.output
+    assert out.output.startswith("refused: "), out.output
+
+
+@pytest.mark.parametrize("missing", ["--store", "--design"])
+def test_feasibility_requires_store_and_design(
+    missing: str, copy_store: Path, design: Path, no_connection: list[str]
+) -> None:
+    args = {"--store": str(copy_store), "--design": str(design)}
+    del args[missing]
+    out = _cli("feasibility", *[x for kv in args.items() for x in kv])
+    assert out.exit_code == 2 and "Missing option" in out.output, out.output
+    assert no_connection == []
+
+
+def test_feasibility_help_touches_no_store(no_connection: list[str]) -> None:
+    out = _cli("feasibility", "--help")
+    assert out.exit_code == 0 and "--store" in out.output and "--design" in out.output
+    assert no_connection == []
+
+
+def _configured_refusals(live: Path, tmp_path: Path) -> dict[str, str]:
+    """Every way to name the configured store (`live`), by case id."""
+    hard = tmp_path / "hard.duckdb"
+    os.link(live, hard)
+    soft = tmp_path / "soft.duckdb"
+    soft.symlink_to(live)
+    linked_dir = tmp_path / "linked-dir"
+    linked_dir.symlink_to(live.parent, target_is_directory=True)
+    (tmp_path / "sub").mkdir()
+    return {
+        "configured": str(live),
+        "hard link": str(hard),
+        "symlink": str(soft),
+        "symlinked directory": str(linked_dir / live.name),
+        "dotdot": str(tmp_path / "sub" / ".." / live.name),
+        "missing": str(tmp_path / "no-such-copy.duckdb"),
+        "case variant": str(live.with_name(live.name.upper())),
+        "a directory": str(tmp_path),
+    }
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "configured",
+        "hard link",
+        "symlink",
+        "symlinked directory",
+        "dotdot",
+        "missing",
+        "case variant",
+        "a directory",
+    ],
+)
+def test_feasibility_refuses_the_owners_store_and_a_missing_path(
+    case: str, live: Path, tmp_path: Path, design: Path, no_connection: list[str]
+) -> None:
+    before = (_sha(live), live.stat().st_mtime_ns)
+    out = _feasibility(_configured_refusals(live, tmp_path)[case], design)
+    _only_a_refusal(out)
+    assert no_connection == []
+    assert (_sha(live), live.stat().st_mtime_ns) == before
+
+
+def test_feasibility_refuses_a_relative_path_to_the_configured_store(
+    live: Path, design: Path, monkeypatch: pytest.MonkeyPatch, no_connection: list[str]
+) -> None:
+    monkeypatch.chdir(live.parent)
+    before = _sha(live)
+    _only_a_refusal(_feasibility(live.name, design))
+    assert no_connection == [] and _sha(live) == before
+
+
+def test_feasibility_refuses_a_bad_design_before_any_read(
+    copy_store: Path, tmp_path: Path, no_connection: list[str]
+) -> None:
+    bad = tmp_path / "bad.toml"
+    bad.write_text(FEASIBILITY_DESIGN.read_text().replace('source = "form4"', 'source = "nope"'))
+    out = _feasibility(copy_store, bad)
+    _only_a_refusal(out)
+    assert "source" in out.output
+    assert no_connection == []
+    _only_a_refusal(_feasibility(copy_store, tmp_path / "absent.toml"))
+    assert no_connection == []
+
+
+def test_feasibility_header_names_the_file_and_a_good_call_is_byte_stable(
+    copy_store: Path, design: Path, live: Path
+) -> None:
+    live_before = (_sha(live), live.stat().st_mtime_ns)
+    before = (_sha(copy_store), copy_store.stat().st_mtime_ns)
+    siblings = sorted(p.name for p in copy_store.parent.iterdir())
+    first = _feasibility(copy_store, design)
+    second = _feasibility(copy_store, design)
+    assert first.exit_code == 0 and second.exit_code == 0, first.output
+    assert first.stdout == second.stdout and first.stdout.strip()
+    store_line = next(x for x in first.stdout.splitlines() if x.startswith("store: "))
+    assert str(copy_store) in store_line
+    assert f"size {copy_store.stat().st_size} bytes" in store_line
+    modified = datetime.fromtimestamp(copy_store.stat().st_mtime, tz=UTC)
+    assert modified.strftime("%Y-%m-%d") in store_line and "modified " in store_line
+    assert "newest ingest feasibility-fixture-1" in store_line
+    assert first.stdout.rstrip().splitlines()[-1].startswith("feasibility: ")
+    assert (_sha(copy_store), copy_store.stat().st_mtime_ns) == before
+    assert sorted(p.name for p in copy_store.parent.iterdir()) == siblings
+    assert (_sha(live), live.stat().st_mtime_ns) == live_before
+
+
+def test_feasibility_opens_the_copy_read_only(
+    copy_store: Path, design: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened: list[tuple[str, bool]] = []
+    real_connect = duckdb.connect
+
+    def spy(database: str = ":memory:", read_only: bool = False, **kw: Any) -> Any:
+        opened.append((str(database), read_only))
+        return real_connect(database, read_only=read_only, **kw)
+
+    monkeypatch.setattr(duckdb, "connect", spy)
+    assert _feasibility(copy_store, design).exit_code == 0
+    assert opened == [(str(copy_store), True)]
+
+
+def test_feasibility_refusal_after_opening_is_exit_2_with_only_the_refusal(
+    tmp_path: Path, design: Path
+) -> None:
+    """A copy with no development boundary is refused by the reader (exit 2, no block)."""
+    bare = fx.build_feasibility_store(tmp_path / "bare.duckdb", with_boundary=False).path
+    out = _feasibility(bare, design)
+    _only_a_refusal(out)
+    assert "boundary" in out.output
+
+
+def test_feasibility_not_a_store_is_a_refusal(tmp_path: Path, design: Path) -> None:
+    junk = tmp_path / "junk.duckdb"
+    junk.write_text("not a database")
+    _only_a_refusal(_feasibility(junk, design))
+
+
+def test_feasibility_refusal_echoing_an_option_value_is_scrubbed(
+    tmp_path: Path, design: Path
+) -> None:
+    out = _feasibility(tmp_path / BAD, design)  # _cli asserts no secret survives
+    _only_a_refusal(out)
+    assert "<scrubbed>" in out.output, out.output
+    bad_design = tmp_path / f"{BAD}.toml"
+    out = _feasibility(fx.build_feasibility_store(tmp_path / "c.duckdb").path, bad_design)
+    _only_a_refusal(out)
+    assert "<scrubbed>" in out.output, out.output
+
+
+# --- feasibility: the owner's live store as resolved WITHOUT this call's overrides (safety B1) ---
+
+
+@pytest.fixture
+def anchored(live: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A project root whose `.env` names `live` as the owner's store (the env file the
+    live-store lookup reads, ignoring `STORE__PATH` and `TRADEPARTNER_ENV_FILE`)."""
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / ".env").write_text(f"STORE__PATH={live}\n", encoding="utf-8")
+    monkeypatch.setattr(book_actions, "PROJECT_ROOT", root)
+    return root
+
+
+def _assert_live_refused(live: Path, name: Path | str, design_file: Path) -> None:
+    before = (_sha(live), live.stat().st_mtime_ns)
+    _only_a_refusal(_feasibility(name, design_file))
+    assert (_sha(live), live.stat().st_mtime_ns) == before
+
+
+def test_feasibility_refuses_the_live_store_when_store_path_is_overridden_to_a_copy(
+    live: Path,
+    anchored: Path,
+    copy_store: Path,
+    design: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    no_connection: list[str],
+) -> None:
+    monkeypatch.setenv("STORE__PATH", str(copy_store))
+    _assert_live_refused(live, live, design)
+    assert no_connection == []
+
+
+def test_feasibility_refuses_the_live_store_from_another_directory_with_a_relative_default(
+    live: Path,
+    anchored: Path,
+    tmp_path: Path,
+    design: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    no_connection: list[str],
+) -> None:
+    monkeypatch.delenv("STORE__PATH")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    _assert_live_refused(live, live, design)
+    assert no_connection == []
+
+
+def test_feasibility_refuses_the_live_store_when_the_env_file_names_a_copy(
+    live: Path,
+    anchored: Path,
+    copy_store: Path,
+    tmp_path: Path,
+    design: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    no_connection: list[str],
+) -> None:
+    other = tmp_path / "other.env"
+    other.write_text(f"STORE__PATH={copy_store}\n", encoding="utf-8")
+    monkeypatch.delenv("STORE__PATH")
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(other))
+    _assert_live_refused(live, live, design)
+    assert no_connection == []
+
+
+@pytest.mark.parametrize("case", ["hard link", "symlink", "symlinked directory"])
+def test_feasibility_refuses_aliases_of_the_live_store_under_an_override(
+    case: str,
+    live: Path,
+    anchored: Path,
+    copy_store: Path,
+    tmp_path: Path,
+    design: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    no_connection: list[str],
+) -> None:
+    monkeypatch.setenv("STORE__PATH", str(copy_store))
+    name = _configured_refusals(live, tmp_path)[case]
+    _assert_live_refused(live, name, design)
+    assert no_connection == []
+
+
+def test_feasibility_refuses_the_live_store_when_the_configured_file_is_absent(
+    live: Path,
+    anchored: Path,
+    tmp_path: Path,
+    design: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    no_connection: list[str],
+) -> None:
+    monkeypatch.setenv("STORE__PATH", str(tmp_path / "absent.duckdb"))
+    _assert_live_refused(live, live, design)
+    assert no_connection == []
+
+
+def test_feasibility_refuses_when_the_live_config_cannot_be_read(
+    copy_store: Path, design: Path, monkeypatch: pytest.MonkeyPatch, no_connection: list[str]
+) -> None:
+    def broken(*_: Any, **__: Any) -> Path:
+        raise ValueError("bad .env")
+
+    monkeypatch.setattr(book_actions, "live_store_path", broken)
+    _only_a_refusal(_feasibility(copy_store, design))
+    assert no_connection == []
+
+
+def test_feasibility_refuses_a_symlink_loop_as_the_configured_path(
+    copy_store: Path,
+    tmp_path: Path,
+    design: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    no_connection: list[str],
+) -> None:
+    loop = tmp_path / "loop.duckdb"
+    loop.symlink_to(loop)
+    monkeypatch.setenv("STORE__PATH", str(loop))
+    _only_a_refusal(_feasibility(copy_store, design))
+    assert no_connection == []
+
+
+def test_feasibility_prints_and_opens_the_resolved_path(
+    copy_store: Path, tmp_path: Path, design: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    link = tmp_path / "link-to-copy.duckdb"
+    link.symlink_to(copy_store)
+    opened: list[str] = []
+    real_connect = duckdb.connect
+
+    def spy(database: str = ":memory:", read_only: bool = False, **kw: Any) -> Any:
+        opened.append(str(database))
+        return real_connect(database, read_only=read_only, **kw)
+
+    monkeypatch.setattr(duckdb, "connect", spy)
+    out = _feasibility(link, design)
+    assert out.exit_code == 0, out.output
+    assert opened == [str(copy_store.resolve())]
+    store_line = next(x for x in out.stdout.splitlines() if x.startswith("store: "))
+    assert str(copy_store.resolve()) in store_line and str(link) not in store_line
+
+
+def test_feasibility_a_copy_open_for_writing_is_a_refusal_not_busy(
+    copy_store: Path, design: Path
+) -> None:
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import duckdb,sys;c=duckdb.connect(sys.argv[1]);print('ready',flush=True);"
+            "sys.stdin.readline()",
+            str(copy_store),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None and holder.stdout.readline().strip() == "ready"
+        out = _feasibility(copy_store, design)
+        _only_a_refusal(out)
+        assert "not a copy" in out.output and "open for writing" in out.output
+    finally:
+        assert holder.stdin is not None
+        holder.stdin.write("\n")
+        holder.stdin.flush()
+        holder.wait(timeout=30)
+
+
+def test_feasibility_refuses_the_live_store_named_with_a_tilde_in_the_env_file(
+    live: Path,
+    tmp_path: Path,
+    copy_store: Path,
+    design: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    no_connection: list[str],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    shutil.copy(live, home / "owner.duckdb")
+    owner = home / "owner.duckdb"
+    monkeypatch.setenv("HOME", str(home))
+    root = tmp_path / "project-tilde"
+    root.mkdir()
+    (root / ".env").write_text("STORE__PATH=~/owner.duckdb\n", encoding="utf-8")
+    monkeypatch.setattr(book_actions, "PROJECT_ROOT", root)
+    monkeypatch.setenv("STORE__PATH", str(copy_store))
+    _assert_live_refused(owner, owner, design)
+    assert no_connection == []

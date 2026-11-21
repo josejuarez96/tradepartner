@@ -1,0 +1,18 @@
+# Fixture design (statement_fact), with a cited rho.
+source = "statement_fact"
+entry = "next_open_after_instant"
+hold_sessions = 20
+rho = 0.3
+rho_source = "fixture: a cited correlation for tests only"
+
+[filter]
+form = ["10-K", "10-Q"]
+comparative = false
+
+[window]
+start = 2018-01-02
+end = 2019-03-29
+
+[band]
+lookback_sessions = 20
+edges = [200000000, 50000000]

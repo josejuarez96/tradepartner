@@ -1,0 +1,15 @@
+# Fixture design (corporate_action).
+source = "corporate_action"
+entry = "next_session_after_date"
+hold_sessions = 20
+
+[filter]
+action_type = "split"
+
+[window]
+start = 2018-01-02
+end = 2019-03-29
+
+[band]
+lookback_sessions = 20
+edges = [200000000, 50000000]
