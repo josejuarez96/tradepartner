@@ -12,11 +12,13 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
 import pytest
+import requests
 from alpaca.data.enums import CorporateActionsType, DataFeed
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import CorporateActionsRequest, StockBarsRequest
 from alpaca.trading.client import TradingClient
+from requests.adapters import HTTPAdapter
 
 from tradepartner.adapters import alpaca_raw
 from tradepartner.config import Settings
@@ -546,3 +548,42 @@ def test_assets_all_refuses_a_payload_that_is_not_the_raw_list(
     monkeypatch.setattr(TradingClient, "get_all_assets", lambda self: {"assets": []})
     with pytest.raises(TypeError, match="raw assets list"):
         alpaca_raw.assets_all(_settings(), clock=lambda: datetime(2026, 10, 13, tzinfo=UTC))
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        alpaca_raw._stock_data_client,
+        alpaca_raw._corporate_actions_client,
+        alpaca_raw._trading_client,
+    ],
+)
+def test_data_clients_get_the_configured_timeout(factory: Any) -> None:
+    """#3622: alpaca-py sends no timeout, so each market-data client's session
+    gets the adapter that applies `alpaca.data_request_timeout_seconds`."""
+    settings = Settings(
+        _env_file=None,
+        alpaca_api_key="PKFAKE1234567890ABCD",
+        alpaca_api_secret="SKFAKE1234567890ABCD",
+        alpaca={"data_request_timeout_seconds": 7.5},
+    )
+    client = factory(settings)
+    adapter = client._session.get_adapter("https://data.alpaca.markets/v2/stocks/bars")
+    assert isinstance(adapter, alpaca_raw.TimeoutAdapter) and adapter.timeout == 7.5
+
+
+def test_data_timeout_adapter_keeps_a_caller_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#3622: the adapter fills in a missing timeout and never overrides a given one."""
+    seen: list[Any] = []
+
+    def fake_send(self: HTTPAdapter, request: requests.PreparedRequest, **kwargs: Any) -> str:
+        seen.append(kwargs.get("timeout"))
+        return "sent"
+
+    monkeypatch.setattr(HTTPAdapter, "send", fake_send)
+    adapter = alpaca_raw.TimeoutAdapter(5)
+    request = requests.Request("GET", "https://data.alpaca.markets/v2/stocks/bars").prepare()
+    adapter.send(request)
+    adapter.send(request, timeout=None)
+    adapter.send(request, timeout=2.0)
+    assert seen == [5, 5, 2.0]

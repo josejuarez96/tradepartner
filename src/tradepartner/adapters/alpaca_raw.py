@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
+import requests
 from alpaca.data.enums import Adjustment, CorporateActionsType, DataFeed
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -30,6 +31,7 @@ from alpaca.data.requests import CorporateActionsRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from pydantic import SecretStr
+from requests.adapters import HTTPAdapter
 
 from tradepartner.config import Settings, get_settings
 
@@ -74,14 +76,45 @@ def _credentials(settings: Settings) -> tuple[str, str]:
     return api_key, api_secret
 
 
+class TimeoutAdapter(HTTPAdapter):
+    """An `HTTPAdapter` that applies `timeout` to every request sent without one;
+    the SDK's session passes none, so without this a request could hang forever."""
+
+    def __init__(self, timeout: float) -> None:
+        super().__init__()
+        self.timeout = timeout
+
+    def send(self, request: requests.PreparedRequest, **kwargs: Any) -> requests.Response:  # type: ignore[override]
+        """Send with the configured timeout unless the caller set one."""
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = self.timeout
+        return super().send(request, **kwargs)
+
+
+def _with_timeout[ClientT: (StockHistoricalDataClient, CorporateActionsClient, TradingClient)](
+    client: ClientT, settings: Settings
+) -> ClientT:
+    """`client` with `alpaca.data_request_timeout_seconds` on every HTTPS request (#3622).
+
+    `_session` is a private SDK attribute, pinned by a test so an upgrade that
+    renames it fails loudly. The SDK's own retry (`_retry`) is left as it is.
+    """
+    client._session.mount("https://", TimeoutAdapter(settings.alpaca.data_request_timeout_seconds))
+    return client
+
+
 def _stock_data_client(settings: Settings) -> StockHistoricalDataClient:
     api_key, secret_key = _credentials(settings)
-    return StockHistoricalDataClient(api_key=api_key, secret_key=secret_key, raw_data=True)
+    return _with_timeout(
+        StockHistoricalDataClient(api_key=api_key, secret_key=secret_key, raw_data=True), settings
+    )
 
 
 def _corporate_actions_client(settings: Settings) -> CorporateActionsClient:
     api_key, secret_key = _credentials(settings)
-    return CorporateActionsClient(api_key=api_key, secret_key=secret_key, raw_data=True)
+    return _with_timeout(
+        CorporateActionsClient(api_key=api_key, secret_key=secret_key, raw_data=True), settings
+    )
 
 
 def _trading_client(settings: Settings) -> TradingClient:
@@ -89,7 +122,9 @@ def _trading_client(settings: Settings) -> TradingClient:
     # `paper=True` selects the paper-trading base URL for the *trading*
     # endpoints; the assets snapshot is account-agnostic reference data, so
     # this has no bearing on which market data is returned.
-    return TradingClient(api_key=api_key, secret_key=secret_key, raw_data=True, paper=True)
+    return _with_timeout(
+        TradingClient(api_key=api_key, secret_key=secret_key, raw_data=True, paper=True), settings
+    )
 
 
 def _symbol_batches(symbols: list[str], settings: Settings) -> list[list[str]]:
