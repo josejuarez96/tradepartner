@@ -134,7 +134,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date
-from decimal import ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP, Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP, Decimal, InvalidOperation
 
 import polars as pl
 
@@ -380,12 +380,17 @@ def _on_grid(left: Decimal, step: Decimal, split_ratios: int) -> Decimal:
 
 def round_down(quantity: float, decimals: int) -> float:
     """`quantity` rounded toward zero to `decimals` places, from its shortest
-    decimal form (so 0.57 stays 0.57): never up."""
+    decimal form (so 0.57 stays 0.57): never up. A quantity with more digits at
+    `decimals` places than `Decimal` arithmetic carries is refused with
+    `ValueError`, like every other bad input here (#3655)."""
     if decimals < 0:
         raise ValueError(f"decimals must be non-negative, got {decimals}")
     _finite(quantity, "quantity")
     step = Decimal(1).scaleb(-decimals)
-    return float(Decimal(repr(quantity)).quantize(step, rounding=ROUND_DOWN))
+    try:
+        return float(Decimal(repr(quantity)).quantize(step, rounding=ROUND_DOWN))
+    except InvalidOperation:
+        raise ValueError(f"quantity {quantity} cannot be rounded to {decimals} places") from None
 
 
 def _dec(value: float) -> Decimal:

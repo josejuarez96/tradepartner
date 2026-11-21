@@ -34,6 +34,7 @@ dev = [
     "bt==1.2.3",
     "pytest-xdist>=3.8.0",
     "pytest-timeout>=2.4.0",
+    "hypothesis>=6.170.17",
 ]
 
 [build-system]
