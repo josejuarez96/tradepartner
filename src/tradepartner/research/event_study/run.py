@@ -29,8 +29,13 @@ from tradepartner.research import RunHandle, require_handle
 from tradepartner.research.datafiles import data_dir
 from tradepartner.research.event_study.peers import assign_buckets, attach_spreads
 from tradepartner.research.event_study.reader import EventStudyReader
-from tradepartner.research.event_study.stats import net_long, net_short, overlap_result_interval
-from tradepartner.research.event_study.summary import evaluate_kill, summarise
+from tradepartner.research.event_study.stats import (
+    DEFAULT_SE_METHOD,
+    net_long,
+    net_short,
+    se_result_interval,
+)
+from tradepartner.research.event_study.summary import entry_quarters, evaluate_kill, summarise
 
 ET = ZoneInfo("America/New_York")
 PRE_MATCH_DROP_REASONS = (
@@ -321,6 +326,7 @@ def summarise_study(
     short_line = next((line for line in design["kill"] if line["side"] == "short"), None)
     primary_cost = float(long_line["cost_bps"]) if long_line else float(design["cost_bps"][-1])
     short_borrow = float(short_line["borrow_bps"]) if short_line else float(design["borrow_bps"][0])
+    se_method = str(design.get("se_method", DEFAULT_SE_METHOD))
     summary = summarise(
         processed,
         counts,
@@ -335,6 +341,7 @@ def summarise_study(
         short_borrow=short_borrow,
         z=float(design["z"]),
         peer_window=int(design["peer_window"]),
+        se_method=se_method,
     )
     reading_key = {
         "raw": "spread",
@@ -367,9 +374,11 @@ def summarise_study(
                 for row in selected
             ]
             t_values = gross if line["t_metric"] == "gross_spread_bp" else net
-            interval = overlap_result_interval(
+            interval = se_result_interval(
                 t_values,
                 [int(row["entry_index"]) for row in selected],
+                entry_quarters(selected, se_method),
+                method=se_method,
                 max_lag_sessions=horizon - 1 + 2 * int(design["peer_window"]),
                 z=float(design["z"]),
             )
@@ -379,6 +388,7 @@ def summarise_study(
                 "gross_spread_bp": gross_bp,
                 "net_bp": net_bp,
                 **{f"t_{kind}": interval["t"] for kind in (*design["cluster_by"], "min")},
+                **{k: interval[k] for k in ("t_raw", "z_eq", "quarters") if k in interval},
             }
         result = evaluate_kill(
             {
@@ -584,6 +594,7 @@ def run_study(
             counts[key] += value
     counts.update(count_study_events(event_rows, design, counts, derived))
     summary = summarise_study(processed, counts, design)
+    se_method = str(design.get("se_method", DEFAULT_SE_METHOD))
     matching = design.get("matching", "entry_known")
     summary["exploratory"]["matching"] = matching
     summary["exploratory"]["delisted_exit_note"] = (
@@ -601,6 +612,8 @@ def run_study(
             "slug": run.slug,
             "max_read_t": reader.max_read_t,
             "matching": matching,
+            # Under the default nothing is added, so a pre-amendment artifact is byte-identical.
+            **({} if se_method == DEFAULT_SE_METHOD else {"se_method": se_method}),
         },
         "events": processed,
         "summary": summary,

@@ -90,6 +90,35 @@ def test_delisting_return_is_optional_and_absent_is_not_written_back(tmp_path: P
             )
 
 
+def test_se_method_is_optional_and_absent_is_not_written_back(tmp_path: Path) -> None:
+    """#3679: absent hashes as before; an explicit value hashes differently; values are enumerated."""
+    source = FIXTURE.read_text()
+    assert "se_method" not in source
+    absent = _parse(tmp_path / "absent", source)
+    assert absent.study is not None
+    assert "se_method" not in absent.study
+    assert (
+        absent.params_sha256 == "41e65b1b61b89655aba8c430bd7e2f8a126af95176ed22e6bc802e7330318be5"
+    )
+    assert "se_method" not in json.loads(absent.params_json)["study"]
+    anchor = 'matching = "ex_post"\n'
+    hashes = {}
+    for value in ("hansen_hodrick", "quarter_cluster_t"):
+        parsed = _parse(
+            tmp_path / value, source.replace(anchor, anchor + f'se_method = "{value}"\n')
+        )
+        assert parsed.study is not None
+        assert parsed.study["se_method"] == value
+        hashes[value] = parsed.params_sha256
+    assert len({*hashes.values(), absent.params_sha256}) == 3
+    for bad in ('"bartlett"', '"QUARTER_CLUSTER_T"', "1", "true"):
+        with pytest.raises(ExperimentFileError, match=r"study\.se_method"):
+            _parse(
+                tmp_path / f"bad{abs(hash(bad))}",
+                source.replace(anchor, anchor + f"se_method = {bad}\n"),
+            )
+
+
 @pytest.mark.parametrize(
     ("old", "new", "match"),
     [
