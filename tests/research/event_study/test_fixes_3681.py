@@ -104,9 +104,3 @@ def test_fallback_long_kill_uses_the_net_figure() -> None:
     )
     assert won["secondary"]["kill_long"] == 0.0  # type: ignore[index]
     assert _summary(-0.05, ("raw",))["secondary"]["kill_long"] == 1.0  # type: ignore[index]
-
-
-def test_fallback_long_kill_resolves_the_registered_reading_names() -> None:
-    """The design's reading names (`beta_adjusted`, ...) find the summary's readings."""
-    names = ("raw", "beta_adjusted", "size_tight", "size_tight_beta_adjusted")
-    assert _summary(0.05, names)["secondary"]["kill_long"] == 0.0  # type: ignore[index]

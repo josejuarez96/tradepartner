@@ -16,12 +16,6 @@ from tradepartner.research.event_study.stats import (
 )
 
 BPS = 10_000
-#: The design's reading names for the summary's `badj`, `sz` and `szb` readings.
-_REGISTERED_READINGS = {
-    "beta_adjusted": "badj",
-    "size_tight": "sz",
-    "size_tight_beta_adjusted": "szb",
-}
 
 
 def _mean_bp(values: Sequence[float]) -> float:
@@ -270,10 +264,6 @@ def summarise(
             reading["calibrated_t"] = interval["t"]
             for kind in ("min", "event_date", "month", "quarter"):
                 reading[f"t_{kind}"] = interval["t"]
-    # A registered line names its readings as the design does (#3681).
-    for registered, short_name in _REGISTERED_READINGS.items():
-        long_readings[registered] = long_readings[short_name]
-        short_readings[registered] = short_readings[short_name]
     long_kill = evaluate_kill(kill_lines["long"], long_readings)
     short_kill = evaluate_kill(kill_lines["short"], short_readings)
     sec["kill_long"] = float(long_kill["killed"])
