@@ -312,6 +312,21 @@ command and no `--out` flag (C12). The model client is `make_app`'s
 `model_client` edge (`job.CLIENT_FACTORY`, which builds the disabled client
 unless both spend ceilings and the key are set in the owner's environment).
 
+Feasibility counts (research-registry spec, amendment 2026-11-21, #3702; plan T455):
+
+- `tradepartner feasibility --store <copy> --design <file>` prints the counts-only
+  block (`research.feasibility`) for a design, read from a COPY of the store. It is the
+  one command that takes a store path, and it decides which file gets opened, in this
+  order: (1) `--store` and `--design` are required, no default; (2) the `--store` path
+  is refused, on paths and before any connection, when it does not exist, is not a
+  file, or is `settings.store.path` by file identity (`Path.samefile`: a hard
+  link, a symlink, a relative or `..` path); (3) the design is parsed, a refusal
+  before any read; (4) only then is the copy opened read-only (`open_read_only`);
+  (5) the counts are read and the block printed. The check cannot tell a copy from
+  another live store, so the block's header prints the file's path, size,
+  modification time and newest ingest. Every refusal exits 2 and prints one
+  scrubbed line and nothing else; a busy copy exits 1. Nothing is written.
+
 Paper trading (Phase 4 spec req 16; plans T67 and T90; ADR 0010 amendment
 2026-10-04):
 
@@ -1559,6 +1574,27 @@ def _experiments_dir(settings: Settings) -> Path:
     """`research.experiments_dir`, relative to the project root unless absolute."""
     configured = Path(settings.research.experiments_dir)
     return configured if configured.is_absolute() else PROJECT_ROOT / configured
+
+
+def _check_copy_path(store: Path, settings: Settings) -> None:
+    """Refuse `store` unless it is an existing file that is not `settings.store.path`.
+
+    The path-level restatement of `registry._is_real_store` (which needs an open
+    connection, so cannot run before one): file identity (`Path.samefile`, so a hard
+    link, a symlink, a symlinked directory, a relative or `..` path all match) when the
+    configured file exists, else the resolved paths. Only `os.stat`-style calls are made:
+    no file is opened. Raises `OSError` (the refusal's words) and never returns a verdict
+    it could not reach: an unreadable path is a refusal.
+    """
+    if not store.is_file():
+        raise OSError(f"--store {store}: not an existing file")
+    configured = Path(settings.store.path).expanduser()
+    if configured.exists():
+        same = store.samefile(configured)
+    else:
+        same = store.resolve() == configured.resolve()
+    if same:
+        raise OSError(f"--store {store}: that is the configured store; pass a copy of it")
 
 
 def _refusal(exc: BaseException, settings: Settings) -> typer.Exit:
@@ -7306,6 +7342,46 @@ def make_app(
             )
         if gaps.height:
             raise typer.Exit(1)
+
+    @app.command()
+    def feasibility(
+        store: Annotated[
+            Path, typer.Option(help="a COPY of the store, never the configured store")
+        ],
+        design: Annotated[Path, typer.Option(help="the feasibility design file (TOML)")],
+    ) -> None:
+        """Counts-only feasibility block for a design, from a copy of the store (T455).
+
+        Reads no return and writes nothing. Refuses, before any connection, a missing
+        path and the configured store (file identity). The operator makes the copy and
+        never passes a file any process writes: the header prints the file's path,
+        size, modification time and newest ingest so the counted file can be checked."""
+        s = settings()
+        # Lazy: the research modules and pandas/duckdb-backed readers load only here.
+        from tradepartner.research import feasibility as feas
+        from tradepartner.research.feasibility_block import render_block
+        from tradepartner.research.feasibility_design import (
+            FeasibilityDesignError,
+            parse_design_file,
+        )
+
+        try:
+            _check_copy_path(store, s)
+        except OSError as exc:
+            raise _refusal(exc, s) from None
+        try:
+            parsed = parse_design_file(design)
+        except FeasibilityDesignError as exc:
+            raise _refusal(exc, s) from None
+        copy = s.model_copy(update={"store": s.store.model_copy(update={"path": str(store)})})
+        try:
+            with open_read_only(copy) as conn:
+                counts = feas.count_feasibility(conn, parsed, store=feas.read_store_facts(conn))
+        except StoreLockedError as exc:
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
+        except (feas.FeasibilityRefused, duckdb.Error, OSError) as exc:
+            raise _refusal(exc, s) from None
+        _echo_scrubbed(render_block(parsed, counts), s)
 
     return app
 
