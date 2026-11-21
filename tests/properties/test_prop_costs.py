@@ -50,7 +50,7 @@ def test_trade_cost_refuses_or_returns_a_finite_non_negative_cost(
 
 @pytest.mark.xfail(
     strict=True,
-    reason="#3655 follow-up, not filed yet: a finite notional above about 1e304 overflows "
+    reason="#3694: a finite notional above about 1e304 overflows "
     "to an infinite cost; found by the explore profile, outside the non-finite-input "
     "refusal this issue makes",
 )
