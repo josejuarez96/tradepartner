@@ -4,7 +4,7 @@ The closed forms of the idea-pipeline spec's 2026-11-21 amendment (#3702),
 section B, and the effective-count rule of the research-registry spec's
 feasibility amendment of the same date, item 4. Every input is an argument:
 this module reads no store, no clock and no config, so the feasibility command
-(T442 to T444) and the card print the same numbers from the same functions.
+(T453 to T455) and the card print the same numbers from the same functions.
 
 Units are basis points (bp) unless a name says otherwise. Entry sessions are
 integer positions on the trading calendar (the caller's calendar, never
@@ -37,7 +37,7 @@ DEFAULT_BORROW_LONG_SHORT_BP = (
 )
 # Pass it as ``borrow_bp_per_month`` for a long/short trial; a long-only book pays none.
 # Default correlation of two different issuers' overlapping matched spreads, per unit of shared
-# hold: quant-auditor ruling on research-registry open question 2 (PR #3745 comment, T441) and
+# hold: quant-auditor ruling on research-registry open question 2 (PR #3745 comment, T452) and
 # the spec sentence PR #3705 is amended to carry. UNGRADED; a cited rho overrides it.
 DEFAULT_CROSS_ISSUER_RHO = 0.05
 DEFAULT_LEGS_CHARGED = 1  # E1 design: only the treated leg pays (R = 2c).
@@ -141,7 +141,7 @@ def event_min_count(
 
     ``SE_max = min(net/(t_f + z), (net - F)/z)``, ``n_min = (sd/SE_max)^2``. At
     ``z <= 0`` (power at or under 50%) the floor leg never binds, so ``SE_max = net/(t_f + z)``;
-    ``ValueError`` when ``t_f + z <= 0`` (no count meets that power). ``None`` when
+    ``1`` when ``t_f + z <= 0`` (every count meets that power). ``None`` when
     ``net <= F``: no count reaches even 50% (the reject case).
     """
     _require_positive("sd_bp", sd_bp)
@@ -150,7 +150,7 @@ def event_min_count(
         return None
     z = z_power(power)
     if t_floor + z <= 0:
-        raise ValueError("t_floor + z must be positive: no count reaches this power")
+        return 1
     se_max = net / (t_floor + z)
     if z > 0:
         se_max = min(se_max, (net - floor_bp) / z)
@@ -325,3 +325,19 @@ def effective_count_ceiling(
     _require_positive("window_sessions", window_sessions)
     _require_positive("rho", rho)
     return window_sessions / (rho * hold_sessions)
+
+
+def effective_count_same_session_bound(
+    hold_sessions: int,
+    window_sessions: int,
+    rho: float = DEFAULT_CROSS_ISSUER_RHO,
+) -> float:
+    """Tighter bound ``S / (1 + rho * h)`` on the default ``n_eff``.
+
+    Events on one entry session are one cluster, so ``N / B <= S``; the default
+    ``n_eff`` is then at most ``S / (1 + rho * h)``, below :func:`effective_count_ceiling`
+    (which assumes ``B`` can reach 0).
+    """
+    _require_positive("hold_sessions", hold_sessions)
+    _require_positive("window_sessions", window_sessions)
+    return window_sessions / (1.0 + rho * hold_sessions)

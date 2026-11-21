@@ -1,4 +1,4 @@
-"""Shape and effective-count arithmetic (T441, #3741): the spec's cells, and purity."""
+"""Shape and effective-count arithmetic (T452, #3741): the spec's cells, and purity."""
 
 from __future__ import annotations
 
@@ -235,13 +235,44 @@ def test_worked_case_exact_and_by_hand() -> None:
     assert by_hand == pytest.approx(ec.n_eff, rel=0.05)
 
 
-def test_e1_shape_by_hand_against_ceiling() -> None:
-    """E1: about 20,000 events over 20 quarters (63 sessions each), hold 60, B 2."""
-    s = 20 * 63
-    est = shape.effective_count_by_hand(20_000, 2.0, 60, s)
-    assert est == pytest.approx(400, rel=0.05)
-    assert shape.effective_count_ceiling(60, s) == pytest.approx(420)
-    assert est < shape.effective_count_ceiling(60, s)
+def _e1_events(bunched: bool) -> list[tuple[str, int]]:
+    """Synthetic E1 set: 20,000 events, 1,000 issuers, 20 quarters of 63 sessions (seeded)."""
+    rng = random.Random(452)
+    events = []
+    for _ in range(20_000):
+        quarter = rng.randrange(20)
+        within = int(63 * rng.random() ** 2) if bunched else rng.randrange(63)
+        events.append((f"i{rng.randrange(1000)}", quarter * 63 + within))
+    return events
+
+
+def test_e1_synthetic_exact_against_hand_formula_and_bounds() -> None:
+    s, hold = 20 * 63, 60
+    ceiling = shape.effective_count_ceiling(hold, s)
+    same_session = shape.effective_count_same_session_bound(hold, s)
+    assert ceiling == pytest.approx(420)
+    assert same_session == pytest.approx(315)
+    results = {}
+    for bunched in (False, True):
+        ec = shape.effective_count(_e1_events(bunched), hold)
+        results[bunched] = ec
+        hand = shape.effective_count_by_hand(ec.n, ec.same_date_factor, hold, s)
+        assert hand == pytest.approx(ec.n_eff, rel=0.05)
+        assert ec.n_eff <= same_session < ceiling
+        assert hand <= ceiling
+    uniform, bunch = results[False], results[True]
+    assert bunch.same_date_factor > uniform.same_date_factor
+    assert 15 < uniform.same_date_factor < 20  # about N/S + 1 = 16.9 for uniform arrival
+    assert 290 < uniform.n_eff < 315  # the auditor's uniform set gave 312.9
+    assert 150 < bunch.n_eff < uniform.n_eff  # bunching lowers it further
+
+
+def test_same_session_bound_formula_and_refusals() -> None:
+    assert shape.effective_count_same_session_bound(60, 1260) == pytest.approx(
+        1260 / (1 + 0.05 * 60)
+    )
+    with pytest.raises(ValueError):
+        shape.effective_count_same_session_bound(60, 0)
 
 
 def test_by_hand_tracks_exact_on_bunched_events() -> None:
@@ -286,9 +317,12 @@ def test_min_count_at_thirty_percent() -> None:
     assert shape.event_min_count(200.0, 100.0, 866.0, power=0.3) == 17
 
 
-def test_min_count_refuses_when_t_floor_cannot_be_met() -> None:
-    with pytest.raises(ValueError):
-        shape.event_min_count(200.0, 100.0, 866.0, power=0.1, t_floor=1.0)
+def test_min_count_is_one_when_every_count_meets_the_power() -> None:
+    # t_f + z <= 0 (z(0.1) = -1.28, t_f 1.0): n = 1 meets it. Not None (the reject case).
+    n = shape.event_min_count(200.0, 100.0, 866.0, power=0.1, t_floor=1.0)
+    assert n == 1
+    assert shape.event_pass_probability(200.0, 100.0, 866.0, 1) >= 0.1
+    assert shape.event_min_count(130.0, 100.0, 866.0, power=0.1) is None
 
 
 def test_borrow_constant() -> None:
