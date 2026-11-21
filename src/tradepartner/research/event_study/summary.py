@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import math
 from collections.abc import Hashable, Mapping, Sequence
+from datetime import date
 from typing import Any
 
 from tradepartner.research.event_study.stats import (
+    DEFAULT_SE_METHOD,
     cluster_stats,
+    entry_quarter,
     hold_overlap_sessions,
     kish_clusters,
     net_long,
     net_short,
-    overlap_result_interval,
+    se_result_interval,
 )
 
 BPS = 10_000
@@ -20,6 +23,13 @@ BPS = 10_000
 
 def _mean_bp(values: Sequence[float]) -> float:
     return sum(values) / len(values) * BPS if values else math.nan
+
+
+def entry_quarters(rows: Sequence[Mapping[str, Any]], se_method: str) -> list[int] | None:
+    """Calendar quarter of each row's entry date; only ``quarter_cluster_t`` reads them."""
+    if se_method == DEFAULT_SE_METHOD:
+        return None
+    return [entry_quarter(date.fromisoformat(str(row["entry"]))) for row in rows]
 
 
 def _cluster_key(row: Mapping[str, Any], kind: str) -> Hashable:
@@ -63,7 +73,10 @@ def evaluate_kill(
         result = readings.get(name, {})
         effect, t = float(result.get(metric, math.nan)), float(result.get(t_key, math.nan))
         details[name] = {metric: effect, t_key: t}
-        for key in ("effect_bp", "ci_low_bp", "ci_high_bp", "mde_80_bp", "calibrated_t"):
+        for key in (
+            *("effect_bp", "ci_low_bp", "ci_high_bp", "mde_80_bp", "calibrated_t"),
+            *("t_raw", "z_eq", "quarters"),
+        ):
             if key in result:
                 details[name][key] = float(result[key])
         if not math.isfinite(effect) or not math.isfinite(t) or effect < floor or t < t_floor:
@@ -92,6 +105,7 @@ def summarise(
     short_borrow: float,
     z: float,
     peer_window: int,
+    se_method: str = DEFAULT_SE_METHOD,
 ) -> dict[str, Any]:
     """Build C1b secondary keys by declared group and add calibrated inference.
 
@@ -102,7 +116,10 @@ def summarise(
     kill-line t use the overlap-calibrated SE with lag ``h - 1 + 2 *
     peer_window`` (peers enter up to ``peer_window`` sessions from the event,
     so two spreads share bars at entry distance up to that lag), computed on the
-    same net series the kill line judges.
+    same net series the kill line judges. ``se_method`` (``[study].se_method``,
+    #3679) picks the statistic: the default is the flat Hansen-Hodrick SE, byte
+    for byte; ``quarter_cluster_t`` clusters by calendar quarter of entry and the
+    kill-line t is then ``z_eq``, the t(G - 1) statistic on the normal scale.
     """
     treated = [group for group in groups if group != peer_group]
     if len(treated) != 2 or not horizons or not cluster_by:
@@ -244,12 +261,17 @@ def summarise(
                 if is_short
                 else [net_long(value, primary_cost) for value in raw_values]
             )
-            interval = overlap_result_interval(
+            interval = se_result_interval(
                 net,
                 [int(row["entry_index"]) for row in selected],
+                entry_quarters(selected, se_method),
+                method=se_method,
                 max_lag_sessions=lag,
                 z=z,
             )
+            for extra in ("t_raw", "z_eq", "quarters"):
+                if extra in interval:
+                    reading[extra] = interval[extra]
             for field, target in (
                 ("effect", "effect_bp"),
                 ("ci_low", "ci_low_bp"),
@@ -275,9 +297,11 @@ def summarise(
         "n": len(values),
         "n_clusters": int(primary_stats["clusters"]),
     }
-    inference = overlap_result_interval(
+    inference = se_result_interval(
         values,
         [int(row["entry_index"]) for row in long_rows],
+        entry_quarters(long_rows, se_method),
+        method=se_method,
         max_lag_sessions=lag,
         z=z,
     )

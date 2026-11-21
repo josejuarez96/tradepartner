@@ -42,11 +42,14 @@ The block below is the only part the registry parses (`research/experiment.py`).
 - Keep other fenced blocks out of the parameter block; its first bare ` ``` ` line
   closes it.
 - For a reusable return event study, add `[study]` and one or more `[[study.kill]]`
-  tables inside this same block. Every study key except `matching` and `delisting_return` is required, including cost,
+  tables inside this same block. Every study key except `matching`, `delisting_return` and `se_method` is required, including cost,
   borrow, `z`, and `cluster_by`; `study.configurations` must cover the kill lines
   and fit within `budget.configurations`. Kill readings are `raw`,
   `beta_adjusted`, `size_tight`, or `size_tight_beta_adjusted`. `delisting_return`
-  is optional (absent reads as `none`); new designs write `failure_v1`.
+  is optional (absent reads as `none`); new designs write `failure_v1`. `se_method` is
+  optional too (absent reads as `hansen_hodrick`); new designs write `quarter_cluster_t`,
+  and a kill line's `t_floor` is then compared with the t(G-1) statistic on the normal
+  scale (spec amendment 2026-11-21, #3679).
 
 ```toml experiment
 slug = "<slug>"
@@ -120,6 +123,7 @@ expected_effect = "<words: the prior, at or below the brief's haircuts for retur
 # z = 1.645
 # cluster_by = ["month", "quarter"]
 # delisting_return = "failure_v1" # new designs; or "severe_v1"; "none" reproduces older runs (absent reads as none). The runner refuses anything but none until T412 lands
+# se_method = "quarter_cluster_t" # new designs: calendar-quarter-of-entry cluster SE, CR1, t(G-1), kill t on the normal scale (z_eq); or "hansen_hodrick" (absent reads as this, reproducing older runs). Refused at registration when the window or an entry_start sub-window spans fewer than 8 calendar quarters; events in fewer than 8 quarters give an undefined t that kills
 # [[study.kill]]
 # name = "long"
 # side = "long" # or "short"; selects the net-return formula

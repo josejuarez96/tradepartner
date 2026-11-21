@@ -90,6 +90,35 @@ def test_delisting_return_is_optional_and_absent_is_not_written_back(tmp_path: P
             )
 
 
+def test_se_method_is_optional_and_absent_is_not_written_back(tmp_path: Path) -> None:
+    """#3679: absent hashes as before; an explicit value differs; values are enumerated."""
+    source = FIXTURE.read_text()
+    assert "se_method" not in source
+    absent = _parse(tmp_path / "absent", source)
+    assert absent.study is not None
+    assert "se_method" not in absent.study
+    assert (
+        absent.params_sha256 == "41e65b1b61b89655aba8c430bd7e2f8a126af95176ed22e6bc802e7330318be5"
+    )
+    assert "se_method" not in json.loads(absent.params_json)["study"]
+    anchor = 'matching = "ex_post"\n'
+    hashes = {}
+    for value in ("hansen_hodrick", "quarter_cluster_t"):
+        parsed = _parse(
+            tmp_path / value, source.replace(anchor, anchor + f'se_method = "{value}"\n')
+        )
+        assert parsed.study is not None
+        assert parsed.study["se_method"] == value
+        hashes[value] = parsed.params_sha256
+    assert len({*hashes.values(), absent.params_sha256}) == 3
+    for bad in ('"bartlett"', '"QUARTER_CLUSTER_T"', "1", "true"):
+        with pytest.raises(ExperimentFileError, match=r"study\.se_method"):
+            _parse(
+                tmp_path / f"bad{abs(hash(bad))}",
+                source.replace(anchor, anchor + f"se_method = {bad}\n"),
+            )
+
+
 @pytest.mark.parametrize(
     ("old", "new", "match"),
     [
@@ -169,3 +198,51 @@ def test_study_z_must_match_declared_interval_side(
     )
     with pytest.raises(ExperimentFileError, match=match):
         _parse(tmp_path, source)
+
+
+def test_quarter_cluster_t_refuses_a_window_with_too_few_quarters(tmp_path: Path) -> None:
+    """#3679: knowable from the frozen dates, so refused at registration, before any read."""
+    source = FIXTURE.read_text().replace(
+        'matching = "ex_post"\n', 'matching = "ex_post"\nse_method = "quarter_cluster_t"\n'
+    )
+    old_end = "end = 2023-12-29"
+    assert old_end in source
+    seven = source.replace(old_end, "end = 2016-12-30")  # 2015Q2 .. 2016Q4
+    with pytest.raises(ExperimentFileError, match=r"at least 8 entry quarters.*spans 7"):
+        _parse(tmp_path / "seven", seven)
+    eight = source.replace(old_end, "end = 2017-03-31")  # 2015Q2 .. 2017Q1
+    assert _parse(tmp_path / "eight", eight).study is not None
+    sub = eight.replace('name = "long"\n', 'name = "long"\nentry_start = 2016-07-01\n')
+    with pytest.raises(ExperimentFileError, match=r"entry_start 2016-07-01.*spans 3"):
+        _parse(tmp_path / "sub", sub)
+    # the default statistic has no such rule: C1b-style short windows still register
+    flat = FIXTURE.read_text().replace(old_end, "end = 2016-12-30")
+    assert _parse(tmp_path / "flat", flat).study is not None
+
+
+def test_quarter_cluster_t_study_block_survives_the_params_json_round_trip(tmp_path: Path) -> None:
+    """#3679 audit: what the CLI reads back (`params_json`) must satisfy every new consumer.
+
+    A TOML date comes back as ISO text, so the new window check must take it as text, and
+    the other values the new code reads (`se_method`, `z`, `peer_window`, kill floors) keep
+    their types.
+    """
+    from datetime import date
+
+    from tradepartner.research.event_study.stats import SE_METHODS, thin_window_reason
+
+    source = FIXTURE.read_text().replace(
+        'matching = "ex_post"\n', 'matching = "ex_post"\nse_method = "quarter_cluster_t"\n'
+    )
+    source = source.replace('name = "long"\n', 'name = "long"\nentry_start = 2020-01-02\n')
+    parsed = _parse(tmp_path / "rt", source)
+    assert parsed.study is not None
+    assert parsed.study["kill"][0]["entry_start"] == date(2020, 1, 2)  # the parser path: a date
+    design = json.loads(parsed.params_json)["study"]
+    assert design["kill"][0]["entry_start"] == "2020-01-02"  # the stored path: text
+    assert design["se_method"] in SE_METHODS
+    assert isinstance(design["z"], float) and isinstance(design["peer_window"], int)
+    assert all(isinstance(line["t_floor"], float) for line in design["kill"])
+    starts = [line.get("entry_start") for line in design["kill"]]
+    assert thin_window_reason(parsed.window_start, parsed.window_end, starts) is None
+    assert thin_window_reason(parsed.window_start, date(2020, 12, 31), starts) is not None

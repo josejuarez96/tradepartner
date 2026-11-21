@@ -6,6 +6,26 @@ import math
 from collections import Counter, defaultdict
 from collections.abc import Hashable, Sequence
 from datetime import date, timedelta
+from statistics import NormalDist
+from typing import Final
+
+#: `[study].se_method` values (#3679). ``hansen_hodrick`` is the flat-kernel
+#: overlap SE every study registered before the amendment ran under, and what an
+#: absent key reads as. ``quarter_cluster_t`` is the calendar-quarter-of-entry
+#: cluster SE on the pooled mean with the CR1 factor, judged against t(G - 1).
+SE_METHODS: Final = ("hansen_hodrick", "quarter_cluster_t")
+DEFAULT_SE_METHOD: Final = "hansen_hodrick"
+#: A frozen term of ``quarter_cluster_t``: fewer entry quarters than this and
+#: the statistic is refused. G - 1 degrees of freedom below 7 leave a t
+#: reference too heavy-tailed to mean anything; changing it is a new method name.
+QUARTER_CLUSTER_MIN_QUARTERS: Final = 8
+
+
+_Z_EQ_CAP: Final = 40.0
+
+
+class TooFewClustersError(ValueError):
+    """The study has fewer entry quarters than ``quarter_cluster_t`` can judge."""
 
 
 def cluster_stats(values: Sequence[float], clusters: Sequence[Hashable]) -> dict[str, float]:
@@ -180,3 +200,210 @@ def net_long(spread: float, cost_bps: float) -> float:
 def net_short(spread: float, cost_bps: float, borrow_bps: float, horizon: int) -> float:
     """Short spread after cost and prorated borrow."""
     return -spread - 2 * cost_bps / 10_000 - borrow_bps / 10_000 * horizon / 252
+
+
+def entry_quarter(entry: date) -> int:
+    """Calendar-quarter index of an entry date: ``year * 4 + (month - 1) // 3``."""
+    return entry.year * 4 + (entry.month - 1) // 3
+
+
+def entry_quarters_spanned(start: date, end: date) -> int:
+    """Calendar quarters a window of entry dates can touch; an upper bound on G."""
+    return entry_quarter(end) - entry_quarter(start) + 1
+
+
+def thin_window_reason(
+    window_start: date, window_end: date, entry_starts: Sequence[date | str | None]
+) -> str | None:
+    """Why ``quarter_cluster_t`` can never reach its minimum G, from frozen dates alone.
+
+    Checks the study window and each kill line's ``entry_start`` sub-window
+    (``None`` for a line without one). Returns None when every one spans at
+    least ``QUARTER_CLUSTER_MIN_QUARTERS`` calendar quarters. An ``entry_start``
+    read from a stored design (``params_json``) is ISO text, not a date; both are
+    accepted here, the one place that reads them.
+    """
+    spans = [("window", window_start)]
+    for raw in entry_starts:
+        if raw is not None:
+            d = raw if isinstance(raw, date) else date.fromisoformat(str(raw))
+            spans.append((f"entry_start {d}", max(d, window_start)))
+    for label, start in spans:
+        n = entry_quarters_spanned(start, window_end)
+        if n < QUARTER_CLUSTER_MIN_QUARTERS:
+            return (
+                f"se_method = 'quarter_cluster_t' needs at least {QUARTER_CLUSTER_MIN_QUARTERS} "
+                f"entry quarters; the {label} to {window_end} spans {n}"
+            )
+    return None
+
+
+def _betainc(a: float, b: float, x: float) -> float:
+    """Regularised incomplete beta ``I_x(a, b)`` by the continued fraction (Lentz)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    front = math.exp(
+        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log1p(-x)
+    )
+    if x > (a + 1.0) / (a + b + 2.0):
+        return 1.0 - _betainc(b, a, 1.0 - x)
+    tiny = 1e-300
+    c, d = 1.0, 1.0 - (a + b) * x / (a + 1.0)
+    d = 1.0 / (d if abs(d) > tiny else tiny)
+    h = d
+    for m in range(1, 500):
+        for numerator in (
+            m * (b - m) * x / ((a + 2 * m - 1) * (a + 2 * m)),
+            -(a + m) * (a + b + m) * x / ((a + 2 * m) * (a + 2 * m + 1)),
+        ):
+            d = 1.0 + numerator * d
+            d = 1.0 / (d if abs(d) > tiny else tiny)
+            c = 1.0 + numerator / (c if abs(c) > tiny else tiny)
+            h *= d * c
+        if abs(d * c - 1.0) < 1e-14:
+            break
+    return front * h / a
+
+
+def student_t_cdf(t: float, df: int) -> float:
+    """Student t distribution function with ``df`` degrees of freedom."""
+    if df < 1:
+        raise ValueError("df must be at least 1")
+    if math.isnan(t):
+        return math.nan
+    if math.isinf(t):
+        return 1.0 if t > 0 else 0.0
+    tail = 0.5 * _betainc(df / 2.0, 0.5, df / (df + t * t))
+    return 1.0 - tail if t > 0 else tail
+
+
+def student_t_quantile(p: float, df: int) -> float:
+    """Inverse of `student_t_cdf` by bisection, for ``0 < p < 1``."""
+    if not 0.0 < p < 1.0:
+        raise ValueError("p must be in (0, 1)")
+    low, high = -1e3, 1e3
+    for _ in range(200):
+        mid = (low + high) / 2.0
+        if student_t_cdf(mid, df) < p:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2.0
+
+
+def quarter_cluster_stats(
+    values: Sequence[float], quarters: Sequence[int], *, min_quarters: int
+) -> dict[str, float]:
+    """Pooled mean with a calendar-quarter cluster SE, CR1 factor and t(G - 1) reference.
+
+    ``quarters`` is the calendar quarter of each event's entry date
+    (`entry_quarter`). The SE is the one-way cluster SE of the pooled mean times
+    ``sqrt(G / (G - 1))``; ``t`` is the raw ratio; ``z_eq = Phi^-1(F_{t,G-1}(t))``
+    is that t mapped to the normal scale, so a kill-line floor written as a
+    normal-scale t (1.0, 1.645) keeps its meaning (the same one-sided tail).
+    Raises `TooFewClustersError` when 0 < G < ``min_quarters``; `se_result_interval`
+    maps that to an undefined (killing) t at run time.
+    """
+    if len(values) != len(quarters):
+        raise ValueError("values and quarters must have equal length")
+    n = len(values)
+    groups = len(set(quarters))
+    if n == 0:  # nothing to judge: undefined, which a kill line counts as a kill (as today)
+        return {
+            "n": 0,
+            "mean": math.nan,
+            "se": math.nan,
+            "t": math.nan,
+            "z_eq": math.nan,
+            "clusters": 0,
+        }
+    if groups < min_quarters or groups < 2:
+        raise TooFewClustersError(
+            f"quarter_cluster_t needs at least {max(min_quarters, 2)} entry quarters, got {groups}"
+        )
+    nan = math.nan
+    if any(not math.isfinite(v) for v in values):
+        return {"n": n, "mean": nan, "se": nan, "t": nan, "z_eq": nan, "clusters": groups}
+    mean = sum(values) / n
+    sums: dict[int, float] = defaultdict(float)
+    for value, quarter in zip(values, quarters, strict=True):
+        sums[quarter] += value - mean
+    variance = sum(total * total for total in sums.values())
+    se = math.sqrt(variance * groups / (groups - 1)) / n
+    if not se > 0:
+        return {"n": n, "mean": mean, "se": nan, "t": nan, "z_eq": nan, "clusters": groups}
+    t = mean / se
+    tail = student_t_cdf(-abs(t), groups - 1)
+    # Finite even when the tail underflows, so an overwhelming pass is not a "NaN or inf" kill.
+    z_eq = math.copysign(-NormalDist().inv_cdf(tail) if tail > 0.0 else _Z_EQ_CAP, t)
+    return {"n": n, "mean": mean, "se": se, "t": t, "z_eq": z_eq, "clusters": groups}
+
+
+def se_result_interval(
+    values: Sequence[float],
+    entry_indices: Sequence[int],
+    quarters: Sequence[int] | None,
+    *,
+    method: str,
+    max_lag_sessions: int,
+    z: float,
+) -> dict[str, float]:
+    """The verdict fields under ``method``; ``hansen_hodrick`` is `overlap_result_interval` exactly.
+
+    Under ``quarter_cluster_t`` the interval uses the t(G - 1) quantile at the
+    normal tail ``Phi(z)``, ``t`` is the kill-line statistic on the normal scale
+    (``z_eq``), and ``t_raw``, ``z_eq``, ``quarters`` and ``df`` are added.
+    ``quarters`` is required for that method only.
+    """
+    if method not in SE_METHODS:
+        raise ValueError(f"unknown se_method {method!r}")
+    if method == "hansen_hodrick":
+        return overlap_result_interval(
+            values, entry_indices, max_lag_sessions=max_lag_sessions, z=z
+        )
+    if quarters is None:
+        raise ValueError("quarter_cluster_t needs the entry quarter of each event")
+    if not math.isfinite(z) or z <= 0:
+        raise ValueError("z must be finite and positive")
+    try:
+        stats = quarter_cluster_stats(values, quarters, min_quarters=QUARTER_CLUSTER_MIN_QUARTERS)
+    except TooFewClustersError:
+        # Events fell in fewer quarters than the method can judge: undefined, which a
+        # kill line counts as a kill exactly as it counts a NaN t (no exception, no failed run).
+        nan = math.nan
+        found = len(set(quarters))
+        mean = sum(values) / len(values)
+        return {
+            "effect": mean,
+            "se": nan,
+            "t": nan,
+            "t_raw": nan,
+            "z_eq": nan,
+            "ci_low": nan,
+            "ci_high": nan,
+            "mde_80": nan,
+            "n": len(values),
+            "clusters": found,
+            "quarters": found,
+            "df": max(found - 1, 0),
+        }
+    df = max(int(stats["clusters"]) - 1, 1)
+    mean, se = stats["mean"], stats["se"]
+    crit = student_t_quantile(NormalDist().cdf(z), df) if se == se else math.nan
+    power = student_t_quantile(0.8, df) if se == se else math.nan
+    return {
+        "effect": mean,
+        "se": se,
+        "t": stats["z_eq"],
+        "t_raw": stats["t"],
+        "z_eq": stats["z_eq"],
+        "ci_low": mean - crit * se,
+        "ci_high": mean + crit * se,
+        "mde_80": (crit + power) * se,
+        "n": stats["n"],
+        "clusters": stats["clusters"],
+        "quarters": stats["clusters"],
+        "df": df,
+    }
