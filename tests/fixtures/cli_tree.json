@@ -4,9 +4,7 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
           "default": "all",
-          "envvar": null,
           "is_flag": false,
           "name": "source",
           "nargs": 1,
@@ -18,9 +16,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "backfill_",
           "nargs": 1,
@@ -32,9 +28,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "since",
           "nargs": 1,
@@ -46,9 +39,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "actions_backfill",
           "nargs": 1,
@@ -60,9 +51,7 @@
           "type": "boolean"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "name_changes_only",
           "nargs": 1,
@@ -74,9 +63,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "through",
           "nargs": 1,
@@ -88,9 +74,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "dry_run",
           "nargs": 1,
@@ -104,9 +88,7 @@
           "type": "boolean"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "fill_holes_",
           "nargs": 1,
@@ -118,9 +100,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "security",
           "nargs": 1,
@@ -132,9 +111,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "bulk_from_cache",
           "nargs": 1,
@@ -146,9 +123,7 @@
           "type": "boolean"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "rebuild_statement_facts",
           "nargs": 1,
@@ -160,9 +135,7 @@
           "type": "boolean"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "rebuild_filing_events",
           "nargs": 1,
@@ -174,9 +147,7 @@
           "type": "boolean"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "rebuild_classifications",
           "nargs": 1,
@@ -188,9 +159,7 @@
           "type": "boolean"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "rebuild_index",
           "nargs": 1,
@@ -202,9 +171,7 @@
           "type": "boolean"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "statement_backfill",
           "nargs": 1,
@@ -216,9 +183,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "restamp_from",
           "nargs": 1,
@@ -230,9 +194,6 @@
           "type": "path"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "restamp_window_earlier_ok",
           "nargs": 1,
@@ -244,9 +205,6 @@
           "type": "path"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "import_dir",
           "nargs": 1,
@@ -258,9 +216,7 @@
           "type": "path"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "census_sec_forms",
           "nargs": 1,
@@ -272,9 +228,7 @@
           "type": "boolean"
         },
         {
-          "choices": [],
           "default": 20000,
-          "envvar": null,
           "is_flag": false,
           "name": "census_xml_bytes",
           "nargs": 1,
@@ -286,9 +240,7 @@
           "type": "int"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "sec_forms_only",
           "nargs": 1,
@@ -306,9 +258,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "name": "symbol",
           "nargs": 1,
           "opts": [
@@ -319,9 +268,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "since",
           "nargs": 1,
@@ -333,9 +279,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "cik",
           "nargs": 1,
@@ -347,9 +290,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "name",
           "nargs": 1,
@@ -361,9 +301,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "exchange",
           "nargs": 1,
@@ -381,9 +318,7 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "dry_run",
           "nargs": 1,
@@ -397,9 +332,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "expect_bar_rows",
           "nargs": 1,
@@ -411,9 +343,6 @@
           "type": "int"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "expect_action_rows",
           "nargs": 1,
@@ -425,9 +354,6 @@
           "type": "int"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "release",
           "nargs": 1,
@@ -439,9 +365,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "allow_orphans",
           "nargs": 1,
@@ -459,9 +382,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "security",
           "nargs": 1,
@@ -473,9 +393,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "from_",
           "nargs": 1,
@@ -487,9 +404,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "to",
           "nargs": 1,
@@ -501,9 +415,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "release",
           "nargs": 1,
@@ -515,9 +426,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "dry_run",
           "nargs": 1,
@@ -531,9 +440,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "expect_bar_rows",
           "nargs": 1,
@@ -545,9 +451,6 @@
           "type": "int"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "expect_action_rows",
           "nargs": 1,
@@ -565,9 +468,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "output",
           "nargs": 1,
@@ -579,9 +479,6 @@
           "type": "path"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "max_requests",
           "nargs": 1,
@@ -593,9 +490,6 @@
           "type": "int"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "from_quarter",
           "nargs": 1,
@@ -607,9 +501,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "to_quarter",
           "nargs": 1,
@@ -621,9 +512,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "resume_file",
           "nargs": 1,
@@ -635,9 +523,7 @@
           "type": "path"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "count_only",
           "nargs": 1,
@@ -657,9 +543,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "manifest",
           "nargs": 1,
@@ -671,9 +554,6 @@
           "type": "path"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "release",
           "nargs": 1,
@@ -685,9 +565,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "expect_rows",
           "nargs": 1,
@@ -699,9 +576,7 @@
           "type": "int"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "dry_run",
           "nargs": 1,
@@ -721,9 +596,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "manifest",
           "nargs": 1,
@@ -735,9 +607,6 @@
           "type": "path"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "release",
           "nargs": 1,
@@ -749,9 +618,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "expect_rows",
           "nargs": 1,
@@ -763,9 +629,7 @@
           "type": "int"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "dry_run",
           "nargs": 1,
@@ -785,9 +649,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "zip_dir",
           "nargs": 1,
@@ -799,9 +660,6 @@
           "type": "path"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "output",
           "nargs": 1,
@@ -819,9 +677,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "manifest",
           "nargs": 1,
@@ -833,9 +688,6 @@
           "type": "path"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "release",
           "nargs": 1,
@@ -847,9 +699,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "expect_rows",
           "nargs": 1,
@@ -861,9 +710,7 @@
           "type": "int"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "dry_run",
           "nargs": 1,
@@ -883,9 +730,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "output",
           "nargs": 1,
@@ -897,9 +741,6 @@
           "type": "path"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "zip_dir",
           "nargs": 1,
@@ -917,9 +758,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "release",
           "nargs": 1,
@@ -931,9 +769,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "to",
           "nargs": 1,
@@ -945,9 +780,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "dry_run",
           "nargs": 1,
@@ -961,9 +794,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "expect_action_rows",
           "nargs": 1,
@@ -981,9 +811,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "since",
           "nargs": 1,
@@ -995,9 +822,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "through",
           "nargs": 1,
@@ -1009,9 +833,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "release",
           "nargs": 1,
@@ -1023,9 +844,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "security",
           "nargs": 1,
@@ -1037,9 +855,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "dry_run",
           "nargs": 1,
@@ -1053,9 +869,7 @@
           "type": "boolean"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "span",
           "nargs": 1,
@@ -1069,9 +883,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "allow_collision",
           "nargs": 1,
@@ -1083,9 +894,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "skip_collisions",
           "nargs": 1,
@@ -1105,9 +914,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "release",
           "nargs": 1,
@@ -1119,9 +925,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "dry_run",
           "nargs": 1,
@@ -1135,9 +939,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "expect_action_rows",
           "nargs": 1,
@@ -1155,9 +956,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "since",
           "nargs": 1,
@@ -1169,9 +967,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "release",
           "nargs": 1,
@@ -1183,9 +978,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "through",
           "nargs": 1,
@@ -1197,9 +989,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "dry_run",
           "nargs": 1,
@@ -1219,9 +1009,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "release",
           "nargs": 1,
@@ -1233,9 +1020,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "dry_run",
           "nargs": 1,
@@ -1249,9 +1034,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "expect_rows",
           "nargs": 1,
@@ -1269,9 +1051,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "release",
           "nargs": 1,
@@ -1283,9 +1062,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "from_release",
           "nargs": 1,
@@ -1297,9 +1073,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "table",
           "nargs": 1,
@@ -1311,9 +1084,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "key",
           "nargs": 1,
@@ -1325,9 +1095,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "dry_run",
           "nargs": 1,
@@ -1341,9 +1109,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "expect_rows",
           "nargs": 1,
@@ -1361,9 +1126,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "parent",
           "nargs": 1,
@@ -1375,9 +1137,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "child",
           "nargs": 1,
@@ -1389,9 +1148,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "ex_date",
           "nargs": 1,
@@ -1403,9 +1159,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "fraction",
           "nargs": 1,
@@ -1423,9 +1176,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "security",
           "nargs": 1,
@@ -1437,9 +1187,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "action_id",
           "nargs": 1,
@@ -1451,9 +1198,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "reason",
           "nargs": 1,
@@ -1465,9 +1209,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "reinstate",
           "nargs": 1,
@@ -1481,9 +1223,7 @@
           "type": "boolean"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "dry_run",
           "nargs": 1,
@@ -1497,9 +1237,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "expect_known_at",
           "nargs": 1,
@@ -1517,9 +1254,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "manifest",
           "nargs": 1,
@@ -1531,9 +1265,6 @@
           "type": "path"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "release",
           "nargs": 1,
@@ -1545,9 +1276,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "dry_run",
           "nargs": 1,
@@ -1567,9 +1296,7 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "apply",
           "nargs": 1,
@@ -1581,9 +1308,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "expect_rows",
           "nargs": 1,
@@ -1595,9 +1319,6 @@
           "type": "int"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "expect_digest",
           "nargs": 1,
@@ -1609,9 +1330,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "allow_traded",
           "nargs": 1,
@@ -1623,9 +1342,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "release",
           "nargs": 1,
@@ -1643,9 +1359,7 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "check",
           "nargs": 1,
@@ -1659,9 +1373,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "jumps_before",
           "nargs": 1,
@@ -1673,9 +1384,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": true,
           "name": "coverage",
           "nargs": 1,
@@ -1705,9 +1413,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "name": "out_dir",
           "nargs": 1,
           "opts": [
@@ -1724,9 +1429,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "name": "hypothesis",
           "nargs": 1,
           "opts": [
@@ -1737,9 +1439,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "start",
           "nargs": 1,
@@ -1751,9 +1450,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "end",
           "nargs": 1,
@@ -1765,9 +1461,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "spend_holdout",
           "nargs": 1,
@@ -1781,9 +1475,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "holdout_reason",
           "nargs": 1,
@@ -1795,9 +1486,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "holdout_repeat",
           "nargs": 1,
@@ -1811,9 +1500,7 @@
           "type": "boolean"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "override_gap",
           "nargs": 1,
@@ -1827,9 +1514,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "gap_reason",
           "nargs": 1,
@@ -1841,9 +1525,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "note",
           "nargs": 1,
@@ -1855,9 +1536,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "measured_cost_bps",
           "nargs": 1,
@@ -1875,9 +1553,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "hypothesis",
           "nargs": 1,
@@ -1889,9 +1564,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "include_synthetic",
           "nargs": 1,
@@ -1911,9 +1584,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "name": "trial_id",
           "nargs": 1,
           "opts": [
@@ -1924,9 +1594,7 @@
           "type": "int"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "holdout_repeat",
           "nargs": 1,
@@ -1946,9 +1614,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "registration",
           "nargs": 1,
@@ -1960,9 +1625,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "family",
           "nargs": 1,
@@ -1974,9 +1636,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "kind",
           "nargs": 1,
@@ -1988,9 +1647,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "include_synthetic",
           "nargs": 1,
@@ -2010,9 +1667,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "family",
           "nargs": 1,
@@ -2024,9 +1678,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "candidate",
           "nargs": 1,
@@ -2038,9 +1689,7 @@
           "type": "str"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "include_synthetic",
           "nargs": 1,
@@ -2054,9 +1703,7 @@
           "type": "boolean"
         },
         {
-          "choices": [],
           "default": false,
-          "envvar": null,
           "is_flag": true,
           "name": "candidates",
           "nargs": 1,
@@ -2070,9 +1717,6 @@
           "type": "boolean"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "since",
           "nargs": 1,
@@ -2090,9 +1734,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "start",
           "nargs": 1,
@@ -2104,9 +1745,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "end",
           "nargs": 1,
@@ -2118,9 +1756,6 @@
           "type": "str"
         },
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "out",
           "nargs": 1,
@@ -2138,9 +1773,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "history",
           "nargs": 1,
@@ -2158,9 +1790,6 @@
       "commands": [],
       "params": [
         {
-          "choices": [],
-          "default": null,
-          "envvar": null,
           "is_flag": false,
           "name": "reference",
           "nargs": 1,
@@ -2172,9 +1801,7 @@
           "type": "path"
         },
         {
-          "choices": [],
           "default": "SPY",
-          "envvar": null,
           "is_flag": false,
           "name": "symbol",
           "nargs": 1,
@@ -2194,9 +1821,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "name": "file",
               "nargs": 1,
               "opts": [
@@ -2207,9 +1831,6 @@
               "type": "path"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "operations_book_of",
               "nargs": 1,
@@ -2221,9 +1842,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reason",
               "nargs": 1,
@@ -2247,9 +1865,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "trial",
               "nargs": 1,
@@ -2261,9 +1876,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reason",
               "nargs": 1,
@@ -2281,9 +1893,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "date_",
               "nargs": 1,
@@ -2295,9 +1904,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reason",
               "nargs": 1,
@@ -2315,9 +1921,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "sessions",
               "nargs": 1,
@@ -2329,9 +1932,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "order_sessions",
               "nargs": 1,
@@ -2343,9 +1943,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reason",
               "nargs": 1,
@@ -2363,9 +1960,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "alert",
               "nargs": 1,
@@ -2377,9 +1971,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reason",
               "nargs": 1,
@@ -2399,9 +1990,6 @@
               "commands": [],
               "params": [
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "name",
                   "nargs": 1,
@@ -2413,9 +2001,6 @@
                   "type": "str"
                 },
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "backup",
                   "nargs": 1,
@@ -2427,9 +2012,6 @@
                   "type": "path"
                 },
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "reason",
                   "nargs": 1,
@@ -2447,9 +2029,6 @@
               "commands": [],
               "params": [
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "name",
                   "nargs": 1,
@@ -2461,9 +2040,6 @@
                   "type": "str"
                 },
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "from_",
                   "nargs": 1,
@@ -2475,9 +2051,6 @@
                   "type": "str"
                 },
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "to",
                   "nargs": 1,
@@ -2489,9 +2062,6 @@
                   "type": "str"
                 },
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "reason",
                   "nargs": 1,
@@ -2509,9 +2079,6 @@
               "commands": [],
               "params": [
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "name",
                   "nargs": 1,
@@ -2523,9 +2090,7 @@
                   "type": "str"
                 },
                 {
-                  "choices": [],
                   "default": false,
-                  "envvar": null,
                   "is_flag": true,
                   "name": "record",
                   "nargs": 1,
@@ -2543,9 +2108,6 @@
               "commands": [],
               "params": [
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "name",
                   "nargs": 1,
@@ -2557,9 +2119,6 @@
                   "type": "str"
                 },
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "count",
                   "nargs": 1,
@@ -2571,9 +2130,6 @@
                   "type": "int"
                 },
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "security_id",
                   "nargs": 1,
@@ -2591,9 +2147,6 @@
               "commands": [],
               "params": [
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "name",
                   "nargs": 1,
@@ -2605,9 +2158,6 @@
                   "type": "str"
                 },
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "backup",
                   "nargs": 1,
@@ -2619,9 +2169,6 @@
                   "type": "path"
                 },
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "trial",
                   "nargs": 1,
@@ -2633,9 +2180,6 @@
                   "type": "int"
                 },
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "reason",
                   "nargs": 1,
@@ -2653,9 +2197,6 @@
               "commands": [],
               "params": [
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "name": "path",
                   "nargs": 1,
                   "opts": [
@@ -2682,9 +2223,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "name": "file",
               "nargs": 1,
               "opts": [
@@ -2701,9 +2239,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "name": "slug",
               "nargs": 1,
               "opts": [
@@ -2714,9 +2249,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "time_budget_minutes",
               "nargs": 1,
@@ -2728,9 +2260,7 @@
               "type": "float"
             },
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "rerun",
               "nargs": 1,
@@ -2744,9 +2274,6 @@
               "type": "boolean"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "note",
               "nargs": 1,
@@ -2764,9 +2291,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "name": "slug",
               "nargs": 1,
               "opts": [
@@ -2783,9 +2307,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "name": "slug",
               "nargs": 1,
               "opts": [
@@ -2802,9 +2323,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "name": "slug",
               "nargs": 1,
               "opts": [
@@ -2815,9 +2333,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "file",
               "nargs": 1,
@@ -2829,9 +2344,6 @@
               "type": "path"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reason",
               "nargs": 1,
@@ -2849,9 +2361,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "name": "slug",
               "nargs": 1,
               "opts": [
@@ -2862,9 +2371,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reason",
               "nargs": 1,
@@ -2899,9 +2405,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "name": "file",
               "nargs": 1,
               "opts": [
@@ -2918,9 +2421,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "name": "slug",
               "nargs": 1,
               "opts": [
@@ -2931,9 +2431,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "dataset",
               "nargs": 1,
@@ -2945,9 +2442,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "split",
               "nargs": 1,
@@ -2959,9 +2453,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "config",
               "nargs": 1,
@@ -2973,9 +2464,6 @@
               "type": "path"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "configurations",
               "nargs": 1,
@@ -2987,9 +2475,7 @@
               "type": "int"
             },
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "spend_holdout",
               "nargs": 1,
@@ -3003,9 +2489,6 @@
               "type": "boolean"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "holdout_reason",
               "nargs": 1,
@@ -3017,9 +2500,7 @@
               "type": "str"
             },
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "holdout_repeat",
               "nargs": 1,
@@ -3033,9 +2514,6 @@
               "type": "boolean"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "note",
               "nargs": 1,
@@ -3053,9 +2531,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "run",
               "nargs": 1,
@@ -3067,9 +2542,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reason",
               "nargs": 1,
@@ -3087,9 +2559,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "run",
               "nargs": 1,
@@ -3113,9 +2582,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "candidate",
               "nargs": 1,
@@ -3127,9 +2593,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "source",
               "nargs": 1,
@@ -3141,9 +2604,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "kill_line_url",
               "nargs": 1,
@@ -3155,9 +2615,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "kill_line_file",
               "nargs": 1,
@@ -3169,9 +2626,6 @@
               "type": "path"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "kill_line_posted_at",
               "nargs": 1,
@@ -3183,9 +2637,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "read_at",
               "nargs": 1,
@@ -3197,9 +2648,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "window_start",
               "nargs": 1,
@@ -3211,9 +2659,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "window_end",
               "nargs": 1,
@@ -3225,9 +2670,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "configurations",
               "nargs": 1,
@@ -3239,9 +2681,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "verdict",
               "nargs": 1,
@@ -3253,9 +2692,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "desk_read",
               "nargs": 1,
@@ -3267,9 +2703,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "family",
               "nargs": 1,
@@ -3281,9 +2714,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "probe",
               "nargs": 1,
@@ -3295,9 +2725,6 @@
               "type": "path"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "probe_sha256",
               "nargs": 1,
@@ -3309,9 +2736,7 @@
               "type": "str"
             },
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "probe_unavailable",
               "nargs": 1,
@@ -3325,9 +2750,6 @@
               "type": "boolean"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reason",
               "nargs": 1,
@@ -3339,9 +2761,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "input_files",
               "nargs": 1,
@@ -3353,9 +2772,6 @@
               "type": "path"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "pin",
               "nargs": 1,
@@ -3367,9 +2783,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "audit_url",
               "nargs": 1,
@@ -3381,9 +2794,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "holdout_reason",
               "nargs": 1,
@@ -3395,9 +2805,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "note",
               "nargs": 1,
@@ -3426,9 +2833,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "assets",
               "nargs": 1,
@@ -3452,9 +2856,7 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "apply_",
               "nargs": 1,
@@ -3472,9 +2874,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "path",
               "nargs": 1,
@@ -3486,9 +2885,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "run",
               "nargs": 1,
@@ -3506,9 +2902,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "mode",
               "nargs": 1,
@@ -3520,9 +2913,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "accession",
               "nargs": 1,
@@ -3534,9 +2924,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "file_date",
               "nargs": 1,
@@ -3548,9 +2935,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "release",
               "nargs": 1,
@@ -3562,9 +2946,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "expect",
               "nargs": 1,
@@ -3576,9 +2957,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "expect_digest",
               "nargs": 1,
@@ -3602,9 +2980,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "name",
               "nargs": 1,
@@ -3616,9 +2991,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "version",
               "nargs": 1,
@@ -3630,9 +3002,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "path",
               "nargs": 1,
@@ -3644,9 +3013,6 @@
               "type": "path"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "event_start",
               "nargs": 1,
@@ -3658,9 +3024,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "event_end",
               "nargs": 1,
@@ -3672,9 +3035,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "event_column",
               "nargs": 1,
@@ -3686,9 +3046,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "split_json",
               "nargs": 1,
@@ -3700,9 +3057,6 @@
               "type": "path"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "sealed",
               "nargs": 1,
@@ -3714,9 +3068,7 @@
               "type": "str"
             },
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "locked",
               "nargs": 1,
@@ -3730,9 +3082,6 @@
               "type": "boolean"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "seed",
               "nargs": 1,
@@ -3744,9 +3093,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "note",
               "nargs": 1,
@@ -3772,9 +3118,7 @@
               "commands": [],
               "params": [
                 {
-                  "choices": [],
                   "default": "2016-01-01",
-                  "envvar": null,
                   "is_flag": false,
                   "name": "since",
                   "nargs": 1,
@@ -3786,9 +3130,6 @@
                   "type": "str"
                 },
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "until",
                   "nargs": 1,
@@ -3800,9 +3141,6 @@
                   "type": "str"
                 },
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "cik",
                   "nargs": 1,
@@ -3814,9 +3152,6 @@
                   "type": "str"
                 },
                 {
-                  "choices": [],
-                  "default": null,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "limit",
                   "nargs": 1,
@@ -3828,9 +3163,7 @@
                   "type": "int"
                 },
                 {
-                  "choices": [],
                   "default": 40000,
-                  "envvar": null,
                   "is_flag": false,
                   "name": "max_requests",
                   "nargs": 1,
@@ -3858,9 +3191,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "frame",
               "nargs": 1,
@@ -3872,9 +3202,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "seed",
               "nargs": 1,
@@ -3886,9 +3213,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "n",
               "nargs": 1,
@@ -3900,9 +3224,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "exclude",
               "nargs": 1,
@@ -3914,9 +3235,6 @@
               "type": "path"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "seeds",
               "nargs": 1,
@@ -3928,9 +3246,7 @@
               "type": "path"
             },
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "lock",
               "nargs": 1,
@@ -3942,9 +3258,6 @@
               "type": "boolean"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "extend",
               "nargs": 1,
@@ -3962,9 +3275,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "run",
               "nargs": 1,
@@ -3976,9 +3286,7 @@
               "type": "int"
             },
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "finish",
               "nargs": 1,
@@ -3996,9 +3304,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "name": "slug",
               "nargs": 1,
               "opts": [
@@ -4009,9 +3314,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "dataset",
               "nargs": 1,
@@ -4023,9 +3325,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "split",
               "nargs": 1,
@@ -4037,9 +3336,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "model",
               "nargs": 1,
@@ -4051,9 +3347,7 @@
               "type": "str"
             },
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "dry_run",
               "nargs": 1,
@@ -4065,9 +3359,7 @@
               "type": "boolean"
             },
             {
-              "choices": [],
               "default": 1,
-              "envvar": null,
               "is_flag": false,
               "name": "configurations",
               "nargs": 1,
@@ -4079,9 +3371,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "accepted_from",
               "nargs": 1,
@@ -4093,9 +3382,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "accepted_to",
               "nargs": 1,
@@ -4107,9 +3393,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "limit",
               "nargs": 1,
@@ -4121,9 +3404,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "drift_gold",
               "nargs": 1,
@@ -4135,9 +3415,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "drift_baseline_run",
               "nargs": 1,
@@ -4149,9 +3426,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reversed_order_baseline_run",
               "nargs": 1,
@@ -4163,9 +3437,7 @@
               "type": "int"
             },
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "spend_holdout",
               "nargs": 1,
@@ -4179,9 +3451,6 @@
               "type": "boolean"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "holdout_reason",
               "nargs": 1,
@@ -4203,9 +3472,6 @@
                   "commands": [],
                   "params": [
                     {
-                      "choices": [],
-                      "default": null,
-                      "envvar": null,
                       "is_flag": false,
                       "name": "corpus",
                       "nargs": 1,
@@ -4217,9 +3483,6 @@
                       "type": "path"
                     },
                     {
-                      "choices": [],
-                      "default": null,
-                      "envvar": null,
                       "is_flag": false,
                       "name": "as_of",
                       "nargs": 1,
@@ -4231,9 +3494,7 @@
                       "type": "str"
                     },
                     {
-                      "choices": [],
                       "default": false,
-                      "envvar": null,
                       "is_flag": true,
                       "name": "register_",
                       "nargs": 1,
@@ -4265,9 +3526,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "hypothesis",
               "nargs": 1,
@@ -4279,9 +3537,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "book",
               "nargs": 1,
@@ -4293,9 +3548,7 @@
               "type": "str"
             },
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "now",
               "nargs": 1,
@@ -4313,9 +3566,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reason",
               "nargs": 1,
@@ -4327,9 +3577,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "book",
               "nargs": 1,
@@ -4347,9 +3594,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "book",
               "nargs": 1,
@@ -4367,9 +3611,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "book",
               "nargs": 1,
@@ -4387,9 +3628,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reason",
               "nargs": 1,
@@ -4401,9 +3639,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "book",
               "nargs": 1,
@@ -4415,9 +3650,7 @@
               "type": "str"
             },
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "every_book",
               "nargs": 1,
@@ -4435,9 +3668,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reason",
               "nargs": 1,
@@ -4449,9 +3679,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "book",
               "nargs": 1,
@@ -4463,9 +3690,7 @@
               "type": "str"
             },
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "accept_broker_fills",
               "nargs": 1,
@@ -4477,9 +3702,7 @@
               "type": "boolean"
             },
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "accept_rejections_flag",
               "nargs": 1,
@@ -4491,9 +3714,7 @@
               "type": "boolean"
             },
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "accept_fill_band_flag",
               "nargs": 1,
@@ -4505,9 +3726,7 @@
               "type": "boolean"
             },
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "accept_fill_mismatch_flag",
               "nargs": 1,
@@ -4525,9 +3744,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "book",
               "nargs": 1,
@@ -4545,9 +3761,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "book",
               "nargs": 1,
@@ -4559,9 +3772,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "window_id",
               "nargs": 1,
@@ -4573,9 +3783,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "through",
               "nargs": 1,
@@ -4593,9 +3800,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "book",
               "nargs": 1,
@@ -4607,9 +3811,7 @@
               "type": "str"
             },
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "verbose",
               "nargs": 1,
@@ -4627,9 +3829,7 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "verbose",
               "nargs": 1,
@@ -4647,9 +3847,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "book",
               "nargs": 1,
@@ -4661,9 +3858,7 @@
               "type": "str"
             },
             {
-              "choices": [],
               "default": false,
-              "envvar": null,
               "is_flag": true,
               "name": "every_book",
               "nargs": 1,
@@ -4681,9 +3876,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reason",
               "nargs": 1,
@@ -4695,9 +3887,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "book",
               "nargs": 1,
@@ -4715,9 +3904,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "kind",
               "nargs": 1,
@@ -4729,9 +3915,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reason",
               "nargs": 1,
@@ -4743,9 +3926,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "session",
               "nargs": 1,
@@ -4757,9 +3937,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "name",
               "nargs": 1,
@@ -4771,9 +3948,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "book",
               "nargs": 1,
@@ -4791,9 +3965,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "order",
               "nargs": 1,
@@ -4805,9 +3976,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reason",
               "nargs": 1,
@@ -4819,9 +3987,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "book",
               "nargs": 1,
@@ -4839,9 +4004,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reason",
               "nargs": 1,
@@ -4853,9 +4015,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "break_id",
               "nargs": 1,
@@ -4867,9 +4026,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "book",
               "nargs": 1,
@@ -4881,9 +4037,6 @@
               "type": "str"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "reverse",
               "nargs": 1,
@@ -4901,9 +4054,6 @@
           "commands": [],
           "params": [
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "export",
               "nargs": 1,
@@ -4915,9 +4065,6 @@
               "type": "file"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "tax_year",
               "nargs": 1,
@@ -4929,9 +4076,6 @@
               "type": "int"
             },
             {
-              "choices": [],
-              "default": null,
-              "envvar": null,
               "is_flag": false,
               "name": "book",
               "nargs": 1,

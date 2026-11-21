@@ -64,15 +64,20 @@ def _parameter(param: Any) -> dict[str, Any]:
     # The value a command gets when the caller says nothing, and where else it can
     # come from: a changed default, a new env var or a changed choice list moves the
     # golden (safety review of #3648). A default built at call time is recorded as such.
+    # Each is recorded only when it says something (no default, no env var and no
+    # choice list is the common case), which keeps the golden a third of the size.
     default = param.default
     if callable(default):
         record["default"] = "<built at call time>"
-    elif default is None or isinstance(default, (bool, int, float, str)):
+    elif isinstance(default, (bool, int, float, str)):
         record["default"] = default
-    else:
+    elif default is not None:
         record["default"] = repr(default)
-    record["envvar"] = param.envvar
-    record["choices"] = list(getattr(param.type, "choices", None) or [])
+    if param.envvar is not None:
+        record["envvar"] = param.envvar
+    choices = list(getattr(param.type, "choices", None) or [])
+    if choices:
+        record["choices"] = choices
     return record
 
 
