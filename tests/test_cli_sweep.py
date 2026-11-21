@@ -696,6 +696,14 @@ def _commands(group: Any) -> Iterator[Any]:
             yield from _commands(command)
 
 
+def _command_paths(group: Any, path: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], Any]]:
+    """Every command under a Typer group with its full path, nested groups included."""
+    for name, command in group.commands.items():
+        yield (*path, name), command
+        if hasattr(command, "commands"):
+            yield from _command_paths(command, (*path, name))
+
+
 def test_no_lab_command_takes_a_store_path_window_holdout_gap_or_synthetic_option() -> None:
     root: Any = typer.main.get_command(cli.make_app())
     run = root.commands["sweep"].commands["run"]
@@ -723,7 +731,7 @@ def test_no_lab_command_takes_a_store_path_window_holdout_gap_or_synthetic_optio
                         assert not FORBIDDEN_OPTION.search(opt), (command.name, opt)
     # and no option anywhere in the app names a store path, but `feasibility --store`
     # (T455, #3744): the path of a COPY, refused when it is the configured store
-    for command in _commands(root):
-        allowed = {"--store"} if command.name == "feasibility" else set()
+    for path, command in _command_paths(root):
+        allowed = {"--store"} if path == ("feasibility",) else set()
         for param in command.params:
             assert {o for o in param.opts if re.search(r"store", o)} <= allowed, param.opts

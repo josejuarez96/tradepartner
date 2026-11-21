@@ -318,14 +318,18 @@ Feasibility counts (research-registry spec, amendment 2026-11-21, #3702; plan T4
   block (`research.feasibility`) for a design, read from a COPY of the store. It is the
   one command that takes a store path, and it decides which file gets opened, in this
   order: (1) `--store` and `--design` are required, no default; (2) the `--store` path
-  is refused, on paths and before any connection, when it does not exist, is not a
-  file, or is `settings.store.path` by file identity (`Path.samefile`: a hard
-  link, a symlink, a relative or `..` path); (3) the design is parsed, a refusal
+  is resolved once (`resolve(strict=True)`) and refused, on paths and before any
+  connection, when it does not exist, is not a file, or is the configured store
+  (`settings.store.path`) or the owner's live store as `book_actions.live_store_path`
+  reads it, ignoring `STORE__PATH` and `TRADEPARTNER_ENV_FILE`, by file identity
+  (`Path.samefile`: a hard link, a symlink, a relative or `..` path); (3) the design is
+  parsed, a refusal
   before any read; (4) only then is the copy opened read-only (`open_read_only`);
   (5) the counts are read and the block printed. The check cannot tell a copy from
   another live store, so the block's header prints the file's path, size,
   modification time and newest ingest. Every refusal exits 2 and prints one
-  scrubbed line and nothing else; a busy copy exits 1. Nothing is written.
+  scrubbed line and nothing else, a copy open for writing by another process included
+  (it is not a copy). Nothing is written.
 
 Paper trading (Phase 4 spec req 16; plans T67 and T90; ADR 0010 amendment
 2026-10-04):
@@ -1576,25 +1580,49 @@ def _experiments_dir(settings: Settings) -> Path:
     return configured if configured.is_absolute() else PROJECT_ROOT / configured
 
 
-def _check_copy_path(store: Path, settings: Settings) -> None:
-    """Refuse `store` unless it is an existing file that is not `settings.store.path`.
+def _check_copy_path(store: Path, settings: Settings) -> Path:
+    """The resolved path of `store`, or a refusal (`OSError`) unless it is an existing
+    file that is neither the configured store nor the owner's live store.
 
-    The path-level restatement of `registry._is_real_store` (which needs an open
-    connection, so cannot run before one): file identity (`Path.samefile`, so a hard
-    link, a symlink, a symlinked directory, a relative or `..` path all match) when the
-    configured file exists, else the resolved paths. Only `os.stat`-style calls are made:
-    no file is opened. Raises `OSError` (the refusal's words) and never returns a verdict
-    it could not reach: an unreadable path is a refusal.
+    `store` is resolved ONCE (`resolve(strict=True)`); every check runs on that path and
+    the caller opens and prints that same path. The owner's store is matched twice: as
+    `settings.store.path` names it for this call (under the project root too when it is
+    relative), and as the live store the repo defines independently of this call's
+    overrides (`book_actions.live_store_path`: the project-root `.env`, with `STORE__PATH`
+    and `TRADEPARTNER_ENV_FILE` ignored). A match is by file identity (`Path.samefile`, so
+    a hard link, a symlink, a symlinked directory, a relative or `..` path all match) when
+    that file exists, else by resolved path (the registry's real-store rule, on paths).
+    No file is opened. An unreadable live config or an unresolvable path is a refusal.
     """
-    if not store.is_file():
+    from tradepartner.dashboard import book_actions
+
+    try:
+        real = store.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise OSError(f"--store {store}: not an existing file ({exc})") from None
+    if not real.is_file():
         raise OSError(f"--store {store}: not an existing file")
     configured = Path(settings.store.path).expanduser()
-    if configured.exists():
-        same = store.samefile(configured)
-    else:
-        same = store.resolve() == configured.resolve()
-    if same:
-        raise OSError(f"--store {store}: that is the configured store; pass a copy of it")
+    candidates = [configured]
+    if not configured.is_absolute():
+        candidates.append(PROJECT_ROOT / configured)
+    try:
+        candidates.append(book_actions.live_store_path())
+    except (ValueError, OSError, RuntimeError):
+        raise OSError(
+            f"--store {store}: the owner's live store config could not be read, "
+            "so a copy cannot be told from it"
+        ) from None
+    for candidate in candidates:
+        try:
+            same = real.samefile(candidate) if candidate.exists() else real == candidate.resolve()
+        except (OSError, RuntimeError):
+            raise OSError(f"--store {store}: cannot compare it with {candidate}") from None
+        if same:
+            raise OSError(
+                f"--store {store}: that is the owner's store; pass a copy that no process writes"
+            )
+    return real
 
 
 def _refusal(exc: BaseException, settings: Settings) -> typer.Exit:
@@ -7366,19 +7394,26 @@ def make_app(
         )
 
         try:
-            _check_copy_path(store, s)
+            real = _check_copy_path(store, s)
         except OSError as exc:
             raise _refusal(exc, s) from None
         try:
             parsed = parse_design_file(design)
         except FeasibilityDesignError as exc:
             raise _refusal(exc, s) from None
-        copy = s.model_copy(update={"store": s.store.model_copy(update={"path": str(store)})})
+        copy = s.model_copy(update={"store": s.store.model_copy(update={"path": str(real)})})
         try:
             with open_read_only(copy) as conn:
                 counts = feas.count_feasibility(conn, parsed, store=feas.read_store_facts(conn))
-        except StoreLockedError as exc:
-            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
+        except StoreLockedError:
+            # A write lock means a process has it open for writing: not a copy. Never "busy".
+            raise _refusal(
+                OSError(
+                    f"--store {real} is open for writing by another process, so it is "
+                    "not a copy; pass a copy that no process writes"
+                ),
+                s,
+            ) from None
         except (feas.FeasibilityRefused, duckdb.Error, OSError) as exc:
             raise _refusal(exc, s) from None
         _echo_scrubbed(render_block(parsed, counts), s)
