@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 import duckdb
 import polars as pl
@@ -20,12 +20,12 @@ from conftest import load_chain_overlay, load_universe_fixtures
 from polars.testing import assert_frame_equal
 
 from backtest.fake_provider import FakeProvider
-from tradepartner.backtest import engine
+from tradepartner.backtest import engine, strategies
 from tradepartner.backtest.costs import Commissions, trade_cost
 from tradepartner.backtest.engine import STRATEGY_SERIES, BacktestResult, run
 from tradepartner.backtest.fills import apply_trades
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
-from tradepartner.backtest.signals import momentum_12_1
+from tradepartner.backtest.signals import anchor_sessions, momentum_12_1
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import all_sessions, last_completed_session, session_close
 from tradepartner.config import Cadence, HypothesisFamily, Settings, SignalAnchor
@@ -130,15 +130,17 @@ def _rows(result: BacktestResult, session: date) -> Any:
 class TestReads:
     def test_marking_bound_is_computed_once_per_step(self, monkeypatch: pytest.MonkeyPatch) -> None:
         original_bound = engine._marking_bound
-        original_anchor = engine.anchor_sessions
+        strategy = strategies.signal_for("momentum")
+        original_anchor = strategy.marking_anchor
+        assert original_anchor is not None
         bounds = 0
         anchors = 0
         held_months_by_step: list[set[tuple[int, int]]] = []
 
-        def counted_anchor(*args: Any, **kwargs: Any) -> tuple[date, date]:
+        def counted_anchor(params: Settings, session: date) -> date:
             nonlocal anchors
             anchors += 1
-            return original_anchor(*args, **kwargs)
+            return original_anchor(params, session)
 
         def counted_bound(*args: Any, **kwargs: Any) -> date:
             nonlocal bounds
@@ -153,7 +155,11 @@ class TestReads:
             )
             return original_bound(*args, **kwargs)
 
-        monkeypatch.setattr(engine, "anchor_sessions", counted_anchor)
+        monkeypatch.setitem(
+            cast(dict[HypothesisFamily, strategies.Strategy], strategies._SIGNALS),
+            "momentum",
+            dataclasses.replace(strategy, marking_anchor=counted_anchor),
+        )
         monkeypatch.setattr(engine, "_marking_bound", counted_bound)
         _run(_provider(), levels=(0.0, 15.0, 30.0, 100.0))
         steps = len(rebalance_sessions(T0, T3)) - 1
@@ -188,7 +194,7 @@ class TestReads:
             )
             if family in ("momentum", "combined"):
                 bounds.append(
-                    engine.anchor_sessions(
+                    anchor_sessions(
                         plan.session,
                         settings.strategy.formation_months,
                         settings.strategy.skip_months,
@@ -205,7 +211,7 @@ class TestReads:
                 )
                 if family in ("momentum", "combined"):
                     bounds.extend(
-                        engine.anchor_sessions(
+                        anchor_sessions(
                             since,
                             settings.strategy.formation_months,
                             settings.strategy.skip_months,
@@ -2238,3 +2244,45 @@ class TestSuccessorChains:
         assert [row.n_targets for row in result.rebalances] == [1, 1]
         assert [row.counts["n_spin_offs_unvalued"] for row in result.rebalances] == [0, 1]
         assert [row.counts["n_late_spin_offs"] for row in result.rebalances] == [0, 1]
+
+
+def test_the_engine_names_no_family() -> None:
+    """A family's needs reach the engine through `strategies.signal_for` only (#3662)."""
+    tree = ast.parse((SRC / "engine.py").read_text())
+    docstrings: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            first = node.body[0] if node.body else None
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                docstrings.add(id(first.value))
+    families = set(get_args(HypothesisFamily))
+    named = [
+        (node.value, node.lineno)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value in families
+        and id(node) not in docstrings
+    ]
+    assert named == []
+
+
+def test_marking_anchor_is_declared_for_momentum_and_combined_only() -> None:
+    declared = {
+        family
+        for family in strategies._FAMILY_IO
+        if strategies.signal_for(family).marking_anchor is not None
+    }
+    assert declared == {"momentum", "combined"}
+    params = _params()
+    anchor = strategies.signal_for("momentum").marking_anchor
+    assert anchor is not None
+    assert (
+        anchor(params, T1)
+        == anchor_sessions(
+            T1,
+            params.strategy.formation_months,
+            params.strategy.skip_months,
+            params.schedule.signal_anchor,
+        )[0]
+    )

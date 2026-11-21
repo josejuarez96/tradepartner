@@ -55,6 +55,7 @@ _Read = _MomentumRead | _ProfitabilityRead | _CombinedRead
 
 _Reader = Callable[[DataProvider, Settings, date, datetime, Sequence[str]], _Read]
 _Signal = Callable[[_Read, Settings, date, datetime, Sequence[str]], SignalResult]
+_MarkingAnchor = Callable[[Settings, date], date]
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,9 @@ class Strategy:
     exclusion_reasons: tuple[str, ...]
     count_names: tuple[str, ...]
     section: str
+    #: The earliest session whose prices the family's signal reads for a plan at
+    #: `session`; `None` when the signal reads no price history.
+    marking_anchor: _MarkingAnchor | None = None
 
 
 def _screens(params: Settings) -> bool:
@@ -252,20 +256,44 @@ def _combined_signal(
     )
 
 
+def _formation_anchor(params: Settings, session: date) -> date:
+    """The first session of the formation window a plan at `session` ranks on."""
+    return anchor_sessions(
+        session,
+        params.strategy.formation_months,
+        params.strategy.skip_months,
+        params.schedule.signal_anchor,
+    )[0]
+
+
 # The reads and the (reader, signal) pair are family-specific code; `exclusion_reasons`,
 # `count_names` and `section` derive from `config.FAMILIES` (ADR 0014 point 2, T128), so
 # `Plan.exclusions` and `Plan.counts` carry exactly the names each family declares.
-_FAMILY_IO: Mapping[HypothesisFamily, tuple[tuple[str, ...], _Reader, _Signal]] = {
-    "momentum": (("adjusted_prices",), _momentum_read, _momentum_signal),
-    "oracle": (("adjusted_prices",), _oracle_read, _momentum_signal),
-    "profitability": (("statement_facts", "sics"), _profitability_read, _profitability_signal),
-    "combined": (("adjusted_prices", "statement_facts", "sics"), _combined_read, _combined_signal),
+# The fourth element is `Strategy.marking_anchor`: every row states it, so a new family
+# cannot leave the engine's marking read unbounded by omission (#3662).
+_FAMILY_IO: Mapping[
+    HypothesisFamily, tuple[tuple[str, ...], _Reader, _Signal, _MarkingAnchor | None]
+] = {
+    "momentum": (("adjusted_prices",), _momentum_read, _momentum_signal, _formation_anchor),
+    "oracle": (("adjusted_prices",), _oracle_read, _momentum_signal, None),
+    "profitability": (
+        ("statement_facts", "sics"),
+        _profitability_read,
+        _profitability_signal,
+        None,
+    ),
+    "combined": (
+        ("adjusted_prices", "statement_facts", "sics"),
+        _combined_read,
+        _combined_signal,
+        _formation_anchor,
+    ),
 }
 
 
 def _build_signals() -> Mapping[HypothesisFamily, Strategy]:
     out: dict[HypothesisFamily, Strategy] = {}
-    for family, (reads, reader, signal) in _FAMILY_IO.items():
+    for family, (reads, reader, signal, marking_anchor) in _FAMILY_IO.items():
         spec = FAMILIES[family]
         out[family] = Strategy(
             reads=reads,
@@ -274,6 +302,7 @@ def _build_signals() -> Mapping[HypothesisFamily, Strategy]:
             exclusion_reasons=spec.exclusion_reasons,
             count_names=spec.count_names,
             section=spec.sections[0],
+            marking_anchor=marking_anchor,
         )
     return out
 
