@@ -47,6 +47,7 @@ from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, OrderR
 from pydantic import SecretStr
 from requests.adapters import HTTPAdapter
 
+from tradepartner.adapters.alpaca_raw import RETRY_STATUS_CODES as _RETRY_STATUS_CODES
 from tradepartner.config import MAIN_BOOK_ID, Settings, get_settings, paper_key_variable_names
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -54,7 +55,6 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 # `GET /v2/account/activities` at most 100 per page (Alpaca API reference).
 OPEN_ORDERS_LIMIT = 500
 ACTIVITIES_PAGE_SIZE = 100
-_RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 _DUPLICATE_STATUS_CODE = 422
 _DUPLICATE_ERROR_CODE = 40010001  # shared with three other refusals (#1884, #1901)
 #: Exact message in tests/fixtures/alpaca/paper/duplicate_client_order_id.json.

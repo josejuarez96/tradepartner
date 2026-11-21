@@ -74,6 +74,12 @@ def _credentials(settings: Settings) -> tuple[str, str]:
     return api_key, api_secret
 
 
+#: The Alpaca statuses worth asking again: rate limit and the transient server
+#: errors. One definition for the order client's retry and the data adapter's
+#: transient test (#3631); it lives here so no data module imports the order client.
+RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+
 def _stock_data_client(settings: Settings) -> StockHistoricalDataClient:
     api_key, secret_key = _credentials(settings)
     return StockHistoricalDataClient(api_key=api_key, secret_key=secret_key, raw_data=True)
