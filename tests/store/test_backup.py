@@ -484,3 +484,153 @@ def test_the_test_open_leaves_the_copy_byte_identical(
         assert copied.execute("SELECT version FROM schema_version").fetchall() == [(34,)]
     finally:
         copied.close()
+
+
+# --- #3675: two backups stamped with the same minute ---------------------------
+
+
+def _other_run_after_the_checks(
+    monkeypatch: pytest.MonkeyPatch, other: Any, *, times: int = 1
+) -> None:
+    """Call `other()` the first `times` times `backup_store` opens the store: after
+    its early name checks have passed and before it has made any file. That is the
+    window in which another backup of the same minute used to go unseen."""
+    real_open = backup.open_read_only
+    calls = 0
+
+    def opening(settings: Settings) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls <= times:
+            other()
+        return real_open(settings)
+
+    monkeypatch.setattr(backup, "open_read_only", opening)
+
+
+def _bak_files(store: Path) -> dict[str, tuple[int, str]]:
+    """Every backup file beside `store`: its inode and its SHA-256."""
+    return {
+        p.name: (p.stat().st_ino, _sha(p)) for p in sorted(store.parent.glob(f"{store.name}.bak-*"))
+    }
+
+
+def test_a_second_backup_in_the_same_minute_refuses_and_leaves_the_first_intact(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3675: the second run had passed its name checks before the first made its
+    files; it must refuse, not write over the first's copy, WAL copy and manifest."""
+    Path(f"{store}.wal").write_bytes(b"log bytes")
+    first: list[backup.BackupResult] = []
+    seen: list[dict[str, tuple[int, str]]] = []
+
+    def first_run() -> None:
+        # the nested run's own open must not start a third
+        monkeypatch.setattr(backup, "open_read_only", real_open)
+        first.append(backup_store(Settings(), now=NOW, git_commit="first"))
+        seen.append(_bak_files(store))
+
+    real_open = backup.open_read_only
+    _other_run_after_the_checks(monkeypatch, first_run)
+    with pytest.raises(BackupError, match="already exists"):
+        backup_store(Settings(), now=NOW.replace(second=1), git_commit="second")
+
+    [result] = first
+    assert result.wal_copy_path is not None
+    assert _bak_files(store) == seen[0]  # same files, same inodes, same bytes
+    assert sorted(seen[0]) == sorted(
+        p.name for p in (result.copy_path, result.wal_copy_path, result.manifest_path)
+    )
+    manifest = json.loads(result.manifest_path.read_text())
+    assert manifest["git_commit"] == "first" and manifest["complete"] is True
+    assert manifest["store_sha256"] == _sha(result.copy_path) == result.store_sha256
+    assert manifest["wal_sha256"] == _sha(result.wal_copy_path) == result.wal_sha256
+
+
+def test_a_failing_second_backup_never_deletes_the_first_runs_files(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3675: the cleanup of a failed run removes only what that run made; it used
+    to unlink the target name, which was the other run's finished copy."""
+    Path(f"{store}.wal").write_bytes(b"log bytes")
+    seen: list[dict[str, tuple[int, str]]] = []
+    real_open = backup.open_read_only
+    real_connect = duckdb.connect
+
+    def first_run() -> None:
+        monkeypatch.setattr(backup, "open_read_only", real_open)
+        backup_store(Settings(), now=NOW, git_commit="first")
+        seen.append(_bak_files(store))
+
+        def connect(database: Any = ":memory:", *args: Any, **kwargs: Any) -> Any:
+            if ".bak-" in str(database):  # only the second run's test-open comes here
+                raise duckdb.IOException("the copy is not a database")
+            return real_connect(database, *args, **kwargs)
+
+        monkeypatch.setattr(duckdb, "connect", connect)
+
+    _other_run_after_the_checks(monkeypatch, first_run)
+    with pytest.raises(BackupError):
+        backup_store(Settings(), now=NOW, git_commit="second")
+    assert len(seen[0]) == 3
+    assert _bak_files(store) == seen[0]
+
+
+def test_a_backup_refuses_a_minute_another_run_has_claimed_and_touches_nothing_of_it(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3675: a run that is still copying holds `<copy>.manifest.json.partial`; a
+    second run that got past the name checks is stopped by that claim, and neither
+    its refusal nor its cleanup touches the running one's files."""
+    copy = Path(f"{store}.bak-20261020-1405")
+    running = {
+        Path(f"{copy}.manifest.json.partial"): b'{"complete": false}\n',
+        Path(f"{copy}.partial"): b"half a store",
+        Path(f"{copy}.wal.partial"): b"half a wal",
+    }
+
+    def other_run_starts() -> None:
+        for path, content in running.items():
+            path.write_bytes(content)
+
+    _other_run_after_the_checks(monkeypatch, other_run_starts)
+    with pytest.raises(BackupError, match="another backup"):
+        backup_store(Settings(), now=NOW, git_commit="second")
+    for path, content in running.items():
+        assert path.read_bytes() == content
+    assert sorted(p.name for p in store.parent.glob("*.bak-*")) == sorted(p.name for p in running)
+
+
+def test_a_backup_started_while_another_copies_is_refused_and_the_first_finishes(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second run that starts in the middle of the first's copy step."""
+    real_copyfile = backup.shutil.copyfile
+    refusals: list[str] = []
+
+    def copyfile(src: Path, dst: Path) -> None:
+        real_copyfile(src, dst)
+        if not refusals:
+            with pytest.raises(BackupError) as refused:
+                backup_store(Settings(), now=NOW, git_commit="second")
+            refusals.append(str(refused.value))
+
+    monkeypatch.setattr(backup.shutil, "copyfile", copyfile)
+    result = backup_store(Settings(), now=NOW, git_commit="first")
+    assert len(refusals) == 1
+    manifest = json.loads(result.manifest_path.read_text())
+    assert manifest["git_commit"] == "first"
+    assert manifest["store_sha256"] == _sha(result.copy_path) == _sha(store)
+    assert not list(store.parent.glob("*.partial"))
+
+
+def test_a_failed_backup_removes_its_own_files_and_frees_the_minute(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The claim goes with the failed run, so the next run of that minute works."""
+    with monkeypatch.context() as patched:
+        patched.setattr(backup, "_test_open", lambda copy: (_ for _ in ()).throw(BackupError("x")))
+        with pytest.raises(BackupError):
+            backup_store(Settings(), now=NOW, git_commit="c")
+    assert not list(store.parent.glob("*.bak-*"))
+    assert backup_store(Settings(), now=NOW, git_commit="c").copy_path.is_file()
