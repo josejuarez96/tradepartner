@@ -417,7 +417,7 @@ def test_module_names_no_research_table_no_store_research_and_no_filing_events()
     assert "store.research" not in source and "store import research" not in source
     assert not re.search(r"\bresearch_(registrations|datasets|runs|results|decisions)\b", source)
     assert "filing_events" not in source
-    assert "registry.boundary_date" in source
+    assert "import boundary_date" in source
 
 
 # --- Counts are right (hand-computed on the fixture) ---

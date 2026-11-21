@@ -50,7 +50,8 @@ from tradepartner.research.feasibility_block import (
 )
 from tradepartner.research.feasibility_design import FeasibilityDesign
 from tradepartner.research.shape import effective_count
-from tradepartner.store import registry, schema
+from tradepartner.store import schema
+from tradepartner.store.registry import boundary_date
 
 __all__ = ["FeasibilityRefused", "count_feasibility", "read_store_facts"]
 
@@ -181,7 +182,7 @@ def count_feasibility(
     development boundary or the window ends after it. `store` carries the header facts
     (read from the copy by `read_store_facts` when omitted).
     """
-    boundary = registry.boundary_date(conn)
+    boundary = boundary_date(conn)
     if boundary is None:
         raise FeasibilityRefused("the copy has no development boundary")
     if design.window_end > boundary:
