@@ -493,7 +493,7 @@ import re
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime
+from datetime import date, datetime, time
 from itertools import pairwise
 from typing import Any
 from zoneinfo import ZoneInfo
