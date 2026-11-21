@@ -64,8 +64,10 @@ _HAS_BARS_SQL = (
 )
 _SECURITIES_SQL = "SELECT security_id, cik FROM securities WHERE known_at <= ?"
 _DELISTINGS_SQL = (
-    "SELECT DISTINCT security_id FROM delistings "
-    "WHERE effective_on >= ? AND effective_on <= ? AND known_at <= ?"
+    "SELECT DISTINCT security_id FROM ("
+    "SELECT security_id, effective_on, row_number() OVER "
+    "(PARTITION BY security_id, filed_at ORDER BY known_at DESC) AS n "
+    "FROM delistings WHERE known_at <= ?) WHERE n = 1 AND effective_on >= ? AND effective_on <= ?"
 )
 _INGEST_SQL = (
     "SELECT run_id, COALESCE(finished_at, started_at) AS ended FROM ingestion_runs "
@@ -100,19 +102,38 @@ def read_store_facts(conn: duckdb.DuckDBPyConnection) -> StoreFacts:
     )
 
 
+#: What identifies one filed fact across its revisions (the first-known row is the event).
+_IDENTITY: dict[str, tuple[str, ...]] = {
+    "form4": ("accession", "line_no"),
+    "statement_fact": ("cik", "fact_name", "period_start", "period_end", "filing_accession"),
+    "form25": ("security_id", "filed_at"),
+    "corporate_action": ("security_id", "action_type", "ex_date"),
+}
+
+
 def _event_rows(
     conn: duckdb.DuckDBPyConnection, design: FeasibilityDesign, start: datetime, cut: datetime
 ) -> list[tuple[str, datetime]]:
-    """`(issuer, known_at)` of every source row matching the filter, known in `[start, cut]`."""
+    """`(issuer, known_at)` of each fact's FIRST-known row, if it matches and is known in range.
+
+    A later revision, cancellation or restatement never removes or re-dates an event
+    (`SourceSpec`'s rule), so the filter and the window test the first-known row.
+    """
     spec = design.spec
-    clauses = [f"{spec.issuer_column} IS NOT NULL", "known_at >= ?", "known_at <= ?"]
-    params: list[object] = [start, cut]
+    identity = ", ".join(_IDENTITY[design.source])
+    clauses = [f"{spec.issuer_column} IS NOT NULL", "known_at >= ?"]
+    params: list[object] = [cut, start]
     for column, values in design.filters:
         if column not in spec.filter_columns:
             raise FeasibilityRefused(f"filter.{column}: not a filterable column of {spec.table}")
         clauses.append(f"{column} IN ({', '.join('?' for _ in values)})")
         params.extend(values)
-    sql = f"SELECT {spec.issuer_column}, known_at FROM {spec.table} WHERE {' AND '.join(clauses)}"
+    cols = ", ".join(dict.fromkeys([spec.issuer_column, *spec.filter_columns, "known_at"]))
+    sql = (
+        f"SELECT {spec.issuer_column}, known_at FROM ("
+        f"SELECT {cols}, row_number() OVER (PARTITION BY {identity} ORDER BY known_at) AS n "
+        f"FROM {spec.table} WHERE known_at <= ?) WHERE n = 1 AND {' AND '.join(clauses)}"
+    )
     return [(str(r[0]), _utc(r[1])) for r in conn.execute(sql, params).fetchall()]
 
 
@@ -256,9 +277,7 @@ def count_feasibility(
     return FeasibilityCounts(
         store=store if store is not None else read_store_facts(conn),
         boundary=boundary,
-        timestamp=TimestampCounts(
-            rows_matched=len(rows), rows_after_window=0, events_without_entry=no_entry
-        ),
+        timestamp=TimestampCounts(rows_matched=len(rows), events_without_entry=no_entry),
         cells=tuple(cells),
         totals=tuple(totals),
         events_hold_past_window=sum(
@@ -281,7 +300,7 @@ def _coverage(
     ended = [
         str(r[0])
         for r in conn.execute(
-            _DELISTINGS_SQL, [design.window_start, design.window_end, cut]
+            _DELISTINGS_SQL, [cut, design.window_start, design.window_end]
         ).fetchall()
     ]
     with_bars = (

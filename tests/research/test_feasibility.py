@@ -260,10 +260,9 @@ def test_window_after_the_boundary_is_refused_before_any_event_or_price_read(
     assert not [s for s in rec.sql if "prices_daily" in s or "sec_form4" in s]
 
 
-def test_a_copy_with_no_boundary_is_refused(built: fx.FeasibilityStore, tmp_path: Path) -> None:
-    path = _copy(built, tmp_path)
-    _edit(path, "DELETE FROM owner_decisions WHERE kind = 'development_boundary'")
-    conn = duckdb.connect(str(path), read_only=True)
+def test_a_copy_with_no_boundary_is_refused(tmp_path: Path) -> None:
+    built = fx.build_feasibility_store(tmp_path / "nb.duckdb", with_boundary=False)
+    conn = built.connect()
     rec = Recorder(conn)
     with pytest.raises(feas.FeasibilityRefused, match="no development boundary"):
         feas.count_feasibility(rec, _design(), store=FACTS)  # type: ignore[arg-type]
@@ -327,24 +326,24 @@ def _totals(counts: fb.FeasibilityCounts) -> dict[int | None, tuple[int, int, in
 
 def test_form4_counts_match_the_hand_count(built: fx.FeasibilityStore) -> None:
     counts = _counts(built.path, _design())
-    # Rows: 12 matched (both filers of AAA on 2018-03-12 are rows); events 11 (they are one).
-    assert counts.timestamp == fb.TimestampCounts(12, 0, 0)
+    # Rows: 14 matched (both filers of AAA on 2018-03-12 are rows); events 13 (they are one).
+    assert counts.timestamp == fb.TimestampCounts(14, 0)
     assert counts.boundary == fx.BOUNDARY
     assert _cells(counts) == {
         (2018, 0): (2, 2, 1),  # AAA 03-13 and 03-20
-        (2018, 1): (3, 3, 2),  # BBB 03-13, BBB 05-14, DDD 08-21
+        (2018, 1): (5, 4, 3),  # BBB and DDD 03-13, BBB 05-14, FFF 05-17, DDD 08-21
         (2018, 2): (2, 2, 1),  # CCC 03-13 and 07-05
         (2018, None): (2, 2, 2),  # AAA 01-11 (short lookback) and EEE (no bars)
         (2019, 0): (1, 1, 1),  # AAA 02-05
         (2019, 1): (1, 1, 1),  # BBB 03-28
     }
-    assert _totals(counts) == {0: (3, 3, 1), 1: (4, 4, 2), 2: (2, 2, 1), None: (2, 2, 2)}
+    assert _totals(counts) == {0: (3, 3, 1), 1: (6, 5, 3), 2: (2, 2, 1), None: (2, 2, 2)}
     assert counts.events_hold_past_window == 1  # BBB 03-28 + 20 sessions
     n_sessions = len([s for s in built.sessions if built.window_start <= s <= built.window_end])
     assert counts.window_sessions == n_sessions
-    # (f): DDD, EEE, FFF end in the window (GGG after it); DDD and FFF have bars;
-    # DDD and EEE have events; only DDD has both.
-    assert counts.coverage == fb.DelisterCoverage(3, 2, 2, 1)
+    # (f): DDD, EEE, FFF end in the window (GGG after it; CCC files in it but is effective
+    # after it); DDD and FFF have bars; all three have events; DDD and FFF have both.
+    assert counts.coverage == fb.DelisterCoverage(3, 2, 3, 2)
 
 
 def test_effective_count_one_issuer_with_overlapping_holds(built: fx.FeasibilityStore) -> None:
@@ -398,13 +397,15 @@ def test_effective_count_default_cited_rho_and_bounds_equal_the_double_sum(
     built: fx.FeasibilityStore,
 ) -> None:
     d = date
-    # The nine events with bars (AAA, BBB and CCC share 2018-03-13), by hand; entry = next session.
+    # The eleven events with bars, by hand; entry = next session. Four share 2018-03-13.
     events = [
         ("AAA", d(2018, 3, 13)),
         ("BBB", d(2018, 3, 13)),
         ("CCC", d(2018, 3, 13)),
+        ("DDD", d(2018, 3, 13)),
         ("AAA", d(2018, 3, 20)),
         ("BBB", d(2018, 5, 14)),
+        ("FFF", d(2018, 5, 17)),
         ("CCC", d(2018, 7, 5)),
         ("DDD", d(2018, 8, 21)),
         ("AAA", d(2019, 2, 5)),
@@ -417,31 +418,62 @@ def test_effective_count_default_cited_rho_and_bounds_equal_the_double_sum(
     ):
         counts = _counts(built.path, design)
         low = next(t for t in counts.totals if t.band == 1)  # every banded event is under 1e15
-        assert low.raw_events == 9 and low.effective is not None
+        assert low.raw_events == 11 and low.effective is not None
         default, cited, zero, one = _brute(indexed, 20, rho)
         eff = low.effective
         assert eff.n_eff == pytest.approx(default if rho is None else cited)
         assert eff.n_eff_rho0 == pytest.approx(zero)
         assert eff.n_eff_rho1 == pytest.approx(one)
         assert eff.n / eff.same_date_factor / eff.overlap_factor == pytest.approx(eff.n_eff)
-        # One session holds three events: sum m_d^2 = 3^2 + 6 * 1^2 = 15, B = 15 / 9.
-        assert eff.same_date_factor == pytest.approx(15 / 9)
+        # One session holds four events: sum m_d^2 = 4^2 + 7 * 1^2 = 23, B = 23 / 11.
+        assert eff.same_date_factor == pytest.approx(23 / 11)
+
+
+def _mid_2018(path: Path, rho: float | None) -> fb.BandTotal:
+    """The mid band over 2018 only: BBB and DDD on 03-13, BBB 05-14, FFF 05-17, DDD 08-21."""
+    extra = "" if rho is None else f'rho = {rho}\nrho_source = "test"\n'
+    text = (fx.DESIGN_DIR / "form4.toml").read_text().replace("2019-03-29", "2018-12-31")
+    design = fd.parse_design_text(extra + text)
+    return next(t for t in _counts(path, design).totals if t.band == 1)
+
+
+def test_the_planted_mid_band_under_the_default_rho_zero_and_rho_point_three(
+    built: fx.FeasibilityStore,
+) -> None:
+    # A = (BBB, 3-13), B = (DDD, 3-13), C = (BBB, 5-14), D = (FFF, 5-17), E = (DDD, 8-21).
+    # Only A-B (one session, o = 1) and C-D (3 apart, o = 17/20) are overlapping pairs of
+    # different issuers. N = 5:  default 5 + 2 (1 + .05 * .85) = 7.085; rho 0 gives 5;
+    # rho .3 gives 5 + 2 * .3 * (1 + .85) = 6.11.
+    default = _mid_2018(built.path, None).effective
+    zero = _mid_2018(built.path, 0.0).effective
+    cited = _mid_2018(built.path, 0.3).effective
+    assert default is not None and zero is not None and cited is not None
+    assert default.n_eff == pytest.approx(25 / 7.085)  # 3.529
+    assert default.n_eff_rho0 == pytest.approx(5.0)
+    assert zero.n_eff == pytest.approx(5.0)
+    assert cited.n_eff == pytest.approx(25 / 6.11)  # 4.092
+    assert default.same_date_factor == pytest.approx(7 / 5)  # sum m_d^2 = 4 + 3 = 7
 
 
 def test_form25_source_counts_issuers_and_coverage(built: fx.FeasibilityStore) -> None:
     counts = _counts(built.path, _design("form25"))
-    # DDD (mid), EEE (no bars), FFF (mid) end in the window; GGG (2019-05) does not.
-    assert _totals(counts) == {0: (0, 0, 0), 1: (2, 2, 2), 2: (0, 0, 0), None: (1, 1, 1)}
+    # Four episodes: DDD (mid), EEE (no bars), FFF (mid), CCC (filed in the window); the
+    # revision rows of DDD and FFF are not events.
+    assert counts.timestamp.rows_matched == 4
+    assert _totals(counts) == {0: (0, 0, 0), 1: (2, 2, 2), 2: (1, 1, 1), None: (1, 1, 1)}
     assert counts.coverage == fb.DelisterCoverage(3, 2, 3, 2)
 
 
 def test_statement_fact_and_corporate_action_filters(built: fx.FeasibilityStore) -> None:
     facts = _counts(built.path, _design("statement_fact"))
-    # AAA 10-K and BBB 10-Q only: comparative, 8-K, after-window and after-boundary rows go.
-    assert facts.timestamp.rows_matched == 2
-    assert _totals(facts) == {0: (1, 1, 1), 1: (1, 1, 1), 2: (0, 0, 0), None: (0, 0, 0)}
+    # AAA 10-K, and BBB's three 10-Qs (2018-01-16 13:45 UTC enters that day, with no full
+    # lookback yet; 03-14 13:45 UTC, after the open in New York, enters the next session; 05-10
+    # 11:00 UTC before the open): comparative, 8-K, after-window and after-boundary rows go.
+    assert facts.timestamp.rows_matched == 4
+    assert _totals(facts) == {0: (1, 1, 1), 1: (2, 2, 1), 2: (0, 0, 0), None: (1, 1, 1)}
     actions = _counts(built.path, _design("corporate_action"))
-    assert actions.timestamp.rows_matched == 2  # AAA and CCC splits; BBB's is after the window
+    # AAA's and CCC's splits, once each: cancellations are revision rows, not events.
+    assert actions.timestamp.rows_matched == 2
     assert _totals(actions) == {0: (1, 1, 1), 1: (0, 0, 0), 2: (1, 1, 1), None: (0, 0, 0)}
 
 
@@ -461,7 +493,7 @@ def test_events_with_no_entry_session_in_the_window(
     # Known on the window's last session, before the close: its entry (next session) is outside.
     _insert_form4(path, "AAA", datetime(2019, 3, 29, 15, tzinfo=UTC), "Z8")
     counts = _counts(path, _design())
-    assert counts.timestamp == fb.TimestampCounts(13, 0, 1)
+    assert counts.timestamp == fb.TimestampCounts(15, 1)
     assert _totals(counts) == _totals(_counts(built.path, _design()))
 
 
@@ -541,3 +573,84 @@ def test_a_hold_counts_sessions_across_a_holiday(
     # Two sessions apart in a 3-session hold: o = 1/3, n_eff = 4 / (2 + 2/3) = 1.5.
     # By weekdays o would be 0 and n_eff 2.0.
     assert eff.n_eff == pytest.approx(1.5)
+
+
+# --- Point in time, with teeth: the restated AAA bars ---
+
+
+def test_restated_aaa_bars_known_after_the_window_are_never_read(
+    built: fx.FeasibilityStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Twelve AAA bars restated (known 2019-06-03, after the window) would drop AAA to $10M."""
+    design = _design()
+    honest = _counts(built.path, design)
+    top = next(t for t in honest.totals if t.band == 0)
+    assert top.raw_events == 3  # AAA stays in the top band: its 2018-03-13 and 03-20 events
+    # A reader that ignores known_at (no cut, and the latest version of each bar) is wrong.
+    monkeypatch.setattr(
+        feas, "_BARS_SQL", feas._BARS_SQL.replace("AND known_at <= ?", "AND ? IS NOT NULL")
+    )
+    monkeypatch.setattr(
+        feas,
+        "_lookback_median",
+        lambda bars, sessions, decided_at, _real=feas._lookback_median: _real(
+            bars, sessions, datetime.max.replace(tzinfo=UTC)
+        ),
+    )
+    careless = _counts(built.path, design)
+    assert next(t for t in careless.totals if t.band == 0).raw_events < top.raw_events
+    assert next(t for t in careless.totals if t.band == 2).raw_events > 2
+
+
+# --- Revisions: an event is the first-known row ---
+
+
+def _delete_revisions(path: Path, *, inside_window: bool) -> None:
+    cut = datetime(2019, 3, 29, 21, tzinfo=UTC)
+    statements = [
+        "DELETE FROM corporate_actions WHERE cancelled AND known_at "
+        + ("<= " if inside_window else "> ")
+        + f"TIMESTAMPTZ '{cut.isoformat()}'"
+    ]
+    for issuer, _filed, _effective, known in fx.DELISTING_REVISIONS:
+        if (known <= cut) == inside_window:
+            statements.append(
+                f"DELETE FROM delistings WHERE security_id = 'SEC_{issuer}' "
+                f"AND known_at = TIMESTAMPTZ '{known.isoformat()}'"
+            )
+    _edit(path, *statements)
+
+
+@pytest.mark.parametrize("name", ["corporate_action", "form25"])
+@pytest.mark.parametrize("inside_window", [False, True])
+def test_revisions_never_change_which_row_an_event_is_counted_from(
+    built: fx.FeasibilityStore, tmp_path: Path, name: str, inside_window: bool
+) -> None:
+    """Cancellations and revised Form 25s, inside the window or after it, are invisible."""
+    design = _design(name)
+    path = _copy(built, tmp_path)
+    _delete_revisions(path, inside_window=inside_window)
+    assert _block(path, design) == _block(built.path, design)
+
+
+def test_a_delisting_revised_after_the_window_still_ends_inside_it(
+    built: fx.FeasibilityStore,
+) -> None:
+    """FFF's revision (effective 2019-06-03, known 2019-05-02) is after the cut: FFF counts."""
+    counts = _counts(built.path, _design())
+    assert counts.coverage.delisted == 3 and counts.coverage.delisted_with_bars == 2
+
+
+def test_a_form_25_filed_in_the_window_and_effective_after_it_is_not_a_delister(
+    built: fx.FeasibilityStore,
+) -> None:
+    """Spec (f): "issuers whose listing ended inside the window"; the end is `effective_on`.
+
+    CCC files 2019-03-20 and is effective 2019-04-03: it is an event of the form25 source
+    (filed in the window) with bars, and not a delister in the window.
+    """
+    counts = _counts(built.path, _design("form25"))
+    assert counts.coverage.delisted == 3  # DDD, EEE, FFF; not CCC, not GGG
+    assert counts.coverage.delisted_with_events == 3
+    low = next(t for t in counts.totals if t.band == 2)
+    assert low.raw_events == 1 and low.issuers == 1
