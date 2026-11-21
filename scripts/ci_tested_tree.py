@@ -243,7 +243,7 @@ def main(argv: Sequence[str] | None = None, api: Api | None = None) -> int:
         shard_count = int(os.environ["PYTEST_SHARD_COUNT"])
         run = decide_refresh if refresh else decide
         skip, reason = run(api or GhApi(), repo, args[0], shard_count)
-    except Exception as exc:  # fail closed on anything at all
+    except Exception as exc:  # fail closed on anything at all  # noqa: BLE001
         skip, reason = False, f"lookup failed ({type(exc).__name__}: {exc})"
     print(f"main tested-tree check: {'skip' if skip else 'run'}: {reason}", file=sys.stderr)
     print("skip" if skip else "run")

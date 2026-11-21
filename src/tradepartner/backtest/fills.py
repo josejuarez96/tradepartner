@@ -65,7 +65,7 @@ def _prices_on(frame: pl.DataFrame, session: date, field: str) -> dict[str, floa
     return prices
 
 
-def apply_trades(
+def apply_trades(  # noqa: PLR0913
     positions: Mapping[str, float],
     cash: float,
     targets: Mapping[str, float],
@@ -211,7 +211,7 @@ def apply_trades(
     )
 
 
-def _apply_signed_trades(
+def _apply_signed_trades(  # noqa: C901
     positions: Mapping[str, float],
     cash: float,
     targets: Mapping[str, float],

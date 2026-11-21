@@ -375,7 +375,7 @@ def _cash_base(
     return _finite(reconciliation.broker_cash, f"{name} broker_cash"), reconciliation.known_at
 
 
-def from_journal(
+def from_journal(  # noqa: C901, PLR0912
     fills: Sequence[OrderedFill],
     orders: Sequence[OrderRow],
     adjustments: Sequence[AdjustmentRow],

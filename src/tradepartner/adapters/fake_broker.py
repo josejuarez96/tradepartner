@@ -499,7 +499,7 @@ class FakeBroker(Broker):
         """`True` only when built `FakeBroker(paper=True)`; shorts fill only then."""
         return self._paper
 
-    def submit(self, request: OrderRequest) -> Order:
+    def submit(self, request: OrderRequest) -> Order:  # noqa: C901, PLR0912
         self._log("submit", request)
         if self.on_submit is not None:
             self.on_submit(request)

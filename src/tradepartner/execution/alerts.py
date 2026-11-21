@@ -407,7 +407,7 @@ class Alerter:
             return utc_now(), "clock fault"
         try:
             now = self._clock()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return utc_now(), f"clock raised {type(exc).__name__}"
         if not isinstance(now, datetime) or now.utcoffset() is None:
             return utc_now(), "clock returned no tz-aware datetime"
@@ -423,7 +423,7 @@ class Alerter:
                 self._email(kind, message)
             else:
                 return Delivery(channel, False, f"unknown channel {channel!r}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return Delivery(channel, False, self._scrub(_describe(exc)))
         return Delivery(channel, True)
 
@@ -465,7 +465,7 @@ class Alerter:
             # reply must not turn it into a failed delivery, nor mask a send error.
             try:
                 client.quit()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 client.close()
 
     def _scrub(self, text: str) -> str:

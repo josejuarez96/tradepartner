@@ -661,7 +661,7 @@ def _dividend_fraction(
     return residue_at_start / mark.quantity
 
 
-def _residue_term(
+def _residue_term(  # noqa: C901, PLR0912, PLR0915
     journal: Journal,
     actions: pl.DataFrame,
     window: PaperWindowRow,
@@ -1513,7 +1513,7 @@ def _slippage_for_report(
     now = utc_now()
     try:
         return window_slippage(conn, window_id, now), None
-    except Exception as exc:  # a slippage diagnostic never blocks the report row
+    except Exception as exc:  # a slippage diagnostic never blocks the report row  # noqa: BLE001
         message = str(exc)
         return None, f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 

@@ -266,7 +266,7 @@ def recheck_form4_multi_owner(
     return summary
 
 
-def repair_form4_multi_owner(
+def repair_form4_multi_owner(  # noqa: C901
     settings: Settings,
     manifest: Path,
     release: str,

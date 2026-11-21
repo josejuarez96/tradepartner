@@ -783,7 +783,7 @@ def _cash_allows(band: _Band, difference: Decimal, bound: Decimal) -> bool:
     return Decimal(str(band.low)) - bound <= difference <= Decimal(str(band.high)) + bound
 
 
-def compare(
+def compare(  # noqa: C901, PLR0912, PLR0915
     ledger: Ledger,
     positions: Mapping[str, Position],
     open_orders: Sequence[Order],
