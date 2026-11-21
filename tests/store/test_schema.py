@@ -15,7 +15,6 @@ import hashlib
 import subprocess
 import sys
 import textwrap
-import time
 from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -2085,6 +2084,22 @@ def test_open_for_write_creates_missing_parent_directory(tmp_path: Path) -> None
     assert nested_path.exists()
 
 
+class _FakeTime:
+    """A clock that only moves when `sleep` is called, and records each sleep
+    (#3661; the same small class as in `test_read_retry.py`)."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
 def test_open_for_write_does_not_retry_non_lock_io_errors(tmp_path: Path) -> None:
     """A real, non-lock `IOException` (here: `store.path` names an
     existing directory, not a file) must propagate immediately, not spin
@@ -2094,12 +2109,14 @@ def test_open_for_write_does_not_retry_non_lock_io_errors(tmp_path: Path) -> Non
     a_directory.mkdir()
     settings = Settings(_env_file=None, store={"path": str(a_directory), "lock_retry_seconds": 5})
 
-    start = time.monotonic()
-    with pytest.raises(duckdb.IOException), open_for_write(settings):
+    fake = _FakeTime()
+    with (
+        pytest.raises(duckdb.IOException),
+        open_for_write(settings, clock=fake.clock, sleep=fake.sleep),
+    ):
         pass  # pragma: no cover - connect() itself raises
-    elapsed = time.monotonic() - start
 
-    assert elapsed < 1.0
+    assert fake.sleeps == []
 
 
 def test_open_for_write_raises_store_locked_error_for_same_process_reader(
@@ -2116,11 +2133,13 @@ def test_open_for_write_raises_store_locked_error_for_same_process_reader(
 
     reader = duckdb.connect(database=settings.store.path, read_only=True)
     try:
-        start = time.monotonic()
-        with pytest.raises(StoreLockedError, match="different mode"), open_for_write(settings):
+        fake = _FakeTime()
+        with (
+            pytest.raises(StoreLockedError, match="different mode"),
+            open_for_write(settings, clock=fake.clock, sleep=fake.sleep),
+        ):
             pass  # pragma: no cover - connect() itself raises
-        elapsed = time.monotonic() - start
-        assert elapsed < 1.0
+        assert fake.sleeps == []
     finally:
         reader.close()
 
@@ -2160,11 +2179,19 @@ def test_open_for_write_retries_then_raises_store_locked_error(tmp_path: Path) -
         assert proc.stdout.readline().strip() == "HELD"
 
         settings = Settings(_env_file=None, store={"path": str(db_path), "lock_retry_seconds": 1})
-        start = time.monotonic()
-        with pytest.raises(StoreLockedError), open_for_write(settings):
+        fake = _FakeTime()
+        with (
+            pytest.raises(StoreLockedError, match="within 1s"),
+            open_for_write(settings, clock=fake.clock, sleep=fake.sleep),
+        ):
             pass  # pragma: no cover - lock acquisition should never succeed
-        elapsed = time.monotonic() - start
-        assert elapsed >= 1.0
+        store = settings.store
+        assert fake.sleeps[0] == store.lock_retry_initial_delay_seconds
+        assert all(
+            later == pytest.approx(min(2 * earlier, store.lock_retry_max_delay_seconds))
+            for earlier, later in zip(fake.sleeps, fake.sleeps[1:-1], strict=False)
+        )
+        assert sum(fake.sleeps) == pytest.approx(store.lock_retry_seconds)
     finally:
         proc.terminate()
         proc.wait(timeout=10)
