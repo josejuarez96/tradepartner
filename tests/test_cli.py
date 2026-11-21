@@ -3792,3 +3792,136 @@ def test_a_retracted_bar_with_an_empty_price_is_a_named_error(tmp_path: Path) ->
     assert checked.exit_code == 1
     assert "release refused" in checked.output and "unreadable price or volume" in checked.output
     assert "Traceback" not in checked.output
+
+
+# --- an exception that escapes a command (#3697) --------------------------------
+
+#: Neither key- nor email-shaped: only the configured-secret scrub can mask it.
+_ESCAPED_SECRET = "opaque/pass word-" + "z" * 9
+#: Run in a child so the real `main()`, the real stderr and the real exit code are seen.
+#: `stale-keys` has no catch-all; `_store_missing` is its first call after settings.
+_ESCAPING_COMMAND = """
+import os, sys
+from tradepartner import cli
+
+def _deep(_settings):
+    raise RuntimeError(f"bad {os.environ['ALPACA_API_SECRET']}")
+
+cli._store_missing = _deep
+sys.argv = ["tradepartner", "stale-keys"]
+cli.main()
+"""
+
+
+def _run_escaping_command(tmp_path: Path, **env: str) -> Any:  # CompletedProcess[str]
+    import subprocess
+    import sys
+
+    child_env = {
+        **os.environ,
+        "TRADEPARTNER_ENV_FILE": str(tmp_path / "none.env"),
+        "STORE__PATH": str(tmp_path / "store.duckdb"),
+        **env,
+    }
+    return subprocess.run(
+        [sys.executable, "-c", _ESCAPING_COMMAND],
+        capture_output=True,
+        text=True,
+        env=child_env,
+        cwd=tmp_path,
+        check=False,
+    )
+
+
+def test_an_exception_that_escapes_a_command_prints_a_scrubbed_traceback(tmp_path: Path) -> None:
+    """#3697: outside the four `paper` crash sites an exception left `main()` through
+    Python's default handler, which prints the message, secrets included, to stderr."""
+    result = _run_escaping_command(tmp_path, ALPACA_API_SECRET=_ESCAPED_SECRET)
+    assert result.returncode == 1, result.stderr
+    assert _ESCAPED_SECRET not in result.stderr
+    assert "Traceback (most recent call last)" in result.stderr
+    assert "in _deep" in result.stderr
+    assert "failed: RuntimeError: bad <scrubbed>" in result.stderr
+    assert result.stderr.index("failed: RuntimeError") < result.stderr.index("Traceback")
+    assert result.stdout == ""
+
+
+def test_an_escaped_exception_is_pattern_scrubbed_when_settings_cannot_load(
+    tmp_path: Path,
+) -> None:
+    """Settings may be what failed: the traceback still prints, through the pattern-only
+    scrub. `_deep` never runs here; the command's own `settings()` call raises."""
+    key_shaped = "PK" + "Q" * 20
+    result = _run_escaping_command(
+        tmp_path, ALPACA_API_SECRET=key_shaped, STORE__LOCK_RETRY_SECONDS=f"api_key={key_shaped}"
+    )
+    assert result.returncode == 1, result.stderr
+    assert key_shaped not in result.stderr
+    assert "Traceback (most recent call last)" in result.stderr
+    assert "failed: ValidationError" in result.stderr
+
+
+def test_an_escaped_exception_falls_back_to_the_pattern_scrub(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no settings there is no configured secret to mask: the patterns still run."""
+
+    def unloadable() -> Settings:
+        raise ValueError("settings cannot be built")
+
+    monkeypatch.setattr(cli, "get_settings", unloadable)
+    key_shaped = "PK" + "Q" * 20
+    try:
+        raise RuntimeError(f"auth with {key_shaped} for owner@example.com")
+    except RuntimeError as exc:
+        cli._echo_escaped(exc)
+    err = capsys.readouterr().err
+    assert err.startswith("failed: RuntimeError: auth with <scrubbed> for <scrubbed>\n")
+    assert "Traceback (most recent call last)" in err
+    assert key_shaped not in err and "owner@example.com" not in err
+
+
+def test_main_leaves_a_usage_error_and_a_command_exit_code_alone(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """Click's own usage error (2) and a command's `typer.Exit` keep their output and
+    exit codes: no failure line, no traceback."""
+    import sys
+
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
+    monkeypatch.setenv("STORE__PATH", str(tmp_path / "absent.duckdb"))
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)  # Typer replaces it
+    for argv, code in ((["no-such-command"], 2), (["stale-keys"], 1)):
+        monkeypatch.setattr(sys, "argv", ["tradepartner", *argv])
+        with pytest.raises(SystemExit) as raised:
+            cli.main()
+        captured = capsys.readouterr()
+        assert raised.value.code == code, argv
+        assert "Traceback" not in captured.err and "failed:" not in captured.err, argv
+    assert "no store" in captured.err.lower() or "no store" in captured.out.lower()
+
+
+@pytest.mark.parametrize(
+    "printed",
+    [
+        lambda secret: json.dumps({"password": secret}),  # JSON-escaped: \\" and \\u00e9
+        lambda secret: repr(secret.encode()),  # bytes repr: \\xc3\\xa9
+    ],
+    ids=["json", "bytes"],
+)
+def test_the_traceback_scrub_covers_a_secret_json_escaped_and_as_bytes(
+    capsys: pytest.CaptureFixture[str], printed: Any
+) -> None:
+    secret = 'café"quoted\\pass-' + "w" * 9
+    settings = Settings(_env_file=None, alpaca_api_secret=secret)
+    shown = printed(secret)
+    assert secret not in shown and repr(secret)[1:-1] not in shown  # a form of its own
+    try:
+        raise RuntimeError(f"request body {shown}")
+    except RuntimeError as exc:
+        cli._echo_traceback(exc, settings)
+    err = capsys.readouterr().err
+    assert "Traceback (most recent call last)" in err and "request body" in err
+    for form in (json.dumps(secret)[1:-1], repr(secret.encode())[2:-1]):
+        assert form not in err, form
+    assert "pass-" + "w" * 9 not in err
