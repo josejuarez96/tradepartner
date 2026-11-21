@@ -2726,25 +2726,34 @@ def _census_lines(
     return lines
 
 
-def make_app(
-    *,
-    settings: Callable[[], Settings] = get_settings,
-    clock: Clock = utc_now,
-    edgar_client: httpx.Client | None = None,
-    price_source: Callable[[Settings], PriceSource] | None = None,
-    rate_source: Callable[[Settings], RateSource] = lambda s: FredRateSource(settings=s),
-    assets_source: Callable[[Settings, Clock], alpaca_raw.AssetsFetch] = (
-        lambda s, c: alpaca_raw.assets_all(s, clock=c)
-    ),
-    launcher: Launcher = subprocess.call,
-    parse_export: Callable[[Path], list[BrokerLotRow]] = parse_broker_export,
-    sweep_clock: lab.Clock | None = None,
-    broker: BrokerFactory = build_broker,
-    model_client: job.ClientFactory = job.CLIENT_FACTORY,
-    icloud: archive_cmd.IcloudFactory = archive_cmd.default_icloud,
-) -> typer.Typer:
-    """The `tradepartner` Typer app over the given edges (module docstring)."""
-    app = typer.Typer(no_args_is_help=True, add_completion=False, pretty_exceptions_enable=False)
+@dataclass(frozen=True)
+class _Edges:
+    """`make_app`'s edges, one field per keyword, handed to each `_register_<group>`."""
+
+    settings: Callable[[], Settings]
+    clock: Clock
+    edgar_client: httpx.Client | None
+    price_source: Callable[[Settings], PriceSource] | None
+    rate_source: Callable[[Settings], RateSource]
+    assets_source: Callable[[Settings, Clock], alpaca_raw.AssetsFetch]
+    launcher: Launcher
+    parse_export: Callable[[Path], list[BrokerLotRow]]
+    sweep_clock: lab.Clock | None
+    broker: BrokerFactory
+    model_client: job.ClientFactory
+    icloud: archive_cmd.IcloudFactory
+
+
+def _register_data(app: typer.Typer, edges: _Edges) -> None:
+    """Ingest, backfill, repair, refetch, spinoff and retract commands."""
+    settings, clock, edgar_client, price_source, rate_source, assets_source = (
+        edges.settings,
+        edges.clock,
+        edges.edgar_client,
+        edges.price_source,
+        edges.rate_source,
+        edges.assets_source,
+    )
 
     @app.command()
     def ingest(
@@ -4135,6 +4144,11 @@ def make_app(
         for line in result.lines():
             typer.echo(line)
 
+
+def _register_reports(app: typer.Typer, edges: _Edges) -> None:
+    """`health`, `dashboard`, `stale-keys` and `export`."""
+    settings, clock, launcher = edges.settings, edges.clock, edges.launcher
+
     @app.command()
     def health(
         check: Annotated[
@@ -4313,6 +4327,11 @@ def make_app(
         except StoreLockedError as exc:
             raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         typer.echo(f"exported {len(tables)} tables to {out_dir}")
+
+
+def _register_backtest(app: typer.Typer, edges: _Edges) -> None:
+    """`backtest`, `hypothesis register`, `trials` and `trial-reproduce`."""
+    settings = edges.settings
 
     @app.command()
     def backtest(
@@ -4533,6 +4552,11 @@ def make_app(
                 typer.echo(f"  {line}")
             raise typer.Exit(1)
         typer.echo(f"reproduced: all {result.compared} base-level strategy metrics are equal")
+
+
+def _register_decisions(app: typer.Typer, edges: _Edges) -> None:
+    """The `decision` commands, `decision data-release` among them."""
+    settings = edges.settings
 
     decision_app = typer.Typer(no_args_is_help=True, help="Record an owner decision.")
     app.add_typer(decision_app, name="decision")
@@ -4977,6 +5001,11 @@ def make_app(
         """Note an alert inside the shakedown span (ADR 0017 E.1 and E.7)."""
         decision_id = _shakedown_write("shakedown_note", {"alert_id": alert}, reason)
         typer.echo(f"decision {decision_id}: shakedown_note for alert {alert}")
+
+
+def _register_lab(app: typer.Typer, edges: _Edges) -> None:
+    """`sweep`, `lab status`, `experiment`, `experiments`, `exposure record` and `exposures`."""
+    settings, clock, sweep_clock = edges.settings, edges.clock, edges.sweep_clock
 
     sweep_app = typer.Typer(no_args_is_help=True, help="Register, run and judge sweeps.")
     app.add_typer(sweep_app, name="sweep")
@@ -5516,6 +5545,11 @@ def make_app(
         for r in listed:
             _echo_scrubbed(_exposure_line(r), s)
 
+
+def _register_store(app: typer.Typer, edges: _Edges) -> None:
+    """The `store` and `archive` commands."""
+    settings, clock, icloud = edges.settings, edges.clock, edges.icloud
+
     store_app = typer.Typer(no_args_is_help=True, help="Look after the store file.")
     app.add_typer(store_app, name="store")
 
@@ -5677,6 +5711,17 @@ def make_app(
             raise _fail(_scrubbed(f"rederive refused: {_describe(exc)}", s), 1) from None
         for line in lines:
             _echo_scrubbed(line, s)
+
+
+def _register_research(app: typer.Typer, edges: _Edges) -> None:
+    """`dataset register`, `corpus fetch` and the `research` commands."""
+    settings, clock, edgar_client, launcher, model_client = (
+        edges.settings,
+        edges.clock,
+        edges.edgar_client,
+        edges.launcher,
+        edges.model_client,
+    )
 
     dataset_app = typer.Typer(no_args_is_help=True, help="Register research datasets.")
     app.add_typer(dataset_app, name="dataset")
@@ -6274,6 +6319,16 @@ def make_app(
         if result.outcome in ("ok", "unfinished"):
             return
         raise typer.Exit(1 if result.outcome == "failed" else USAGE_ERROR)
+
+
+def _register_paper(app: typer.Typer, edges: _Edges) -> None:
+    """The `paper` commands."""
+    settings, clock, broker, parse_export = (
+        edges.settings,
+        edges.clock,
+        edges.broker,
+        edges.parse_export,
+    )
 
     paper_app = typer.Typer(no_args_is_help=True, help="Paper trading (Phase 4).")
     app.add_typer(paper_app, name="paper")
@@ -7187,6 +7242,11 @@ def make_app(
         if not report.clean:
             raise typer.Exit(LOTS_RECONCILE_DIFFERENCE_EXIT)
 
+
+def _register_checks(app: typer.Typer, edges: _Edges) -> None:
+    """`index-check`, `identity-check` and `close-gap`."""
+    settings, clock = edges.settings, edges.clock
+
     @app.command("index-check")
     def index_check_(
         start: Annotated[
@@ -7307,6 +7367,49 @@ def make_app(
         if gaps.height:
             raise typer.Exit(1)
 
+
+def make_app(
+    *,
+    settings: Callable[[], Settings] = get_settings,
+    clock: Clock = utc_now,
+    edgar_client: httpx.Client | None = None,
+    price_source: Callable[[Settings], PriceSource] | None = None,
+    rate_source: Callable[[Settings], RateSource] = lambda s: FredRateSource(settings=s),
+    assets_source: Callable[[Settings, Clock], alpaca_raw.AssetsFetch] = (
+        lambda s, c: alpaca_raw.assets_all(s, clock=c)
+    ),
+    launcher: Launcher = subprocess.call,
+    parse_export: Callable[[Path], list[BrokerLotRow]] = parse_broker_export,
+    sweep_clock: lab.Clock | None = None,
+    broker: BrokerFactory = build_broker,
+    model_client: job.ClientFactory = job.CLIENT_FACTORY,
+    icloud: archive_cmd.IcloudFactory = archive_cmd.default_icloud,
+) -> typer.Typer:
+    """The `tradepartner` Typer app over the given edges (module docstring)."""
+    app = typer.Typer(no_args_is_help=True, add_completion=False, pretty_exceptions_enable=False)
+    edges = _Edges(
+        settings=settings,
+        clock=clock,
+        edgar_client=edgar_client,
+        price_source=price_source,
+        rate_source=rate_source,
+        assets_source=assets_source,
+        launcher=launcher,
+        parse_export=parse_export,
+        sweep_clock=sweep_clock,
+        broker=broker,
+        model_client=model_client,
+        icloud=icloud,
+    )
+    _register_data(app, edges)
+    _register_reports(app, edges)
+    _register_backtest(app, edges)
+    _register_decisions(app, edges)
+    _register_lab(app, edges)
+    _register_store(app, edges)
+    _register_research(app, edges)
+    _register_paper(app, edges)
+    _register_checks(app, edges)
     return app
 
 
