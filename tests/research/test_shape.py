@@ -1,9 +1,10 @@
-"""Shape and effective-count arithmetic (T441, #3741): the spec's cells, and purity."""
+"""Shape and effective-count arithmetic (T452, #3741): the spec's cells, and purity."""
 
 from __future__ import annotations
 
 import ast
 import math
+import random
 from collections.abc import Callable
 from pathlib import Path
 
@@ -170,40 +171,162 @@ def test_same_issuer_same_session_is_one_cluster() -> None:
     assert ec.n_eff == pytest.approx(1.0)
 
 
-def test_bounds_and_default_match_the_pairwise_definition() -> None:
-    events = [("A", 0), ("B", 0), ("A", 5), ("C", 12), ("B", 30), ("D", 31)]
-    hold = 20
+def _brute_n_eff(
+    events: list[tuple[str, int]], hold: int, rho: float | None, cross: float
+) -> float:
+    """O(N^2) pairwise sum straight from the spec's definition."""
 
     def overlap(a: int, b: int) -> float:
         return max(0, hold - abs(a - b)) / hold
 
-    def n_eff(rho: float | None) -> float:
-        total = 0.0
-        for a, i in enumerate(events):
-            for b, j in enumerate(events):
-                if a == b:
-                    total += 1.0
-                elif i[0] == j[0]:
-                    total += overlap(i[1], j[1])
-                elif rho is None:
-                    total += 1.0 if i[1] == j[1] else 0.0
-                else:
-                    total += rho * overlap(i[1], j[1])
-        return len(events) ** 2 / total
-
-    ec = shape.effective_count(events, hold, rho=0.4)
-    assert ec.n_eff == pytest.approx(n_eff(0.4))
-    assert ec.n_eff_rho0 == pytest.approx(n_eff(0.0))
-    assert ec.n_eff_rho1 == pytest.approx(n_eff(1.0))
-    assert shape.effective_count(events, hold).n_eff == pytest.approx(n_eff(None))
-    assert ec.n_eff_rho1 <= ec.n_eff <= ec.n_eff_rho0
+    total = 0.0
+    for a, i in enumerate(events):
+        for b, j in enumerate(events):
+            if a == b:
+                total += 1.0
+            elif i[0] == j[0]:
+                total += overlap(i[1], j[1])
+            elif rho is not None:
+                total += rho * overlap(i[1], j[1])
+            elif i[1] == j[1]:
+                total += 1.0
+            else:
+                total += cross * overlap(i[1], j[1])
+    return len(events) ** 2 / total
 
 
-def test_open_question_2_comparison() -> None:
-    """One event a session, distinct issuers, 20-session holds: default vs rho = 1."""
+def test_default_cross_issuer_rho_is_the_auditors_ruling() -> None:
+    assert shape.DEFAULT_CROSS_ISSUER_RHO == 0.05
+
+
+def test_old_identity_holds_with_zero_cross_session_rho() -> None:
+    pairs = [(0, 0), (0, 1), (0, 2), (3, 0), (4, 0), (4, 1)]
+    ec = shape.effective_count([(f"{d}-{k}", d) for d, k in pairs], 20, cross_issuer_rho=0.0)
+    assert ec.n_eff == pytest.approx(36 / (9 + 1 + 4))  # N^2 / sum m_d^2
+
+
+def test_randomized_brute_force_agreement() -> None:
+    rng = random.Random(3741)
+    for _ in range(300):
+        n = rng.randint(1, 60)
+        hold = rng.randint(1, 45)
+        issuers = [f"i{k}" for k in range(rng.randint(1, 8))]
+        events = [(rng.choice(issuers), rng.randint(-30, 40)) for _ in range(n)]
+        # an issuer twice on one session, and unsorted input
+        events.append(events[0])
+        rng.shuffle(events)
+        cross = rng.choice([0.0, 0.05, 0.3])
+        for rho in (None, 0.0, 0.03, 0.5, 1.0):
+            ec = shape.effective_count(events, hold, rho=rho, cross_issuer_rho=cross)
+            assert ec.n_eff == pytest.approx(_brute_n_eff(events, hold, rho, cross), rel=1e-9)
+            assert ec.n_eff_rho0 == pytest.approx(_brute_n_eff(events, hold, 0.0, cross), rel=1e-9)
+            assert ec.n_eff_rho1 == pytest.approx(_brute_n_eff(events, hold, 1.0, cross), rel=1e-9)
+            assert ec.n == pytest.approx(ec.n_eff * ec.same_date_factor * ec.overlap_factor)
+
+
+def test_worked_case_exact_and_by_hand() -> None:
+    """Auditor's case: 1,000 one-a-day events, distinct issuers, 20-session hold."""
     ec = shape.effective_count([(f"i{k}", k) for k in range(1000)], 20)
-    assert ec.n_eff == pytest.approx(1000.0)  # the default sees no shared session
-    assert ec.n_eff_rho1 == pytest.approx(50.0, rel=0.02)  # N / (1 + hold - 1) edge-corrected
+    assert ec.n_eff == pytest.approx(515, abs=5)
+    assert ec.n_eff_rho1 == pytest.approx(50.3, abs=0.5)
+    assert ec.n_eff_rho0 == pytest.approx(1000.0)
+    by_hand = shape.effective_count_by_hand(1000, ec.same_date_factor, 20, 1000)
+    assert by_hand == pytest.approx(500.0)
+    assert by_hand == pytest.approx(ec.n_eff, rel=0.05)
+
+
+def _e1_events(bunched: bool) -> list[tuple[str, int]]:
+    """Synthetic E1 set: 20,000 events, 1,000 issuers, 20 quarters of 63 sessions (seeded)."""
+    rng = random.Random(452)
+    events = []
+    for _ in range(20_000):
+        quarter = rng.randrange(20)
+        within = int(63 * rng.random() ** 2) if bunched else rng.randrange(63)
+        events.append((f"i{rng.randrange(1000)}", quarter * 63 + within))
+    return events
+
+
+def test_e1_synthetic_exact_against_hand_formula_and_bounds() -> None:
+    s, hold = 20 * 63, 60
+    ceiling = shape.effective_count_ceiling(hold, s)
+    same_session = shape.effective_count_same_session_bound(hold, s)
+    assert ceiling == pytest.approx(420)
+    assert same_session == pytest.approx(315)
+    results = {}
+    for bunched in (False, True):
+        ec = shape.effective_count(_e1_events(bunched), hold)
+        results[bunched] = ec
+        hand = shape.effective_count_by_hand(ec.n, ec.same_date_factor, hold, s)
+        assert hand == pytest.approx(ec.n_eff, rel=0.05)
+        assert ec.n_eff <= same_session < ceiling
+        assert hand <= ceiling
+    uniform, bunch = results[False], results[True]
+    assert bunch.same_date_factor > uniform.same_date_factor
+    assert 15 < uniform.same_date_factor < 20  # about N/S + 1 = 16.9 for uniform arrival
+    assert 290 < uniform.n_eff < 315  # the auditor's uniform set gave 312.9
+    assert 150 < bunch.n_eff < uniform.n_eff  # bunching lowers it further
+
+
+def test_same_session_bound_formula_and_refusals() -> None:
+    assert shape.effective_count_same_session_bound(60, 1260) == pytest.approx(
+        1260 / (1 + 0.05 * 60)
+    )
+    with pytest.raises(ValueError):
+        shape.effective_count_same_session_bound(60, 0)
+
+
+def test_by_hand_tracks_exact_on_bunched_events() -> None:
+    rng = random.Random(7)
+    events = [(f"i{rng.randrange(400)}", rng.randrange(600)) for _ in range(6000)]
+    ec = shape.effective_count(events, 60)
+    est = shape.effective_count_by_hand(ec.n, ec.same_date_factor, 60, 660)
+    assert est == pytest.approx(ec.n_eff, rel=0.15)
+
+
+def test_by_hand_refuses_bad_inputs() -> None:
+    with pytest.raises(ValueError):
+        shape.effective_count_by_hand(0, 1.0, 20, 100)
+    with pytest.raises(ValueError):
+        shape.effective_count_ceiling(20, 100, rho=0.0)
+
+
+def test_overlap_factor_can_fall_below_one_under_a_cited_rho() -> None:
+    ec = shape.effective_count([(f"i{k}", 7) for k in range(4)], 20, rho=0.0)
+    assert ec.same_date_factor == pytest.approx(4.0)
+    assert ec.overlap_factor == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize(("power", "sd", "expected"), [(0.5, 866.0, 75), (0.5, 1500.0, 225)])
+def test_min_count_at_fifty_percent(power: float, sd: float, expected: int) -> None:
+    assert shape.event_min_count(200.0, 100.0, sd, power=power) == expected
+
+
+def test_min_count_is_exact_over_the_power_range() -> None:
+    # both branches (floor leg for net 140, t leg for net 100) and the switch (~55.2 bp net)
+    for gross in (140.0, 155.2, 155.3, 200.0, 300.0):
+        for power in (0.3, 0.5, 0.65, 0.8, 0.9):
+            n = shape.event_min_count(gross, 100.0, 866.0, power=power)
+            assert n is not None
+            p = shape.event_pass_probability(gross, 100.0, 866.0, n)
+            assert p >= power - 1e-9
+            if n > 1:
+                assert shape.event_pass_probability(gross, 100.0, 866.0, n - 1) < power
+
+
+def test_min_count_at_thirty_percent() -> None:
+    assert shape.event_min_count(200.0, 100.0, 866.0, power=0.3) == 17
+
+
+def test_min_count_is_one_when_every_count_meets_the_power() -> None:
+    # t_f + z <= 0 (z(0.1) = -1.28, t_f 1.0): n = 1 meets it. Not None (the reject case).
+    n = shape.event_min_count(200.0, 100.0, 866.0, power=0.1, t_floor=1.0)
+    assert n == 1
+    assert shape.event_pass_probability(200.0, 100.0, 866.0, 1) >= 0.1
+    assert shape.event_min_count(130.0, 100.0, 866.0, power=0.1) is None
+
+
+def test_borrow_constant() -> None:
+    assert pytest.approx(1.25) == shape.DEFAULT_BORROW_LONG_SHORT_BP
 
 
 # --- Purity ---
