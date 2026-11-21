@@ -54,16 +54,16 @@ The owner's list of 2026-11-02 (spec, "Data / interfaces"); extend by editing th
 
 ## Card shape
 
-**Cards written from 2026-11-21 (#3702; [spec amendment](../specs/idea-pipeline.md#amendment-2026-11-21-3702-the-passable-shape-on-the-card)).** The Shape block comes first and replaces lines 3 and 7. Its closed form, defaults and worked example are in the spec amendment, sections B to D. A card under 2 on the cost line is `rejected: shape` and nothing more is done for it. The cards below were written before this date; they keep the earlier shape and are not re-scored.
+**Cards written from 2026-11-21 (#3702; [spec amendment](../specs/idea-pipeline.md#amendment-2026-11-21-3702-the-passable-shape-on-the-card)).** The Shape block comes first and replaces lines 3 and 7. Its closed form, defaults and worked example are in the spec amendment, sections B to D. A card that no count could carry past the decision cost (an event idea with gross at or under the round trip plus the net floor; a trial with net at or under zero) is `rejected: shape` and nothing more is done for it. Under a ratio of 2 a card carries a warning and its power line decides. The cards below were written before this date; they keep the earlier shape and are not re-scored.
 
 ```
 ### <id>  <one-line mechanism>
 source: B|C|A|D|E (<batch row date>)   ·   written: <date>   ·   by: owner | agent | workflow <id>
 shape:         <event, hold <h> sessions | trial, <cadence>>; band <band>; decision cost <c> bp per side (ADR 0023 harsh cell)
-  cost:        turnover <x>/yr one-sided; gross <g> bp per <event | month> (<source>; QI-2 <applied once | post-publication figure>); round trip <R> bp; ratio g/R <r> against 2   ·   beside it: <r> at arrival, <r> at the paper basis
-  power:       event: raw <n>/yr over <years>, ÷ clustering <B>, ÷ overlap <O>, n_eff <n> against n_min <n>   |   trial: <T> months, net IR <x> against <bar>
+  cost:        turnover <x>/yr (one-sided, all legs, over equity); gross <g> bp per <event | month> (<source>; QI-2 <applied once | post-publication figure>); round trip <R> bp (<legs charged>); ratio g/R <r> (guide: 2)   ·   beside it: <r> at arrival, <r> at the paper basis
+  power:       event: raw <n>/yr over <years> (<estimate, source | counts block, sha>), ÷ clustering <B>, ÷ overlap <O>, n_eff <n> against n_min <n>   |   trial: <T> months, net IR <x> against <bar>
   pass chance: <p>% = Φ(<z>); sd <value> (<source; never held returns>); rule <floor F, t floor | line 40 with SR* <value>>
-  result:      pass | rejected: shape | deferred: power | blocked: cost measurement (<band>)
+  result:      pass | pass, warning: under 2× | rejected: shape | deferred: power | blocked: cost measurement (<band>) | blocked: <other capability>
 1 persists because:  inefficiency <who keeps losing, why> | premium <what loss we are paid to carry, when it arrives> | constraint <on whom>
 2 capture:           capacity at $100-$100k <yes/no, why>; hold <n> sessions fits patience <yes/no>; execution needed <held | q6>
 4 data:              timestamp <field>; delisted coverage <ok | thin>; history <2016+ | pre-2016>
