@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import re
 import shutil
+import zlib
 from collections.abc import Callable
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -18,7 +19,7 @@ import duckdb
 import pytest
 from fixtures.research import feasibility_store as fx
 
-from tradepartner.calendar import last_completed_session
+from tradepartner.calendar import last_completed_session, session_close
 from tradepartner.research import feasibility as feas
 from tradepartner.research import feasibility_block as fb
 from tradepartner.research import feasibility_design as fd
@@ -27,6 +28,24 @@ from tradepartner.store.db import insert_row
 FACTS = fb.StoreFacts("copy.duckdb", 1, datetime(2026, 1, 1, tzinfo=UTC), 49, "run-1", None)
 SRC = Path(feas.__file__)
 PRICE_COLUMNS = {"security_id", "session", "close", "volume", "known_at"}
+_BARS_WHERE = (
+    "WHERE list_contains(?, security_id) AND session >= ? AND session <= ? AND known_at <= ?"
+)
+_WINDOW = "WINDOW w AS (PARTITION BY security_id ORDER BY session)"
+MUTANT_SQL = {
+    # drop a bar whose close moved more than 5% from the one before
+    "outlier_filter": (
+        "SELECT security_id, session, close, volume, known_at FROM ("
+        "SELECT security_id, session, close, volume, known_at, "
+        f"close / lag(close) OVER w AS step FROM prices_daily {_BARS_WHERE} {_WINDOW}"
+        ") WHERE step IS NULL OR abs(step - 1) <= 0.05"
+    ),
+    # scale each bar's level by that bar's own close-to-close ratio
+    "per_bar_ratio": (
+        "SELECT security_id, session, close * COALESCE(close / lag(close) OVER w, 1.0) AS close, "
+        f"volume, known_at FROM prices_daily {_BARS_WHERE} {_WINDOW}"
+    ),
+}
 
 
 @pytest.fixture(scope="module")
@@ -112,21 +131,33 @@ def test_read_only_hard_rule_file_unchanged_and_no_write_possible(
 # --- Levels only, from five columns ---
 
 
+def _check_price_sql(sql: str) -> None:
+    """Every SELECT of a statement that names `prices_daily` lists only the five columns."""
+    if "prices_daily" not in sql:
+        return
+    lists = re.findall(r"SELECT\s+(?:DISTINCT\s+)?(.*?)\s+FROM\s", sql, re.S)
+    assert lists
+    for items in lists:
+        # Split on top-level commas only: an item with a call or an expression is not a column.
+        assert {c.strip() for c in items.split(",")} <= PRICE_COLUMNS, sql
+    assert not re.search(r"\bOVER\b|\b(lag|lead)\b|\*|/", sql, re.I), sql
+    assert not re.search(r"\b(open|high|low|adj\w*)\b", sql, re.I), sql
+
+
 def test_prices_daily_is_read_through_exactly_five_columns(built: fx.FeasibilityStore) -> None:
     seen = 0
     for name in ("form4", "form25", "statement_fact", "corporate_action"):
         for sql in _recorded(built.path, _design(name)):
-            if "prices_daily" not in sql:
-                continue
-            seen += 1
-            select = re.match(r"\s*SELECT\s+(DISTINCT\s+)?(.*?)\s+FROM\s", sql, re.S)
-            assert select is not None
-            columns = {c.strip() for c in select.group(2).split(",")}
-            assert columns <= PRICE_COLUMNS
-            assert "*" not in sql
-            assert not re.search(r"\b(open|high|low|adj\w*)\b", sql, re.I)
+            seen += "prices_daily" in sql
+            _check_price_sql(sql)
     assert seen >= 4
     assert not re.search(r"SELECT\s+\*|\.\*", SRC.read_text())
+
+
+@pytest.mark.parametrize("name", sorted(MUTANT_SQL))
+def test_the_five_column_check_catches_a_lag_query(name: str) -> None:
+    with pytest.raises(AssertionError):
+        _check_price_sql(MUTANT_SQL[name])
 
 
 def test_open_high_low_are_never_read(built: fx.FeasibilityStore, tmp_path: Path) -> None:
@@ -139,37 +170,81 @@ def test_open_high_low_are_never_read(built: fx.FeasibilityStore, tmp_path: Path
 
 # --- No return and no price change ---
 
-_FACTOR = "(1 << CAST(hash(security_id, session) % 4 AS INTEGER))"
+SOURCES4 = ["form4", "form25", "statement_fact", "corporate_action"]
+
+
+def _stable_offset(security_id: str) -> int:
+    return zlib.crc32(security_id.encode()) % 8
 
 
 def _factor_store(built: fx.FeasibilityStore, tmp_path: Path) -> Path:
-    """Every session's close divided by its own power of two, volume multiplied by it.
+    """Each session's close divided by a power of two, volume multiplied by it.
 
-    `close * volume` is unchanged bit for bit (the factors are powers of two); every
-    close-to-close change differs.
+    The factor is `1 << ((k + offset(security)) % 8)` for the session's ordinal k, so two
+    adjacent sessions never share one: every close-to-close change differs, and (powers of
+    two) every `close * volume` is unchanged bit for bit.
     """
     path = _copy(built, tmp_path)
-    _edit(
-        path,
-        f"UPDATE prices_daily SET close = close / {_FACTOR}, volume = volume * {_FACTOR}",
-    )
+    conn = duckdb.connect(str(path))
+    try:
+        sessions = [
+            r[0]
+            for r in conn.execute("SELECT DISTINCT session FROM prices_daily ORDER BY 1").fetchall()
+        ]
+        ids = [
+            r[0] for r in conn.execute("SELECT DISTINCT security_id FROM prices_daily").fetchall()
+        ]
+        conn.execute("CREATE TEMP TABLE ramp (security_id VARCHAR, session DATE, f BIGINT)")
+        conn.executemany(
+            "INSERT INTO ramp VALUES (?, ?, ?)",
+            [
+                (sid, session, 1 << ((k + _stable_offset(sid)) % 8))
+                for sid in ids
+                for k, session in enumerate(sessions)
+            ],
+        )
+        conn.execute(
+            "UPDATE prices_daily SET close = close / r.f, volume = volume * r.f FROM ramp r "
+            "WHERE r.security_id = prices_daily.security_id AND r.session = prices_daily.session"
+        )
+    finally:
+        conn.close()
     return path
 
 
-def test_factor_case_changes_every_price_change_and_no_level(
+def _first_bars(path: Path) -> dict[str, list[tuple[date, float, int]]]:
+    conn = duckdb.connect(str(path), read_only=True)
+    try:
+        rows = conn.execute(
+            "SELECT security_id, session, close, volume FROM prices_daily "
+            "WHERE known_at < TIMESTAMPTZ '2019-01-01' ORDER BY security_id, session"
+        ).fetchall()
+    finally:
+        conn.close()
+    out: dict[str, list[tuple[date, float, int]]] = {}
+    for sid, session, close, volume in rows:
+        out.setdefault(sid, []).append((session, close, volume))
+    return out
+
+
+def test_factor_case_alters_every_close_to_close_change_and_no_level(
     built: fx.FeasibilityStore, tmp_path: Path
 ) -> None:
-    path = _factor_store(built, tmp_path)
-    q = "SELECT security_id, session, close, volume FROM prices_daily ORDER BY 1, 2"
-    a = built.connect().execute(q).fetchall()
-    b = duckdb.connect(str(path), read_only=True).execute(q).fetchall()
-    assert [r[2] * r[3] for r in a] == [r[2] * r[3] for r in b]
-    changed = [x[2] / y[2] for x, y in zip(a, b, strict=True)]
-    assert len({round(c, 9) for c in changed}) > 3
-    assert [r[2] for r in a] != [r[2] for r in b]
+    before = _first_bars(built.path)
+    after = _first_bars(_factor_store(built, tmp_path))
+    changes = same = 0
+    for sid, bars in before.items():
+        moved = after[sid]
+        for (_, c0, v0), (_, c1, v1) in zip(bars, moved, strict=True):
+            assert c0 * v0 == c1 * v1  # every level, bit for bit
+        for i in range(1, len(bars)):
+            changes += 1
+            same += (bars[i][1] / bars[i - 1][1]) == (moved[i][1] / moved[i - 1][1])
+    assert changes > 1000
+    assert same == 0  # not one close-to-close change survives
 
 
-@pytest.mark.parametrize("name", ["form4", "form25", "statement_fact", "corporate_action"])
+@pytest.mark.parametrize("name", SOURCES4)
 def test_factor_case_block_is_byte_identical(
     built: fx.FeasibilityStore, tmp_path: Path, name: str
 ) -> None:
@@ -177,26 +252,58 @@ def test_factor_case_block_is_byte_identical(
     assert _block(_factor_store(built, tmp_path), design) == _block(built.path, design)
 
 
-def test_mutant_reader_with_one_close_change_fails_the_factor_case(
-    built: fx.FeasibilityStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _per_event_mutant(path: Path) -> Callable[..., float | None]:
+    """A reader whose band is the median level times one close-to-close ratio at its end."""
+    bars = _first_bars(path)
+    where: dict[tuple[date, float], tuple[str, int]] = {}
+    for sid, rows in bars.items():
+        for i, (session, close, volume) in enumerate(rows):
+            where[(session, close * volume)] = (sid, i)
+    real = _REAL_MEDIAN
+
+    def mutant(
+        by_session: dict[date, list[tuple[datetime, float]]],
+        sessions: list[date],
+        decided_at: datetime,
+    ) -> float | None:
+        level = real(by_session, sessions, decided_at)
+        done = sessions[-1]
+        key = (done, by_session[done][-1][1]) if by_session.get(done) else None
+        if level is None or key is None or key not in where:
+            return level
+        sid, i = where[key]
+        return level * bars[sid][i][1] / bars[sid][i - 1][1]
+
+    return mutant
+
+
+_REAL_MEDIAN = feas._lookback_median
+MUTANTS = ("outlier_filter", "per_bar_ratio", "per_event_ratio")
+
+
+@pytest.mark.parametrize("mutant", MUTANTS)
+@pytest.mark.parametrize("name", SOURCES4)
+def test_a_reader_that_reads_one_close_to_close_change_fails_the_factor_case(
+    built: fx.FeasibilityStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    mutant: str,
 ) -> None:
-    """The fixture is sensitive: a reader that reads one close-to-close change is caught."""
-    design = _design()
+    """The fixture is sensitive: each reader that reads a price change is caught."""
+    design = _design(name)
     factor = _factor_store(built, tmp_path)
-    # An "outlier filter": drop a bar whose close moved more than 5% from the one before.
-    mutant_sql = (
-        "SELECT security_id, session, close, volume, known_at FROM ("
-        "SELECT security_id, session, close, volume, known_at, "
-        "close / lag(close) OVER w AS step FROM prices_daily "
-        "WHERE list_contains(?, security_id) AND session >= ? AND session <= ? AND known_at <= ? "
-        "WINDOW w AS (PARTITION BY security_id ORDER BY session)"
-        ") WHERE step IS NULL OR abs(step - 1) <= 0.05"
-    )
-    # The honest reader passes on the factor store ...
-    assert _block(factor, design) == _block(built.path, design)
-    # ... and the mutant does not.
-    monkeypatch.setattr(feas, "_BARS_SQL", mutant_sql)
-    assert _block(factor, design) != _block(built.path, design)
+    assert _block(factor, design) == _block(built.path, design)  # the honest reader passes
+    if mutant == "per_event_ratio":
+        # Built per store: each run reads the ratios of the file it is counting.
+        monkeypatch.setattr(feas, "_lookback_median", _per_event_mutant(factor))
+        wrong_factor = _block(factor, design)
+        monkeypatch.setattr(feas, "_lookback_median", _per_event_mutant(built.path))
+        wrong_base = _block(built.path, design)
+    else:
+        monkeypatch.setattr(feas, "_BARS_SQL", MUTANT_SQL[mutant])
+        wrong_factor, wrong_base = _block(factor, design), _block(built.path, design)
+    assert wrong_factor != wrong_base
 
 
 def _lookback_keep(
@@ -654,3 +761,224 @@ def test_a_form_25_filed_in_the_window_and_effective_after_it_is_not_a_delister(
     assert counts.coverage.delisted_with_events == 3
     low = next(t for t in counts.totals if t.band == 2)
     assert low.raw_events == 1 and low.issuers == 1
+
+
+# --- Identity: a fact's natural key, whatever the insert order ---
+
+
+def _insert_joint_form4(path: Path, owners: list[tuple[str, bool]]) -> None:
+    """One joint Form 4 for CCC: the same accession, line_no and known_at, one row per owner."""
+    accepted = datetime(2018, 8, 14, 15, tzinfo=UTC)
+    conn = duckdb.connect(str(path))
+    try:
+        for filer, officer in owners:
+            insert_row(
+                conn,
+                "sec_form4_transactions",
+                {
+                    "accession": "0000000077-18-000001",
+                    "issuer_cik": fx.CIK["CCC"],
+                    "filer_cik": filer,
+                    "line_no": 0,
+                    "is_director": False,
+                    "is_officer": officer,
+                    "is_ten_percent_owner": not officer,
+                    "is_other": False,
+                    "transaction_date": accepted.date(),
+                    "transaction_code": "P",
+                    "acquired_disposed": "A",
+                    "shares": 100,
+                    "ownership_form": "D",
+                    "security_title": "Common Stock",
+                    "accepted_at": accepted,
+                    "known_at": accepted,
+                    "ingested_at": accepted,
+                    "source": "test",
+                    "provenance": "filing",
+                },
+            )
+    finally:
+        conn.close()
+
+
+def test_a_joint_form_4_counts_the_same_in_either_insert_order(
+    built: fx.FeasibilityStore, tmp_path: Path
+) -> None:
+    results = []
+    for number, owners in enumerate(
+        ([("991", True), ("992", False)], [("992", False), ("991", True)])
+    ):
+        folder = tmp_path / f"order{number}"
+        folder.mkdir()
+        path = _copy(built, folder)
+        _edit(path, "DELETE FROM sec_form4_transactions")
+        _insert_joint_form4(path, owners)
+        counts = _counts(path, _design())
+        results.append((counts.timestamp, _totals(counts)))
+    # The officer's row matches the filter: one row, one event (low band, CCC).
+    assert results[0] == results[1]
+    assert results[0][0].rows_matched == 1
+    assert results[0][1][2] == (1, 1, 1)
+
+
+def _only_actions(path: Path, rows: list[tuple[date, datetime]]) -> None:
+    """BBB split id X1, re-dated: (ex_date, known_at) revisions of one action."""
+    _edit(path, "DELETE FROM corporate_actions")
+    conn = duckdb.connect(str(path))
+    try:
+        for ex_date, known in rows:
+            insert_row(
+                conn,
+                "corporate_actions",
+                {
+                    "security_id": "SEC_BBB",
+                    "action_type": "split",
+                    "ex_date": ex_date,
+                    "ratio_or_amount": 2.0,
+                    "source_action_id": "X1",
+                    "cancelled": False,
+                    "known_at": known,
+                    "ingested_at": known,
+                    "source": "test",
+                    "provenance": "action",
+                },
+            )
+    finally:
+        conn.close()
+
+
+def test_a_re_dated_action_with_a_source_id_is_one_event(
+    built: fx.FeasibilityStore, tmp_path: Path
+) -> None:
+    path = _copy(built, tmp_path)
+    _only_actions(
+        path,
+        [
+            (date(2018, 8, 1), datetime(2018, 7, 20, 21, tzinfo=UTC)),
+            (date(2018, 8, 15), datetime(2018, 9, 10, 21, tzinfo=UTC)),
+        ],
+    )
+    counts = _counts(path, _design("corporate_action"))
+    assert counts.timestamp.rows_matched == 1
+    assert _totals(counts)[1] == (1, 1, 1)
+
+
+def _only_delistings(path: Path, rows: list[tuple[str, str, str]]) -> None:
+    """DDD Form 25 rows filed at one instant: (form, class_title, exchange)."""
+    _edit(path, "DELETE FROM delistings")
+    filed = datetime(2018, 9, 7, 13, tzinfo=UTC)
+    conn = duckdb.connect(str(path))
+    try:
+        for form, class_title, exchange in rows:
+            insert_row(
+                conn,
+                "delistings",
+                {
+                    "security_id": "SEC_DDD",
+                    "form": form,
+                    "class_title": class_title,
+                    "exchange": exchange,
+                    "filed_at": filed,
+                    "effective_on": date(2018, 9, 17),
+                    "known_at": filed,
+                    "ingested_at": filed,
+                    "source": "test",
+                    "provenance": "filing",
+                },
+            )
+    finally:
+        conn.close()
+
+
+def test_two_form_25_rows_differing_only_in_class_or_exchange_are_two_facts(
+    built: fx.FeasibilityStore, tmp_path: Path
+) -> None:
+    path = _copy(built, tmp_path)
+    _only_delistings(path, [("25", "Common Stock", "XNYS"), ("25", "Warrants", "XNYS")])
+    assert _counts(path, _design("form25")).timestamp.rows_matched == 2
+    _only_delistings(path, [("25", "Common Stock", "XNYS"), ("25", "Common Stock", "XNAS")])
+    assert _counts(path, _design("form25")).timestamp.rows_matched == 2
+
+
+@pytest.mark.parametrize("order", [0, 1])
+def test_a_filter_on_exchange_picks_the_row_by_its_value_not_its_position(
+    built: fx.FeasibilityStore, tmp_path: Path, order: int
+) -> None:
+    path = _copy(built, tmp_path)
+    rows = [("25", "Common Stock", "XNYS"), ("25", "Common Stock", "XNAS")]
+    _only_delistings(path, rows if order == 0 else rows[::-1])
+    text = (fx.DESIGN_DIR / "form25.toml").read_text()
+    design = fd.parse_design_text(
+        text.replace("[window]", '[filter]\nexchange = "XNAS"\n\n[window]')
+    )
+    assert _counts(path, design).timestamp.rows_matched == 1
+
+
+# --- The hold's last session, and delisters' bars inside the window ---
+
+
+def test_hold_past_the_window_end_counts_the_hold_as_entry_to_entry_plus_h_minus_1(
+    built: fx.FeasibilityStore, tmp_path: Path
+) -> None:
+    sessions = list(built.sessions)
+    last = sessions.index(built.window_end)
+    path = _copy(built, tmp_path)
+    _edit(path, "DELETE FROM sec_form4_transactions")
+    for issuer, entry in (("AAA", last - 19), ("BBB", last - 18)):  # H = 20
+        day = sessions[entry - 1]
+        _insert_form4(path, issuer, datetime(day.year, day.month, day.day, 15, tzinfo=UTC), issuer)
+    counts = _counts(path, _design())
+    # AAA holds sessions last-19 .. last (inside); BBB last-18 .. last+1 (past the end).
+    assert counts.events_hold_past_window == 1
+
+
+def test_a_delister_whose_only_bars_predate_the_window_has_no_bars_for_coverage(
+    built: fx.FeasibilityStore, tmp_path: Path
+) -> None:
+    path = _copy(built, tmp_path)
+    early = datetime(2017, 12, 1, 15, tzinfo=UTC)
+    stamp = session_close(date(2017, 12, 29))
+    conn = duckdb.connect(str(path))
+    try:
+        insert_row(
+            conn,
+            "securities",
+            {
+                "security_id": "SEC_HHH",
+                "cik": "0000008",
+                "name": "HHH",
+                "benchmark": False,
+                "known_at": early,
+                "ingested_at": early,
+                "source": "test",
+                "provenance": "snapshot",
+            },
+        )
+        conn.execute(
+            "INSERT INTO prices_daily (security_id, session, open, high, low, close, volume, "
+            "known_at, ingested_at, source, provenance) VALUES "
+            "('SEC_HHH', DATE '2017-12-29', 1, 1, 1, 10, 1000000, ?, ?, 'test', 'bar')",
+            [stamp, stamp],
+        )
+        filed = datetime(2018, 5, 20, 13, tzinfo=UTC)
+        insert_row(
+            conn,
+            "delistings",
+            {
+                "security_id": "SEC_HHH",
+                "form": "25",
+                "class_title": "Common Stock",
+                "exchange": "XNYS",
+                "filed_at": filed,
+                "effective_on": date(2018, 6, 1),
+                "known_at": filed,
+                "ingested_at": filed,
+                "source": "test",
+                "provenance": "filing",
+            },
+        )
+    finally:
+        conn.close()
+    cov = _counts(path, _design()).coverage
+    assert cov.delisted == 4  # HHH ends inside the window
+    assert cov.delisted_with_bars == 2  # but its only bar is from before it
