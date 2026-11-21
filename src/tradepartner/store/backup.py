@@ -11,6 +11,12 @@ opens the copy read-only once and runs one query; then writes
 the SHA-256 of each copied file. Every written file and the directory are
 fsynced before it returns. It never overwrites.
 
+The partial manifest is also the run's claim on its minute: it is created with
+`O_CREAT | O_EXCL`, so of two backups stamped with the same minute exactly one
+gets it, and the other is refused before it writes anything. The names are
+checked again once the claim is held, because a run that finished a moment ago
+no longer holds one. The claim lasts until the manifest is renamed into place.
+
 The retention sweep may remove only (a) old copies whose manifest says
 `reason: "pre_migration"`, together with their WAL and manifest, and (b) what a
 crashed pre-migration run left: the files beside a partial manifest that says
@@ -101,6 +107,19 @@ def _write_synced(path: Path, record: dict[str, object]) -> None:
         os.fsync(handle.fileno())
 
 
+def _create_new(path: Path) -> None:
+    """Create `path` empty, or raise `FileExistsError`: never open an existing file."""
+    os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))
+
+
+def _taken(temp: Path) -> str:
+    """The refusal for a temporary name that is already there."""
+    return (
+        f"{temp} exists: another backup of this minute is running, or an earlier run "
+        "left it; wait a minute and run again, or read it, then remove it"
+    )
+
+
 def _copy_checked(source: Path, temp: Path) -> str:
     """Copy `source` to `temp`, fsync it, and return the SHA-256 both share."""
     shutil.copyfile(source, temp)
@@ -158,12 +177,17 @@ def backup_store(
     temps = [Path(f"{p}.partial") for p in (target, wal_target, manifest)]
     for temp in temps:
         if temp.exists():
-            raise BackupError(f"{temp} is left over from an earlier run; read it, then remove it")
+            raise BackupError(_taken(temp))
     if reason == PRE_MIGRATION:
         check_backup_disk_space(settings)
 
-    # Every file this run has made so far; a failure removes exactly these.
+    # Every file this run has made so far, apart from the manifest: a path is added
+    # only once this run has created it, and a failure removes exactly these.
     made: list[Path] = []
+    # The partial manifest this run created exclusively, later the manifest it was
+    # renamed to. It is what keeps another run out of this minute, so a failure
+    # removes it last.
+    claim: Path | None = None
     try:
         with open_read_only(settings) as conn:
             schema_version = _schema_version(conn)
@@ -174,23 +198,37 @@ def backup_store(
             }
             if reason is not None:
                 record["reason"] = reason
-            # First, so every later file of this run has a sibling that says what it is.
-            made.append(temps[2])
+            # First, so every later file of this run has a sibling that says what it is,
+            # and created exclusively, so it is also this run's claim on the minute.
+            try:
+                _create_new(temps[2])
+            except FileExistsError as exc:
+                raise BackupError(_taken(temps[2])) from exc
+            claim = temps[2]
             _write_synced(temps[2], record)
+            # Again, now that no other run can start on these names: one that finished
+            # between the checks above and the claim holds no claim any more.
+            for path in (target, wal_target, manifest):
+                if path.exists():
+                    raise BackupError(f"{path} already exists; wait a minute and run again")
             has_wal = wal.is_file()
-            made.append(temps[0])
+            for temp in temps[:2] if has_wal else temps[:1]:
+                try:
+                    _create_new(temp)
+                except FileExistsError as exc:
+                    raise BackupError(_taken(temp)) from exc
+                made.append(temp)
             store_sha256 = _copy_checked(store, temps[0])
             wal_sha256: str | None = None
             if has_wal:
-                made.append(temps[1])
                 wal_sha256 = _copy_checked(wal, temps[1])
             store_bytes = store.stat().st_size
             wal_bytes = wal.stat().st_size if has_wal else None
-            made.append(target)
             temps[0].rename(target)
+            made[0] = target
             if has_wal:
-                made.append(wal_target)
                 temps[1].rename(wal_target)
+                made[1] = wal_target
             _fsync_dir(store.parent)
             # After the renames, so DuckDB finds `<copy>.wal`; the source is still held.
             _test_open(target)
@@ -210,16 +248,15 @@ def backup_store(
             if reason is not None:
                 record["reason"] = reason
             _write_synced(temps[2], record)
-            made.append(manifest)
             temps[2].rename(manifest)
+            claim = manifest
             _fsync_dir(store.parent)
     except StoreLockedError as exc:
         raise BackupError(
             f"the store is in use ({exc}); stop the jobs and close other sessions first"
         ) from exc
     except BaseException:
-        for path in made:
-            path.unlink(missing_ok=True)
+        _remove_own(made, claim)
         raise
 
     return BackupResult(
@@ -233,6 +270,15 @@ def backup_store(
         store_sha256=store_sha256,
         wal_sha256=wal_sha256,
     )
+
+
+def _remove_own(made: list[Path], claim: Path | None) -> None:
+    """Remove what a failed run made: its files, then its claim, so no other run
+    can start on these names while they are being removed."""
+    for path in reversed(made):
+        path.unlink(missing_ok=True)
+    if claim is not None:
+        claim.unlink(missing_ok=True)
 
 
 def check_backup_disk_space(settings: Settings) -> None:
