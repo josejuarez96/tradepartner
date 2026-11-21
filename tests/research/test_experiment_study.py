@@ -218,3 +218,31 @@ def test_quarter_cluster_t_refuses_a_window_with_too_few_quarters(tmp_path: Path
     # the default statistic has no such rule: C1b-style short windows still register
     flat = FIXTURE.read_text().replace(old_end, "end = 2016-12-30")
     assert _parse(tmp_path / "flat", flat).study is not None
+
+
+def test_quarter_cluster_t_study_block_survives_the_params_json_round_trip(tmp_path: Path) -> None:
+    """#3679 audit: what the CLI reads back (`params_json`) must satisfy every new consumer.
+
+    A TOML date comes back as ISO text, so the new window check must take it as text, and
+    the other values the new code reads (`se_method`, `z`, `peer_window`, kill floors) keep
+    their types.
+    """
+    from datetime import date
+
+    from tradepartner.research.event_study.stats import SE_METHODS, thin_window_reason
+
+    source = FIXTURE.read_text().replace(
+        'matching = "ex_post"\n', 'matching = "ex_post"\nse_method = "quarter_cluster_t"\n'
+    )
+    source = source.replace('name = "long"\n', 'name = "long"\nentry_start = 2020-01-02\n')
+    parsed = _parse(tmp_path / "rt", source)
+    assert parsed.study is not None
+    assert parsed.study["kill"][0]["entry_start"] == date(2020, 1, 2)  # the parser path: a date
+    design = json.loads(parsed.params_json)["study"]
+    assert design["kill"][0]["entry_start"] == "2020-01-02"  # the stored path: text
+    assert design["se_method"] in SE_METHODS
+    assert isinstance(design["z"], float) and isinstance(design["peer_window"], int)
+    assert all(isinstance(line["t_floor"], float) for line in design["kill"])
+    starts = [line.get("entry_start") for line in design["kill"]]
+    assert thin_window_reason(parsed.window_start, parsed.window_end, starts) is None
+    assert thin_window_reason(parsed.window_start, date(2020, 12, 31), starts) is not None

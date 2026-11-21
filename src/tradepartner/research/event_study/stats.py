@@ -213,16 +213,21 @@ def entry_quarters_spanned(start: date, end: date) -> int:
 
 
 def thin_window_reason(
-    window_start: date, window_end: date, entry_starts: Sequence[date | None]
+    window_start: date, window_end: date, entry_starts: Sequence[date | str | None]
 ) -> str | None:
     """Why ``quarter_cluster_t`` can never reach its minimum G, from frozen dates alone.
 
     Checks the study window and each kill line's ``entry_start`` sub-window
     (``None`` for a line without one). Returns None when every one spans at
-    least ``QUARTER_CLUSTER_MIN_QUARTERS`` calendar quarters.
+    least ``QUARTER_CLUSTER_MIN_QUARTERS`` calendar quarters. An ``entry_start``
+    read from a stored design (``params_json``) is ISO text, not a date; both are
+    accepted here, the one place that reads them.
     """
     spans = [("window", window_start)]
-    spans += [(f"entry_start {d}", max(d, window_start)) for d in entry_starts if d is not None]
+    for raw in entry_starts:
+        if raw is not None:
+            d = raw if isinstance(raw, date) else date.fromisoformat(str(raw))
+            spans.append((f"entry_start {d}", max(d, window_start)))
     for label, start in spans:
         n = entry_quarters_spanned(start, window_end)
         if n < QUARTER_CLUSTER_MIN_QUARTERS:

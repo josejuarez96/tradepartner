@@ -298,6 +298,16 @@ def test_data_driven_thin_quarters_is_an_undefined_t_that_kills_not_an_exception
     assert math.isnan(out["t"]) and out["effect"] == 2.5 and out["quarters"] == 4
 
 
+def test_thin_window_reason_reads_a_json_round_tripped_design() -> None:
+    """The CLI reads `params_json`: a TOML date comes back as ISO text, not a date (audit)."""
+    design = json.loads(json.dumps({"kill": [{"entry_start": date(2016, 7, 1)}]}, default=str))
+    starts = [line.get("entry_start") for line in design["kill"]]
+    assert isinstance(starts[0], str)
+    reason = thin_window_reason(date(2015, 4, 1), date(2017, 3, 31), starts)
+    assert reason is not None and "entry_start 2016-07-01" in reason
+    assert thin_window_reason(date(2015, 4, 1), date(2019, 3, 31), starts) is None
+
+
 def test_thin_window_reason_from_frozen_dates() -> None:
     assert thin_window_reason(date(2015, 4, 1), date(2017, 3, 31), [None]) is None
     reason = thin_window_reason(date(2015, 4, 1), date(2016, 12, 30), [None])
