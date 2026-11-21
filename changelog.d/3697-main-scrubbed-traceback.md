@@ -1,0 +1,3 @@
+- #3697: an exception that escapes any CLI command now prints a failure line and a scrubbed traceback on stderr (exit 1) instead of Python's unscrubbed default; JSON-escaped and bytes-repr secret forms are masked too.
+### Fixed
+- An exception that no command catches no longer leaves `tradepartner` through Python's default handler with an unscrubbed traceback: `main()` prints `failed: <Type>: <message>` and the traceback to stderr through the crash scrub and exits 1, with the pattern-only scrub when settings cannot be loaded. The crash scrub also masks the JSON-escaped and bytes-repr forms of each configured secret (#3697).

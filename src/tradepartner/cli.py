@@ -1471,24 +1471,56 @@ def _describe_failure(exc: BaseException, *, scheduled: bool = False) -> str:
     return f"{_describe(exc)}\n{plain.failure_hint(exc, scheduled=scheduled)}"
 
 
-def _echo_traceback(exc: BaseException, settings: Settings) -> None:
-    """Print the scrubbed traceback of a crash to stderr, after its failure line
-    (#3621): the frames, the chain of causes and contexts, and any notes; source
-    lines of code, never locals. Crash sites only; a refusal prints no traceback.
+def _crash_scrubbed(text: str, secrets: Sequence[str]) -> str:
+    """`text`, a crash's failure line or traceback, through the `cli_record` scrub and
+    the wider masking a crash needs.
 
     A traceback prints `repr()` text and every chained cause, so on top of the
-    `cli_record` scrub each configured secret is also masked in any case and in
-    its repr-escaped form, as the Alerter does for a delivery error."""
-    text = _scrubbed("".join(traceback.format_exception(exc)), settings)
+    `cli_record` scrub each of `secrets` is also masked in any case and in its
+    repr-escaped form, as the Alerter does for a delivery error, and in its
+    JSON-escaped and bytes-repr forms (#3697): a request body or a raw payload in an
+    error prints the secret that way. With no `secrets` only the scrub's patterns
+    apply (emails, key-shaped tokens, credential header lines)."""
+    text = scrub_text(text, secrets=secrets)[0]
     forms = {
         form
-        for secret in _configured_secrets(settings)
-        for form in (secret, repr(secret)[1:-1])
+        for secret in secrets
+        for form in (
+            secret,
+            repr(secret)[1:-1],
+            json.dumps(secret)[1:-1],
+            repr(secret.encode())[2:-1],
+        )
         if form
     }
     for form in sorted(forms, key=len, reverse=True):
         text = re.sub(re.escape(form), SCRUBBED, text, flags=re.IGNORECASE)
-    typer.echo(text, err=True)
+    return text
+
+
+def _echo_traceback(exc: BaseException, settings: Settings) -> None:
+    """Print the scrubbed traceback of a crash to stderr, after its failure line
+    (#3621): the frames, the chain of causes and contexts, and any notes; source
+    lines of code, never locals. Crash sites only; a refusal prints no traceback.
+    Masked as `_crash_scrubbed` describes."""
+    text = "".join(traceback.format_exception(exc))
+    typer.echo(_crash_scrubbed(text, _configured_secrets(settings)), err=True)
+
+
+def _echo_escaped(exc: Exception) -> None:
+    """Print the failure line and the scrubbed traceback of an exception no command
+    caught (#3697) to stderr, in place of Python's default handler, which scrubs
+    nothing; a scheduled job's stderr is a log file.
+
+    Settings are loaded here for their secrets. They may be what failed to load, so
+    when they cannot be built the pattern-only scrub is used: no configured secret is
+    known then, and the config models keep input values out of their own errors."""
+    try:
+        secrets = _configured_secrets(get_settings())
+    except Exception:
+        secrets = []
+    typer.echo(_crash_scrubbed(f"failed: {_describe(exc)}", secrets), err=True)
+    typer.echo(_crash_scrubbed("".join(traceback.format_exception(exc)), secrets), err=True)
 
 
 def _echo_scrubbed(text: str, settings: Settings) -> None:
@@ -7340,8 +7372,19 @@ def make_app(
 
 
 def main() -> None:
-    """Console-script entry point (`[project.scripts] tradepartner`)."""
-    make_app()()
+    """Console-script entry point (`[project.scripts] tradepartner`).
+
+    An exception no command caught prints one failure line and its scrubbed traceback
+    to stderr and exits 1 (#3697). Click turns its own usage errors, aborts and a
+    command's `typer.Exit` into `SystemExit` before they reach here, so their output
+    and exit codes are untouched."""
+    try:
+        make_app()()
+    except (typer.Exit, typer.Abort):
+        raise
+    except Exception as exc:
+        _echo_escaped(exc)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
