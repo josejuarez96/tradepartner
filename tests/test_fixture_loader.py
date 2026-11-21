@@ -184,9 +184,10 @@ def test_loader_creates_store_markers_and_writes_the_fixture_marker(
     tmp_path: Path, store_conn: duckdb.DuckDBPyConnection
 ) -> None:
     """Strategy-lab plan T101: the fixture loader is the writer of the `fixture`
-    marker (spec, Definitions, Fixture marker); `init_schema` alone never
-    creates `store_markers`, so the real store has neither table nor row."""
-    assert "store_markers" not in _table_names(store_conn)
+    marker (spec, Definitions, Fixture marker); `init_schema` creates
+    `store_markers` empty with the other lab tables (#3672) and never writes the
+    row, so the real store has the table and no marker."""
+    assert store_conn.execute("SELECT COUNT(*) FROM store_markers").fetchone() == (0,)
     fixtures_dir = tmp_path / "universe"
     fixtures_dir.mkdir()
 

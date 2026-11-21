@@ -25,7 +25,7 @@ import pytest
 from pydantic import ValidationError
 
 from tradepartner.config import Settings
-from tradepartner.store import journal, schema
+from tradepartner.store import journal, lab_schema, schema
 from tradepartner.store.db import (
     StoreLockedError,
     _is_lock_error,
@@ -1339,12 +1339,15 @@ def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_ro
             "edgar_filers",
             "edgar_index_files",
             "retracted_rows",
+            # Version 50 (#3672): this store was built without the lab schema.
+            *lab_schema.LAB_TABLE_NAMES,
         }
         assert {table for table in shape_before if shape_after[table] != shape_before[table]} == {
             "listings",
             "classifications",
             "trial_metrics",
             "trial_results",
+            "owner_decisions",  # version 50: its `kind` CHECK gains the lab's kinds
         }
         rows_after = _all_rows(conn, tables_before)
         # Version 48 (#3076) appends a NULL `issuer_class` to every classification.
@@ -2400,7 +2403,7 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
     (T172b) is version 28; #1813's skip reasons (T202a) are version 29;
     #821's `successor_chains` (T187) is version 30."""
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RETRACTED_ROWS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_FRESH_LAB_VERSION + 1
 
 
 def test_version_42_adds_snapshot_sightings_to_a_version_41_store() -> None:
@@ -2420,9 +2423,9 @@ def test_version_42_adds_snapshot_sightings_to_a_version_41_store() -> None:
         schema.init_schema(conn)
         assert "snapshot_sightings" in _shape(conn)
         assert max(_versions(conn)) == schema.CURRENT_SCHEMA_VERSION
-        assert _versions(conn) == [41, 42, 43, 44, 45, 46, 47, 48, 49]
+        assert _versions(conn) == [41, 42, 43, 44, 45, 46, 47, 48, 49, 50]
         schema.init_schema(conn)
-        assert _versions(conn) == [41, 42, 43, 44, 45, 46, 47, 48, 49]
+        assert _versions(conn) == [41, 42, 43, 44, 45, 46, 47, 48, 49, 50]
     finally:
         conn.close()
 

@@ -16,7 +16,7 @@ from typing import Any, get_args
 
 import duckdb
 import pytest
-from conftest import mark_pre_lab
+from conftest import mark_pre_lab, strip_lab
 
 from tradepartner.backtest import sweep
 from tradepartner.store import lab_registry, lab_schema, registry, schema
@@ -39,9 +39,13 @@ _PHASE3_DECISION_KINDS = ("gap_signoff", "gap_override", "holdout_spend")
 
 
 def _fresh_store() -> duckdb.DuckDBPyConnection:
+    """A store without the lab schema, as `init_schema` created a fresh one at
+    schema version 16 to 49 (`strip_lab`; since #3672 a fresh store has it):
+    what `apply_lab_schema` is applied to here."""
     conn = duckdb.connect(":memory:")
     configure_connection(conn)
     schema.init_schema(conn)
+    strip_lab(conn)
     return conn
 
 
@@ -403,8 +407,8 @@ def _version_19_store(conn: duckdb.DuckDBPyConnection, *, lab: bool) -> None:
     version-3 DDL widened to version 19's kinds."""
     configure_connection(conn)
     schema.init_schema(conn)
-    if lab:
-        lab_schema.apply_lab_schema(conn)
+    if not lab:
+        strip_lab(conn)  # created fresh after version 16: no lab schema until 50 (#3672)
     conn.execute("DROP TABLE owner_decisions")
     conn.execute(schema._CREATE_OWNER_DECISIONS)
     kinds = _V19_LAB_KINDS if lab else _V19_PLAIN_KINDS
@@ -492,6 +496,35 @@ def _rows_but_versions(conn: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[
     return {t: _rows_in_order(conn, t) for t in sorted(_tables(conn) - {"schema_version"})}
 
 
+def _rows_of(
+    conn: duckdb.DuckDBPyConnection, before: dict[str, list[tuple[Any, ...]]]
+) -> dict[str, list[tuple[Any, ...]]]:
+    """The rows now in the tables `before` snapshotted."""
+    return {t: _rows_in_order(conn, t) for t in before}
+
+
+def _repair_kinds(lab: bool) -> tuple[str, ...]:
+    """The kinds version 50 adds to a store created without the lab (#3672), at
+    the lab step, so before any later version's kinds."""
+    return () if lab else ("promotion", "sweep_retired")
+
+
+def _assert_lab_after_migration(
+    conn: duckdb.DuckDBPyConnection, before: dict[str, list[tuple[Any, ...]]], lab: bool
+) -> None:
+    """Every store has the lab after migrating (#3672). One that had it gains no
+    table; one created without it gains exactly the lab tables, its hypotheses
+    marked pre-lab and no row elsewhere."""
+    assert lab_schema.is_lab_initialised(conn)
+    gained = _tables(conn) - {"schema_version"} - set(before)
+    assert gained == (set() if lab else set(lab_schema.LAB_TABLE_NAMES))
+    if not lab:
+        assert _rows_in_order(conn, "sweeps") == []
+        assert [r[0] for r in _rows_in_order(conn, "pre_lab_hypotheses")] == [
+            r[0] for r in _rows_in_order(conn, "hypotheses")
+        ]
+
+
 @pytest.mark.parametrize("lab", [True, False], ids=["lab", "plain"])
 def test_migrating_a_version_19_store_keeps_every_row(lab: bool) -> None:
     """The migration from 19 is additive: every row of every table, every
@@ -503,15 +536,19 @@ def test_migrating_a_version_19_store_keeps_every_row(lab: bool) -> None:
     check_before = _kind_check(conn)
     columns_before = {t: _columns(conn, t) for t in before}
     schema.init_schema(conn)
-    assert _rows_but_versions(conn) == before
+    assert _rows_of(conn, before) == before
     assert {t: _columns(conn, t) for t in before} == columns_before
     added = ", ".join(
         f"'{k}'"
-        for k in (*lab_schema.SHAKEDOWN_DECISION_KINDS, *lab_schema.OPERATIONS_DECISION_KINDS)
+        for k in (
+            *_repair_kinds(lab),
+            *lab_schema.SHAKEDOWN_DECISION_KINDS,
+            *lab_schema.OPERATIONS_DECISION_KINDS,
+        )
     )
     assert _kind_check(conn) == check_before.replace("'))));", f"', {added}))));")
     assert _versions(conn) == list(range(19, schema.CURRENT_SCHEMA_VERSION + 1))
-    assert lab_schema.is_lab_initialised(conn) == lab
+    _assert_lab_after_migration(conn, before, lab)
     for decision_id, kind in enumerate(lab_schema.SHAKEDOWN_DECISION_KINDS, start=20):
         conn.execute(
             "INSERT INTO owner_decisions VALUES (?, ?, ?, NULL, NULL, '{}', 'r')",
@@ -582,7 +619,7 @@ def test_read_only_open_of_a_version_19_store_passes_and_has_no_span(tmp_path: P
 
 def test_a_fresh_store_allows_the_shakedown_kinds_and_the_lab_keeps_them() -> None:
     conn = _fresh_store()
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RETRACTED_ROWS_VERSION + 1 and _versions(
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_FRESH_LAB_VERSION + 1 and _versions(
         conn
     ) == [schema.CURRENT_SCHEMA_VERSION]
     for decision_id, kind in enumerate(lab_schema.SHAKEDOWN_DECISION_KINDS, start=1):
@@ -635,11 +672,12 @@ def test_migrating_a_version_21_store_keeps_every_row(lab: bool) -> None:
     check_before = _kind_check(conn)
     columns_before = {t: _columns(conn, t) for t in before}
     schema.init_schema(conn)
-    assert _rows_but_versions(conn) == before
+    assert _rows_of(conn, before) == before
     assert {t: _columns(conn, t) for t in before} == columns_before
-    assert _kind_check(conn) == check_before.replace("'))));", "', 'operations_book'))));")
+    added = ", ".join(f"'{k}'" for k in (*_repair_kinds(lab), "operations_book"))
+    assert _kind_check(conn) == check_before.replace("'))));", f"', {added}))));")
     assert _versions(conn) == list(range(21, schema.CURRENT_SCHEMA_VERSION + 1))
-    assert lab_schema.is_lab_initialised(conn) == lab
+    _assert_lab_after_migration(conn, before, lab)
     conn.execute(
         "INSERT INTO owner_decisions VALUES (40, ?, 'operations_book', NULL, NULL, '{}', 'r')",
         [AT],
@@ -713,9 +751,13 @@ def test_a_fresh_store_allows_the_operations_kind_and_the_lab_keeps_it() -> None
 # --- is_lab_initialised, LabNotInitialised -------------------------------------
 
 
-def test_init_schema_does_not_initialise_the_lab() -> None:
-    conn = _fresh_store()
-    assert not lab_schema.is_lab_initialised(conn)
+def test_init_schema_initialises_the_lab() -> None:
+    """#3672: `init_schema` gives a fresh store the lab schema; a store created
+    before that (`_fresh_store`) has none."""
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    assert lab_schema.is_lab_initialised(conn)
+    assert not lab_schema.is_lab_initialised(_fresh_store())
 
 
 def test_is_lab_initialised_false_on_a_plain_fixture_store(
@@ -878,8 +920,9 @@ def test_write_fixture_marker_called_only_from_load_universe_fixtures() -> None:
 
 
 def test_schema_py_calls_the_lab_ddl_only_from_the_lab_migration() -> None:
-    """Since T113 (#1195) `init_schema` applies the lab DDL through the version-16
-    migration `_migrate_lab` only (a migrating store), never on a fresh store
+    """`init_schema` applies the lab DDL through the version-16 migration
+    `_migrate_lab` (a migrating store, T113; a fresh one, #3672) and the
+    version-50 repair `_repair_missing_lab`, nowhere else
     (`tests/store/test_lab_migration.py`)."""
     tree = ast.parse((REPO / "src/tradepartner/store/schema.py").read_text())
     callers: dict[str, set[str]] = {}
@@ -889,5 +932,6 @@ def test_schema_py_calls_the_lab_ddl_only_from_the_lab_migration() -> None:
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute | ast.Name):
                     name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
                     callers.setdefault(str(name), set()).add(func.name)
-    assert callers["apply_lab_schema"] == {"_migrate_lab"}
-    assert callers["_migrate_lab"] == {"init_schema"}
+    assert callers["apply_lab_schema"] == {"_migrate_lab", "_repair_missing_lab"}
+    assert callers["_migrate_lab"] == {"init_schema", "_repair_missing_lab"}
+    assert callers["_repair_missing_lab"] == {"init_schema"}

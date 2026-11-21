@@ -16,6 +16,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from conftest import strip_lab
 
 from tradepartner.backtest.metrics import METRIC_KEYS
 from tradepartner.config import Settings
@@ -66,6 +67,10 @@ def _version_14_store(conn: duckdb.DuckDBPyConnection) -> None:
     for three series at two levels), a refused trial, a price row and a journal
     row."""
     schema.init_schema(conn)
+    strip_lab(conn)  # a version-14 store has no lab schema (#3672: a fresh one now does)
+    # ... and only the three Phase 3 decision kinds (versions 18, 20 and 22 add the rest).
+    conn.execute("DROP TABLE owner_decisions")
+    conn.execute(schema._CREATE_OWNER_DECISIONS)
     # `development_boundary` is version 18's (#1319, T140b), dropped too.
     trials = (*_TRIALS_V15, "development_boundary")
     for table, columns in (("trials", trials), ("trial_results", ("sharpe_unit",))):
@@ -160,7 +165,7 @@ def v14() -> Iterator[duckdb.DuckDBPyConnection]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RETRACTED_ROWS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_FRESH_LAB_VERSION + 1
 
 
 def test_the_rename_table_covers_every_phase3_period_key() -> None:
@@ -253,8 +258,7 @@ def test_the_migrated_store_is_shaped_as_a_fresh_one(v14: duckdb.DuckDBPyConnect
     schema.init_schema(v14)
     fresh = duckdb.connect(":memory:")
     try:
-        schema.init_schema(fresh)
-        lab_schema.apply_lab_schema(fresh)  # a fresh store has no lab table
+        schema.init_schema(fresh)  # with the lab schema since #3672
         ddl = "SELECT table_name, sql FROM duckdb_tables() ORDER BY 1"
         assert v14.execute(ddl).fetchall() == fresh.execute(ddl).fetchall()
     finally:

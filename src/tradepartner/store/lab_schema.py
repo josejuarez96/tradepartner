@@ -7,7 +7,11 @@ nothing in `schema.py` calls this module: no version bump, no edit there. Every
 lab task builds and tests on the `lab_store` test fixture (a fixture store with
 `apply_lab_schema` applied), and every lab read and write calls `require_lab`
 first, so a store without the lab tables (the owner's store before T113, a plain
-fixture store) raises `LabNotInitialised` and keeps the Phase 3 rules.
+fixture store) raises `LabNotInitialised` and keeps the Phase 3 rules. Since
+schema version 50 (#3672) `init_schema` also gives the lab schema to a fresh
+store and to a version-16 to 49 store created without it, so only a store not
+yet migrated to 50 (opened read-only) and the tests' plain fixture store
+(`tests/conftest.py`'s `strip_lab`) are without it.
 
 - `apply_lab_schema(conn)` creates the seven lab registry tables
   (`family_rules`, `sweeps`, `sweep_variants`, `hypothesis_fingerprints`,
@@ -329,8 +333,9 @@ def has_fixture_marker(conn: duckdb.DuckDBPyConnection) -> bool:
 def is_lab_initialised(conn: duckdb.DuckDBPyConnection) -> bool:
     """Whether every `LAB_TABLE_NAMES` table exists. Read by table presence,
     never by a `schema_version` row: true on the `lab_store` fixture, false on
-    a plain fixture store (which has only `store_markers`) and on the owner's
-    store until the lab migration (T113)."""
+    a plain fixture store (which has only `store_markers`) and on a store not
+    yet migrated past the version that gives it the lab (15, or 16 to 49 when
+    it was created fresh; #3672)."""
     (present,) = conn.execute(  # type: ignore[misc]
         "SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = current_database() "
         "AND schema_name = current_schema() AND table_name IN "
@@ -425,8 +430,8 @@ def apply_lab_schema(conn: duckdb.DuckDBPyConnection) -> None:
     by the staging rebuild, every row kept byte-identical (module docstring).
     Needs a store `init_schema` has created (the registry tables must exist).
     Idempotent: a second call changes nothing. One transaction (the caller's if
-    open). Writes no `schema_version` row and is
-    called by nothing in `schema.py` until the lab migration (T113)."""
+    open). Writes no `schema_version` row; `schema._migrate_lab` calls it for a
+    migrating store (T113) and, since version 50, a fresh one (#3672)."""
     with atomic(conn):
         for ddl in _LAB_TABLE_DDL:
             conn.execute(ddl)

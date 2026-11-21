@@ -62,8 +62,10 @@ def test_every_listed_setting_changes_hash(key: str) -> None:
 # then #3363's `BUILD_RULES_VERSION` 9 (at 8 the hash is 9e881b83...f56932).
 # then #3362's `BUILD_RULES_VERSION` 10 (at 9 the hash is 0512a8aa...996a855).
 # then #3390's `BUILD_RULES_VERSION` 11 (at 10 the hash is c5591bf7...12cfe).
-# then #3325's `BUILD_RULES_VERSION` 12 (at 11 the hash is 0b36a3c6...b69452).
-MAIN_DEFAULT_HASH = "12d62e301d2eb3b01b74e30e447c6fd3d85d381a47a0939a61865f0b82bb4437"
+# then #3325's `BUILD_RULES_VERSION` 12 (at 11 the hash is 0b36a3c6...b69452),
+# then #3672's `CURRENT_SCHEMA_VERSION` 50 (a fresh store gets the lab schema; at 49
+# the hash is 12d62e30...bb4437).
+MAIN_DEFAULT_HASH = "c10d5e218da0051c06ecf540757275d01b097a30c27ad40d49349478c30e1348"
 
 
 def test_hash_at_defaults_equals_the_hex_pinned_from_main() -> None:

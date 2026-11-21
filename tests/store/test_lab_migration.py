@@ -24,6 +24,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from conftest import strip_lab
 
 from tradepartner import config
 from tradepartner.backtest import frozen, hypothesis
@@ -114,6 +115,7 @@ def _version_15_store(conn: duckdb.DuckDBPyConnection, tmp_path: Path) -> dict[s
     re-registration of it (same frozen set, new slug and doc hash), a
     `profitability` hypothesis, `ok` and refused trials, and owner decisions."""
     schema.init_schema(conn)
+    strip_lab(conn)
     assert not lab_schema.is_lab_initialised(conn)
     conn.execute("UPDATE schema_version SET version = 15")
     twin = _register(conn, TWIN_FILE, drop=_SCHEDULE)
@@ -182,7 +184,7 @@ def _hypothesis_ids(conn: duckdb.DuckDBPyConnection) -> list[int]:
 
 
 def test_version_is_17_and_16_is_the_pre_expansion_seams_version() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RETRACTED_ROWS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_FRESH_LAB_VERSION + 1
     assert schema._PRE_EXPANSION_SEAMS_VERSION == 16
     assert schema._PRE_LAB_VERSION == 15
 
@@ -344,6 +346,7 @@ def test_a_store_with_no_hypothesis_gets_empty_lab_tables(tmp_path: Path) -> Non
     conn = duckdb.connect(":memory:")
     try:
         schema.init_schema(conn)
+        strip_lab(conn)
         conn.execute("UPDATE schema_version SET version = 15")
         schema.init_schema(conn)
         assert lab_schema.is_lab_initialised(conn)
@@ -353,19 +356,182 @@ def test_a_store_with_no_hypothesis_gets_empty_lab_tables(tmp_path: Path) -> Non
         conn.close()
 
 
-def test_a_fresh_store_stays_without_the_lab_tables() -> None:
-    """A store created at the current version has no lab tables (plan choice 2: the
-    plain fixture store keeps the Phase 3 rules; the `lab_store` fixture applies
-    them)."""
+def test_a_fresh_store_gets_the_lab_tables() -> None:
+    """#3672: a store created at the current version has the eight lab tables, empty,
+    and the two widened enumerations, so a lab entry point no longer raises
+    `LabNotInitialised` there."""
     conn = duckdb.connect(":memory:")
     try:
         schema.init_schema(conn)
-        assert not lab_schema.is_lab_initialised(conn)
+        assert set(lab_schema.LAB_TABLE_NAMES) <= _tables(conn)
+        assert lab_schema.is_lab_initialised(conn)
+        lab_schema.require_lab(conn)
+        assert not lab_registry.is_pre_lab(conn, 1)
+        for table in lab_schema.LAB_TABLE_NAMES:
+            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,)
+        _, statuses = lab_schema._current_enum(conn, "trial_results", "status")
+        assert "'refused_variant'" in statuses
+        _, kinds = lab_schema._current_enum(conn, "owner_decisions", "kind")
+        assert "'promotion'" in kinds and "'sweep_retired'" in kinds
         assert conn.execute("SELECT version FROM schema_version").fetchall() == [
             (schema.CURRENT_SCHEMA_VERSION,)
         ]
     finally:
         conn.close()
+
+
+def _version_49_store_without_the_lab(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> dict[str, int]:
+    """A store as `init_schema` created it fresh at schema version 49 (#3672: no lab
+    table, the two enumerations without the lab's values), then used under the
+    Phase 3 rules: two hypotheses of two families, trials, an owner decision and a
+    fact row."""
+    schema.init_schema(conn)
+    strip_lab(conn)
+    conn.execute("UPDATE schema_version SET version = ?", [schema._PRE_FRESH_LAB_VERSION])
+    twin = _register(conn, TWIN_FILE)
+    prof = _register(conn, PROF_FILE)
+    ok = _trial(conn, twin, tmp_path, "ok")
+    _trial(conn, prof, tmp_path, "refused_window")
+    registry.record_decision(
+        conn,
+        kind="operations_book",
+        reason="a version-22 kind, kept by the repair",
+        values={},
+        hypothesis_id=twin.hypothesis_id,
+        trial_id=ok,
+    )
+    conn.execute(
+        "INSERT INTO prices_daily VALUES "
+        "('SEC_A', '2022-12-30', 1, 1, 1, 1, 1, ?, ?, 'test', 'bar')",
+        [_CUTOFF, _CUTOFF],
+    )
+    return {"twin": twin.hypothesis_id, "prof": prof.hypothesis_id}
+
+
+def test_a_version_49_store_created_without_the_lab_gains_it(tmp_path: Path) -> None:
+    """#3672, version 50: a later `init_schema` repairs a store that recorded the
+    current version without the lab tables. Every row of every table that existed is
+    kept (the two rebuilt tables byte-identical, only their `CHECK` text wider), and
+    its hypotheses are marked pre-lab with fingerprints and family rules, as the lab
+    migration marks a version-15 store's."""
+    conn = duckdb.connect(":memory:")
+    try:
+        ids = _version_49_store_without_the_lab(conn, tmp_path)
+        assert not lab_schema.is_lab_initialised(conn)
+        with pytest.raises(lab_schema.LabNotInitialised):
+            lab_registry.is_pre_lab(conn, ids["twin"])
+        before_tables = _tables(conn)
+        before = _snapshot(conn, before_tables)
+
+        schema.init_schema(conn)
+
+        assert lab_schema.is_lab_initialised(conn)
+        assert _tables(conn) == before_tables | set(lab_schema.LAB_TABLE_NAMES)
+        after = _snapshot(conn, before_tables)
+        for table in sorted(before_tables - {"schema_version", *_REBUILT}):
+            assert after[table] == before[table], table
+        for table in _REBUILT:
+            assert after[table][1:] == before[table][1:], table
+            assert after[table][0] != before[table][0]
+        assert before["owner_decisions"][1] == 1 and before["trial_results"][1] == 2
+        assert before["prices_daily"][1] == 1
+        versions = conn.execute("SELECT version FROM schema_version ORDER BY 1").fetchall()
+        assert versions == [(schema._PRE_FRESH_LAB_VERSION,), (schema.CURRENT_SCHEMA_VERSION,)]
+        assert lab_registry.is_pre_lab(conn, ids["twin"])
+        assert lab_registry.is_pre_lab(conn, ids["prof"])
+        fingerprints = conn.execute("SELECT hypothesis_id FROM hypothesis_fingerprints ORDER BY 1")
+        assert [i for (i,) in fingerprints.fetchall()] == sorted(ids.values())
+        families = conn.execute("SELECT family FROM family_rules ORDER BY 1").fetchall()
+        assert families == [("momentum",), ("profitability",)]
+        for table, column, added in (
+            ("trial_results", "status", lab_schema.LAB_TRIAL_STATUSES),
+            ("owner_decisions", "kind", lab_schema.LAB_DECISION_KINDS),
+        ):
+            _, values = lab_schema._current_enum(conn, table, column)
+            assert all(f"'{value}'" in values for value in added)
+
+        # Idempotent: a second open changes nothing at all.
+        every = _snapshot(conn, _tables(conn))
+        schema.init_schema(conn)
+        assert _snapshot(conn, _tables(conn)) == every
+    finally:
+        conn.close()
+
+
+def test_a_version_49_store_that_has_the_lab_only_gains_its_version_row(
+    v15: tuple[duckdb.DuckDBPyConnection, dict[str, int]],
+) -> None:
+    """A store that migrated through version 16 (the lab tables, filled) and stands
+    at 49: the version-50 step changes no table's DDL and no row."""
+    conn, _ = v15
+    schema.init_schema(conn)
+    conn.execute("DELETE FROM schema_version WHERE version > ?", [schema._PRE_FRESH_LAB_VERSION])
+    tables = _tables(conn) - {"schema_version"}
+    before = _snapshot(conn, tables)
+    schema.init_schema(conn)
+    assert _tables(conn) - {"schema_version"} == tables
+    assert _snapshot(conn, tables) == before
+    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (
+        schema.CURRENT_SCHEMA_VERSION,
+    )
+
+
+def test_a_version_49_store_with_a_partial_lab_gets_the_missing_tables_only() -> None:
+    """A store that already holds one of the three tables the migration fills is never
+    filled a second time: the repair only creates what is missing."""
+    conn = duckdb.connect(":memory:")
+    try:
+        schema.init_schema(conn)
+        conn.execute("DROP TABLE sweep_trials")
+        conn.execute("INSERT INTO pre_lab_hypotheses VALUES (7, ?)", [_CUTOFF])
+        conn.execute("UPDATE schema_version SET version = ?", [schema._PRE_FRESH_LAB_VERSION])
+        assert not lab_schema.is_lab_initialised(conn)
+        schema.init_schema(conn)
+        assert lab_schema.is_lab_initialised(conn)
+        assert conn.execute("SELECT hypothesis_id FROM pre_lab_hypotheses").fetchall() == [(7,)]
+    finally:
+        conn.close()
+
+
+def test_a_failed_repair_leaves_the_store_at_version_49(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_49_store_without_the_lab(conn, tmp_path)
+        before = _snapshot(conn, _tables(conn))
+
+        def boom(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(lab_registry, "write_family_rules", boom)
+        with pytest.raises(RuntimeError, match="boom"):
+            schema.init_schema(conn)
+        assert _snapshot(conn, _tables(conn)) == before
+        assert not lab_schema.is_lab_initialised(conn)
+    finally:
+        conn.close()
+
+
+def test_read_only_open_of_a_version_49_store_without_the_lab_still_refuses_lab_reads(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v49.duckdb"
+    conn = duckdb.connect(str(path))
+    try:
+        ids = _version_49_store_without_the_lab(conn, tmp_path)
+    finally:
+        conn.close()
+    ro = duckdb.connect(str(path), read_only=True)
+    try:
+        schema.init_schema(ro)
+        assert registry.get_hypothesis_by_id(ro, ids["twin"]).family == "momentum"
+        with pytest.raises(lab_schema.LabNotInitialised):
+            lab_registry.is_pre_lab(ro, ids["twin"])
+    finally:
+        ro.close()
 
 
 def test_a_failed_population_leaves_the_store_at_version_15(
