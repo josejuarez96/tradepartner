@@ -19,7 +19,7 @@ So a P&L objective would be unmeasurable, and a benchmark-beating objective woul
 
 ## Decision
 
-**Primary objective, ranked:** (1) learn to make disciplined, evidence-based decisions, demonstrated by process metrics; (2) calibration, once anything in the system emits probabilities; (3) beating a benchmark, explicitly optional and not a criterion for any phase exit. *(Marked 2026-11-21, #3695: how objective 3 reads for one strategy book is under review, a decision put to the owner with three options; see the [amendment of 2026-11-21 below](#amendment-2026-11-21-what-a-strategy-book-is-for-core-and-satellite-3695).)*
+**Primary objective, ranked:** (1) learn to make disciplined, evidence-based decisions, demonstrated by process metrics; (2) calibration, once anything in the system emits probabilities; (3) beating a benchmark, explicitly optional and not a criterion for any phase exit. *(Amended 2026-11-21, #3695: how objective 3 reads for one strategy book is recorded in the [amendment of 2026-11-21 below](#amendment-2026-11-21-what-a-strategy-book-is-for-core-and-satellite-3695), on the owner's choice among three options.)*
 
 **Benchmarks:** SPY and MTUM, both total return (dividends reinvested), computed inside the system from the same `PriceSource` and with the same cost model as the strategy. They are measured against, never targeted. A backtest or paper result is reported only alongside both. *(Amended 2026-11-20, #3686: the series a book's excess is judged over is its **yardstick**, the net-matched blend of SPY and T-bills for a book with a short leg. It is SPY for every long-only book, so nothing changes there, and SPY and MTUM are still reported beside every result, [amendment below](#amendment-2026-11-20-the-yardstick-is-the-net-matched-blend-3686).)*
 
@@ -111,7 +111,7 @@ Each non-excluded month's absolute residual must be at most the window's frozen 
 
 ## Amendment 2026-11-21: what a strategy book is for, core and satellite (#3695)
 
-*A decision for the owner, drafted on his word of 2026-11-21 (#3695). **He has not chosen an option.** Merging the PR records option (b), the recommended one, and the numbered decisions at the end, unless the owner says otherwise on the PR. One line back ("a", "b" or "c") is enough. This amendment is stacked on the [amendment of 2026-11-20](#amendment-2026-11-20-the-yardstick-is-the-net-matched-blend-3686) (#3686, PR #3690) and merges after it. The three inline markers this PR adds (one on the Decision above, two in the hypothesis backlog) say only "under review", so they are true under any option; they are edited to the chosen option before merge if the owner picks (a) or (c). Docs only: no code, no store read, no return read, no trial.*
+*A decision for the owner, drafted on his word of 2026-11-21 (#3695). **He has not chosen an option.** Merging the PR records option (b), the recommended one, and the numbered decisions at the end, unless the owner says otherwise on the PR. One line back ("a", "b" or "c") is enough. This amendment is stacked on the [amendment of 2026-11-20](#amendment-2026-11-20-the-yardstick-is-the-net-matched-blend-3686) (#3686, PR #3690) and merges after it. This PR adds three inline markers. The one on the Decision above points here and is true under (a) and (b); it is edited before merge only if the owner picks (c). The two in the hypothesis backlog say only "under review" and stay as they are under every option, since Q4 stays open. Docs only: no code, no store read, no return read, no trial.*
 
 ### The choice, in two minutes
 
@@ -271,7 +271,7 @@ Nothing is built for this merge. The work below exists only if the owner answers
 - **Q3. Should rung 4 ask a satellite for more than a sign?** With a lower bar, more no-edge books reach the exam door. This is #3571, #3572 and question 50. It is named here so the owner decides them knowing (b) raises their weight. No recommendation is added to theirs.
 - **Q4. What did the "no" of 2026-10-03 on B2 mean?** The backlog records it as: a higher Sharpe at a lower return is not acceptable under ADR 0005, "whose objective is return against the benchmark". The Decision above ranks process first and benchmark-beating optional. So which was it?
   - (i) You want a return above SPY, whatever this ADR says. That is option (a), and it is a reason to pick (a) here.
-  - (ii) It was a reading of ADR 0005 as it was put to you. Then B2's parking note is restated after you choose an option.
+  - (ii) It was a reading of ADR 0005. Then B2's parking note is restated after you choose an option.
 
   *No recommendation. B2 stays parked either way, and this merge changes no word of the 2026-10-03 record.*
 
@@ -286,4 +286,4 @@ Unless the owner says otherwise on the PR:
 6. **No rule a book is read by changes:** not the yardstick rules of 2026-11-20, not line 40, not the forward exam, not the stop criteria, not the charter.
 7. **Q1 to Q4 are open, and they are the owner's.**
 
-**If the owner says (a):** decisions 1 and 2 are dropped, and 3 to 7 are recorded. **If he says (c):** only 5 is recorded, and a new ADR is drafted for his word before any rule moves. In either case the three inline markers are edited to the chosen option before merge.
+**If the owner says (a):** decisions 1 and 2 are dropped, and 3 to 7 are recorded. **If he says (c):** only 5 is recorded, and a new ADR is drafted for his word before any rule moves. The marker on the Decision above is edited before merge only if he says (c); the two backlog markers stay as they are.
