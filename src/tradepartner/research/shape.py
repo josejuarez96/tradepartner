@@ -32,6 +32,14 @@ DEFAULT_SD_REF_HOLD_SESSIONS = 60  # The hold that figure is quoted at.
 DEFAULT_SIGMA_LONG_SHORT_BP = 140.0  # Monthly sd, 50/50 long/short book (claim SH-4).
 DEFAULT_SIGMA_LONG_ONLY_BP = 231.0  # Monthly sd, long-only vs SPY: 8% a year (Audit B, B3).
 DEFAULT_SR_STAR_NEW_ROOT_FAMILY = 0.0  # Annual DSR bar for a new root family today (#3571).
+DEFAULT_BORROW_LONG_SHORT_BP = (
+    1.25  # 30 bp a year on a 0.5 short leg, per month (PR #3683; UNGRADED).
+)
+# Pass it as ``borrow_bp_per_month`` for a long/short trial; a long-only book pays none.
+# Default correlation of two different issuers' overlapping matched spreads, per unit of shared
+# hold: quant-auditor ruling on research-registry open question 2 (PR #3745 comment, T441) and
+# the spec sentence PR #3705 is amended to carry. UNGRADED; a cited rho overrides it.
+DEFAULT_CROSS_ISSUER_RHO = 0.05
 DEFAULT_LEGS_CHARGED = 1  # E1 design: only the treated leg pays (R = 2c).
 DEFAULT_DECISION_COST_BP = 50.0  # c: ADR 0023's harsh cell, bp per side (decision 1).
 
@@ -131,15 +139,21 @@ def event_min_count(
 ) -> int | None:
     """Smallest effective count with ``power`` chance of a pass, rounded up.
 
-    ``SE_max = min(net/(t_f + z), (net - F)/z)``, ``n_min = (sd/SE_max)^2``.
-    ``None`` when ``net <= F``: no count reaches even 50% (the reject case).
+    ``SE_max = min(net/(t_f + z), (net - F)/z)``, ``n_min = (sd/SE_max)^2``. At
+    ``z <= 0`` (power at or under 50%) the floor leg never binds, so ``SE_max = net/(t_f + z)``;
+    ``ValueError`` when ``t_f + z <= 0`` (no count meets that power). ``None`` when
+    ``net <= F``: no count reaches even 50% (the reject case).
     """
     _require_positive("sd_bp", sd_bp)
     net = gross_bp - round_trip_bp
     if net <= floor_bp:
         return None
     z = z_power(power)
-    se_max = min(net / (t_floor + z), (net - floor_bp) / z)
+    if t_floor + z <= 0:
+        raise ValueError("t_floor + z must be positive: no count reaches this power")
+    se_max = net / (t_floor + z)
+    if z > 0:
+        se_max = min(se_max, (net - floor_bp) / z)
     return math.ceil((sd_bp / se_max) ** 2 - _ROUND_UP_TOLERANCE)
 
 
@@ -195,7 +209,9 @@ class EffectiveCount:
     ``n_eff`` is the deciding figure (default clusters, or the cited rho);
     ``n_eff_rho0`` and ``n_eff_rho1`` are the two bounds of the cited form.
     ``same_date_factor`` (B) and ``overlap_factor`` (O) satisfy
-    ``n_eff = n / B / O``; ``rho`` is ``None`` under the default.
+    ``n_eff = n / B / O``; ``rho`` is ``None`` under the default. B is always the
+    same-session (rho = 1) figure, so under a cited rho below 1 ``O`` can be under 1
+    (m events on one session at rho 0 give B = m and O = 1/m); read B * O as one factor.
     """
 
     n: int
@@ -224,19 +240,23 @@ def effective_count(
     hold_sessions: int,
     *,
     rho: float | None = None,
+    cross_issuer_rho: float = DEFAULT_CROSS_ISSUER_RHO,
 ) -> EffectiveCount:
     """``n_eff = N^2 / sum_i sum_j w_ij`` for ``(issuer, entry_session)`` events.
 
     ``entry_session`` is an integer trading-calendar position. ``o_ij`` is the
     share of the hold two events have in common, ``max(0, h - |delta|) / h``. Same
-    issuer: ``w_ij = o_ij``. Different issuers: by default ``w_ij = 1`` on a
-    shared entry session, else 0 (one cluster per entry session); with a cited
-    ``rho``, ``w_ij = rho * o_ij``.
+    issuer: ``w_ij = o_ij``. Different issuers, by default: ``w_ij = 1`` on a shared
+    entry session, else ``cross_issuer_rho * o_ij`` (0.05; set 0 for the old
+    one-cluster-per-session identity ``N^2 / sum m_d^2``). With a cited ``rho`` it
+    replaces both: ``w_ij = rho * o_ij`` for every pair of different issuers.
     """
     if hold_sessions < 1:
         raise ValueError("hold_sessions must be at least 1")
     if rho is not None and not 0.0 <= rho <= 1.0:
         raise ValueError("rho must be in [0, 1]")
+    if not 0.0 <= cross_issuer_rho <= 1.0:
+        raise ValueError("cross_issuer_rho must be in [0, 1]")
     by_session: Counter[int] = Counter()
     by_issuer: defaultdict[Hashable, Counter[int]] = defaultdict(Counter)
     by_session_issuer: Counter[tuple[int, Hashable]] = Counter()
@@ -250,12 +270,14 @@ def effective_count(
 
     all_pairs = _ordered_pair_overlap(by_session, hold_sessions)
     same_issuer = sum(_ordered_pair_overlap(c, hold_sessions) for c in by_issuer.values())
-    # Different-issuer ordered pairs on one session: all pairs there minus the same-issuer ones.
+    # Different-issuer ordered pairs on one session (o = 1): all pairs there minus same-issuer.
     same_session_other = sum(m * (m - 1) for m in by_session.values()) - sum(
         c * (c - 1) for c in by_session_issuer.values()
     )
+    # Different-issuer overlap on different sessions.
+    cross_overlap = all_pairs - same_issuer - same_session_other
 
-    default_sum = n + same_issuer + same_session_other
+    default_sum = n + same_issuer + same_session_other + cross_issuer_rho * cross_overlap
     rho0_sum = n + same_issuer
     rho1_sum = n + all_pairs
     cited_sum = n + same_issuer + (rho * (all_pairs - same_issuer) if rho is not None else 0.0)
@@ -272,3 +294,34 @@ def effective_count(
         overlap_factor=n_eff_dates / deciding,
         rho=rho,
     )
+
+
+def effective_count_by_hand(
+    n: float,
+    same_date_factor: float,
+    hold_sessions: int,
+    window_sessions: int,
+    rho: float = DEFAULT_CROSS_ISSUER_RHO,
+) -> float:
+    """Hand estimate ``n_eff ~ 1 / (B/N + rho * h / S)`` for ``S`` sessions in the window.
+
+    An approximation of the exact default for events spread across the window; it
+    never exceeds :func:`effective_count_ceiling`.
+    """
+    _require_positive("n", n)
+    _require_positive("same_date_factor", same_date_factor)
+    _require_positive("hold_sessions", hold_sessions)
+    _require_positive("window_sessions", window_sessions)
+    return 1.0 / (same_date_factor / n + rho * hold_sessions / window_sessions)
+
+
+def effective_count_ceiling(
+    hold_sessions: int,
+    window_sessions: int,
+    rho: float = DEFAULT_CROSS_ISSUER_RHO,
+) -> float:
+    """Ceiling ``S / (rho * h)`` that ``n_eff`` approaches as N grows (needs ``rho > 0``)."""
+    _require_positive("hold_sessions", hold_sessions)
+    _require_positive("window_sessions", window_sessions)
+    _require_positive("rho", rho)
+    return window_sessions / (rho * hold_sessions)
