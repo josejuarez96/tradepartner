@@ -123,7 +123,7 @@ expected_effect = "<words: the prior, at or below the brief's haircuts for retur
 # z = 1.645
 # cluster_by = ["month", "quarter"]
 # delisting_return = "failure_v1" # new designs; or "severe_v1"; "none" reproduces older runs (absent reads as none). The runner refuses anything but none until T412 lands
-# se_method = "quarter_cluster_t" # new designs: calendar-quarter-of-entry cluster SE, CR1, t(G-1), kill t on the normal scale (z_eq); or "hansen_hodrick" (absent reads as this, reproducing older runs). Refused below 8 entry quarters
+# se_method = "quarter_cluster_t" # new designs: calendar-quarter-of-entry cluster SE, CR1, t(G-1), kill t on the normal scale (z_eq); or "hansen_hodrick" (absent reads as this, reproducing older runs). Refused at registration when the window or an entry_start sub-window spans fewer than 8 calendar quarters; events in fewer than 8 quarters give an undefined t that kills
 # [[study.kill]]
 # name = "long"
 # side = "long" # or "short"; selects the net-return formula

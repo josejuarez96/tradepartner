@@ -32,6 +32,7 @@ from tradepartner.research.event_study.stats import (
     se_result_interval,
     student_t_cdf,
     student_t_quantile,
+    thin_window_reason,
 )
 from tradepartner.research.event_study.summary import summarise
 
@@ -111,10 +112,14 @@ def test_overlap_design_stays_mildly_liberal_but_bounded() -> None:
     Holds spill into the next season, and a 1,200-session span holds about 20
     independent 60-session holds, so no cluster-robust t is exact here. The
     measured .069 here (the auditor's seeds: .061; HH: .088) is held under .08 at
-    1,500 replications; this is a ceiling, not a claim of calibration. At the 1.0
+    1,500 replications (20,000 replications: .062). The ceiling barely separates the
+    methods (HH measures .083 to .088), so it is a seeded regression ceiling, not a
+    discriminator or a claim of calibration; the strict comparison with HH is. At the 1.0
     line it measures about .199 where .159 is intended.
     """
-    at_1645 = _rates("overlap", 1500)["quarter_cluster_t"]
+    rates = _rates("overlap", 1500)
+    at_1645 = rates["quarter_cluster_t"]
+    assert at_1645[1] < rates["hansen_hodrick"][1]  # strictly better than HH on the same seeds
     assert at_1645[1] <= 0.08
     assert at_1645[0] <= 0.22
     assert at_1645[2] == 0
@@ -278,7 +283,26 @@ def test_summarise_quarter_method_judges_z_eq_against_the_floor() -> None:
     assert got != _run(rows)
 
 
-def test_summarise_refuses_a_study_with_too_few_quarters() -> None:
-    rows = [r for r in _rows_with_entry() if int(r["entry_index"]) < 600]  # type: ignore[call-overload]
-    with pytest.raises(TooFewClustersError):
-        _run(rows, se_method="quarter_cluster_t")
+def test_data_driven_thin_quarters_is_an_undefined_t_that_kills_not_an_exception() -> None:
+    """Window long enough, events in 5 quarters: t is NaN and the line kills, as an HH NaN does."""
+    rows = [r for r in _rows_with_entry() if int(r["entry_index"]) < 400]  # type: ignore[call-overload]
+    got = _run(rows, se_method="quarter_cluster_t")
+    reading = got["kill"]["long"]["readings"]["raw"]  # type: ignore[index]
+    assert reading["quarters"] < 8
+    assert math.isnan(reading["calibrated_t"]) and math.isnan(reading["z_eq"])
+    assert got["kill"]["long"]["killed"] is True  # type: ignore[index]
+    values = [1.0, 2.0, 3.0, 4.0]
+    out = se_result_interval(
+        values, [1, 2, 3, 4], [0, 1, 2, 3], method="quarter_cluster_t", max_lag_sessions=5, z=1.0
+    )
+    assert math.isnan(out["t"]) and out["effect"] == 2.5 and out["quarters"] == 4
+
+
+def test_thin_window_reason_from_frozen_dates() -> None:
+    assert thin_window_reason(date(2015, 4, 1), date(2017, 3, 31), [None]) is None
+    reason = thin_window_reason(date(2015, 4, 1), date(2016, 12, 30), [None])
+    assert reason is not None and "spans 7" in reason
+    sub = thin_window_reason(date(2015, 4, 1), date(2017, 3, 31), [date(2016, 7, 1)])
+    assert sub is not None and "entry_start 2016-07-01" in sub
+    # a sub-window starting before the window is judged from the window start
+    assert thin_window_reason(date(2015, 4, 1), date(2017, 3, 31), [date(2010, 1, 1)]) is None

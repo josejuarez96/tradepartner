@@ -207,6 +207,32 @@ def entry_quarter(entry: date) -> int:
     return entry.year * 4 + (entry.month - 1) // 3
 
 
+def entry_quarters_spanned(start: date, end: date) -> int:
+    """Calendar quarters a window of entry dates can touch; an upper bound on G."""
+    return entry_quarter(end) - entry_quarter(start) + 1
+
+
+def thin_window_reason(
+    window_start: date, window_end: date, entry_starts: Sequence[date | None]
+) -> str | None:
+    """Why ``quarter_cluster_t`` can never reach its minimum G, from frozen dates alone.
+
+    Checks the study window and each kill line's ``entry_start`` sub-window
+    (``None`` for a line without one). Returns None when every one spans at
+    least ``QUARTER_CLUSTER_MIN_QUARTERS`` calendar quarters.
+    """
+    spans = [("window", window_start)]
+    spans += [(f"entry_start {d}", max(d, window_start)) for d in entry_starts if d is not None]
+    for label, start in spans:
+        n = entry_quarters_spanned(start, window_end)
+        if n < QUARTER_CLUSTER_MIN_QUARTERS:
+            return (
+                f"se_method = 'quarter_cluster_t' needs at least {QUARTER_CLUSTER_MIN_QUARTERS} "
+                f"entry quarters; the {label} to {window_end} spans {n}"
+            )
+    return None
+
+
 def _betainc(a: float, b: float, x: float) -> float:
     """Regularised incomplete beta ``I_x(a, b)`` by the continued fraction (Lentz)."""
     if x <= 0.0:
@@ -272,7 +298,8 @@ def quarter_cluster_stats(
     ``sqrt(G / (G - 1))``; ``t`` is the raw ratio; ``z_eq = Phi^-1(F_{t,G-1}(t))``
     is that t mapped to the normal scale, so a kill-line floor written as a
     normal-scale t (1.0, 1.645) keeps its meaning (the same one-sided tail).
-    Raises `TooFewClustersError` when 0 < G < ``min_quarters``; never returns it as NaN.
+    Raises `TooFewClustersError` when 0 < G < ``min_quarters``; `se_result_interval`
+    maps that to an undefined (killing) t at run time.
     """
     if len(values) != len(quarters):
         raise ValueError("values and quarters must have equal length")
@@ -335,7 +362,28 @@ def se_result_interval(
         raise ValueError("quarter_cluster_t needs the entry quarter of each event")
     if not math.isfinite(z) or z <= 0:
         raise ValueError("z must be finite and positive")
-    stats = quarter_cluster_stats(values, quarters, min_quarters=QUARTER_CLUSTER_MIN_QUARTERS)
+    try:
+        stats = quarter_cluster_stats(values, quarters, min_quarters=QUARTER_CLUSTER_MIN_QUARTERS)
+    except TooFewClustersError:
+        # Events fell in fewer quarters than the method can judge: undefined, which a
+        # kill line counts as a kill exactly as it counts a NaN t (no exception, no failed run).
+        nan = math.nan
+        found = len(set(quarters))
+        mean = sum(values) / len(values)
+        return {
+            "effect": mean,
+            "se": nan,
+            "t": nan,
+            "t_raw": nan,
+            "z_eq": nan,
+            "ci_low": nan,
+            "ci_high": nan,
+            "mde_80": nan,
+            "n": len(values),
+            "clusters": found,
+            "quarters": found,
+            "df": max(found - 1, 0),
+        }
     df = max(int(stats["clusters"]) - 1, 1)
     mean, se = stats["mean"], stats["se"]
     crit = student_t_quantile(NormalDist().cdf(z), df) if se == se else math.nan

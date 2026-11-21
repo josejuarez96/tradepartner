@@ -34,6 +34,7 @@ from tradepartner.research.event_study.stats import (
     net_long,
     net_short,
     se_result_interval,
+    thin_window_reason,
 )
 from tradepartner.research.event_study.summary import entry_quarters, evaluate_kill, summarise
 
@@ -441,6 +442,10 @@ def run_study(
     end = getattr(study, "window_end", None)
     if not isinstance(start, date) or not isinstance(end, date) or end < start:
         raise ValueError("registered study window is required")
+    if str(design.get("se_method", DEFAULT_SE_METHOD)) == "quarter_cluster_t":
+        thin = thin_window_reason(start, end, [line.get("entry_start") for line in design["kill"]])
+        if thin is not None:  # knowable from the frozen dates: refuse before any read (#3514)
+            raise ValueError(thin)
     if not isinstance(study, Mapping) and getattr(study, "slug", run.slug) != run.slug:
         raise ValueError("study slug differs from run")
     cfg = settings or get_settings()

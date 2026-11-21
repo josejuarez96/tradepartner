@@ -198,3 +198,23 @@ def test_study_z_must_match_declared_interval_side(
     )
     with pytest.raises(ExperimentFileError, match=match):
         _parse(tmp_path, source)
+
+
+def test_quarter_cluster_t_refuses_a_window_with_too_few_quarters(tmp_path: Path) -> None:
+    """#3679: knowable from the frozen dates, so refused at registration, before any read."""
+    source = FIXTURE.read_text().replace(
+        'matching = "ex_post"\n', 'matching = "ex_post"\nse_method = "quarter_cluster_t"\n'
+    )
+    old_end = "end = 2023-12-29"
+    assert old_end in source
+    seven = source.replace(old_end, "end = 2016-12-30")  # 2015Q2 .. 2016Q4
+    with pytest.raises(ExperimentFileError, match=r"at least 8 entry quarters.*spans 7"):
+        _parse(tmp_path / "seven", seven)
+    eight = source.replace(old_end, "end = 2017-03-31")  # 2015Q2 .. 2017Q1
+    assert _parse(tmp_path / "eight", eight).study is not None
+    sub = eight.replace('name = "long"\n', 'name = "long"\nentry_start = 2016-07-01\n')
+    with pytest.raises(ExperimentFileError, match=r"entry_start 2016-07-01.*spans 3"):
+        _parse(tmp_path / "sub", sub)
+    # the default statistic has no such rule: C1b-style short windows still register
+    flat = FIXTURE.read_text().replace(old_end, "end = 2016-12-30")
+    assert _parse(tmp_path / "flat", flat).study is not None

@@ -50,7 +50,7 @@ import polars as pl
 
 from tradepartner.config import Settings, get_settings
 from tradepartner.config_backtest import DELISTING_POLICIES
-from tradepartner.research.event_study.stats import SE_METHODS
+from tradepartner.research.event_study.stats import SE_METHODS, thin_window_reason
 
 #: `kind` (Definitions, Kind). A code constant, pinned by a test; a new value is a
 #: spec amendment (req 2).
@@ -738,6 +738,12 @@ def parse_experiment_file(
             study_raw, path, budget_configurations, primary_ci_level, primary_inference
         )
         flat["study"] = study
+    if study is not None and study.get("se_method") == "quarter_cluster_t":
+        reason = thin_window_reason(
+            window_start, window_end, [line.get("entry_start") for line in study["kill"]]
+        )
+        if reason is not None:
+            raise ExperimentFileError(f"{path}: {reason}")
     stop_rule = _require_str("budget.stop_rule", flat["budget.stop_rule"], path)
     expected_effect = _require_str("budget.expected_effect", flat["budget.expected_effect"], path)
 
