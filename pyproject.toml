@@ -45,7 +45,33 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP", "SIM", "RUF", "DTZ"]  # DTZ: no naive datetimes
+select = [
+    "E", "F", "I", "B", "UP", "SIM", "RUF",
+    "DTZ",      # no naive datetimes
+    "BLE001",   # no new blind `except Exception`
+    "T20",      # no `print` in src/ (scripts/ and tests/ are exempt below)
+    "C901",     # function complexity (mccabe)
+    "PLR0912",  # branches per function
+    "PLR0913",  # arguments per function
+    "PLR0915",  # statements per function
+]
+
+# The lint ratchet (T437, #3632). Limits measured 2026-11-20 at about the 99th percentile
+# of `src/`. Every offender that existed then carries a per-line `# noqa`, written by
+# `ruff check --add-noqa` and never by hand; RUF100 fails a comment that is no longer
+# needed, so the list can only shrink. Lower a limit only together with removing
+# grandfather comments; never raise one.
+[tool.ruff.lint.mccabe]
+max-complexity = 25
+
+[tool.ruff.lint.pylint]
+max-branches = 25
+max-statements = 100
+max-args = 12
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/**" = ["T20"]
+"tests/**" = ["T20"]
 
 [tool.mypy]
 strict = true

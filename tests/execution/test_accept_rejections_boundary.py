@@ -619,7 +619,7 @@ def _cli_flag_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[str
     return found
 
 
-def misuses(tree: ast.Module, module: str = "") -> list[str]:
+def misuses(tree: ast.Module, module: str = "") -> list[str]:  # noqa: C901, PLR0912
     """Rule 3, fail closed: a parameter that is not keyword-only (so no
     positional argument can feed it), a binding other than a keyword-only
     parameter or a bare annotated field, a PEP 695 type parameter named for

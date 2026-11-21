@@ -395,7 +395,7 @@ def summarise_study(
     return summary
 
 
-def run_study(
+def run_study(  # noqa: C901, PLR0912, PLR0915
     handle: object,
     study: Mapping[str, Any] | Any,
     events: Sequence[Mapping[str, Any]] | pl.DataFrame,

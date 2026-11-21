@@ -616,7 +616,7 @@ class EdgarFilingSource(FilingSource):
     """Filing records from SEC EDGAR. `client` and `clock` are injectable for
     tests; `.requests` counts the HTTP requests made through the client."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0915
         self,
         settings: Settings,
         client: httpx.Client | None = None,
@@ -1561,7 +1561,7 @@ class EdgarFilingSource(FilingSource):
                     )
             quarter = (year + 1, 1) if number == 4 else (year, number + 1)
 
-    def incremental_index(self, state: IncrementalIndexState) -> IncrementalIndexResult:
+    def incremental_index(self, state: IncrementalIndexState) -> IncrementalIndexResult:  # noqa: C901, PLR0912, PLR0915
         """Propose daily, pending and reconcile rows without writing the store."""
         now = ensure_tz_aware_utc(state.now, field_name="state.now")
         stored: dict[tuple[str, str], FilingRow] = {}
@@ -4044,7 +4044,7 @@ class EdgarFilingSource(FilingSource):
                 extract = context.run(
                     self._fetch_filename_extract, cik, record, read_document, on_worker=True
                 )
-            except BaseException as error:  # handed to the caller, raised in order there
+            except BaseException as error:  # noqa: BLE001  # handed to the caller, raised in order there
                 future.set_exception(error)
             else:
                 future.set_result(extract)

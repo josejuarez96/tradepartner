@@ -299,14 +299,14 @@ def _write_json(path: Path, payload: Any, *, secrets: Iterable[str]) -> None:
     scrubbed, count = scrub_json(payload, secrets=secrets)
     path.write_text(json.dumps(scrubbed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _note_recorded(path)
-    print(f"cli_record: scrubbed {count} value(s) in {path.name}")
+    print(f"cli_record: scrubbed {count} value(s) in {path.name}")  # noqa: T201
 
 
 def _write_text(path: Path, text: str, *, secrets: Iterable[str]) -> None:
     scrubbed, count = scrub_text(text, secrets=secrets)
     path.write_text(scrubbed, encoding="utf-8")
     _note_recorded(path)
-    print(f"cli_record: scrubbed {count} value(s) in {path.name}")
+    print(f"cli_record: scrubbed {count} value(s) in {path.name}")  # noqa: T201
 
 
 def _write_text_gz(path: Path, text: str, *, secrets: Iterable[str]) -> None:
@@ -315,7 +315,7 @@ def _write_text_gz(path: Path, text: str, *, secrets: Iterable[str]) -> None:
     with gzip.open(path, "wt", encoding="utf-8") as fh:
         fh.write(scrubbed)
     _note_recorded(path)
-    print(f"cli_record: scrubbed {count} value(s) in {path.name} (gzip)")
+    print(f"cli_record: scrubbed {count} value(s) in {path.name} (gzip)")  # noqa: T201
 
 
 def accessions_in_company_facts(payload: Any) -> set[str]:
@@ -550,7 +550,7 @@ def _record_edgar(settings: Settings, secrets: list[str]) -> None:
 
         picked = _pick_filing(submissions, _FORM_PREFERENCE[label])
         if picked is None:
-            print(
+            print(  # noqa: T201
                 f"cli_record: no matching filing found for {label} ({cik}); skipping",
                 file=sys.stderr,
             )
@@ -812,13 +812,13 @@ def _paper_finish(
         out["open_orders_after"] = raw.list_open_orders()
     except (AlpacaTradingError, PaperRecordingError) as error:
         message = scrub_text(str(error), secrets=_configured_secrets(settings))[0]
-        print(f"cli_record: NOT FLAT? flattening failed ({message}); check it", file=sys.stderr)
+        print(f"cli_record: NOT FLAT? flattening failed ({message}); check it", file=sys.stderr)  # noqa: T201
         raise
     residue = [str(p.get("symbol")) for p in out["positions_after"]] + [
         str(o.get("client_order_id")) for o in out["open_orders_after"]
     ]
     if residue:
-        print(f"cli_record: NOT FLAT: {', '.join(residue)}; check it", file=sys.stderr)
+        print(f"cli_record: NOT FLAT: {', '.join(residue)}; check it", file=sys.stderr)  # noqa: T201
     return residue
 
 
@@ -916,7 +916,7 @@ def _run_paper(
     except (PaperRecordingError, AlpacaTradingError) as error:
         # An adapter error can echo a response body; scrub it like a fixture (#334).
         message = scrub_text(str(error), secrets=_configured_secrets(settings))[0]
-        print(f"cli_record: {message}", file=sys.stderr)
+        print(f"cli_record: {message}", file=sys.stderr)  # noqa: T201
         return 1
     account = recordings["account_before"]
     secrets = _configured_secrets(settings) + [
@@ -929,7 +929,7 @@ def _run_paper(
     RECORDED_AT_FILE.write_text(
         json.dumps({**previous, **_recorded_at}, indent=2, sort_keys=True) + "\n"
     )
-    print(f"cli_record: wrote paper fixtures under {ALPACA_PAPER_FIXTURES_DIR}")
+    print(f"cli_record: wrote paper fixtures under {ALPACA_PAPER_FIXTURES_DIR}")  # noqa: T201
     return 0
 
 
@@ -941,11 +941,11 @@ def main(argv: Sequence[str] = ()) -> int:
     and needs only the paper keys; `SYMBOL` is a tradable, non-fractionable name."""
     target = argv[0] if argv else "all"
     if target == "paper" and len(argv) != 2:
-        print("cli_record: usage: paper NON_FRACTIONABLE_SYMBOL", file=sys.stderr)
+        print("cli_record: usage: paper NON_FRACTIONABLE_SYMBOL", file=sys.stderr)  # noqa: T201
         return 2
     if target not in ("all", "fsn", "paper") or (target != "paper" and len(argv) > 1):
         # A typo must not fall through to the full recorder (Alpaca keys too).
-        print(
+        print(  # noqa: T201
             f"cli_record: unknown target {target!r}; use 'fsn', 'paper SYMBOL' or no target",
             file=sys.stderr,
         )
@@ -961,25 +961,25 @@ def main(argv: Sequence[str] = ()) -> int:
         ) as error:
             # Fixed text today; scrubbed anyway so every recorder error has one rule (#342).
             message = scrub_text(str(error), secrets=_configured_secrets(settings))[0]
-            print(f"cli_record: {message}", file=sys.stderr)
+            print(f"cli_record: {message}", file=sys.stderr)  # noqa: T201
             return 1
         return _run_paper(raw, settings, argv[1].upper())
 
     if target == "fsn":
         if _non_blank_secret(settings.sec_edgar_user_agent) is None:
-            print(
+            print(  # noqa: T201
                 "cli_record: missing required secret(s): SEC_EDGAR_USER_AGENT. Set it in "
                 ".env (see .env.example) before running the recorder.",
                 file=sys.stderr,
             )
             return 1
         _record_fsn(settings, _configured_secrets(settings))
-        print(f"cli_record: wrote FSN fixtures under {EDGAR_FSN_FIXTURES_DIR}")
+        print(f"cli_record: wrote FSN fixtures under {EDGAR_FSN_FIXTURES_DIR}")  # noqa: T201
         return 0
 
     missing = _missing_secret_names(settings)
     if missing:
-        print(
+        print(  # noqa: T201
             "cli_record: missing required secret(s): "
             + ", ".join(missing)
             + ". Set them in .env (see .env.example) before running the recorder.",
@@ -995,7 +995,7 @@ def main(argv: Sequence[str] = ()) -> int:
     _record_alpaca(settings, secrets)
     RECORDED_AT_FILE.write_text(json.dumps(_recorded_at, indent=2, sort_keys=True) + "\n")
 
-    print(f"cli_record: wrote fixtures under {FIXTURES_ROOT}")
+    print(f"cli_record: wrote fixtures under {FIXTURES_ROOT}")  # noqa: T201
     return 0
 
 

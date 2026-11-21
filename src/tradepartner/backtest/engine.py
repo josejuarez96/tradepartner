@@ -1079,7 +1079,7 @@ def _fill_to_targets(
     )
 
 
-def _step(
+def _step(  # noqa: C901, PLR0912, PLR0913, PLR0915
     book: _Book,
     plan: Plan,
     index: int,
@@ -2039,7 +2039,7 @@ def _plan_all(
                 strategy.reader(requests, variant.settings, read, t, universes[read])
             except _ReadError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 on_failure(variant, exc)
         for key, asked in requests.asked.items():
             view.share(key, asked)
@@ -2052,7 +2052,7 @@ def _plan_all(
             )
         except _ReadError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             on_failure(variant, exc)
     return plans
 
@@ -2187,7 +2187,7 @@ def _run_group(
         variant.cutoff = cutoff
         try:
             variant.plan = _no_benchmark_members(plans[variant.trial_id], benchmarks)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             failed(variant, exc)
             continue
         capital = variant.settings.backtest.initial_capital
@@ -2286,7 +2286,7 @@ def _run_group(
                 )
             except _ReadError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 failed(variant, exc)
     for variant in group:
         metrics = variant.settings.metrics

@@ -254,7 +254,7 @@ def stale_listings_at(
     return out
 
 
-def survivorship_gap(
+def survivorship_gap(  # noqa: C901
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
     settings: Settings | None = None,

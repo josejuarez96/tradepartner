@@ -77,7 +77,7 @@ def _bps_key(value: float) -> str:
     return str(int(number)) if number.is_integer() else repr(number).replace(".", "p")
 
 
-def summarise(
+def summarise(  # noqa: PLR0913
     rows: Sequence[Mapping[str, Any]],
     counts: Mapping[str, Any],
     *,

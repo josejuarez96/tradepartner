@@ -718,7 +718,7 @@ def _switch(connect: Connect, window: PaperWindowRow) -> switch.SwitchState:
     )
 
 
-def resume(
+def resume(  # noqa: C901, PLR0912, PLR0915
     settings: Settings,
     connect: Connect,
     broker: Broker,
@@ -896,7 +896,7 @@ def resume(
                     fault_type=SystemFaultError.__name__,
                     reason=message,
                 )
-            except Exception as engage_error:
+            except Exception as engage_error:  # noqa: BLE001
                 engaged = switch.WriteFailed(f"{type(engage_error).__name__}: {engage_error}")
             if isinstance(engaged, switch.WriteFailed):
                 state = _switch(connect, window)
@@ -1021,7 +1021,7 @@ def resume(
                         fault_type=ReconciliationError.__name__,
                         reason=str(exc),
                     )
-                except Exception as engage_error:  # a bad clock reading, say
+                except Exception as engage_error:  # a bad clock reading, say  # noqa: BLE001
                     engaged = switch.WriteFailed(f"{type(engage_error).__name__}: {engage_error}")
                 if isinstance(engaged, switch.WriteFailed):
                     refusal.append(
@@ -1068,7 +1068,7 @@ def resume(
                     source="drawdown",
                     reason=crossing.reason,
                 )
-            except Exception as engage_error:  # a bad clock reading, say
+            except Exception as engage_error:  # a bad clock reading, say  # noqa: BLE001
                 engaged = switch.WriteFailed(f"{type(engage_error).__name__}: {engage_error}")
             if isinstance(engaged, switch.WriteFailed):
                 # The switch stays engaged either way (we are on the engaged

@@ -396,7 +396,7 @@ def watch(slot_path: Path, child: Child) -> threading.Thread:
     def wait_and_record() -> None:
         try:
             code = child.wait()
-        except Exception:
+        except Exception:  # noqa: BLE001
             return
         _store_exit_code(slot_path, child.pid, int(code))
 
