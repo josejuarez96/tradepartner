@@ -537,6 +537,9 @@ def _app_default_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[
             found.append(f"{node.lineno}: names {name} as an attribute")
         elif isinstance(node, (ast.Name, ast.Attribute)) and name in _CLICK_REACH:
             found.append(f"{node.lineno}: names {name}")
+        elif isinstance(node, ast.Attribute) and name == "os":
+            # `subprocess.os`, `pathlib.os`: the same module by another road.
+            found.append(f"{node.lineno}: reaches os through another module")
         elif isinstance(node, ast.Name) and name == "os":
             # #3652: `os` is here for `os.umask` alone; `os.environ`, `os.putenv`
             # or `os` passed along could set settings and stay unseen.
@@ -1144,6 +1147,10 @@ def test_the_cli_exception_lets_exactly_its_reviewed_shape_through() -> None:
         CLI_PASS + "import os as o\no.umask(0)\n",
         CLI_PASS + "from os import environ\n",
         CLI_PASS + "from os import umask\n",
+        # ... nor reached through another module that happens to import it
+        CLI_PASS + "subprocess.os.environ['PAPER__X'] = '1'\n",
+        CLI_PASS + "pathlib.os.putenv('PAPER__X', '1')\n",
+        CLI_PASS + "env = pl.os\n",
         # not a `resume` command's parameter
         CLI_PASS.replace('command("resume")', 'command("run")'),
         CLI_PASS.replace('@paper_app.command("resume")\n', ""),
