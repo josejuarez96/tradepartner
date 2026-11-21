@@ -212,8 +212,12 @@ def summarise(
             if name == "raw"
             else f"{long_group}_{main_h}_{name}_gross_bp"
         )
+        key_source = "spread" if name == "raw" else f"spread_{name}"
         long_readings[name] = {
             "gross_spread_bp": float(sec[gross_key]),
+            "net_bp": _mean_bp(
+                [net_long(float(row[f"{key_source}_{main_h}"]), primary_cost) for row in long_rows]
+            ),
         }
         if name == "raw":
             short_net_bp = _mean_bp(
