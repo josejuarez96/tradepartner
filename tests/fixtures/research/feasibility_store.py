@@ -20,11 +20,35 @@ over any 20 sessions of its life:
 | FFF    | mid  | 2018-01-02 to 2018-11-09 (delists)     | delisted with bars, no event         |
 | GGG    | low  | 2018-01-02 to 2019-04-05               | delists after the window             |
 
-Closes are never constant, and every issuer's close-to-close change differs from every
-other's, so a mutant reader that read a close-to-close change would show in the block.
-The planted prices are deliberately not at a round number: `close * volume` varies by a
-few percent around each issuer's level, enough to move a median but never across a band
-edge.
+Closes are never constant and differ by issuer. The planted prices are deliberately not
+at a round number: `close * volume` varies by a few percent around each issuer's level,
+enough to move a median but never across a band edge. AAA sits only 1.5 times above the
+$200M edge, so a factor test (T454's "no price change" case) must choose factors that
+carry AAA across it for a close-to-close reader to show; the fixture does not guarantee it.
+
+Planted cases, by what they are for (new cases are appended; none renamed):
+
+* Same-session cluster inside one band (3-13): BBB and DDD (mid) both enter 2018-03-13.
+  FFF (mid) enters 2018-05-17, three sessions after BBB's 2018-05-14: a cross-issuer pair
+  on nearby sessions whose holds overlap. So in the mid band the default rule (0.05 x o_ij
+  across sessions), rho 0 and a cited rho 0.3 give three different n_eff values (hand
+  values in `test_feasibility_design.py`).
+* Restatements of AAA's bars 2018-02-14 to 2018-03-12 (12 sessions inside the lookback of
+  the 2018-03-13 entry): close 10, volume 1,000,000, known 2019-06-03, after the window's
+  end and before the development boundary. A reader that cuts late reads a median of
+  $10M and moves AAA from the top band to the low band. One restated bar known
+  2020-01-15 (after the boundary) stays.
+* `corporate_actions`: AAA's 2018-06-15 split is cancelled by a revision row known
+  2018-06-20 (inside the window); CCC's 2018-10-10 split by one known 2019-05-01 (after
+  the window, before the boundary). The event is the first-known row; neither removes it.
+* `delistings`: DDD's Form 25 is revised (effective 2018-09-17 to 2018-09-24, known
+  2018-09-12); FFF's is revised after the window (effective 2018-11-12 to 2019-06-03,
+  known 2019-05-02), which would move it out of the window if the latest revision were
+  read; CCC files inside the window (2019-03-20) and is effective after it (2019-04-03).
+* `statement_facts` at 13:45 UTC on 2018-01-16 (8:45 New York, before the open) and on
+  2018-03-14 (9:45 New York, after the open): under `next_open_after_instant` the first
+  enters the same day and the second the next session, which depends on the offset.
+* `build_feasibility_store(path, with_boundary=False)` omits the development boundary row.
 """
 
 from __future__ import annotations
@@ -41,6 +65,8 @@ from tradepartner.store import registry, schema
 from tradepartner.store.db import configure_connection, insert_row
 
 BOUNDARY = date(2019, 12, 31)
+LATE_RESTATED_AT = datetime(2019, 6, 3, 15, tzinfo=UTC)
+"""Known after the window's end and before the boundary: the restated AAA bars."""
 """The development boundary written into the store."""
 WINDOW_START = date(2018, 1, 2)
 WINDOW_END = date(2019, 3, 29)
@@ -190,6 +216,23 @@ FORM4_EVENTS: tuple[tuple[str, datetime, str, bool, str, str], ...] = (
         "F3",
         "known after the development boundary",
     ),
+    # Appended so existing accessions keep their numbers.
+    (
+        "DDD",
+        datetime(2018, 3, 12, 15, tzinfo=UTC),
+        "P",
+        True,
+        "F6",
+        "same session as BBB in the mid band",
+    ),
+    (
+        "FFF",
+        datetime(2018, 5, 16, 15, tzinfo=UTC),
+        "P",
+        True,
+        "F7",
+        "mid band, 3 sessions after BBB: overlapping holds",
+    ),
 )
 
 
@@ -198,7 +241,7 @@ class FeasibilityStore:
     """The built file and the constants a test needs about it."""
 
     path: Path
-    boundary: date
+    boundary: date | None
     window_start: date
     window_end: date
     sessions: tuple[date, ...]
@@ -246,6 +289,26 @@ def _insert_prices(conn: duckdb.DuckDBPyConnection, sessions: tuple[date, ...]) 
                     "bar",
                 )
             )
+    # Restated bars of AAA inside the lookback of its 2018-03-13 entry, known after the
+    # window's end and before the development boundary: a reader that cuts late moves AAA
+    # from the top band to the low band.
+    entry_no = sessions.index(date(2018, 3, 13))
+    for session in sessions[entry_no - 12 : entry_no]:
+        rows.append(
+            (
+                "SEC_AAA",
+                session,
+                10.0,
+                10.0,
+                10.0,
+                10.0,
+                1_000_000,
+                LATE_RESTATED_AT,
+                LATE_RESTATED_AT,
+                "test",
+                "bar",
+            )
+        )
     # A restatement of one old bar, known only after the development boundary.
     restated = datetime(2020, 1, 15, 15, tzinfo=UTC)
     rows.append(
@@ -319,6 +382,9 @@ def _insert_statement_facts(conn: duckdb.DuckDBPyConnection) -> None:
         ("DDD", "8-K", False, date(2018, 3, 31), datetime(2018, 5, 11, 11, tzinfo=UTC)),
         ("BBB", "10-Q", False, date(2018, 12, 31), datetime(2019, 4, 2, 11, tzinfo=UTC)),
         ("AAA", "10-K", False, date(2019, 12, 31), datetime(2020, 2, 28, 21, tzinfo=UTC)),
+        # 13:45 UTC: 8:45 in New York in January (before the open), 9:45 in March (after).
+        ("BBB", "10-Q", False, date(2017, 9, 30), datetime(2018, 1, 16, 13, 45, tzinfo=UTC)),
+        ("BBB", "10-Q", False, date(2018, 2, 28), datetime(2018, 3, 14, 13, 45, tzinfo=UTC)),
     )
     for issuer, form, comparative, period_end, known in rows:
         insert_row(
@@ -352,8 +418,11 @@ def _insert_corporate_actions(conn: duckdb.DuckDBPyConnection) -> None:
         ("CCC", "split", date(2018, 10, 10), datetime(2018, 10, 5, 21, tzinfo=UTC)),
         ("BBB", "split", date(2019, 4, 8), datetime(2019, 4, 3, 21, tzinfo=UTC)),
         ("CCC", "split", date(2020, 2, 18), datetime(2020, 2, 13, 21, tzinfo=UTC)),
+        # Cancellations are revision rows of the same action, known later.
+        ("AAA", "split", date(2018, 6, 15), datetime(2018, 6, 20, 21, tzinfo=UTC), True),
+        ("CCC", "split", date(2018, 10, 10), datetime(2019, 5, 1, 21, tzinfo=UTC), True),
     )
-    for issuer, kind, ex_date, known in rows:
+    for issuer, kind, ex_date, known, *cancelled in rows:
         insert_row(
             conn,
             "corporate_actions",
@@ -362,6 +431,7 @@ def _insert_corporate_actions(conn: duckdb.DuckDBPyConnection) -> None:
                 "action_type": kind,
                 "ex_date": ex_date,
                 "ratio_or_amount": 2.0,
+                "cancelled": bool(cancelled and cancelled[0]),
                 "known_at": known,
                 "ingested_at": known,
                 "source": "test",
@@ -370,8 +440,35 @@ def _insert_corporate_actions(conn: duckdb.DuckDBPyConnection) -> None:
         )
 
 
+# Revisions of a Form 25 episode: (issuer, filed_at, new effective_on, known_at of the revision).
+DELISTING_REVISIONS: tuple[tuple[str, datetime, date, datetime], ...] = (
+    (
+        "DDD",
+        datetime(2018, 9, 7, 13, tzinfo=UTC),
+        date(2018, 9, 24),
+        datetime(2018, 9, 12, 13, tzinfo=UTC),
+    ),
+    (
+        "FFF",
+        datetime(2018, 11, 1, 13, tzinfo=UTC),
+        date(2019, 6, 3),
+        datetime(2019, 5, 2, 13, tzinfo=UTC),
+    ),
+)
+# Filed inside the window, effective after it (not a listing end inside the window).
+FILED_IN_WINDOW_EFFECTIVE_AFTER: tuple[str, datetime, date] = (
+    "CCC",
+    datetime(2019, 3, 20, 13, tzinfo=UTC),
+    date(2019, 4, 3),
+)
+
+
 def _insert_delistings(conn: duckdb.DuckDBPyConnection) -> None:
-    for issuer, filed, effective in DELISTINGS:
+    episodes = [
+        (issuer, filed, effective, filed)
+        for issuer, filed, effective in (*DELISTINGS, FILED_IN_WINDOW_EFFECTIVE_AFTER)
+    ] + list(DELISTING_REVISIONS)
+    for issuer, filed, effective, known in episodes:
         insert_row(
             conn,
             "delistings",
@@ -382,16 +479,19 @@ def _insert_delistings(conn: duckdb.DuckDBPyConnection) -> None:
                 "exchange": "XNYS",
                 "filed_at": filed,
                 "effective_on": effective,
-                "known_at": filed,
-                "ingested_at": filed,
+                "known_at": known,
+                "ingested_at": known,
                 "source": "test",
                 "provenance": "filing",
             },
         )
 
 
-def build_feasibility_store(path: Path) -> FeasibilityStore:
-    """Build the store at `path` (a temp file, never a real store) and return its description."""
+def build_feasibility_store(path: Path, *, with_boundary: bool = True) -> FeasibilityStore:
+    """Build the store at `path` (a temp file, never a real store) and return its description.
+
+    `with_boundary=False` omits the development boundary row (a copy with none).
+    """
     sessions = tuple(s for s in all_sessions() if WINDOW_START <= s <= LAST_BAR_SESSION)
     conn = duckdb.connect(str(path))
     try:
@@ -417,7 +517,10 @@ def build_feasibility_store(path: Path) -> FeasibilityStore:
                 "rows_added": n_prices,
             },
         )
-        registry.write_development_boundary(conn, boundary=BOUNDARY, reason="feasibility fixture")
+        if with_boundary:
+            registry.write_development_boundary(
+                conn, boundary=BOUNDARY, reason="feasibility fixture"
+            )
         rows = {
             table: int(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0])  # type: ignore[index]
             for table in (*SOURCE_TABLES.values(), "prices_daily", "securities", "listings")
@@ -426,7 +529,7 @@ def build_feasibility_store(path: Path) -> FeasibilityStore:
         conn.close()
     return FeasibilityStore(
         path=path,
-        boundary=BOUNDARY,
+        boundary=BOUNDARY if with_boundary else None,
         window_start=WINDOW_START,
         window_end=WINDOW_END,
         sessions=sessions,

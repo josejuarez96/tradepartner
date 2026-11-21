@@ -56,7 +56,13 @@ class SourceSpec:
     filter may name: columns that describe the filed event itself. An identifier
     (security, issuer, owner or filer ids, accession numbers, names) is never one, and
     no date or stamp is: a filter on an identifier would let a design pick names after
-    the fact.
+    the fact. Nor is a continuous or free-text column (an exact-value list would act as a
+    row id) or a revision flag (`cancelled`: filtering on it resolves an event by a later
+    fact).
+
+    The rule the reader (T454) follows for every source: an event is the **first-known**
+    row of an issuer's identity, at its own `known_at`; a later revision, cancellation or
+    restatement never removes or re-dates it.
     """
 
     name: str
@@ -101,11 +107,7 @@ SOURCES: Final[dict[str, SourceSpec]] = {
             "is_officer",
             "is_ten_percent_owner",
             "is_other",
-            "shares",
-            "price",
-            "shares_owned_after",
             "ownership_form",
-            "security_title",
         ),
     ),
     "statement_fact": SourceSpec(
@@ -148,7 +150,7 @@ SOURCES: Final[dict[str, SourceSpec]] = {
             "source_action_id",
             "cancelled",
         ),
-        ("action_type", "ratio_or_amount", "cancelled"),
+        ("action_type",),
     ),
 }
 
@@ -157,36 +159,18 @@ _TOP_KEYS: Final = frozenset(
 )
 _WINDOW_KEYS: Final = frozenset({"start", "end"})
 _BAND_KEYS: Final = frozenset({"lookback_sessions", "edges"})
-SHAPE_FORMS: Final = ("event", "trial")
-BOOKS: Final = ("long_short", "long_only")
-_SHAPE_REQUIRED: Final = {
-    "event": ("gross_bp", "sd_bp", "decision_cost_bps", "floor_bp", "t_floor"),
-    "trial": ("gross_bp", "decision_cost_bps", "book", "turnover_per_month", "months", "sigma_bp"),
-}
-_SHAPE_OPTIONAL: Final = {"event": (), "trial": ("borrow_bp_per_month",)}
+_SHAPE_KEYS: Final = ("gross_bp", "sd_bp", "decision_cost_bps", "floor_bp", "t_floor")
 
 
 @dataclass(frozen=True)
 class ShapeInputs:
-    """The `[shape]` table, copied from the card (units: basis points).
+    """The `[shape]` table, copied from the card (event ideas only; units: basis points)."""
 
-    `form` is `event` (the default) or `trial`. An event shape carries `sd_bp`, `floor_bp`
-    and `t_floor`; a trial shape carries `book`, `turnover_per_month`, `months` and
-    `sigma_bp`, and a `long_short` book must state `borrow_bp_per_month` (a defaulted 0
-    would flatter the pass chance; PR #3745's quant-auditor).
-    """
-
-    form: str
     gross_bp: float
+    sd_bp: float
     decision_cost_bps: float
-    sd_bp: float | None = None
-    floor_bp: float | None = None
-    t_floor: float | None = None
-    book: str | None = None
-    turnover_per_month: float | None = None
-    months: int | None = None
-    sigma_bp: float | None = None
-    borrow_bp_per_month: float | None = None
+    floor_bp: float
+    t_floor: float
 
 
 @dataclass(frozen=True)
@@ -240,7 +224,7 @@ def _number(key: str, value: object) -> float:
     out = float(value)
     if out != out or out in (float("inf"), float("-inf")):
         raise _fail(key, "must be finite")
-    return out
+    return out + 0.0
 
 
 def _positive_int(key: str, value: object) -> int:
@@ -256,13 +240,48 @@ def _date(key: str, value: object) -> date:
     return value
 
 
-def _filter_values(key: str, value: object) -> tuple[Scalar, ...]:
+#: The value type of each filterable column; a mismatch is refused with the key named.
+FILTER_KINDS: Final[dict[str, dict[str, type]]] = {
+    "form4": {
+        "transaction_code": str,
+        "acquired_disposed": str,
+        "is_director": bool,
+        "is_officer": bool,
+        "is_ten_percent_owner": bool,
+        "is_other": bool,
+        "ownership_form": str,
+    },
+    "statement_fact": {
+        "fact_name": str,
+        "xbrl_tag": str,
+        "form": str,
+        "period_days": int,
+        "unit": str,
+        "basis": str,
+        "comparative": bool,
+    },
+    "form25": {"form": str, "exchange": str},
+    "corporate_action": {"action_type": str},
+}
+#: Closed vocabularies the schema defines (`CHECK` constraints).
+FILTER_VOCABULARIES: Final[dict[tuple[str, str], tuple[str, ...]]] = {
+    ("form4", "acquired_disposed"): ("A", "D"),
+    ("statement_fact", "basis"): ("reported", "derived"),
+}
+
+
+def _filter_values(
+    key: str, value: object, kind: type, vocabulary: tuple[str, ...] | None = None
+) -> tuple[Scalar, ...]:
     items = value if isinstance(value, list) else [value]
     if not items:
         raise _fail(key, "membership list must not be empty")
-    kinds = {type(v) for v in items}
-    if not all(isinstance(v, (str, bool, int)) for v in items) or len(kinds) != 1:
-        raise _fail(key, "must be a string, boolean or integer, or a list of one such type")
+    if not all(type(v) is kind for v in items):
+        raise _fail(key, f"must be a {kind.__name__}, or a list of them")
+    if vocabulary is not None:
+        bad = sorted(str(v) for v in items if v not in vocabulary)
+        if bad:
+            raise _fail(key, f"{bad[0]!r} is not one of {', '.join(vocabulary)}")
     return tuple(sorted(set(items), key=lambda v: (str(type(v)), v)))
 
 
@@ -275,13 +294,19 @@ def _filters(
     out = []
     for column in sorted(raw):
         if column not in spec.filter_columns:
-            kind = "an identifier, date or stamp" if column in spec.columns else "not a column"
+            why = (
+                "an identifier, date, stamp or unsuitable column"
+                if column in spec.columns
+                else "not a column"
+            )
             raise _fail(
                 f"filter.{column}",
-                f"{kind} of {spec.table}, not filterable "
+                f"{why} of {spec.table}, not filterable "
                 f"(filterable: {', '.join(spec.filter_columns)})",
             )
-        out.append((column, _filter_values(f"filter.{column}", raw[column])))
+        kind = FILTER_KINDS[spec.name][column]
+        vocab = FILTER_VOCABULARIES.get((spec.name, column))
+        out.append((column, _filter_values(f"filter.{column}", raw[column], kind, vocab)))
     return tuple(out)
 
 
@@ -291,40 +316,17 @@ def _shape_inputs(doc: Mapping[str, Any]) -> ShapeInputs | None:
     raw = doc["shape"]
     if not isinstance(raw, dict):
         raise _fail("shape", "must be a table")
-    form = raw.get("form", "event")
-    if form not in SHAPE_FORMS:
-        raise _fail("shape.form", f"must be one of {', '.join(SHAPE_FORMS)}")
-    required = _SHAPE_REQUIRED[form]
-    allowed = {"form", *required, *_SHAPE_OPTIONAL[form]}
-    unknown = sorted(set(raw) - allowed)
+    unknown = sorted(set(raw) - set(_SHAPE_KEYS))
     if unknown:
-        raise _fail(f"shape.{unknown[0]}", f"unknown key for a {form} shape")
-    for key in required:
+        raise _fail(f"shape.{unknown[0]}", "unknown key")
+    for key in _SHAPE_KEYS:
         if key not in raw:
             raise _fail(f"shape.{key}", "missing key")
-    values: dict[str, Any] = {"form": form}
-    for key in (*required, *_SHAPE_OPTIONAL[form]):
-        if key not in raw:
-            continue
-        if key == "book":
-            if raw[key] not in BOOKS:
-                raise _fail("shape.book", f"must be one of {', '.join(BOOKS)}")
-            values[key] = raw[key]
-        elif key == "months":
-            values[key] = _positive_int("shape.months", raw[key])
-        else:
-            values[key] = _number(f"shape.{key}", raw[key])
-    if values.get("book") == "long_short" and "borrow_bp_per_month" not in raw:
-        raise _fail(
-            "shape.borrow_bp_per_month",
-            "missing: a long/short trial states its borrow cost (bp per month on equity)",
-        )
-    for key in ("sd_bp", "sigma_bp"):
-        if key in values and values[key] <= 0:
-            raise _fail(f"shape.{key}", "must be positive")
-    nonneg = ("decision_cost_bps", "floor_bp", "t_floor", "turnover_per_month")
-    for key in (*nonneg, "borrow_bp_per_month"):
-        if key in values and values[key] < 0:
+    values = {k: _number(f"shape.{k}", raw[k]) for k in _SHAPE_KEYS}
+    if values["sd_bp"] <= 0:
+        raise _fail("shape.sd_bp", "must be positive")
+    for key in ("decision_cost_bps", "floor_bp", "t_floor"):
+        if values[key] < 0:
             raise _fail(f"shape.{key}", "must not be negative")
     return ShapeInputs(**values)
 
@@ -425,9 +427,7 @@ def parse_design_text(text: str, *, name: str = "design") -> FeasibilityDesign:
         normalised["rho"] = rho
         normalised["rho_source"] = rho_source
     if shape_inputs is not None:
-        normalised["shape"] = {
-            k: v for k, v in sorted(asdict(shape_inputs).items()) if v is not None
-        }
+        normalised["shape"] = asdict(shape_inputs)
     return FeasibilityDesign(
         source=source,
         filters=filters,
