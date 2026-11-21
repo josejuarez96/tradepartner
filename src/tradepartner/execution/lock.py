@@ -4,14 +4,15 @@ ADR 0017 B.3, plan T155).
 One process at a time may act on a book's paper account through the journal:
 `paper run`, `resume`, `reconcile`, `start`, `stop`, `abandon` and `settle` each
 take `run_lock(settings, book_id)` for their whole duration. It is an exclusive
-`fcntl.flock` on `<store.path>.paper.<book>.lock`, taken without waiting: a
-second holder of the same book's lock gets `LockHeld` at once (the second
-`paper run` exits `locked`, spec acceptance "Kill mid-run"), never a queue
-behind the first. Another book's lock is another file, so books never wait on
-each other (each book is its own account, ADR 0017 B.4). `book_id` defaults to
-`paper.book_id` (the spec's `--book` default) and must match the book token
-grammar (`store.journal.check_book_id`), so it can never name a path outside
-the store's directory.
+`fcntl.flock` on `<store.path>.paper.<book>.lock`, tried without blocking: a
+second holder of the same book's lock gets `LockHeld` within
+`paper.run_lock_retry_seconds` (the second `paper run` exits `locked`, spec
+acceptance "Kill mid-run"), never a queue behind the first. Another book's
+lock is another file, so books never wait on each other (each book is its own
+account, ADR 0017 B.4). `book_id` defaults to `paper.book_id` (the spec's
+`--book` default) and must match the book token grammar
+(`store.journal.check_book_id`), so it can never name a path outside the
+store's directory.
 
 The operating system releases a `flock` when its file descriptor closes, so a
 crash, a `kill -9` or a reboot leaves nothing to clean up and no stale lock to
@@ -22,9 +23,10 @@ pid, for the `LockHeld` message only.
 page, `paper status`): the kill-switch derivation shows "run in progress" rather
 than "engaged" for an unfinished run while the lock is held
 (`execution.switch.derive`). It tests the lock with a non-blocking shared
-`flock` that it drops at once. A holder starting in that same instant is refused
-as if a run held it; the caller of `run_lock` treats that like any other
-`locked` exit.
+`flock` that it drops at once. A holder starting in that same instant finds the
+file locked, so `run_lock` tries again every `paper.run_lock_poll_seconds` until
+`paper.run_lock_retry_seconds` have passed (#3640): a probe no longer costs a
+run. A wait of 0 refuses at once, as before.
 
 The store and its lock file live on a local disk (the owner's Mac). On a
 network filesystem `flock` may be emulated per process and would not refuse a
@@ -38,6 +40,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -47,6 +50,11 @@ from tradepartner.store.journal import check_book_id
 
 #: Owner read and write only: the file names a pid, nothing else.
 _LOCK_FILE_MODE = 0o600
+
+
+#: Module-level so a test can replace the wait and the clock that bounds it.
+_sleep = time.sleep
+_monotonic = time.monotonic
 
 
 class LockHeld(RuntimeError):
@@ -140,28 +148,41 @@ def _holder(path: Path) -> str:
 @contextmanager
 def run_lock(settings: Settings, book_id: str | None = None) -> Iterator[None]:
     """Hold the book's exclusive run lock for the `with` block, or raise
-    `LockHeld` at once when another holder of that book's lock exists (in this
-    process or another). Released when the block exits, normally or by an
-    exception. `book_id` defaults to `paper.book_id`. Book `main` also holds
-    `legacy_lock_path` for the whole block, refused the same way."""
+    `LockHeld` when another holder of that book's lock still exists (in this
+    process or another) after `paper.run_lock_retry_seconds`. Released when the
+    block exits, normally or by an exception. `book_id` defaults to
+    `paper.book_id`. Book `main` also holds `legacy_lock_path` for the whole
+    block, refused the same way."""
     book = resolve_book(settings, book_id)
+    wait = settings.paper.run_lock_retry_seconds
+    poll = settings.paper.run_lock_poll_seconds
     with ExitStack() as stack:
-        stack.enter_context(_flock(lock_path(settings, book)))
+        stack.enter_context(_flock(lock_path(settings, book), wait, poll))
         if book == MAIN_BOOK_ID:
-            stack.enter_context(_flock(legacy_lock_path(settings)))
+            stack.enter_context(_flock(legacy_lock_path(settings), wait, poll))
         yield
 
 
 @contextmanager
-def _flock(path: Path) -> Iterator[None]:
-    """The exclusive non-blocking `flock` on `path` for the block (`LockHeld`)."""
+def _flock(path: Path, wait_seconds: float, poll_seconds: float) -> Iterator[None]:
+    """The exclusive `flock` on `path` for the block. Each attempt is non-blocking;
+    a refused one is tried again every `poll_seconds` until `wait_seconds` have
+    passed since the first, then `LockHeld` (#3640). A wait of 0 refuses at once."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, _LOCK_FILE_MODE)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise LockHeld(f"the paper run lock {path} is held by {_holder(path)}") from None
+        deadline = _monotonic() + wait_seconds
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - _monotonic()
+                if remaining <= 0:
+                    raise LockHeld(
+                        f"the paper run lock {path} is held by {_holder(path)}"
+                    ) from None
+                _sleep(min(poll_seconds, remaining))
         try:
             os.ftruncate(fd, 0)
             os.write(fd, f"pid {os.getpid()}\n".encode())
