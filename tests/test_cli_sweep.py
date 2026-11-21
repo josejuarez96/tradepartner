@@ -721,7 +721,9 @@ def test_no_lab_command_takes_a_store_path_window_holdout_gap_or_synthetic_optio
                 for opt in param.opts:
                     if opt.startswith("-"):
                         assert not FORBIDDEN_OPTION.search(opt), (command.name, opt)
-    # and no option anywhere in the app names a store path
+    # and no option anywhere in the app names a store path, but `feasibility --store`
+    # (T455, #3744): the path of a COPY, refused when it is the configured store
     for command in _commands(root):
+        allowed = {"--store"} if command.name == "feasibility" else set()
         for param in command.params:
-            assert not any(re.search(r"store", o) for o in param.opts), param.opts
+            assert {o for o in param.opts if re.search(r"store", o)} <= allowed, param.opts
