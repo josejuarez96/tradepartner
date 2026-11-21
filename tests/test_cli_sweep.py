@@ -25,7 +25,7 @@ import re
 import shutil
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -284,6 +284,115 @@ def test_sweep_register_refuses_a_bad_file_and_a_missing_one(store: Path, tmp_pa
     assert out.exit_code == 2, out.output
     assert "refused" in out.output
     assert _cli("sweep", "register", str(tmp_path / "nope.md")).exit_code == 2
+    assert _counts(store) == before
+
+
+# --- sweep register: a root family's first sweep (#3571) ----------------------------
+
+_ROOT_SWEEP = """# Sweep: fixture profitability sweep (test only)
+
+```toml sweep
+slug = "profitability-root"
+family = "profitability"
+title = "Fixture profitability sweep"
+in_sample_start = 2017-01-31
+
+[holdout]
+start = 2026-01-02
+end = 2026-06-30
+
+[profitability]
+basis = "gross"
+annual_period_days = [350, 380]
+max_fact_age_days = 548
+exclude_sic_ranges = [[6000, 6999]]
+include_derived = true
+top_fraction = 0.2
+weighting = "equal"
+
+[costs]
+per_side_bps = 15.0
+commission_per_share = 0.0
+commission_per_order = 0.0
+sensitivity_per_side_bps = [0.0, 30.0, 60.0, 100.0]
+
+[gap]
+count_share_threshold = 0.05
+
+[grid]
+"schedule.rebalance_cadence" = ["month_end", "week_end"]
+
+[lab]
+selection_statistic = "sharpe_annual_excess_spy"
+expected_excess_cagr_spy_pp = 0.0
+expected_range_pp = [-2.0, 2.0]
+promote_at_least = 0.5
+retire_below = 0.0
+```
+
+Placeholder prose.
+"""
+
+
+def _root_file(directory: Path, store: Path) -> Path:
+    """The root-family sweep file, with a development boundary row ahead of the twin's
+    holdout (ADR 0016) so the new family's default window reads no exam month."""
+    with open_for_write(Settings(_env_file=None)) as conn:
+        registry.write_development_boundary(conn, boundary=date(2019, 4, 30), reason="test")
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "profitability-root.md"
+    path.write_text(_ROOT_SWEEP)
+    return path
+
+
+def test_a_root_familys_first_sweep_register_needs_the_looks_and_reason_and_prints_the_seed(
+    store: Path, tmp_path: Path
+) -> None:
+    file = _root_file(tmp_path / "files", store)
+    before = _counts(store)
+    for args in ((), ("--programme-looks", "20"), ("--reason", "r")):
+        out = _cli("sweep", "register", str(file), *args)
+        assert out.exit_code == 2, out.output
+        assert "programme_looks_required" in out.output
+    assert _counts(store) == before
+
+    out = _cli(
+        "sweep",
+        "register",
+        str(file),
+        "--programme-looks",
+        "20",
+        "--reason",
+        "ledger looks at 2026-11-21",
+    )
+    assert out.exit_code == 0, out.output
+    assert "root family seed: SR*" in out.stdout
+    assert "k = 20" in out.stdout and "ledger looks at 2026-11-21" in out.stdout
+    conn = duckdb.connect(str(store), read_only=True)
+    try:
+        (seed,) = conn.execute(
+            "SELECT sr_star_seed_annual FROM family_rules WHERE family = 'profitability'"
+        ).fetchone()  # type: ignore[misc]
+    finally:
+        conn.close()
+    assert seed is not None and seed > 0.5
+
+
+def test_sweep_register_refuses_the_looks_flags_for_an_existing_family(
+    store: Path, tmp_path: Path
+) -> None:
+    before = _counts(store)
+    out = _cli(
+        "sweep",
+        "register",
+        str(_sweep_file(tmp_path / "files")),
+        "--programme-looks",
+        "20",
+        "--reason",
+        "r",
+    )
+    assert out.exit_code == 2, out.output
+    assert "programme_looks_not_allowed" in out.output
     assert _counts(store) == before
 
 

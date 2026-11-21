@@ -627,6 +627,19 @@ def first_session(conn: duckdb.DuckDBPyConnection) -> date | None:
     return session if isinstance(session, date) else None
 
 
+def window_v_floor(
+    in_sample_start: date, holdout_start: date, min_sharpe_variance_annual: float
+) -> float:
+    """The V floor of a family window: the larger of `min_sharpe_variance_annual`
+    and the null variance of an annual Sharpe over the window, ppy / T with ppy = 12
+    and T the window's XNYS month-end periods. `family_v_floor` reads it from a
+    stored rules row; a new family's first registration reads it before any row
+    exists (`root_family_seed`)."""
+    sessions = rebalance_sessions(in_sample_start, holdout_start - timedelta(days=1), "month_end")
+    periods = max(len(sessions) - 1, 1)
+    return max(min_sharpe_variance_annual, MONTHS_PER_YEAR / periods)
+
+
 def family_v_floor(rules: FamilyRules) -> float:
     """The V that stands in for an undefined V (fewer than two pairs; strategy-lab
     spec, amendment 2026-11-06, #3127): the larger of the stored
@@ -634,11 +647,28 @@ def family_v_floor(rules: FamilyRules) -> float:
     family window, ppy / T with ppy = 12 and T the window's XNYS month-end periods
     (40 for momentum's 2020-08-31 .. 2023-12-29, so 0.30). A defined V keeps the
     stored floor (`floored_variance`)."""
-    sessions = rebalance_sessions(
-        rules.in_sample_start, rules.holdout_start - timedelta(days=1), "month_end"
+    return window_v_floor(
+        rules.in_sample_start, rules.holdout_start, rules.min_sharpe_variance_annual
     )
-    periods = max(len(sessions) - 1, 1)
-    return max(rules.min_sharpe_variance_annual, MONTHS_PER_YEAR / periods)
+
+
+def root_family_seed(
+    programme_looks: int,
+    in_sample_start: date,
+    holdout_start: date,
+    min_sharpe_variance_annual: float,
+) -> float:
+    """The `sr_star_seed_annual` of a root family (strategy-lab spec, amendment
+    2026-11-21, #3571): `expected_max_sharpe(1 + k, V)` with `k` the programme look
+    count the owner states and V the family window's floor (`window_v_floor`). An
+    annual Sharpe, on no basis: it enters the high-water mark as a number, whatever
+    basis the trial's own DSR is on. Refuses a negative `k`."""
+    if programme_looks < 0:
+        raise LabRegistryError(f"programme looks must be at least 0, got {programme_looks}")
+    return expected_max_sharpe(
+        1 + programme_looks,
+        window_v_floor(in_sample_start, holdout_start, min_sharpe_variance_annual),
+    )
 
 
 def floored_variance(rules: FamilyRules, variance: float | None) -> float:

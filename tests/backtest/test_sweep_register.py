@@ -29,8 +29,9 @@ import pytest
 from conftest import load_universe_fixtures, mark_pre_lab
 
 from tradepartner import config
-from tradepartner.backtest import frozen, hypothesis, results, sweep
+from tradepartner.backtest import frozen, hypothesis, results, sweep, sweep_report
 from tradepartner.backtest.holdout import Frozen, default_in_sample_window
+from tradepartner.backtest.metrics import expected_max_sharpe, probabilistic_sharpe
 from tradepartner.backtest.sweep import (
     AnchorInfeasibleError,
     DevelopmentBoundaryError,
@@ -40,6 +41,8 @@ from tradepartner.backtest.sweep import (
     FingerprintRegisteredError,
     NewFamilyError,
     NoFamilyRulesError,
+    ProgrammeLooksNotAllowedError,
+    ProgrammeLooksRequiredError,
     SweepFileError,
     SweepRegistration,
     register,
@@ -750,6 +753,10 @@ LATER_HOLDOUT = (date(2026, 1, 2), date(2026, 6, 30))
 #: exam months (#1441).
 BOUNDARY = date(2022, 12, 30)
 
+#: A root family's first sweep states the programme look count and why (#3571).
+LOOKS = 20
+ROOT: dict[str, Any] = {"programme_looks": LOOKS, "reason": "ledger looks at 2026-11-21"}
+
 
 def _practise_before_the_twins_exam(conn: duckdb.DuckDBPyConnection) -> None:
     """The development boundary row at `BOUNDARY` (ADR 0016), without which a new
@@ -840,14 +847,17 @@ def test_a_root_familys_first_sweep_writes_its_rules_with_no_parent_and_its_own_
     assert lab_registry.family_rules(ready, "profitability") is None
     before = _counts(ready)
 
-    result = register(ready, _profitability_sweep(tmp_path), settings, registered_by="test")
+    result = register(ready, _profitability_sweep(tmp_path), settings, registered_by="test", **ROOT)
 
     assert result.created
     assert _counts(ready)["family_rules"] == before["family_rules"] + 1
     rules = lab_registry.family_rules(ready, "profitability")
     assert rules is not None
     assert rules.parent_family is None
-    assert rules.sr_star_seed_annual is None
+    # The root's mark starts at the programme count's SR* (#3571), not at nothing.
+    assert rules.sr_star_seed_annual == pytest.approx(
+        expected_max_sharpe(1 + LOOKS, lab_registry.family_v_floor(rules))
+    )
     assert rules.first_hypothesis_id == result.hypotheses[0].hypothesis_id
     assert (rules.holdout_start, rules.holdout_end) == LATER_HOLDOUT
     assert rules.in_sample_start == date(2018, 1, 31)
@@ -871,7 +881,9 @@ def test_a_root_familys_first_sweep_writes_its_rules_with_no_parent_and_its_own_
 def test_a_root_family_on_an_empty_lab_store_registers(
     lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
-    result = register(lab_store, _profitability_sweep(tmp_path), settings, registered_by="test")
+    result = register(
+        lab_store, _profitability_sweep(tmp_path), settings, registered_by="test", **ROOT
+    )
 
     assert result.created
     rules = lab_registry.family_rules(lab_store, "profitability")
@@ -904,7 +916,9 @@ def test_an_oracle_familys_holdout_is_no_overlap(
         settings=settings,
     )
 
-    assert register(ready, _profitability_sweep(tmp_path), settings, registered_by="test").created
+    assert register(
+        ready, _profitability_sweep(tmp_path), settings, registered_by="test", **ROOT
+    ).created
 
 
 def test_a_new_family_naming_another_parent_is_refused(
@@ -1013,7 +1027,7 @@ def test_the_rules_are_copied_once_and_a_later_config_change_changes_nothing(
         min_sharpe_variance_annual=0.09,
         axis_lattice={"strategy.top_fraction": 0.05},
     )
-    register(ready, _profitability_sweep(tmp_path), first_settings, registered_by="test")
+    register(ready, _profitability_sweep(tmp_path), first_settings, registered_by="test", **ROOT)
     written = lab_registry.family_rules(ready, "profitability")
     assert written is not None
     assert (
@@ -1425,3 +1439,159 @@ def test_borrow_axis_agrees_across_the_three_family_rule_readers(
         assert all(
             {item.split(" ")[0] for item in differences} == expected for differences in found
         )
+
+
+# ── a root family's first sweep and the programme look count (#3571) ────────────────
+
+
+def test_a_root_familys_first_sweep_is_refused_without_both_looks_and_reason(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _practise_before_the_twins_exam(ready)
+    path = _profitability_sweep(tmp_path)
+    for kwargs in ({}, {"programme_looks": LOOKS}, {"reason": "r"}):
+        before = _counts(ready)
+        with pytest.raises(ProgrammeLooksRequiredError, match="programme_looks_required"):
+            register(ready, path, settings, registered_by="test", **kwargs)
+        assert _counts(ready) == before
+    for bad in (
+        {"programme_looks": -1, "reason": "r"},
+        {"programme_looks": LOOKS, "reason": "  "},
+    ):
+        with pytest.raises(ProgrammeLooksRequiredError):
+            register(ready, path, settings, registered_by="test", **bad)
+    assert lab_registry.family_rules(ready, "profitability") is None
+
+
+def test_a_root_familys_seed_is_the_programme_count_at_the_window_v_floor(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _practise_before_the_twins_exam(ready)
+    register(ready, _profitability_sweep(tmp_path), settings, registered_by="test", **ROOT)
+    rules = lab_registry.family_rules(ready, "profitability")
+    assert rules is not None and rules.sr_star_seed_annual is not None
+    floor = lab_registry.family_v_floor(rules)
+    assert floor == pytest.approx(max(0.04, 12 / 95))  # 2018-01-31 .. 2025-12-31, 95 periods
+    assert rules.sr_star_seed_annual == pytest.approx(expected_max_sharpe(1 + LOOKS, floor))
+    assert rules.sr_star_seed_annual > 0.5
+    # It enters the mark through the existing max-of-marks logic, at N = 1 and no runs.
+    mark = lab_registry.family_sr_star_high_water_mark(
+        ready, "profitability", n_trials_today=1, sharpe_variance_annual_today=None
+    )
+    assert mark == pytest.approx(rules.sr_star_seed_annual)
+
+
+def test_a_larger_programme_count_seeds_a_higher_bar(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _practise_before_the_twins_exam(ready)
+    register(
+        ready,
+        _profitability_sweep(tmp_path),
+        settings,
+        registered_by="test",
+        programme_looks=51,
+        reason="E1's design states k = 51",
+    )
+    rules = lab_registry.family_rules(ready, "profitability")
+    assert rules is not None and rules.sr_star_seed_annual is not None
+    floor = lab_registry.family_v_floor(rules)
+    assert rules.sr_star_seed_annual == pytest.approx(expected_max_sharpe(52, floor))
+    assert rules.sr_star_seed_annual > expected_max_sharpe(21, floor)
+
+
+def test_the_flags_are_refused_for_a_child_and_a_later_sweep(
+    ready: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _practise_before_the_twins_exam(ready)
+    # A later sweep of an existing family (momentum has its rules): refused, not ignored.
+    later = _copy(tmp_path, SWEEP_SOURCE, slug="momentum-later")
+    before = _counts(ready)
+    with pytest.raises(ProgrammeLooksNotAllowedError, match="programme_looks_not_allowed"):
+        register(ready, later, settings, registered_by="test", **ROOT)
+    assert _counts(ready) == before
+    # A child family's first sweep: its seed is the parent's mark, never the owner's k.
+    monkeypatch.setitem(config.FAMILY_PARENTS, "profitability", "momentum")
+    child = _profitability_sweep(tmp_path, parent="momentum")
+    with pytest.raises(ProgrammeLooksNotAllowedError, match="programme_looks_not_allowed"):
+        register(ready, child, settings, registered_by="test", reason="r")
+    assert lab_registry.family_rules(ready, "profitability") is None
+
+
+def test_a_later_root_sweep_and_an_unchanged_file_behave_as_before(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _practise_before_the_twins_exam(ready)
+    first_path = _profitability_sweep(tmp_path)
+    first = register(ready, first_path, settings, registered_by="test", **ROOT)
+    seed = lab_registry.family_rules(ready, "profitability")
+    assert seed is not None
+    # The same command again is the existing no-op, flags or not.
+    again = register(ready, first_path, settings, registered_by="test", **ROOT)
+    assert not again.created and again.sweep == first.sweep
+    # A later sweep needs no flags and leaves the rules row, seed included, untouched.
+    second = register(
+        ready,
+        _profitability_sweep(tmp_path, slug="profitability-daily", cadences=("daily",)),
+        settings,
+        registered_by="test",
+    )
+    assert second.created
+    assert lab_registry.family_rules(ready, "profitability") == seed
+
+
+def _first_sweep_verdicts(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path, annual_sharpe: float
+) -> sweep_report.Verdicts:
+    """The first sweep of a new root family at k = LOOKS, judged by `_verdicts` on an
+    argmax whose excess Sharpe is `annual_sharpe` (annual) over 95 monthly periods."""
+    _practise_before_the_twins_exam(ready)
+    result = register(ready, _profitability_sweep(tmp_path), settings, registered_by="test", **ROOT)
+    row = sweep_report.VariantRow(
+        variant_index=1,
+        slug="x",
+        varied={},
+        cadence="month_end",
+        signal_anchor="month_end",
+        status="counted",
+        trial_id=1,
+        excess_cagr_spy=0.0,
+        sharpe_annual_excess_spy=annual_sharpe,
+        dsr_excess=None,
+        cost_drag=None,
+        turnover_annual=None,
+        max_drawdown=None,
+        red_flag=None,
+        message=None,
+    )
+    metrics = {
+        "periods_per_year": 12.0,
+        "n_periods": 95.0,
+        "sharpe_period_excess_spy": annual_sharpe / 12**0.5,
+        "skew_period_excess_spy": 0.0,
+        "kurtosis_period_excess_spy": 3.0,
+    }
+    return sweep_report._verdicts(ready, result.sweep, row, metrics, family_n=1, variance=None)
+
+
+def test_the_3126_noise_variant_is_not_promoted_from_a_new_root_family_at_k_20(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """#3126's counterexample: an annual excess Sharpe of 0.043 passed `promote_at_least`
+    from a new root family at SR* = 0 (PSR about 0.52). Seeded at k = 20 it does not."""
+    verdicts = _first_sweep_verdicts(ready, settings, tmp_path, 0.043)
+    assert verdicts.sr_star_high_water_annual > 0.5
+    assert not verdicts.promote_at_least_met
+    assert verdicts.dsr_excess_at_high_water < 0.1
+    unseeded = probabilistic_sharpe(0.043 / 12**0.5, 0.0, 95, 0.0, 3.0)
+    assert unseeded >= 0.5  # the loophole: at SR* = 0 the same variant is promotable
+
+
+def test_a_variant_above_the_seeded_bar_is_promoted(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    verdicts = _first_sweep_verdicts(ready, settings, tmp_path, 1.2)
+    assert verdicts.promote_at_least_met

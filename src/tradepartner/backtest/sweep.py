@@ -681,6 +681,18 @@ class NewFamilyError(SweepRegistrationError):
     a holdout spend nor a reached spend cap (or no rules at all)."""
 
 
+class ProgrammeLooksRequiredError(SweepRegistrationError):
+    """`programme_looks_required` (#3571): a root family's first registration without
+    both `programme_looks` (k) and a non-blank `reason`, or with a k that is not an
+    integer of at least 0. The seed `expected_max_sharpe(1 + k, V)` needs k."""
+
+
+class ProgrammeLooksNotAllowedError(SweepRegistrationError):
+    """`programme_looks_not_allowed` (#3571): `programme_looks` or `reason` passed
+    where no root family's first registration is being written (a child family, a
+    later sweep, the oracle family). They are refused, never ignored."""
+
+
 class FamilyRuleError(SweepRegistrationError):
     """Req 1(a): the file's holdout, `in_sample_start` or a forbidden-prefix value
     differs from the family rules (`costs.per_side_bps` may only rise)."""
@@ -890,14 +902,51 @@ def _anchor_refusal(file: SweepFile, variant: Variant, first_session: date | Non
     )
 
 
+def _programme_looks_refusal(
+    path: Path, programme_looks: int | None, reason: str | None
+) -> str | None:
+    """The `ProgrammeLooksRequiredError` text for a root family's first registration
+    whose k or reason is missing or malformed, else None."""
+    if programme_looks is None or reason is None:
+        missing = [
+            name
+            for name, value in (("--programme-looks", programme_looks), ("--reason", reason))
+            if value is None
+        ]
+        return (
+            f"{path}: programme_looks_required: a root family's first sweep needs "
+            f"{' and '.join(missing)} (the programme look count k from the ladder ledger "
+            "and why it is that number); the seed is expected_max_sharpe(1 + k, V) (#3571)"
+        )
+    if isinstance(programme_looks, bool) or programme_looks < 0:
+        return (
+            f"{path}: programme_looks_required: --programme-looks must be an integer of "
+            f"at least 0, got {programme_looks!r}"
+        )
+    if not reason.strip():
+        return f"{path}: programme_looks_required: --reason is blank"
+    return None
+
+
 def _new_family_seed(
-    conn: duckdb.DuckDBPyConnection, file: SweepFile, path: Path
+    conn: duckdb.DuckDBPyConnection,
+    file: SweepFile,
+    path: Path,
+    settings: Settings,
+    *,
+    programme_looks: int | None = None,
+    reason: str | None = None,
 ) -> tuple[str | None, float | None]:
     """The lineage refusals of a new family's first registration, before any row is
     written, and its `(parent_family, sr_star_seed_annual)`: the parent from
     `config.FAMILY_PARENTS` (read at call time) and, for a child, the parent's SR*
     high-water mark today (N from `results.family_n`, V on the excess basis from
-    `registry.family_sharpes`, floored by the parent's rules); a root's seed is None."""
+    `registry.family_sharpes`, floored by the parent's rules); a root's seed is
+    `lab_registry.root_family_seed` of the owner's `programme_looks` (#3571), and a
+    root without `programme_looks` and `reason` is refused
+    (`ProgrammeLooksRequiredError`). The oracle family, a synthetic fixture family with
+    no exam, is exempt and seeds None. A child or the oracle family given either flag is
+    refused (`ProgrammeLooksNotAllowedError`)."""
     parents: dict[str, str | None] = {
         str(family): parent for family, parent in config.FAMILY_PARENTS.items()
     }
@@ -912,6 +961,14 @@ def _new_family_seed(
             f"{path}: parent_family {file.parent_family!r} differs from family "
             f"{file.family!r}'s entry in FAMILY_PARENTS ({parent!r})"
         )
+    seeded_root = parent is None and file.family != registry.ORACLE_FAMILY
+    if not seeded_root and (programme_looks is not None or reason is not None):
+        raise ProgrammeLooksNotAllowedError(
+            f"{path}: programme_looks_not_allowed: --programme-looks and --reason seed a "
+            f"root family's first sweep; {file.family!r} is "
+            + ("the oracle family" if parent is None else f"a child of {parent!r}")
+            + " (#3571)"
+        )
     others = conn.execute(
         "SELECT family, holdout_start, holdout_end FROM family_rules WHERE family <> ? "
         "ORDER BY family",
@@ -924,7 +981,18 @@ def _new_family_seed(
                 f"family {other!r}'s [{start}, {end}]"
             )
     if parent is None:
-        return None, None
+        if not seeded_root:
+            return None, None
+        refusal = _programme_looks_refusal(path, programme_looks, reason)
+        if refusal is not None:
+            raise ProgrammeLooksRequiredError(refusal)
+        assert programme_looks is not None
+        return None, lab_registry.root_family_seed(
+            programme_looks,
+            file.in_sample_start,
+            file.holdout_start,
+            settings.lab.min_sharpe_variance_annual,
+        )
     parent_rules = lab_registry.family_rules(conn, parent)
     if parent_rules is None:
         raise NewFamilyError(
@@ -982,6 +1050,8 @@ def register(
     settings: Settings | None = None,
     *,
     registered_by: str,
+    programme_looks: int | None = None,
+    reason: str | None = None,
 ) -> SweepRegistration:
     """Register the sweep in `file` (req 1) and return it.
 
@@ -1002,6 +1072,15 @@ def register(
     row; for a new family, last, its one `family_rules` row (first hypothesis: the
     canonical first variant; its fixed values: `family_rule_params` of that variant's
     frozen set). The transaction is the caller's.
+
+    `programme_looks` (k) and `reason` (#3571) belong to a root family's first
+    registration only: it is refused without them (`ProgrammeLooksRequiredError`) and its
+    rules row stores `sr_star_seed_annual = expected_max_sharpe(1 + k, V)`
+    (`lab_registry.root_family_seed`, V the window's floor). A child family, a later
+    sweep of any family and the oracle family refuse them
+    (`ProgrammeLooksNotAllowedError`); an unchanged file returns its registration before
+    either is read, so repeating the same command is a no-op. Neither k nor the reason
+    is stored (no column carries them); the seed is, and k is recoverable from it.
     """
     require_lab(conn)
     settings = settings if settings is not None else get_settings()
@@ -1056,8 +1135,16 @@ def register(
                 f"{file}: family {parsed.family!r} has registered hypotheses but no family "
                 "rules; the lab migration writes them"
             )
-        new_family = _new_family_seed(conn, parsed, file)
+        new_family = _new_family_seed(
+            conn, parsed, file, settings, programme_looks=programme_looks, reason=reason
+        )
     else:
+        if programme_looks is not None or reason is not None:
+            raise ProgrammeLooksNotAllowedError(
+                f"{file}: programme_looks_not_allowed: family {parsed.family!r} already has "
+                "its rules; --programme-looks and --reason seed a root family's first sweep "
+                "only (#3571)"
+            )
         broken = sorted(
             {d for v in variants for d in _rule_differences(parsed, v.frozen_set, rules)}
         )

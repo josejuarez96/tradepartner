@@ -19,6 +19,7 @@ import streamlit as st
 from tradepartner import calendar
 from tradepartner.backtest import holdout, quiet, results, sweep_report
 from tradepartner.backtest.frozen import frozen_values
+from tradepartner.backtest.metrics import dsr_basis_label
 from tradepartner.config import ENGINE_FAMILIES, Cadence, Settings
 from tradepartner.dashboard import (
     backtest_page,
@@ -600,9 +601,12 @@ def _result_reading(
         "dsr_excess ⓘ is that ratio on the excess-over-SPY basis."
     )
     for row in report.rows:
+        name = "dsr_excess"
+        if row.dsr_basis == "psr":
+            name = dsr_basis_label(row.dsr_basis, report.family_n) or name
         st.write(
             f"Trial ⓘ is one recorded test: variant {row.variant_index} ({row.slug}), "
-            f"{row.status}; today's dsr_excess {_number(row.dsr_excess)} at "
+            f"{row.status}; today's {name} {_number(row.dsr_excess)} at "
             f"today's family N {report.family_n} and SR* "
             f"{_number(report.sr_star_annual)}."
         )
@@ -613,9 +617,12 @@ def _result_reading(
             st.write(f"Sweep {report.state}; the rule has no decision until it is complete.")
     else:
         verdict = report.verdicts
+        statistic = (
+            "dsr_excess" if verdict.sr_star_high_water_annual > 0 else "PSR (undeflated, N = 1)"
+        )
         st.write(
             f"Rule verdict: argmax {verdict.argmax.slug} (variant "
-            f"{verdict.argmax.variant_index}); dsr_excess recomputed at the family's "
+            f"{verdict.argmax.variant_index}); {statistic} recomputed at the family's "
             f"SR* high-water mark is {_number(verdict.dsr_excess_at_high_water)} "
             f"(high-water SR* {_number(verdict.sr_star_high_water_annual)}), "
             "which can differ from today's value above. "

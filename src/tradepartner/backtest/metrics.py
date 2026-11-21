@@ -408,6 +408,17 @@ def probabilistic_sharpe(
     return _NORMAL.cdf(z)
 
 
+def dsr_basis_label(dsr_basis: str | None, n_trials: int | None) -> str | None:
+    """The printed name of a stored DSR basis (#3571, option 2's labelling): a `psr`
+    basis is a probabilistic Sharpe ratio against zero, nothing deflated, so it is
+    printed "PSR (undeflated, N = <n>)" (N = 1 for a new family's first read), never
+    as a deflated Sharpe; any other basis, and None, print as stored. Labels only: no
+    stored key and no number changes."""
+    if dsr_basis != "psr":
+        return dsr_basis
+    return f"PSR (undeflated, N = {n_trials if n_trials is not None else 1})"
+
+
 @dataclass(frozen=True)
 class DeflatedSharpe:
     """One DSR basis for one trial (strategy-lab spec req 9).

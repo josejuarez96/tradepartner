@@ -429,6 +429,7 @@ def _reading_fixture(*, complete: bool = True) -> tuple[SimpleNamespace, SimpleN
         status="counted",
         trial_id=17,
         dsr_excess=0.731,
+        dsr_basis="dsr",
         red_flag=True,
         message=None,
     )

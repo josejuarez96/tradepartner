@@ -1021,3 +1021,37 @@ def test_long_short_keys_and_borrow_series_reach_no_selection_path() -> None:
 def test_excess_cagr_rf_is_none_unless_the_risk_free_source_is_the_store() -> None:
     assert _long_short_metrics(rf=0.02, store=False)["excess_cagr_rf"] is None
     assert _long_short_metrics(rf=0.02, store=True)["excess_cagr_rf"] is not None
+
+
+# --- the label of an undeflated PSR (#3571, option 2) --------------------------------
+
+
+def test_a_psr_basis_prints_as_an_undeflated_psr_and_any_other_basis_as_stored() -> None:
+    from tradepartner.backtest.metrics import dsr_basis_label
+
+    assert dsr_basis_label("psr", 1) == "PSR (undeflated, N = 1)"
+    assert dsr_basis_label("psr", 4) == "PSR (undeflated, N = 4)"
+    assert dsr_basis_label("psr", None) == "PSR (undeflated, N = 1)"
+    assert dsr_basis_label("dsr", 12) == "dsr"
+    assert dsr_basis_label(None, 3) is None
+
+
+def test_the_label_is_attached_to_the_basis_deflated_sharpe_reports() -> None:
+    from tradepartner.backtest.metrics import dsr_basis_label
+
+    metrics = {
+        "sharpe_period_excess_spy": 0.05,
+        "skew_period_excess_spy": 0.0,
+        "kurtosis_period_excess_spy": 3.0,
+        "n_periods": 60.0,
+        "periods_per_year": 12.0,
+    }
+    one_pair = deflated_sharpe(
+        metrics, "excess_spy", n_trials=1, pair_sharpes=[0.2], periods_per_year=12
+    )
+    assert one_pair.dsr_basis == "psr" and one_pair.sr_star == 0.0
+    assert dsr_basis_label(one_pair.dsr_basis, one_pair.n_trials) == "PSR (undeflated, N = 1)"
+    two_pairs = deflated_sharpe(
+        metrics, "excess_spy", n_trials=2, pair_sharpes=[0.2, 0.4], periods_per_year=12
+    )
+    assert dsr_basis_label(two_pairs.dsr_basis, two_pairs.n_trials) == "dsr"
