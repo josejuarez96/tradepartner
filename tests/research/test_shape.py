@@ -249,30 +249,96 @@ def _e1_events(bunched: bool) -> list[tuple[str, int]]:
 def test_e1_synthetic_exact_against_hand_formula_and_bounds() -> None:
     s, hold = 20 * 63, 60
     ceiling = shape.effective_count_ceiling(hold, s)
-    same_session = shape.effective_count_same_session_bound(hold, s)
+    bound = shape.effective_count_default_bound(hold, s)
     assert ceiling == pytest.approx(420)
-    assert same_session == pytest.approx(315)
+    assert bound == pytest.approx(330.2, abs=0.1)
     results = {}
     for bunched in (False, True):
         ec = shape.effective_count(_e1_events(bunched), hold)
         results[bunched] = ec
         hand = shape.effective_count_by_hand(ec.n, ec.same_date_factor, hold, s)
         assert hand == pytest.approx(ec.n_eff, rel=0.05)
-        assert ec.n_eff <= same_session < ceiling
+        assert ec.n_eff <= bound < ceiling
         assert hand <= ceiling
     uniform, bunch = results[False], results[True]
     assert bunch.same_date_factor > uniform.same_date_factor
     assert 15 < uniform.same_date_factor < 20  # about N/S + 1 = 16.9 for uniform arrival
-    assert 290 < uniform.n_eff < 315  # the auditor's uniform set gave 312.9
+    assert 290 < uniform.n_eff < bound  # the auditor's uniform set gave 312.9
     assert 150 < bunch.n_eff < uniform.n_eff  # bunching lowers it further
 
 
-def test_same_session_bound_formula_and_refusals() -> None:
-    assert shape.effective_count_same_session_bound(60, 1260) == pytest.approx(
-        1260 / (1 + 0.05 * 60)
-    )
+def _span(events: list[tuple[str, int]]) -> int:
+    sessions = [d for _, d in events]
+    return max(sessions) - min(sessions) + 1
+
+
+def test_default_bound_on_the_worked_cases() -> None:
+    worked = shape.effective_count([(f"i{k}", k) for k in range(1000)], 20)
+    assert worked.n_eff == pytest.approx(514.6, abs=0.1)
+    assert shape.effective_count_default_bound(20, 1000) == pytest.approx(517.8, abs=0.1)
+    # The auditor's counterexamples to S / (1 + rho h): all within the proved bound.
+    one = shape.effective_count([(f"i{k}", k) for k in range(100)], 1)
+    assert one.n_eff == pytest.approx(shape.effective_count_default_bound(1, 100))  # exact at h=1
+    long_hold = shape.effective_count([(f"i{k}", k) for k in range(10)], 1000)
+    assert long_hold.n_eff == pytest.approx(6.9, abs=0.1)
+    assert long_hold.n_eff <= shape.effective_count_default_bound(1000, 10) + 1e-9
+    assert shape.effective_count_default_bound(1000, 10) == pytest.approx(6.9, abs=0.1)
+
+
+def test_old_same_session_formula_was_not_a_bound() -> None:
+    """The four counterexamples that sank S / (1 + rho h) (kept as plain arithmetic)."""
+    rho = shape.DEFAULT_CROSS_ISSUER_RHO
+
+    def old(h: int, s: int) -> float:
+        return s / (1 + rho * h)
+
+    assert shape.effective_count([(f"i{k}", k) for k in range(1000)], 20).n_eff > old(20, 1000)
+    assert shape.effective_count([(f"i{k}", k) for k in range(100)], 1).n_eff > old(1, 100)
+    assert shape.effective_count([(f"i{k}", k) for k in range(10)], 1000).n_eff > old(1000, 10)
+    same = shape.effective_count([(f"i{k}", 0) for k in range(100)], 20, rho=0.0)
+    assert same.n_eff > old(20, 1)
+
+
+def test_default_bound_holds_on_random_sets() -> None:
+    rng = random.Random(2026)
+    for _ in range(3000):
+        window = rng.randint(1, 40)
+        hold = rng.choice([1, 1, 2, 5, 20, 60, 200])  # includes holds longer than the window
+        n = rng.randint(1, 60)
+        n_issuers = rng.choice([1, 3, 50])  # one issuer many times; many issuers on few sessions
+        events = [(f"i{rng.randrange(n_issuers)}", rng.randrange(window)) for _ in range(n)]
+        rho = rng.choice([0.05, 0.05, 0.0, 0.3])
+        ec = shape.effective_count(events, hold, cross_issuer_rho=rho)
+        bound = shape.effective_count_default_bound(hold, _span(events), rho)
+        assert ec.n_eff <= bound * (1 + 1e-9)
+
+
+def test_default_bound_is_not_a_bound_under_a_cited_rho() -> None:
+    ec = shape.effective_count([(f"i{k}", 0) for k in range(100)], 20, rho=0.0)
+    assert ec.n_eff == pytest.approx(100.0)
+    assert ec.n_eff > shape.effective_count_default_bound(20, 1)
+
+
+def test_ceiling_is_restricted_to_its_valid_region() -> None:
+    assert shape.effective_count_ceiling(60, 1260) == pytest.approx(420)
+    # (1 - rho)(S + h - 1) >= rho h (h - 1): 1253 >= 177 for E1; fails at h 1000, S 10.
     with pytest.raises(ValueError):
-        shape.effective_count_same_session_bound(60, 0)
+        shape.effective_count_ceiling(1000, 10)
+    # on its region the ceiling is at least the proved bound
+    assert shape.effective_count_ceiling(60, 1260) >= shape.effective_count_default_bound(60, 1260)
+    # boundary: h 20, rho 0.05 needs S + 19 >= 0.05 * 380 / 0.95 = 20, i.e. any S >= 1
+    assert shape.effective_count_ceiling(20, 1) == pytest.approx(1 / (0.05 * 20))
+    # h 100: needs S + 99 >= 0.05*9900/0.95 = 521.05, so S 422 fails and S 423 passes
+    with pytest.raises(ValueError):
+        shape.effective_count_ceiling(100, 422)
+    shape.effective_count_ceiling(100, 423)
+
+
+def test_bound_refusals() -> None:
+    with pytest.raises(ValueError):
+        shape.effective_count_default_bound(60, 0)
+    with pytest.raises(ValueError):
+        shape.effective_count_default_bound(0, 10)
 
 
 def test_by_hand_tracks_exact_on_bunched_events() -> None:
