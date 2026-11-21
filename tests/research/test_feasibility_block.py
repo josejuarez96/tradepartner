@@ -63,7 +63,7 @@ def _counts() -> fb.FeasibilityCounts:
             newest_ingest_at=datetime(2026, 11, 19, 22, 0, tzinfo=UTC),
         ),
         boundary=date(2019, 12, 31),
-        timestamp=fb.TimestampCounts(rows_matched=14, rows_after_window=2, events_without_entry=1),
+        timestamp=fb.TimestampCounts(rows_matched=14, events_without_entry=1),
         cells=(
             fb.CountCell(2019, None, 1, 1, 1),
             fb.CountCell(2018, 1, 3, 2, 3),
@@ -204,17 +204,22 @@ def test_a_cited_rho_prints_no_default_hand_formula() -> None:
     assert "by hand" not in block and "proved bound" not in block
 
 
-def test_trial_shape_prints_the_irrx_pass_chance_with_its_borrow() -> None:
-    trial = (
-        '[shape]\nform = "trial"\nbook = "long_short"\ngross_bp = 29\ndecision_cost_bps = 50\n'
-        "turnover_per_month = 1.0\nmonths = 84\nsigma_bp = 140\nborrow_bp_per_month = 1.25\n"
+def test_no_count_of_rows_after_the_window_and_the_shape_line_says_one_leg() -> None:
+    block = fb.render_block(_parse(VALID + SHAPE_200), _counts())
+    assert "after the window" not in block and "known after" not in block
+    assert "1 leg charged" in block
+    assert not hasattr(fb.TimestampCounts(1, 0), "rows_after_window")
+
+
+def test_every_line_break_character_is_escaped_in_values() -> None:
+    counts = _counts()
+    nasty = "a\x0bb\x0cc\x1cd\x1de\x1ef\x85g\u2028h\u2029i\r\nfeasibility: x"
+    forged = fb.FeasibilityCounts(
+        **{
+            **counts.__dict__,
+            "store": fb.StoreFacts(**{**counts.store.__dict__, "store_path": nasty}),
+        }
     )
-    block = fb.render_block(_parse(VALID + trial), _counts())
-    chance = shape.trial_pass_probability(29.0, 101.25, 140.0, 84)
-    assert chance == pytest.approx(1.12e-06, rel=0.05)
-    assert f"pass chance {chance * 100:.2e}%" in block
-    assert "round trip 101.25 bp a month (borrow 1.25)" in block
-    assert "against 0.32" in block
-    no_borrow = trial.replace("borrow_bp_per_month = 1.25\n", "")
-    with pytest.raises(fd.FeasibilityDesignError, match=r"shape\.borrow_bp_per_month"):
-        _parse(VALID + no_borrow)
+    block = fb.render_block(_parse(VALID), forged)
+    assert len(block.splitlines()) == len(block.split("\n"))
+    assert sum(ln.startswith("feasibility:") for ln in block.splitlines()) == 1

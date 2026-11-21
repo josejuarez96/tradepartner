@@ -10,6 +10,7 @@ import pytest
 from fixtures.research import feasibility_store
 
 from tradepartner.research import feasibility_design as fd
+from tradepartner.research import shape
 from tradepartner.research.event_study.run import entry_session
 from tradepartner.store import registry
 
@@ -274,7 +275,7 @@ def test_fixture_store_is_deterministic_and_fixture_designs_fit_it(tmp_path: Pat
         assert (design.window_start, design.window_end) == (a.window_start, a.window_end)
 
 
-# --- the filter allow-lists and the trial shape ---
+# --- the filter allow-lists, typed values and the event-only shape ---
 
 ALLOW_LISTS = {
     "form4": {
@@ -284,11 +285,7 @@ ALLOW_LISTS = {
         "is_officer",
         "is_ten_percent_owner",
         "is_other",
-        "shares",
-        "price",
-        "shares_owned_after",
         "ownership_form",
-        "security_title",
     },
     "statement_fact": {
         "fact_name",
@@ -300,13 +297,31 @@ ALLOW_LISTS = {
         "comparative",
     },
     "form25": {"form", "exchange"},
-    "corporate_action": {"action_type", "ratio_or_amount", "cancelled"},
+    "corporate_action": {"action_type"},
 }
 IDENTIFIERS = {
-    "form4": ("issuer_cik", "filer_cik", "accession", "line_no", "transaction_date", "accepted_at"),
+    "form4": (
+        "issuer_cik",
+        "filer_cik",
+        "accession",
+        "line_no",
+        "transaction_date",
+        "accepted_at",
+        "shares",
+        "price",
+        "shares_owned_after",
+        "security_title",
+    ),
     "statement_fact": ("cik", "filing_accession", "period_end", "value"),
     "form25": ("security_id", "class_title", "filed_at", "effective_on"),
-    "corporate_action": ("security_id", "source_action_id", "ex_date", "announced_at"),
+    "corporate_action": (
+        "security_id",
+        "source_action_id",
+        "ex_date",
+        "announced_at",
+        "ratio_or_amount",
+        "cancelled",
+    ),
 }
 
 
@@ -320,25 +335,129 @@ def _design_for(source: str, filter_line: str) -> str:
 def test_filter_allow_lists_exclude_identifiers_dates_and_stamps(source: str) -> None:
     assert set(fd.SOURCES[source].filter_columns) == ALLOW_LISTS[source]
     assert set(fd.SOURCES[source].filter_columns) <= set(fd.SOURCES[source].columns)
-    for column in ALLOW_LISTS[source]:
-        assert _parse(_design_for(source, f"{column} = 1")).filters[0][0] == column
+    for column, kind in fd.FILTER_KINDS[source].items():
+        value = {str: '"A"', bool: "true", int: "1"}[kind]
+        if (source, column) == ("statement_fact", "basis"):
+            value = '"reported"'
+        assert _parse(_design_for(source, f"{column} = {value}")).filters[0][0] == column
     for column in (*IDENTIFIERS[source], "known_at", "ingested_at", "provenance"):
         _refused(_design_for(source, f'{column} = "x"'), f"filter.{column}")
 
 
-TRIAL = (
-    '[shape]\nform = "trial"\nbook = "long_short"\ngross_bp = 29\ndecision_cost_bps = 50\n'
-    "turnover_per_month = 1.0\nmonths = 84\nsigma_bp = 140\nborrow_bp_per_month = 1.25\n"
-)
+def test_shape_is_event_only_and_a_trial_form_or_key_is_unknown() -> None:
+    for extra in ('form = "trial"', "borrow_bp_per_month = 1.25", "months = 84", "book = 1"):
+        _refused(VALID + SHAPE_200 + extra + "\n", "shape." + extra.split(" ")[0])
 
 
-def test_long_short_trial_shape_needs_its_borrow_cost() -> None:
-    assert _parse(VALID + TRIAL).shape is not None
-    _refused(VALID + TRIAL.replace("borrow_bp_per_month = 1.25\n", ""), "shape.borrow_bp_per_month")
-    long_only = TRIAL.replace("long_short", "long_only").replace("borrow_bp_per_month = 1.25\n", "")
-    assert _parse(VALID + long_only).shape is not None
-    # an event shape needs none, and may not carry one
-    assert _parse(VALID + SHAPE_200).shape is not None
-    _refused(VALID + SHAPE_200 + "borrow_bp_per_month = 1\n", "shape.borrow_bp_per_month")
-    _refused(VALID + TRIAL.replace("months = 84\n", ""), "shape.months")
-    _refused(VALID + TRIAL.replace('"trial"', '"swing"'), "shape.form")
+def test_filter_values_are_typed_by_their_column() -> None:
+    _refused(_design_for("form4", "transaction_code = 1"), "filter.transaction_code")
+    _refused(_design_for("form4", "is_officer = 1"), "filter.is_officer")
+    _refused(_design_for("form4", 'is_officer = "true"'), "filter.is_officer")
+    _refused(_design_for("form4", 'acquired_disposed = "X"'), "filter.acquired_disposed")
+    _refused(_design_for("statement_fact", 'period_days = "90"'), "filter.period_days")
+    _refused(_design_for("statement_fact", "period_days = true"), "filter.period_days")
+    _refused(_design_for("statement_fact", 'basis = "guessed"'), "filter.basis")
+    assert _parse(_design_for("form4", 'transaction_code = ["P", "S"]')).filters
+    assert _parse(_design_for("statement_fact", "period_days = 90")).filters
+
+
+def test_negative_zero_hashes_like_zero() -> None:
+    a = _parse(VALID + SHAPE_200.replace("floor_bp = 30", "floor_bp = 0"))
+    b = _parse(VALID + SHAPE_200.replace("floor_bp = 30", "floor_bp = -0.0"))
+    assert a.sha256 == b.sha256
+
+
+def _mid_band_events(built: feasibility_store.FeasibilityStore) -> list[tuple[str, int]]:
+    """(issuer, entry session position) of the matching 2018 Form 4 events of the mid band."""
+    position = {s: i for i, s in enumerate(built.sessions)}
+    return [
+        (issuer, position[entry_session(accepted, "next_session_after_date")])
+        for issuer, accepted, code, officer, _filer, _why in feasibility_store.FORM4_EVENTS
+        if issuer in {"BBB", "DDD", "FFF"} and code == "P" and officer and accepted.year == 2018
+    ]
+
+
+def test_the_mid_band_tells_the_default_from_rho_zero_from_a_cited_rho(tmp_path: Path) -> None:
+    built = feasibility_store.build_feasibility_store(tmp_path / "f.duckdb")
+    events = _mid_band_events(built)
+    assert len(events) == 5
+    default = shape.effective_count(events, 20)
+    rho0 = shape.effective_count(events, 20, rho=0.0)
+    cited = shape.effective_count(events, 20, rho=0.3)
+    # Events: A = (BBB, 3-13), B = (DDD, 3-13), C = (BBB, 5-14), D = (FFF, 5-17), E = (DDD, 8-21).
+    # Only A-B (one session, o = 1) and C-D (3 sessions apart, o = 17/20 = 0.85) are pairs of
+    # different issuers whose holds overlap; no two events of one issuer overlap. N = 5.
+    #   default: 5 + 2 * (1 + 0.05 * 0.85)  = 7.085  -> 25 / 7.085 = 3.5286
+    #   rho 0:   5                          = 5      -> 25 / 5     = 5.0
+    #   rho 0.3: 5 + 2 * 0.3 * (1 + 0.85)   = 6.11   -> 25 / 6.11  = 4.0917
+    assert default.n_eff == pytest.approx(25 / 7.085)
+    assert rho0.n_eff == pytest.approx(5.0)
+    assert cited.n_eff == pytest.approx(25 / 6.11)
+    assert len({round(v, 6) for v in (default.n_eff, rho0.n_eff, cited.n_eff)}) == 3
+    assert default.same_date_factor > 1.0  # B > 1: two events on one session
+
+
+def test_late_restated_bars_would_move_aaa_across_the_band_edge(tmp_path: Path) -> None:
+    built = feasibility_store.build_feasibility_store(tmp_path / "f.duckdb")
+    window_close = datetime(2019, 3, 29, 20, tzinfo=UTC)
+    entry_no = built.sessions.index(date(2018, 3, 13))
+    lookback = built.sessions[entry_no - 20 : entry_no]
+    conn = built.connect()
+    try:
+
+        def median(cutoff: datetime) -> float:
+            row = conn.execute(
+                "SELECT median(dv) FROM (SELECT arg_max(close * volume, known_at) AS dv "
+                "FROM prices_daily WHERE security_id = 'SEC_AAA' "
+                "AND session >= ? AND session <= ? AND known_at <= ? GROUP BY session)",
+                [lookback[0], lookback[-1], cutoff],
+            ).fetchone()
+            assert row is not None
+            return float(row[0])
+
+        assert median(window_close) > 200e6  # as of the window's end: top band
+        assert median(feasibility_store.LATE_RESTATED_AT) < 50e6  # read late: low band
+        late = conn.execute(
+            "SELECT count(*) FROM prices_daily WHERE known_at > ? AND known_at < ?",
+            [window_close, datetime(2019, 12, 31, tzinfo=UTC)],
+        ).fetchone()
+        assert late is not None and late[0] >= 12
+    finally:
+        conn.close()
+
+
+def test_revisions_cancellations_and_a_copy_with_no_boundary(tmp_path: Path) -> None:
+    built = feasibility_store.build_feasibility_store(tmp_path / "f.duckdb")
+    conn = built.connect()
+    try:
+        cancelled = conn.execute(
+            "SELECT security_id, known_at FROM corporate_actions WHERE cancelled ORDER BY known_at"
+        ).fetchall()
+        assert [c[0] for c in cancelled] == ["SEC_AAA", "SEC_CCC"]
+        assert cancelled[0][1] < datetime(2019, 3, 29, tzinfo=UTC) < cancelled[1][1]
+        revised = conn.execute(
+            "SELECT security_id, count(*) FROM delistings GROUP BY 1 HAVING count(*) > 1 ORDER BY 1"
+        ).fetchall()
+        assert [r[0] for r in revised] == ["SEC_DDD", "SEC_FFF"]
+        filed_inside = conn.execute(
+            "SELECT count(*) FROM delistings WHERE security_id = 'SEC_CCC' "
+            "AND filed_at <= ? AND effective_on > ?",
+            [datetime(2019, 3, 29, 23, tzinfo=UTC), date(2019, 3, 29)],
+        ).fetchone()
+        assert filed_inside == (1,)
+    finally:
+        conn.close()
+    bare = feasibility_store.build_feasibility_store(tmp_path / "bare.duckdb", with_boundary=False)
+    assert bare.boundary is None
+    conn = bare.connect()
+    try:
+        assert registry.boundary_date(conn) is None
+    finally:
+        conn.close()
+
+
+def test_a_filing_at_1345_utc_enters_by_the_new_york_offset() -> None:
+    january = datetime(2018, 1, 16, 13, 45, tzinfo=UTC)  # 8:45 EST: before the open
+    march = datetime(2018, 3, 14, 13, 45, tzinfo=UTC)  # 9:45 EDT: after the open
+    assert entry_session(january, "next_open_after_instant") == date(2018, 1, 16)
+    assert entry_session(march, "next_open_after_instant") == date(2018, 3, 15)

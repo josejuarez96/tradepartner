@@ -49,10 +49,13 @@ class StoreFacts:
 
 @dataclass(frozen=True)
 class TimestampCounts:
-    """(a): rows matched, rows left out for a late `known_at`, events with no entry session."""
+    """(a): rows matched and events with no entry session inside the window.
+
+    There is no count of rows known after the window's end: it would change when later
+    rows are cut, which the spec's truncation-invariance rule forbids.
+    """
 
     rows_matched: int
-    rows_after_window: int
     events_without_entry: int
 
 
@@ -128,8 +131,16 @@ def band_label(design: FeasibilityDesign, band: int | None) -> str:
 
 
 def _one_line(text: str) -> str:
-    """Escape line breaks so no value can forge a block line."""
-    return text.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
+    """Escape every character `str.splitlines` breaks on, so no value can forge a block line."""
+    out = []
+    for ch in text:
+        if ch == "\\":
+            out.append("\\\\")
+        elif len(ch.splitlines()) != 1 or ch.splitlines() != [ch]:
+            out.append(f"\\x{ord(ch):02x}" if ord(ch) < 256 else f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def _iso(value: datetime) -> str:
@@ -156,30 +167,10 @@ def _shape_lines(design: FeasibilityDesign, n_eff_by_band: dict[int | None, floa
 
     Everything else here is independent of T452's signatures; if its forms change (for
     example a count of calendar quarters), only this function changes. An event shape
-    prints per band, since `n_eff` differs by band; a trial shape prints once.
+    prints per band, since `n_eff` differs by band.
     """
     inputs = design.shape
     assert inputs is not None
-    if inputs.form == "trial":
-        assert inputs.turnover_per_month is not None
-        assert inputs.sigma_bp is not None and inputs.months is not None
-        borrow = inputs.borrow_bp_per_month or 0.0
-        round_trip = shape.trial_round_trip_bp(
-            inputs.turnover_per_month, inputs.decision_cost_bps, borrow
-        )
-        net_ir = shape.trial_net_ir(inputs.gross_bp - round_trip, inputs.sigma_bp)
-        bar = shape.trial_required_net_ir(inputs.months)
-        chance = shape.trial_pass_probability(
-            inputs.gross_bp, round_trip, inputs.sigma_bp, inputs.months
-        )
-        return [
-            f"shape (from the card; trial, {inputs.book}):",
-            f"  round trip {round_trip:.2f} bp a month (borrow {borrow:g}); "
-            f"{inputs.months} months, net IR {net_ir:.2f} against {bar:.2f}; "
-            f"pass chance {_pct(chance)}",
-        ]
-    assert inputs.sd_bp is not None
-    assert inputs.floor_bp is not None and inputs.t_floor is not None
     round_trip = shape.event_round_trip_bp(inputs.decision_cost_bps)
     n_min = shape.event_min_count(
         inputs.gross_bp,
@@ -189,7 +180,7 @@ def _shape_lines(design: FeasibilityDesign, n_eff_by_band: dict[int | None, floa
         t_floor=inputs.t_floor,
     )
     n_min_text = "none (net at or under the floor)" if n_min is None else str(n_min)
-    lines = ["shape (from the card; event, power and pass chance per band):"]
+    lines = ["shape (from the card; event, 1 leg charged, power and pass chance per band):"]
     for band in sorted(n_eff_by_band, key=_band_key):
         n_eff = n_eff_by_band[band]
         chance = shape.event_pass_probability(
@@ -260,7 +251,6 @@ def render_block(design: FeasibilityDesign, counts: FeasibilityCounts) -> str:
         f"newest ingest {store.newest_ingest_run_id or 'none'}"
         f"{' at ' + _iso(store.newest_ingest_at) if store.newest_ingest_at else ''}",
         f"(a) timestamp: rows matched {ts.rows_matched}; "
-        f"left out, known after the close of the window's last session {ts.rows_after_window}; "
         f"events with no entry session inside the window {ts.events_without_entry}",
         "(b) counts (raw events, distinct entry sessions, distinct issuers):",
     ]
@@ -322,7 +312,7 @@ def _ledger_line(
         if t.effective is not None
     )
     return (
-        f"{LEDGER_PREFIX} (a) {ts.rows_matched} rows, {ts.rows_after_window} after the window, "
+        f"{LEDGER_PREFIX} (a) {ts.rows_matched} rows, "
         f"{ts.events_without_entry} with no entry session; "
         f"(b) events per band: {events or 'none'}; "
         f"n_eff {n_eff or 'none'} ({_rule_text(design)}); "
