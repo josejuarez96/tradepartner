@@ -258,6 +258,7 @@ from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.lock import LockHeld, resolve_book, run_lock, sandbox_store_refusal
 from tradepartner.execution.lots import LedgerAccount
 from tradepartner.execution.outcomes import write_outcomes_and_lots
+from tradepartner.execution.plain import fault_note
 from tradepartner.execution.plan import (
     DecisionState,
     RebalanceState,
@@ -1154,7 +1155,12 @@ def _pre_run_failed(
             book_id=book,
         )
     except Exception as alert_error:
-        problem = f"run_failed alert not written ({type(alert_error).__name__})"
+        problem = fault_note(
+            "run_failed alert not written",
+            alert_error,
+            alerter.scrub,
+            settings.paper.max_fault_note_chars,
+        )
         exc.add_note(alerter.scrub(f"failed path: {problem}"))
 
 
@@ -1496,7 +1502,7 @@ class _Run:
                 book_id=self.window.book_id,
             )
         except Exception as alert_error:
-            problems.append(f"run_failed alert not written ({type(alert_error).__name__})")
+            problems.append(self._fault_note("run_failed alert not written", alert_error))
         try:
             finished, clock_fault = self._stamp(clock_fault)
             with self.connect() as conn:
@@ -1514,9 +1520,14 @@ class _Run:
                     ),
                 )
         except Exception as write_error:
-            problems.append(f"result row not written ({type(write_error).__name__})")
+            problems.append(self._fault_note("result row not written", write_error))
         if problems:
             exc.add_note(self.alerter.scrub("failed path: " + "; ".join(problems)))
+
+    def _fault_note(self, label: str, exc: BaseException) -> str:
+        """`label (Type: scrubbed message at file.py:line)`, the message cut to
+        `paper.max_fault_note_chars` (#3635)."""
+        return fault_note(label, exc, self.alerter.scrub, self.settings.paper.max_fault_note_chars)
 
     def _stamp(self, clock_fault: bool) -> tuple[datetime, bool]:
         if not clock_fault:
