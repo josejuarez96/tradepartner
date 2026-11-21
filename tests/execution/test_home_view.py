@@ -18,8 +18,8 @@ import pytest
 from tradepartner import health
 from tradepartner.calendar import all_sessions
 from tradepartner.config import RiskConfig, Settings
-from tradepartner.dashboard import research_page
-from tradepartner.execution import home_view, ops
+from tradepartner.dashboard import home_view, research_page
+from tradepartner.execution import ops
 from tradepartner.execution.waiting import KIND_ORDER, WaitingItem
 from tradepartner.store import schema
 from tradepartner.store.db import open_for_write, open_read_only, utc_now

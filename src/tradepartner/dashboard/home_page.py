@@ -1,6 +1,6 @@
 """The Home page (plan T275, amendment 2026-10-26 #2170).
 
-Draws `execution.home_view.build` top to bottom in the approved mockup's order: a
+Draws `dashboard.home_view.build` top to bottom in the approved mockup's order: a
 one-line status, "Needs you", one card per book, the Data status line and the
 Research strip. The view model chose every word and computed every number; this
 module only lays them out. Two small display sums live here because the view model
@@ -27,9 +27,9 @@ import polars as pl
 import streamlit as st
 
 from tradepartner.config import Settings
-from tradepartner.dashboard import header, ops_page, theme
-from tradepartner.execution import book_stats, home_view, ops
-from tradepartner.execution.home_view import BookCard, NeedsYou
+from tradepartner.dashboard import header, home_view, ops_page, theme
+from tradepartner.dashboard.home_view import BookCard, NeedsYou
+from tradepartner.execution import book_stats, ops
 from tradepartner.store.schema import SchemaVersionError
 
 #: The Books tab's route (`app` derives it from the title) and the query key it reads.

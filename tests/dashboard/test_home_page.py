@@ -20,9 +20,8 @@ from dashboard_nav import app_test, nav_calls_fixture  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.config import Settings
-from tradepartner.dashboard import home_page
-from tradepartner.execution import book_activity, home_view, ops
-from tradepartner.execution.home_view import (
+from tradepartner.dashboard import home_page, home_view
+from tradepartner.dashboard.home_view import (
     BookCard,
     DataStatus,
     HomeView,
@@ -30,6 +29,7 @@ from tradepartner.execution.home_view import (
     ResearchStrip,
     StatusLine,
 )
+from tradepartner.execution import book_activity, ops
 from tradepartner.execution.ops import PerformanceData
 from tradepartner.store import schema
 from tradepartner.store.db import open_for_write
