@@ -394,6 +394,11 @@ STORE_READERS: Mapping[str, frozenset[str]] = {
         {"BenchmarkIdentityError", "research_benchmark_security_ids"}
     ),
     "tradepartner.store.delistings": frozenset({"listing_ends_as_of", "delistings_as_of"}),
+    #: The development boundary, read-only (T454, #3743): the feasibility counts reader's one
+    #: registry read ("No store row, and no research-registry table", research-registry spec,
+    #: amendment 2026-11-21: "through `registry.boundary_date`, read-only"). Not the module: the
+    #: registry's writers (`write_development_boundary`, the owner decisions) stay out.
+    "tradepartner.store.registry": frozenset({"boundary_date"}),
     "tradepartner.store.master": frozenset({"securities_as_of", "primary_security_id"}),
 }
 _DYNAMIC = frozenset({"import_module", "__import__"})
