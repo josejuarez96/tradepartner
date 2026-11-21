@@ -250,8 +250,8 @@ The Consequences above say: "Any amendment must cite results that were not the r
 ### What would follow
 
 Nothing is built for this merge. The work below exists only if the owner answers the open questions, and none of it is written here: no spec text, no plan task.
-- **If Q1 is answered for an exposure-matched yardstick:** a backtest spec amendment (a frozen exposure key for a long-only book, the blended series between the two ends that the spec's question 47 defers, the registration, report and promotion refusals extended, a band on the held exposure), with dated markers on the 2026-11-20 amendment's rule 1 and on the strategy-lab spec's requirement 4. Our estimate: three to five class-A tasks after T436 to T439, one of them size M for the blended series.
-- **If Q2 is answered:** dated markers on ADR 0016 and one paper-plan task, as the spec's question 48 already says, widened from long/short books to every book whose yardstick is not SPY. T440's refusal is lifted in the same task.
+- **If Q1 is answered for an exposure-matched yardstick:** a backtest spec amendment (a frozen exposure key for a long-only book, the blended series between the two ends that the spec's question 47 defers, the registration, report and promotion refusals extended, a band on the held exposure), with dated markers on the 2026-11-20 amendment's rule 1 and on the strategy-lab spec's requirement 4. Our estimate: three to five class-A tasks after T447 to T450, one of them size M for the blended series.
+- **If Q2 is answered:** dated markers on ADR 0016 and one paper-plan task, as the spec's question 48 already says, widened from long/short books to every book whose yardstick is not SPY. T451's refusal is lifted in the same task.
 - **Small either way:** one line in the hypothesis template and on the idea card naming the book's yardstick and its expected alpha, and the yardstick shown beside SPY and MTUM on the Books page. Size S each.
 - **Under (a):** nothing. **Under (c):** a new ADR, a sizing run for a new exam statistic, and amendments to ADR 0016, ADR 0023 and possibly the charter, before any build.
 
