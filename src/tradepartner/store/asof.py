@@ -1054,7 +1054,7 @@ def price_jumps_as_of(
     t: datetime,
     security_ids: Sequence[str] | None = None,
     *,
-    settings: Settings | None = None,
+    settings: Settings,
 ) -> pl.DataFrame:
     """Unexplained one-day price jumps known at `t` (#787), sorted by
     `(security_id, session)`.
@@ -1071,7 +1071,6 @@ def price_jumps_as_of(
     (the latest bar before the ex-date, traded or not), while the jump
     check uses the previous traded close. `accepted` is true when
     `universe.accepted_price_jumps` names `<security_id>@<session>`.
-    `settings` defaults to `get_settings()`.
 
     Raises `ValueError` naming the security when a jump candidate carries
     an action `adjusted_prices_as_of` refuses (a negative dividend amount,
@@ -1085,7 +1084,6 @@ def price_jumps_as_of(
     its jump on the list at `t`.
     """
     t = _validate_t(t)
-    settings = settings if settings is not None else get_settings()
     cfg = settings.universe
     with _chains_registered(conn, t) as chains:
         params: list[Any] = [t]
@@ -1546,9 +1544,9 @@ def filing_events_as_of(
         conn.unregister(_FILING_EVENT_SECURITIES_VIEW)
 
 
-def _require_sec_forms_read(settings: Settings | None) -> None:
+def _require_sec_forms_read(settings: Settings) -> None:
     """Keep ownership events outside existing research reads until enabled."""
-    if not (settings if settings is not None else get_settings()).events.sec_forms_read_enabled:
+    if not settings.events.sec_forms_read_enabled:
         raise PermissionError("events.sec_forms_read_enabled is false")
 
 
@@ -1558,7 +1556,7 @@ def sec_filing_events_as_of(
     forms: Sequence[str],
     subject_cik: str | None = None,
     *,
-    settings: Settings | None = None,
+    settings: Settings,
 ) -> pl.DataFrame:
     """Read ownership filings by subject CIK at their UTC acceptance instant.
 
@@ -1608,7 +1606,7 @@ def sec_form4_transactions_as_of(
     t: datetime,
     subject_cik: str | None = None,
     *,
-    settings: Settings | None = None,
+    settings: Settings,
     include_implausible: bool = False,
     with_excluded_count: Literal[False] = False,
 ) -> pl.DataFrame: ...
@@ -1620,7 +1618,7 @@ def sec_form4_transactions_as_of(
     t: datetime,
     subject_cik: str | None = None,
     *,
-    settings: Settings | None = None,
+    settings: Settings,
     include_implausible: bool = False,
     with_excluded_count: Literal[True],
 ) -> tuple[pl.DataFrame, int]: ...
@@ -1631,7 +1629,7 @@ def sec_form4_transactions_as_of(
     t: datetime,
     subject_cik: str | None = None,
     *,
-    settings: Settings | None = None,
+    settings: Settings,
     include_implausible: bool = False,
     with_excluded_count: bool = False,
 ) -> pl.DataFrame | tuple[pl.DataFrame, int]:
@@ -1646,8 +1644,7 @@ def sec_form4_transactions_as_of(
     cannot postdate its own filing); late filings stay readable.
     Request `with_excluded_count` for the count removed.
     """
-    active_settings = settings if settings is not None else get_settings()
-    _require_sec_forms_read(active_settings)
+    _require_sec_forms_read(settings)
     t = _validate_t(t)
     params: list[Any] = [t]
     subject_filter = ""
@@ -1655,8 +1652,8 @@ def sec_form4_transactions_as_of(
         subject_filter = " AND issuer_cik = ?"
         params.append(subject_cik)
     predicate = form4_date_plausibility_sql(
-        active_settings.events.form4_min_transaction_date,
-        active_settings.events.form4_after_acceptance_days,
+        settings.events.form4_min_transaction_date,
+        settings.events.form4_after_acceptance_days,
     )
     base = f"FROM sec_form4_transactions WHERE known_at <= ?{subject_filter}"
     excluded = 0
@@ -2469,7 +2466,7 @@ def unvalued_spin_offs_as_of(
     t: datetime,
     security_ids: Sequence[str] | None = None,
     *,
-    settings: Settings | None = None,
+    settings: Settings,
 ) -> pl.DataFrame:
     """Spin-offs of the parents in `security_ids` (`None`: all) known by `t`
     with `ex_date <= t` that `adjusted_prices_as_of(..., include_dividends=
@@ -2479,7 +2476,7 @@ def unvalued_spin_offs_as_of(
     child on the ex-date is known at `t`) or the dividend's four, applied to
     the parent's prior bar and to D = ratio x the child's close:
     `"no_prior_bar"`, `"outside_calendar_range"`, `"stale_prior_bar"`,
-    `"implausible_amount"`. `settings` defaults to `get_settings()`.
+    `"implausible_amount"`.
     Raises `ValueError` on the same corrupt data `adjusted_prices_as_of`
     does (a non-positive or non-finite ratio or child close).
     """
