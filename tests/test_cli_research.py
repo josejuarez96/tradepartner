@@ -1946,3 +1946,25 @@ def test_feasibility_a_copy_open_for_writing_is_a_refusal_not_busy(
         holder.stdin.write("\n")
         holder.stdin.flush()
         holder.wait(timeout=30)
+
+
+def test_feasibility_refuses_the_live_store_named_with_a_tilde_in_the_env_file(
+    live: Path,
+    tmp_path: Path,
+    copy_store: Path,
+    design: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    no_connection: list[str],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    shutil.copy(live, home / "owner.duckdb")
+    owner = home / "owner.duckdb"
+    monkeypatch.setenv("HOME", str(home))
+    root = tmp_path / "project-tilde"
+    root.mkdir()
+    (root / ".env").write_text("STORE__PATH=~/owner.duckdb\n", encoding="utf-8")
+    monkeypatch.setattr(book_actions, "PROJECT_ROOT", root)
+    monkeypatch.setenv("STORE__PATH", str(copy_store))
+    _assert_live_refused(owner, owner, design)
+    assert no_connection == []

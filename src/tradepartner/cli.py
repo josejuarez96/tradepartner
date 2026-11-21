@@ -1588,7 +1588,7 @@ def _check_copy_path(store: Path, settings: Settings) -> Path:
     the caller opens and prints that same path. The owner's store is matched twice: as
     `settings.store.path` names it for this call (under the project root too when it is
     relative), and as the live store the repo defines independently of this call's
-    overrides (`book_actions.live_store_path`: the project-root `.env`, with `STORE__PATH`
+    overrides (`book_actions.live_settings`: the project-root `.env`, with `STORE__PATH`
     and `TRADEPARTNER_ENV_FILE` ignored). A match is by file identity (`Path.samefile`, so
     a hard link, a symlink, a symlinked directory, a relative or `..` path all match) when
     that file exists, else by resolved path (the registry's real-store rule, on paths).
@@ -1602,12 +1602,16 @@ def _check_copy_path(store: Path, settings: Settings) -> Path:
         raise OSError(f"--store {store}: not an existing file ({exc})") from None
     if not real.is_file():
         raise OSError(f"--store {store}: not an existing file")
-    configured = Path(settings.store.path).expanduser()
+    configured = Path(settings.store.path).expanduser()  # `~` expanded, as the live path's is
     candidates = [configured]
     if not configured.is_absolute():
         candidates.append(PROJECT_ROOT / configured)
     try:
-        candidates.append(book_actions.live_store_path())
+        live = book_actions.live_settings()
+        candidates.append(book_actions.live_store_path(live))
+        # `live_store_path` does not expand `~`; the raw value is expanded here (cli.py only).
+        raw = Path(live.store.path).expanduser()
+        candidates.append(raw if raw.is_absolute() else book_actions.PROJECT_ROOT / raw)
     except (ValueError, OSError, RuntimeError):
         raise OSError(
             f"--store {store}: the owner's live store config could not be read, "
@@ -7383,7 +7387,9 @@ def make_app(
         Reads no return and writes nothing. Refuses, before any connection, a missing
         path and the configured store (file identity). The operator makes the copy and
         never passes a file any process writes: the header prints the file's path,
-        size, modification time and newest ingest so the counted file can be checked."""
+        size, modification time and newest ingest so the counted file can be checked.
+        The owner's store is read from the project root's .env: run this from the main
+        checkout, since in a team worktree the project root is that worktree."""
         s = settings()
         # Lazy: the research modules and pandas/duckdb-backed readers load only here.
         from tradepartner.research import feasibility as feas
