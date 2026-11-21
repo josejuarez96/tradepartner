@@ -91,6 +91,37 @@ def test_trade_cost_rejects_negative_sizes(notional: float, shares: float) -> No
         trade_cost(notional, shares, 15.0, Commissions(per_share=0.0, per_order=0.0))
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_a_non_finite_notional_is_refused(bad: float) -> None:
+    """#3655: `nan < 0` is False, so the sign check alone let a NaN notional through and
+    the cost came back NaN (inf for an infinite one)."""
+    with pytest.raises(ValueError, match="finite"):
+        trade_cost(bad, 1.0, 10.0, Commissions(per_share=0.0, per_order=0.0))
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_a_non_finite_share_count_is_refused(bad: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        trade_cost(1.0, bad, 10.0, Commissions(per_share=0.01, per_order=0.0))
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_buy_notional_refuses_a_non_finite_cash(bad: float) -> None:
+    """#3655: a NaN cash returned a NaN notional."""
+    zero = Commissions(per_share=0.0, per_order=0.0)
+    with pytest.raises(ValueError, match="cash must be non-negative and finite"):
+        buy_notional_after_costs(bad, 10.0, zero, price=10.0)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_buy_notional_refuses_a_non_finite_price(bad: float) -> None:
+    """#3655: a NaN price returned NaN; an infinite one silently dropped the per-share
+    commission."""
+    zero = Commissions(per_share=0.0, per_order=0.0)
+    with pytest.raises(ValueError, match="price must be positive and finite"):
+        buy_notional_after_costs(100.0, 10.0, zero, price=bad)
+
+
 def test_buy_notional_scaled_by_one_over_one_plus_rate() -> None:
     """Spec req 4: with no commissions, notional = cash / (1 + per-side rate)."""
     zero = Commissions(per_share=0.0, per_order=0.0)

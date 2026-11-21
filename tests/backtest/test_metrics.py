@@ -387,6 +387,14 @@ def test_fewer_than_two_pairs_reduces_to_psr(n_trials: int, pairs: list[float]) 
     assert d.dsr == pytest.approx(0.994120, abs=1e-6)
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_expected_max_sharpe_refuses_a_non_finite_variance(bad: float) -> None:
+    """#3655: `nan < 0` is False, so SR* came back NaN (inf for an infinite V) and would
+    have fed the deflated Sharpe."""
+    with pytest.raises(ValueError, match="variance must be non-negative and finite"):
+        expected_max_sharpe(10, bad)
+
+
 def test_expected_max_sharpe_is_zero_for_one_trial() -> None:
     assert expected_max_sharpe(1, 0.01) == 0.0
 

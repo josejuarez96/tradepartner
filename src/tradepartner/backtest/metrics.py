@@ -375,11 +375,12 @@ def expected_max_sharpe(n_trials: int, variance: float) -> float:
 
     SR* = sqrt(V) * ((1 - gamma) * Phi^-1(1 - 1/N) + gamma * Phi^-1(1 - 1/(N*e))).
     Zero for a single trial, where Phi^-1(0) is undefined and there is nothing to deflate.
+    A NaN or infinite `variance` is refused with `ValueError` (#3655).
     """
     if n_trials < 1:
         raise ValueError(f"n_trials must be at least 1, got {n_trials}")
-    if variance < 0:
-        raise ValueError(f"variance must be non-negative, got {variance}")
+    if not math.isfinite(variance) or variance < 0:
+        raise ValueError(f"variance must be non-negative and finite, got {variance}")
     if n_trials == 1:
         return 0.0
     return math.sqrt(variance) * (

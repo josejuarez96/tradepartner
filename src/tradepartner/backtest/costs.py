@@ -97,11 +97,12 @@ def trade_cost(
         + shares * commission_per_share + commission_per_order
 
     A non-zero `impact_coeff` requires a positive `adv`; a zero ADV is never a silent
-    zero impact.
+    zero impact. A NaN or infinite `notional` or `shares` is refused with `ValueError`
+    (#3655): a NaN compares false with everything, so it is never a silent NaN cost.
     """
-    if notional < 0 or shares < 0:
+    if not (math.isfinite(notional) and math.isfinite(shares)) or notional < 0 or shares < 0:
         raise ValueError(
-            f"notional and shares are traded magnitudes and must be non-negative, "
+            f"notional and shares are traded magnitudes and must be non-negative and finite, "
             f"got notional={notional}, shares={shares}"
         )
     if notional == 0 and shares == 0:
@@ -142,12 +143,13 @@ def buy_notional_after_costs(
 
     The spread term adds to `per_side_bps`; the impact term is notional-dependent
     (`sqrt(notional / ADV)`), so the size is found by stepping down until notional plus
-    cost fits. A non-zero `impact_coeff` requires a positive `adv`.
+    cost fits. A non-zero `impact_coeff` requires a positive `adv`. A NaN or infinite
+    `cash` or `price` is refused with `ValueError` (#3655).
     """
-    if cash < 0:
-        raise ValueError(f"cash must be non-negative, got {cash}")
-    if price <= 0:
-        raise ValueError(f"price must be positive, got {price}")
+    if not math.isfinite(cash) or cash < 0:
+        raise ValueError(f"cash must be non-negative and finite, got {cash}")
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError(f"price must be positive and finite, got {price}")
     if impact_coeff != 0.0 and (adv is None or adv <= 0):
         raise ValueError(
             f"impact_coeff is non-zero ({impact_coeff}) but ADV is missing or "
