@@ -64,7 +64,6 @@ from __future__ import annotations
 
 import functools
 import itertools
-import json
 import math
 import re
 import tomllib
@@ -80,7 +79,9 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from tradepartner import config
 from tradepartner.backtest import frozen, hypothesis, results
+from tradepartner.backtest.frozen import _canonical_json
 from tradepartner.backtest.holdout import Frozen, Window, default_in_sample_window
+from tradepartner.backtest.hypothesis import _DATE_KEYS, _flatten
 from tradepartner.backtest.schedule import rebalance_sessions
 from tradepartner.backtest.signals import check_anchor_feasible
 from tradepartner.config import FORBIDDEN_AXIS_PREFIXES, Settings, get_settings
@@ -148,7 +149,6 @@ _LAB_FIELDS: Final = (
     "retire_below",
 )
 _CADENCE_KEY: Final = "schedule.rebalance_cadence"
-_DATE_KEYS: Final = ("in_sample_start", "holdout.start", "holdout.end")
 _BLOCK_OPEN: Final = re.compile(r"^```toml sweep[ \t]*$", re.MULTILINE)
 _BLOCK_CLOSE: Final = re.compile(r"^```[ \t]*$", re.MULTILINE)
 # Float round-off allowed when matching a grid value to its lattice point k x step, as a
@@ -250,17 +250,6 @@ class Variant:
     frozen_set: dict[str, Any]
     params_sha256: str
     fingerprint: str
-
-
-def _flatten(table: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
-    flat: dict[str, Any] = {}
-    for key, value in table.items():
-        dotted = f"{prefix}{key}"
-        if isinstance(value, dict):
-            flat.update(_flatten(value, f"{dotted}."))
-        else:
-            flat[dotted] = value
-    return flat
 
 
 def _block(text: str, path: Path) -> dict[str, Any]:
@@ -370,10 +359,6 @@ def _frozen_set(
         return hypothesis.frozen_params(parsed, settings)
     except hypothesis.HypothesisFileError as exc:
         raise InvalidVariantError(f"{parsed.path}: the variant {dict(values)} {exc}") from exc
-
-
-def _canonical_json(value: object) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 @functools.cache
