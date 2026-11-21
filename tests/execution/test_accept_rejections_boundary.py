@@ -463,6 +463,7 @@ _CLI_IMPORT_ROOTS = frozenset(
         "duckdb",
         "httpx",
         "json",
+        "os",  # #3652: `os.umask` in `main`, the one use, enforced in `_app_default_misuses`
         "pathlib",
         "polars",
         "re",
@@ -536,6 +537,15 @@ def _app_default_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[
             found.append(f"{node.lineno}: names {name} as an attribute")
         elif isinstance(node, (ast.Name, ast.Attribute)) and name in _CLICK_REACH:
             found.append(f"{node.lineno}: names {name}")
+        elif isinstance(node, ast.Attribute) and name == "os":
+            # `subprocess.os`, `pathlib.os`: the same module by another road.
+            found.append(f"{node.lineno}: reaches os through another module")
+        elif isinstance(node, ast.Name) and name == "os":
+            # #3652: `os` is here for `os.umask` alone; `os.environ`, `os.putenv`
+            # or `os` passed along could set settings and stay unseen.
+            parent = parents.get(id(node))
+            if not (isinstance(parent, ast.Attribute) and parent.attr == "umask"):
+                found.append(f"{node.lineno}: uses os for something other than os.umask")
         elif isinstance(node, (ast.Name, ast.Attribute)) and name == "Typer":
             parent = parents.get(id(node))
             called = isinstance(parent, ast.Call) and parent.func is node
@@ -549,6 +559,8 @@ def _app_default_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[
                 root = path.split(".")[0]
                 if root not in _CLI_IMPORT_ROOTS and not getattr(node, "level", 0):
                     found.append(f"{node.lineno}: imports {path}, outside the reviewed roots")
+                elif root == "os" and (isinstance(node, ast.ImportFrom) or alias.asname):
+                    found.append(f"{node.lineno}: imports os by another name")
                 elif parts & _CLICK_REACH:
                     found.append(f"{node.lineno}: imports {alias.name}")
                 elif "Typer" in parts and alias.asname not in (None, "Typer"):
@@ -1128,6 +1140,17 @@ def test_the_cli_exception_lets_exactly_its_reviewed_shape_through() -> None:
         CLI_PASS + "m = getter(paper_app, '__dict__')\n",
         CLI_PASS + "m = sys.modules['oper' + 'ator']\n",
         CLI_PASS + "import pickle\n",
+        # `os` is allowed for `os.umask` alone (#3652)
+        CLI_PASS + "import os\nos.environ['PAPER__X'] = '1'\n",
+        CLI_PASS + "import os\nos.putenv('PAPER__X', '1')\n",
+        CLI_PASS + "import os\nenv = os\n",
+        CLI_PASS + "import os as o\no.umask(0)\n",
+        CLI_PASS + "from os import environ\n",
+        CLI_PASS + "from os import umask\n",
+        # ... nor reached through another module that happens to import it
+        CLI_PASS + "subprocess.os.environ['PAPER__X'] = '1'\n",
+        CLI_PASS + "pathlib.os.putenv('PAPER__X', '1')\n",
+        CLI_PASS + "env = pl.os\n",
         # not a `resume` command's parameter
         CLI_PASS.replace('command("resume")', 'command("run")'),
         CLI_PASS.replace('@paper_app.command("resume")\n', ""),
