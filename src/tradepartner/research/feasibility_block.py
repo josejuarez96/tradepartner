@@ -15,7 +15,7 @@ from datetime import date, datetime
 from typing import Final
 
 from tradepartner.research import shape
-from tradepartner.research.feasibility_design import FeasibilityDesign, ShapeInputs
+from tradepartner.research.feasibility_design import FeasibilityDesign
 from tradepartner.research.shape import EffectiveCount
 
 __all__ = [
@@ -98,6 +98,8 @@ class FeasibilityCounts:
     cells: tuple[CountCell, ...]
     totals: tuple[BandTotal, ...]
     events_hold_past_window: int
+    window_sessions: int
+    """S: sessions of the trading calendar in the design's window, counted by the reader."""
     coverage: DelisterCoverage
 
 
@@ -138,12 +140,46 @@ def _band_key(band: int | None) -> tuple[int, int]:
     return (1, 0) if band is None else (0, band)
 
 
-def _shape_figures(inputs: ShapeInputs, n_eff: float) -> tuple[int | None, float]:
-    """The one call into `shape`: `(n_min, pass chance)` for the card's numbers at `n_eff`.
+def window_quarters(design: FeasibilityDesign) -> int:
+    """G: calendar quarters the window touches (the card's power line names it)."""
+    start, end = design.window_start, design.window_end
+    return (end.year * 4 + (end.month - 1) // 3) - (start.year * 4 + (start.month - 1) // 3) + 1
 
-    Everything else here is independent of T452's signatures; if its event form changes
-    (for example a count of calendar quarters), only this function changes.
+
+def _pct(probability: float) -> str:
+    percent = probability * 100
+    return f"{percent:.2f}%" if percent >= 0.01 or percent == 0 else f"{percent:.2e}%"
+
+
+def _shape_lines(design: FeasibilityDesign, n_eff_by_band: dict[int | None, float]) -> list[str]:
+    """The one place the block calls into `shape`: the card's power line and pass chance.
+
+    Everything else here is independent of T452's signatures; if its forms change (for
+    example a count of calendar quarters), only this function changes. An event shape
+    prints per band, since `n_eff` differs by band; a trial shape prints once.
     """
+    inputs = design.shape
+    assert inputs is not None
+    if inputs.form == "trial":
+        assert inputs.turnover_per_month is not None
+        assert inputs.sigma_bp is not None and inputs.months is not None
+        borrow = inputs.borrow_bp_per_month or 0.0
+        round_trip = shape.trial_round_trip_bp(
+            inputs.turnover_per_month, inputs.decision_cost_bps, borrow
+        )
+        net_ir = shape.trial_net_ir(inputs.gross_bp - round_trip, inputs.sigma_bp)
+        bar = shape.trial_required_net_ir(inputs.months)
+        chance = shape.trial_pass_probability(
+            inputs.gross_bp, round_trip, inputs.sigma_bp, inputs.months
+        )
+        return [
+            f"shape (from the card; trial, {inputs.book}):",
+            f"  round trip {round_trip:.2f} bp a month (borrow {borrow:g}); "
+            f"{inputs.months} months, net IR {net_ir:.2f} against {bar:.2f}; "
+            f"pass chance {_pct(chance)}",
+        ]
+    assert inputs.sd_bp is not None
+    assert inputs.floor_bp is not None and inputs.t_floor is not None
     round_trip = shape.event_round_trip_bp(inputs.decision_cost_bps)
     n_min = shape.event_min_count(
         inputs.gross_bp,
@@ -152,15 +188,36 @@ def _shape_figures(inputs: ShapeInputs, n_eff: float) -> tuple[int | None, float
         floor_bp=inputs.floor_bp,
         t_floor=inputs.t_floor,
     )
-    chance = shape.event_pass_probability(
-        inputs.gross_bp,
-        round_trip,
-        inputs.sd_bp,
-        n_eff,
-        floor_bp=inputs.floor_bp,
-        t_floor=inputs.t_floor,
+    n_min_text = "none (net at or under the floor)" if n_min is None else str(n_min)
+    lines = ["shape (from the card; event, power and pass chance per band):"]
+    for band in sorted(n_eff_by_band, key=_band_key):
+        n_eff = n_eff_by_band[band]
+        chance = shape.event_pass_probability(
+            inputs.gross_bp,
+            round_trip,
+            inputs.sd_bp,
+            n_eff,
+            floor_bp=inputs.floor_bp,
+            t_floor=inputs.t_floor,
+        )
+        lines.append(
+            f"  {band_label(design, band)}: n_eff {n_eff:.1f} against n_min {n_min_text}; "
+            f"pass chance {_pct(chance)}"
+        )
+    return lines
+
+
+def _hand_line(design: FeasibilityDesign, eff: EffectiveCount, window_sessions: int) -> str:
+    """The default's hand formula, its ceiling and its tighter same-session bound."""
+    rho = shape.DEFAULT_CROSS_ISSUER_RHO
+    hold = design.hold_sessions
+    by_hand = shape.effective_count_by_hand(eff.n, eff.same_date_factor, hold, window_sessions, rho)
+    ceiling = shape.effective_count_ceiling(hold, window_sessions, rho)
+    bound = shape.effective_count_same_session_bound(hold, window_sessions, rho)
+    return (
+        f"    by hand 1 / (B/N + {rho:g} x h/S) = {by_hand:.1f}; "
+        f"ceiling {ceiling:.1f}; same-session bound {bound:.1f}"
     )
-    return n_min, chance
 
 
 def _rule_text(design: FeasibilityDesign) -> str:
@@ -226,7 +283,11 @@ def render_block(design: FeasibilityDesign, counts: FeasibilityCounts) -> str:
         f"  events whose hold runs past the window's end (counted, exit not read): "
         f"{counts.events_hold_past_window}"
     )
-    lines.append(f"effective count, hold {design.hold_sessions} sessions ({_rule_text(design)}):")
+    window_s = counts.window_sessions
+    lines.append(
+        f"effective count, hold {design.hold_sessions} sessions "
+        f"({_rule_text(design)}); S {window_s} sessions, G {window_quarters(design)} quarters:"
+    )
     n_eff_by_band: dict[int | None, float] = {}
     for total in totals:
         eff = total.effective
@@ -239,6 +300,8 @@ def render_block(design: FeasibilityDesign, counts: FeasibilityCounts) -> str:
             f"bounds rho 0 {eff.n_eff_rho0:.1f}, rho 1 {eff.n_eff_rho1:.1f}; "
             f"B {eff.same_date_factor:.3f}; O {eff.overlap_factor:.3f}"
         )
+        if design.rho is None:
+            lines.append(_hand_line(design, eff, window_s))
     lines += [
         "(f) delister coverage (by issuer, listing ends inside the window only):",
         f"  issuers delisted {cov.delisted}, with bars {cov.delisted_with_bars}",
@@ -246,14 +309,7 @@ def render_block(design: FeasibilityDesign, counts: FeasibilityCounts) -> str:
         f"with bars {cov.delisted_with_events_and_bars}",
     ]
     if design.shape is not None:
-        lines.append("shape (from the card; power and pass chance per band):")
-        for band in sorted(n_eff_by_band, key=_band_key):
-            n_min, chance = _shape_figures(design.shape, n_eff_by_band[band])
-            n_min_text = "none (net at or under the floor)" if n_min is None else str(n_min)
-            lines.append(
-                f"  {band_label(design, band)}: n_eff {n_eff_by_band[band]:.1f} "
-                f"against n_min {n_min_text}; pass chance {chance * 100:.2f}%"
-            )
+        lines += _shape_lines(design, n_eff_by_band)
     lines.append(_ledger_line(design, counts, totals))
     return "\n".join(lines)
 

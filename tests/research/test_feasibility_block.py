@@ -75,6 +75,7 @@ def _counts() -> fb.FeasibilityCounts:
             fb.BandTotal(0, 4, 3, 2, _effective(3.5, 4)),
         ),
         events_hold_past_window=2,
+        window_sessions=300,
         coverage=fb.DelisterCoverage(3, 2, 1, 1),
     )
 
@@ -176,3 +177,38 @@ def test_module_reads_no_clock_store_or_config() -> None:
         "tradepartner.store",
     ):
         assert needle not in source
+
+
+def test_event_power_line_carries_s_g_hand_formula_ceiling_and_bounds() -> None:
+    block = fb.render_block(_parse(VALID), _counts())
+    assert "S 300 sessions, G 5 quarters" in block  # 2018Q1 to 2019Q1
+    eff = _effective(3.5, 4)
+    by_hand = shape.effective_count_by_hand(4, eff.same_date_factor, 20, 300)
+    ceiling = shape.effective_count_ceiling(20, 300)
+    bound = shape.effective_count_same_session_bound(20, 300)
+    assert (
+        f"by hand 1 / (B/N + 0.05 x h/S) = {by_hand:.1f}; ceiling {ceiling:.1f}; "
+        f"same-session bound {bound:.1f}"
+    ) in block
+    assert "bounds rho 0 7.0, rho 1 1.8" in block
+
+
+def test_a_cited_rho_prints_no_default_hand_formula() -> None:
+    design = _parse('rho = 0.3\nrho_source = "a paper"\n' + VALID)
+    assert "by hand" not in fb.render_block(design, _counts())
+
+
+def test_trial_shape_prints_the_irrx_pass_chance_with_its_borrow() -> None:
+    trial = (
+        '[shape]\nform = "trial"\nbook = "long_short"\ngross_bp = 29\ndecision_cost_bps = 50\n'
+        "turnover_per_month = 1.0\nmonths = 84\nsigma_bp = 140\nborrow_bp_per_month = 1.25\n"
+    )
+    block = fb.render_block(_parse(VALID + trial), _counts())
+    chance = shape.trial_pass_probability(29.0, 101.25, 140.0, 84)
+    assert chance == pytest.approx(1.12e-06, rel=0.05)
+    assert f"pass chance {chance * 100:.2e}%" in block
+    assert "round trip 101.25 bp a month (borrow 1.25)" in block
+    assert "against 0.32" in block
+    no_borrow = trial.replace("borrow_bp_per_month = 1.25\n", "")
+    with pytest.raises(fd.FeasibilityDesignError, match=r"shape\.borrow_bp_per_month"):
+        _parse(VALID + no_borrow)

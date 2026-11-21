@@ -272,3 +272,73 @@ def test_fixture_store_is_deterministic_and_fixture_designs_fit_it(tmp_path: Pat
         design = fd.parse_design_file(feasibility_store.DESIGN_DIR / f"{source}.toml")
         assert design.window_end <= a.boundary
         assert (design.window_start, design.window_end) == (a.window_start, a.window_end)
+
+
+# --- the filter allow-lists and the trial shape ---
+
+ALLOW_LISTS = {
+    "form4": {
+        "transaction_code",
+        "acquired_disposed",
+        "is_director",
+        "is_officer",
+        "is_ten_percent_owner",
+        "is_other",
+        "shares",
+        "price",
+        "shares_owned_after",
+        "ownership_form",
+        "security_title",
+    },
+    "statement_fact": {
+        "fact_name",
+        "xbrl_tag",
+        "form",
+        "period_days",
+        "unit",
+        "basis",
+        "comparative",
+    },
+    "form25": {"form", "exchange"},
+    "corporate_action": {"action_type", "ratio_or_amount", "cancelled"},
+}
+IDENTIFIERS = {
+    "form4": ("issuer_cik", "filer_cik", "accession", "line_no", "transaction_date", "accepted_at"),
+    "statement_fact": ("cik", "filing_accession", "period_end", "value"),
+    "form25": ("security_id", "class_title", "filed_at", "effective_on"),
+    "corporate_action": ("security_id", "source_action_id", "ex_date", "announced_at"),
+}
+
+
+def _design_for(source: str, filter_line: str) -> str:
+    return VALID.replace('source = "form4"', f'source = "{source}"').replace(
+        '[filter]\ntransaction_code = "P"\nis_officer = true\n', f"[filter]\n{filter_line}\n"
+    )
+
+
+@pytest.mark.parametrize("source", sorted(ALLOW_LISTS))
+def test_filter_allow_lists_exclude_identifiers_dates_and_stamps(source: str) -> None:
+    assert set(fd.SOURCES[source].filter_columns) == ALLOW_LISTS[source]
+    assert set(fd.SOURCES[source].filter_columns) <= set(fd.SOURCES[source].columns)
+    for column in ALLOW_LISTS[source]:
+        assert _parse(_design_for(source, f"{column} = 1")).filters[0][0] == column
+    for column in (*IDENTIFIERS[source], "known_at", "ingested_at", "provenance"):
+        _refused(_design_for(source, f'{column} = "x"'), f"filter.{column}")
+
+
+TRIAL = (
+    '[shape]\nform = "trial"\nbook = "long_short"\ngross_bp = 29\ndecision_cost_bps = 50\n'
+    "turnover_per_month = 1.0\nmonths = 84\nsigma_bp = 140\nborrow_bp_per_month = 1.25\n"
+)
+
+
+def test_long_short_trial_shape_needs_its_borrow_cost() -> None:
+    assert _parse(VALID + TRIAL).shape is not None
+    _refused(VALID + TRIAL.replace("borrow_bp_per_month = 1.25\n", ""), "shape.borrow_bp_per_month")
+    long_only = TRIAL.replace("long_short", "long_only").replace("borrow_bp_per_month = 1.25\n", "")
+    assert _parse(VALID + long_only).shape is not None
+    # an event shape needs none, and may not carry one
+    assert _parse(VALID + SHAPE_200).shape is not None
+    _refused(VALID + SHAPE_200 + "borrow_bp_per_month = 1\n", "shape.borrow_bp_per_month")
+    _refused(VALID + TRIAL.replace("months = 84\n", ""), "shape.months")
+    _refused(VALID + TRIAL.replace('"trial"', '"swing"'), "shape.form")

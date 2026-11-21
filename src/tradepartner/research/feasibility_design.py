@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from hashlib import sha256
 from itertools import pairwise
@@ -51,15 +51,19 @@ class FeasibilityDesignError(ValueError):
 class SourceSpec:
     """One of the four closed sources: its table and the columns a filter may test.
 
-    The filed columns are the table's own data columns; the four fact-table columns
-    every fact carries (`known_at`, `ingested_at`, `source`, `provenance`) are not
-    filterable, so a filter cannot reach a stamp.
+    `columns` is every data column of the table (the four fact stamps `known_at`,
+    `ingested_at`, `source` and `provenance` excluded). `filter_columns` is the subset a
+    filter may name: columns that describe the filed event itself. An identifier
+    (security, issuer, owner or filer ids, accession numbers, names) is never one, and
+    no date or stamp is: a filter on an identifier would let a design pick names after
+    the fact.
     """
 
     name: str
     table: str
     issuer_column: str
     columns: tuple[str, ...]
+    filter_columns: tuple[str, ...]
 
 
 #: The four held tables with a `known_at`, as the spec lists them. The 8-K items table is
@@ -90,6 +94,19 @@ SOURCES: Final[dict[str, SourceSpec]] = {
             "date_of_original_submission",
             "accepted_at",
         ),
+        (
+            "transaction_code",
+            "acquired_disposed",
+            "is_director",
+            "is_officer",
+            "is_ten_percent_owner",
+            "is_other",
+            "shares",
+            "price",
+            "shares_owned_after",
+            "ownership_form",
+            "security_title",
+        ),
     ),
     "statement_fact": SourceSpec(
         "statement_fact",
@@ -109,12 +126,14 @@ SOURCES: Final[dict[str, SourceSpec]] = {
             "basis",
             "comparative",
         ),
+        ("fact_name", "xbrl_tag", "form", "period_days", "unit", "basis", "comparative"),
     ),
     "form25": SourceSpec(
         "form25",
         "delistings",
         "security_id",
         ("security_id", "form", "class_title", "exchange", "filed_at", "effective_on"),
+        ("form", "exchange"),
     ),
     "corporate_action": SourceSpec(
         "corporate_action",
@@ -129,6 +148,7 @@ SOURCES: Final[dict[str, SourceSpec]] = {
             "source_action_id",
             "cancelled",
         ),
+        ("action_type", "ratio_or_amount", "cancelled"),
     ),
 }
 
@@ -137,18 +157,36 @@ _TOP_KEYS: Final = frozenset(
 )
 _WINDOW_KEYS: Final = frozenset({"start", "end"})
 _BAND_KEYS: Final = frozenset({"lookback_sessions", "edges"})
-_SHAPE_KEYS: Final = ("gross_bp", "sd_bp", "decision_cost_bps", "floor_bp", "t_floor")
+SHAPE_FORMS: Final = ("event", "trial")
+BOOKS: Final = ("long_short", "long_only")
+_SHAPE_REQUIRED: Final = {
+    "event": ("gross_bp", "sd_bp", "decision_cost_bps", "floor_bp", "t_floor"),
+    "trial": ("gross_bp", "decision_cost_bps", "book", "turnover_per_month", "months", "sigma_bp"),
+}
+_SHAPE_OPTIONAL: Final = {"event": (), "trial": ("borrow_bp_per_month",)}
 
 
 @dataclass(frozen=True)
 class ShapeInputs:
-    """The `[shape]` table, copied from the card (units: basis points)."""
+    """The `[shape]` table, copied from the card (units: basis points).
 
+    `form` is `event` (the default) or `trial`. An event shape carries `sd_bp`, `floor_bp`
+    and `t_floor`; a trial shape carries `book`, `turnover_per_month`, `months` and
+    `sigma_bp`, and a `long_short` book must state `borrow_bp_per_month` (a defaulted 0
+    would flatter the pass chance; PR #3745's quant-auditor).
+    """
+
+    form: str
     gross_bp: float
-    sd_bp: float
     decision_cost_bps: float
-    floor_bp: float
-    t_floor: float
+    sd_bp: float | None = None
+    floor_bp: float | None = None
+    t_floor: float | None = None
+    book: str | None = None
+    turnover_per_month: float | None = None
+    months: int | None = None
+    sigma_bp: float | None = None
+    borrow_bp_per_month: float | None = None
 
 
 @dataclass(frozen=True)
@@ -236,10 +274,12 @@ def _filters(
         raise _fail("filter", "must be a table")
     out = []
     for column in sorted(raw):
-        if column not in spec.columns:
+        if column not in spec.filter_columns:
+            kind = "an identifier, date or stamp" if column in spec.columns else "not a column"
             raise _fail(
                 f"filter.{column}",
-                f"not a filed column of {spec.table} (columns: {', '.join(spec.columns)})",
+                f"{kind} of {spec.table}, not filterable "
+                f"(filterable: {', '.join(spec.filter_columns)})",
             )
         out.append((column, _filter_values(f"filter.{column}", raw[column])))
     return tuple(out)
@@ -251,17 +291,40 @@ def _shape_inputs(doc: Mapping[str, Any]) -> ShapeInputs | None:
     raw = doc["shape"]
     if not isinstance(raw, dict):
         raise _fail("shape", "must be a table")
-    unknown = sorted(set(raw) - set(_SHAPE_KEYS))
+    form = raw.get("form", "event")
+    if form not in SHAPE_FORMS:
+        raise _fail("shape.form", f"must be one of {', '.join(SHAPE_FORMS)}")
+    required = _SHAPE_REQUIRED[form]
+    allowed = {"form", *required, *_SHAPE_OPTIONAL[form]}
+    unknown = sorted(set(raw) - allowed)
     if unknown:
-        raise _fail(f"shape.{unknown[0]}", "unknown key")
-    for key in _SHAPE_KEYS:
+        raise _fail(f"shape.{unknown[0]}", f"unknown key for a {form} shape")
+    for key in required:
         if key not in raw:
             raise _fail(f"shape.{key}", "missing key")
-    values = {k: _number(f"shape.{k}", raw[k]) for k in _SHAPE_KEYS}
-    if values["sd_bp"] <= 0:
-        raise _fail("shape.sd_bp", "must be positive")
-    for key in ("decision_cost_bps", "floor_bp", "t_floor"):
-        if values[key] < 0:
+    values: dict[str, Any] = {"form": form}
+    for key in (*required, *_SHAPE_OPTIONAL[form]):
+        if key not in raw:
+            continue
+        if key == "book":
+            if raw[key] not in BOOKS:
+                raise _fail("shape.book", f"must be one of {', '.join(BOOKS)}")
+            values[key] = raw[key]
+        elif key == "months":
+            values[key] = _positive_int("shape.months", raw[key])
+        else:
+            values[key] = _number(f"shape.{key}", raw[key])
+    if values.get("book") == "long_short" and "borrow_bp_per_month" not in raw:
+        raise _fail(
+            "shape.borrow_bp_per_month",
+            "missing: a long/short trial states its borrow cost (bp per month on equity)",
+        )
+    for key in ("sd_bp", "sigma_bp"):
+        if key in values and values[key] <= 0:
+            raise _fail(f"shape.{key}", "must be positive")
+    nonneg = ("decision_cost_bps", "floor_bp", "t_floor", "turnover_per_month")
+    for key in (*nonneg, "borrow_bp_per_month"):
+        if key in values and values[key] < 0:
             raise _fail(f"shape.{key}", "must not be negative")
     return ShapeInputs(**values)
 
@@ -362,7 +425,9 @@ def parse_design_text(text: str, *, name: str = "design") -> FeasibilityDesign:
         normalised["rho"] = rho
         normalised["rho_source"] = rho_source
     if shape_inputs is not None:
-        normalised["shape"] = {k: float(doc["shape"][k]) for k in _SHAPE_KEYS}
+        normalised["shape"] = {
+            k: v for k, v in sorted(asdict(shape_inputs).items()) if v is not None
+        }
     return FeasibilityDesign(
         source=source,
         filters=filters,
