@@ -61,7 +61,7 @@ The owner's list of 2026-11-02 (spec, "Data / interfaces"); extend by editing th
 source: B|C|A|D|E (<batch row date>)   ·   written: <date>   ·   by: owner | agent | workflow <id>
 shape:         <event, hold <h> sessions | trial, <cadence>>; band <band>; decision cost <c> bp per side (ADR 0023 harsh cell)
   cost:        turnover <x>/yr (one-sided, all legs, over equity); gross <g> bp per <event | month> (<source>; QI-2 <applied once | post-publication figure>); round trip <R> bp (<legs charged>); ratio g/R <r> (guide: 2)   ·   beside it: <r> at arrival, <r> at the paper basis
-  power:       event: raw <n>/yr over <years> (<estimate, source | counts block, sha>), ÷ clustering <B>, ÷ overlap <O>, n_eff <n> against n_min <n>   |   trial: <T> months, net IR <x> against <bar>
+  power:       event: raw <n>/yr over <years> (S <sessions>, G <quarters>; <estimate, source | counts block, sha>), ÷ clustering <B>, ÷ overlap <O>, n_eff <n> = 1 / (B/N + 0.05 × h/S) against n_min <n>   |   trial: <T> months, net IR <x> against <bar>
   pass chance: <p>% = Φ(<z>); sd <value> (<source; never held returns>); rule <floor F, t floor | line 40 with SR* <value>>
   result:      pass | pass, warning: under 2× | rejected: shape | deferred: power | blocked: cost measurement (<band>) | blocked: <other capability>
 1 persists because:  inefficiency <who keeps losing, why> | premium <what loss we are paid to carry, when it arrives> | constraint <on whom>

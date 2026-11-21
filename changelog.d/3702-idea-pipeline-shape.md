@@ -1,3 +1,3 @@
 - #3702 (PR #3705, draft, class B): idea cards start with a Shape block; one cost line at the decision cost, one power line at the idea's own effect; counts-only feasibility command specified, T441-T444 planned
 ### Changed
-- Idea pipeline: the passable shape on the card (ratio against 2 at the 50 bp decision cost, n_eff against n_min, pass chance from PR #3683's closed form); question 3, 4a (d) and the rung-1 screen are one cost line; question 7 and 4a (c) one power line; a counts-only feasibility command is specified and planned as T441-T444 (#3702, PR #3705)
+- Idea pipeline: the passable shape on the card (ratio printed (guide 2); rejected only where no count could pass at the 50 bp decision cost; n_eff against n_min, pass chance from PR #3683's closed form); question 3, 4a (d) and the rung-1 screen are one cost line; question 7 and 4a (c) one power line; a counts-only feasibility command is specified and planned as T441-T444 (#3702, PR #3705)
