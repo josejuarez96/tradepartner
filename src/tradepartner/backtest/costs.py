@@ -99,6 +99,8 @@ def trade_cost(
     A non-zero `impact_coeff` requires a positive `adv`; a zero ADV is never a silent
     zero impact. A NaN or infinite `notional` or `shares` is refused with `ValueError`
     (#3655): a NaN compares false with everything, so it is never a silent NaN cost.
+    A finite input whose cost overflows (a notional near the largest float) is refused
+    with `ValueError` too (#3694), so the result is always a finite cost.
     """
     if not (math.isfinite(notional) and math.isfinite(shares)) or notional < 0 or shares < 0:
         raise ValueError(
@@ -115,12 +117,20 @@ def trade_cost(
                 f"non-positive ({adv}); a non-zero impact needs a positive ADV"
             )
         impact = notional * impact_coeff * math.sqrt(notional / adv)
-    return (
+    cost = (
         notional * (per_side_bps + spread_bps) / BPS_PER_UNIT
         + impact
         + shares * commissions.per_share
         + commissions.per_order
     )
+    # The arithmetic is left as it was (no finite cost moves by an ulp); only a result
+    # that overflowed is refused (#3694).
+    if not math.isfinite(cost):
+        raise ValueError(
+            f"the cost of notional={notional}, shares={shares} is not finite ({cost}): "
+            f"the inputs are finite but too large to cost"
+        )
+    return cost
 
 
 def buy_notional_after_costs(
@@ -144,7 +154,8 @@ def buy_notional_after_costs(
     The spread term adds to `per_side_bps`; the impact term is notional-dependent
     (`sqrt(notional / ADV)`), so the size is found by stepping down until notional plus
     cost fits. A non-zero `impact_coeff` requires a positive `adv`. A NaN or infinite
-    `cash` or `price` is refused with `ValueError` (#3655).
+    `cash` or `price` is refused with `ValueError` (#3655), and so is a finite `cash` so
+    large that the cost of spending it overflows (#3694; it used to size the buy at 0).
     """
     if not math.isfinite(cash) or cash < 0:
         raise ValueError(f"cash must be non-negative and finite, got {cash}")

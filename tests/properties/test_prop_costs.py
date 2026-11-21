@@ -48,20 +48,23 @@ def test_trade_cost_refuses_or_returns_a_finite_non_negative_cost(
     assert cost >= 0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#3694: a finite notional above about 1e304 overflows "
-    "to an infinite cost; found by the explore profile, outside the non-finite-input "
-    "refusal this issue makes",
-)
 def test_trade_cost_of_a_huge_finite_notional_is_refused_or_finite() -> None:
     """The shrunk example the `explore` profile found for the property above (the `ci`
-    budget does not reach it): `notional * bps` overflows before the division."""
+    budget does not reach it): `notional * bps` overflows before the division (#3694)."""
     try:
         cost = trade_cost(8.98846567431158e307, 0.0, 2.0, Commissions(0.0, 0.0))
     except ValueError:
         return
     assert math.isfinite(cost)
+
+
+def test_trade_cost_refuses_a_finite_notional_whose_cost_overflows() -> None:
+    """#3694: the refusal is a `ValueError` that names the cause, never an `inf` cost."""
+    with pytest.raises(ValueError, match="not finite"):
+        trade_cost(8.98846567431158e307, 0.0, 2.0, Commissions(0.0, 0.0))
+    # A share count whose commission overflows is the same shape.
+    with pytest.raises(ValueError, match="not finite"):
+        trade_cost(1.0, 1e308, 0.0, Commissions(10.0, 0.0))
 
 
 @given(
@@ -99,6 +102,13 @@ def test_buy_notional_fits_cash_in_either_debit_order(
     assert notional + cost <= cash
     assert cash - cost - notional >= 0
     assert cash - notional - cost >= 0
+
+
+def test_buy_notional_refuses_a_cash_whose_cost_overflows() -> None:
+    """#3694: `trade_cost`'s refusal propagates; before it, the infinite cost stepped the
+    size down to a silent 0."""
+    with pytest.raises(ValueError, match="not finite"):
+        buy_notional_after_costs(1e308, 2.0, Commissions(0.0, 0.0), price=10.0)
 
 
 @given(cash=_NON_FINITE, bps=_BPS, per_share=_PER_SHARE, per_order=_PER_ORDER, price=_PRICE)
