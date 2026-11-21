@@ -172,6 +172,8 @@ SAFETY_PREFIXES = (
     "src/tradepartner/adapters/edgar.py",
     "src/tradepartner/cli_record.py",
     "src/tradepartner/cli",
+    # the exit codes the scheduled jobs and the wrapper act on (#3651)
+    "src/tradepartner/exit_codes.py",
     "src/tradepartner/config",
     "src/tradepartner/ingest",
     "src/tradepartner/execution/",
