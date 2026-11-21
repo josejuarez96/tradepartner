@@ -24,7 +24,7 @@ from typing import Any
 
 import duckdb
 import pytest
-from conftest import load_universe_fixtures
+from conftest import load_universe_fixtures, strip_lab
 
 from tradepartner.store import lab_schema, schema
 from tradepartner.store.db import configure_connection
@@ -248,7 +248,7 @@ def test_registry_table_names_disjoint_from_fact_table_names() -> None:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RETRACTED_ROWS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_FRESH_LAB_VERSION + 1
 
 
 def test_fresh_init_creates_every_table_at_version_26() -> None:
@@ -261,6 +261,7 @@ def test_fresh_init_creates_every_table_at_version_26() -> None:
         | set(schema.MASTER_CHECK_TABLE_NAMES)
         | set(schema.RESEARCH_TABLE_NAMES)
         | {schema.REBALANCE_COUNTS_TABLE_NAME}
+        | set(lab_schema.LAB_TABLE_NAMES)  # a fresh store gets the lab tables (#3672)
     )
     assert [version for version, _ in _versions(conn)] == [schema.CURRENT_SCHEMA_VERSION]
 
@@ -669,9 +670,9 @@ def _version_17_store(path: Path, *, lab: bool) -> None:
     try:
         configure_connection(conn)
         schema.init_schema(conn)
+        if not lab:
+            strip_lab(conn)  # created fresh after version 16: no lab schema until 50 (#3672)
         load_universe_fixtures(conn, _FIXTURES_UNIVERSE_DIR)
-        if lab:
-            lab_schema.apply_lab_schema(conn)
         conn.execute("DROP TABLE owner_decisions")
         conn.execute(schema._CREATE_OWNER_DECISIONS)
         if lab:
@@ -733,7 +734,11 @@ def test_migrating_a_version_17_store_keeps_every_row(tmp_path: Path, lab: bool)
         ).fetchall()
         check_before = _kind_check(conn)
         schema.init_schema(conn)
-        assert _every_row(conn) == before
+        after = _every_row(conn)
+        assert {table: after[table] for table in before} == before
+        # A store created without the lab gains exactly the lab tables (#3672).
+        gained = set(lab_schema.LAB_TABLE_NAMES) - {"store_markers"}
+        assert set(after) - set(before) == (set() if lab else gained)
         assert before["prices_daily"] and before["securities"]  # facts were there
         assert (
             conn.execute("SELECT decision_id, kind FROM owner_decisions ORDER BY rowid").fetchall()
@@ -742,6 +747,8 @@ def test_migrating_a_version_17_store_keeps_every_row(tmp_path: Path, lab: bool)
         added = ", ".join(
             f"'{k}'"
             for k in (
+                # Version 50 adds the lab's two at the lab step, before version 18's.
+                *(() if lab else ("promotion", "sweep_retired")),
                 *lab_schema.RELEASE_DECISION_KINDS,
                 *lab_schema.SHAKEDOWN_DECISION_KINDS,
                 *lab_schema.OPERATIONS_DECISION_KINDS,
@@ -765,7 +772,7 @@ def test_migrating_a_version_17_store_keeps_every_row(tmp_path: Path, lab: bool)
                 "INSERT INTO owner_decisions VALUES (3, ?, 'data_release', NULL, NULL, '{}', 'r')",
                 [_NOW],
             )
-        assert lab_schema.is_lab_initialised(conn) == lab
+        assert lab_schema.is_lab_initialised(conn)  # with or without it before (#3672)
         # A second open changes nothing more.
         rows, check = _every_row(conn), _kind_check(conn)
         schema.init_schema(conn)
@@ -803,10 +810,13 @@ def test_a_fresh_store_allows_the_version_18_kinds() -> None:
             "INSERT INTO owner_decisions VALUES (?, ?, ?, NULL, NULL, '{}', 'r')",
             [decision_id, _NOW, kind],
         )
-    with pytest.raises(duckdb.ConstraintException):  # still no lab kind without the lab
+    # A fresh store has the lab schema (#3672), so the lab's kinds too.
+    conn.execute(
+        "INSERT INTO owner_decisions VALUES (9, ?, 'promotion', NULL, NULL, '{}', 'r')", [_NOW]
+    )
+    with pytest.raises(duckdb.ConstraintException):
         conn.execute(
-            "INSERT INTO owner_decisions VALUES (9, ?, 'promotion', NULL, NULL, '{}', 'r')",
-            [_NOW],
+            "INSERT INTO owner_decisions VALUES (8, ?, 'made_up', NULL, NULL, '{}', 'r')", [_NOW]
         )
     assert "development_boundary" in {
         r[1] for r in conn.execute("PRAGMA table_info('trials')").fetchall()

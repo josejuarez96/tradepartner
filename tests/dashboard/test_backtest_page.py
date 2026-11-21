@@ -20,6 +20,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from conftest import strip_lab
 from dashboard_nav import NavCall, app_test, nav_calls_fixture, nav_titles  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
@@ -27,7 +28,7 @@ from tradepartner.backtest.metrics import LONG_SHORT_KEYS, METRIC_KEYS, deflated
 from tradepartner.config import Settings
 from tradepartner.dashboard import backtest_page, theme
 from tradepartner.research.experiment import hash_file, parse_experiment_file
-from tradepartner.store import lab_registry, lab_schema, registry, research, schema
+from tradepartner.store import lab_registry, registry, research, schema
 from tradepartner.store.db import insert_row, open_for_write
 
 _APP_PATH = str(
@@ -836,8 +837,8 @@ def _detail_store(tmp_path: Path, *, lab: bool) -> tuple[Path, int, int]:
     seed_settings = Settings(_env_file=None, store={"path": str(tmp_path / "real.duckdb")})
     with open_for_write(Settings(_env_file=None, store={"path": str(store_path)})) as conn:
         schema.init_schema(conn)
-        if lab:
-            lab_schema.apply_lab_schema(conn)
+        if not lab:
+            strip_lab(conn)  # a store created without the lab (#3672: a fresh one has it)
         h1 = _hypothesis(conn, seed_settings, "h1-momentum-12-1", 0.1)
         full = _ok_trial(conn, seed_settings, h1, 0.20, 0.05, details=True)
         # The result row is written, so the weights go in as rows (the writer refuses

@@ -32,7 +32,7 @@ from typing import Any
 import duckdb
 import pytest
 import typer
-from conftest import load_universe_fixtures, mark_pre_lab
+from conftest import load_universe_fixtures, mark_pre_lab, strip_lab
 from typer.testing import CliRunner
 
 from tradepartner import cli
@@ -149,6 +149,7 @@ def template(tmp_path_factory: pytest.TempPathFactory) -> Path:
     try:
         configure_connection(conn)
         schema.init_schema(conn)
+        strip_lab(conn)  # the twin registers before the lab tables exist (#3672)
         load_universe_fixtures(conn, FIXTURES / "universe")
     finally:
         conn.close()

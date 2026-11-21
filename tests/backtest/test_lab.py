@@ -42,7 +42,7 @@ from typing import Any
 
 import duckdb
 import pytest
-from conftest import load_universe_fixtures, mark_pre_lab
+from conftest import load_universe_fixtures, mark_pre_lab, strip_lab
 from pydantic import ValidationError
 
 from tradepartner.backtest import engine, frozen, hypothesis, lab, sweep, sweep_report
@@ -218,6 +218,7 @@ def _lab_template(
     try:
         configure_connection(conn)
         schema.init_schema(conn)
+        strip_lab(conn)  # the twin registers before the lab tables exist (#3672)
         load_universe_fixtures(conn, FIXTURES / "universe")
         if prune:
             _prune_universe(conn)

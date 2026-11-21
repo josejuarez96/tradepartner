@@ -19,6 +19,13 @@
   marker), so every fixture store and every temp-file copy built through it
   (`fixture_store_path`, the `backtest-runner`'s) carries the marker the real
   store never has.
+- `strip_lab` takes the lab schema back off a store `init_schema` created
+  (#3672: a fresh store now gets it), leaving the shape a store created at
+  schema version 16 to 49 had. `fixture_store`, `chain_fixture_store` and
+  `fixture_store_path` call it, so the plain fixture store is still the
+  store without the lab tables that keeps the Phase 3 rules (strategy-lab
+  plan choice 2); a test that wants what `init_schema` gives a fresh store
+  calls `init_schema` itself.
 - `lab_store` is `fixture_store` with `lab_schema.apply_lab_schema` applied
   (strategy-lab plan T101); `mark_pre_lab` is the one writer of
   `pre_lab_hypotheses` outside the lab migration.
@@ -56,7 +63,7 @@ from _pytest.faulthandler import fault_handler_stderr_fd_key
 from tradepartner.adapters import edgar_raw
 from tradepartner.config import Settings
 from tradepartner.store import lab_schema, schema
-from tradepartner.store.db import configure_connection, utc_now
+from tradepartner.store.db import configure_connection, forget_column_types, utc_now
 
 _FIXTURES_UNIVERSE_DIR = Path(__file__).parent / "fixtures" / "universe"
 _FIXTURES_CHAINS_DIR = _FIXTURES_UNIVERSE_DIR / "chains"
@@ -576,6 +583,53 @@ def load_universe_fixtures(conn: duckdb.DuckDBPyConnection, fixtures_dir: Path) 
     _load_table_csvs(conn, fixtures_dir)
 
 
+#: The values `lab_schema.apply_lab_schema` adds to a store created without the
+#: lab at schema version 22 to 49 (the release, shakedown and operations kinds
+#: were already there), which `strip_lab` takes back out.
+_LAB_ONLY_ENUM_VALUES: dict[tuple[str, str], tuple[str, ...]] = {
+    ("trial_results", "status"): lab_schema.LAB_TRIAL_STATUSES,
+    ("owner_decisions", "kind"): ("promotion", "sweep_retired"),
+}
+
+
+def strip_lab(conn: duckdb.DuckDBPyConnection, *, keep_markers: bool = False) -> None:
+    """Take the lab schema off a store, leaving it as `init_schema` created a
+    fresh store at schema version 16 to 49 (#3672): every `LAB_TABLE_NAMES`
+    table dropped (`store_markers` kept with `keep_markers`, as on a plain
+    fixture store) and `trial_results.status` and `owner_decisions.kind`
+    rebuilt without the lab's values, every other value and every row kept in
+    insertion order. The `schema_version` rows are left alone. For a test
+    that needs a store without the lab: the Phase 3 rules, a
+    `LabNotInitialised` refusal, the version-50 repair. A no-op on a store
+    that has no lab table and neither value."""
+    for table in lab_schema.LAB_TABLE_NAMES:
+        if not (keep_markers and table == "store_markers"):
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+    for (table, column), removed in _LAB_ONLY_ENUM_VALUES.items():
+        constraint_text, values = lab_schema._current_enum(conn, table, column)
+        current = re.findall(r"'([^']*)'", values)
+        kept = [value for value in current if value not in removed]
+        if kept == current:
+            continue
+        (live_ddl,) = conn.execute(  # type: ignore[misc]
+            "SELECT sql FROM duckdb_tables() WHERE database_name = current_database() "
+            "AND schema_name = current_schema() AND table_name = ?",
+            [table],
+        ).fetchone()
+        head = f"CREATE TABLE {table}("
+        assert live_ddl.startswith(head) and live_ddl.count(constraint_text) == 1, live_ddl
+        allowed = ", ".join(f"'{value}'" for value in kept)
+        staging = f"{table}_no_lab"
+        conn.execute(
+            f"CREATE TABLE {staging}("
+            + live_ddl[len(head) :].replace(constraint_text, f"CHECK(({column} IN ({allowed})))", 1)
+        )
+        conn.execute(f"INSERT INTO {staging} BY NAME SELECT * FROM {table} ORDER BY rowid")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {staging} RENAME TO {table}")
+    forget_column_types(conn)
+
+
 def load_chain_overlay(conn: duckdb.DuckDBPyConnection) -> None:
     """Load the successor-chain overlay (`tests/fixtures/universe/chains/`, #821,
     T187) on top of a store `load_universe_fixtures` filled: the four req 13 chain
@@ -669,6 +723,7 @@ def fixture_store() -> Iterator[duckdb.DuckDBPyConnection]:
     conn = duckdb.connect(":memory:")
     configure_connection(conn)
     schema.init_schema(conn)
+    strip_lab(conn)
     load_universe_fixtures(conn, _FIXTURES_UNIVERSE_DIR)
     try:
         yield conn
@@ -683,6 +738,7 @@ def chain_fixture_store() -> Iterator[duckdb.DuckDBPyConnection]:
     conn = duckdb.connect(":memory:")
     configure_connection(conn)
     schema.init_schema(conn)
+    strip_lab(conn)
     load_universe_fixtures(conn, _FIXTURES_UNIVERSE_DIR)
     load_chain_overlay(conn)
     try:
@@ -728,6 +784,7 @@ def fixture_store_path(tmp_path: Path) -> Path:
     try:
         configure_connection(conn)
         schema.init_schema(conn)
+        strip_lab(conn)
         load_universe_fixtures(conn, _FIXTURES_UNIVERSE_DIR)
     finally:
         conn.close()

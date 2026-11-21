@@ -260,10 +260,10 @@ registry; #83 took version 2 first, so the registry is version 3):
   its window, every frozen value under `FORBIDDEN_AXIS_PREFIXES`, the live
   caps, `min_sharpe_variance_annual` and `axis_lattice` from `Settings`,
   `FAMILY_PARENTS`' parent and a NULL `sr_star_seed_annual`. No hypothesis
-  is registered and no other table changes. A **fresh** store is created at
-  version 16 **without** the lab tables (strategy-lab plan choice 2: a
-  store without them keeps the Phase 3 rules; the `lab_store` test fixture
-  applies them), so `is_lab_initialised` stays the test, never the version.
+  is registered and no other table changes. From version 16 to 49 a **fresh**
+  store was created **without** the lab tables (strategy-lab plan choice 2: a
+  store without them keeps the Phase 3 rules); version 50 ends that (#3672).
+  `is_lab_initialised` stays the test, never the version.
   `REGISTRY_TABLE_NAMES` lists the lab tables after the eight Phase 3 ones.
   A read-only connection accepts a version-15 store without migrating it:
   every read but the lab tables works (`lab_schema.require_lab` raises
@@ -638,7 +638,23 @@ registry; #83 took version 2 first, so the registry is version 3):
   migration creates the table and changes no row; a read-only version-48
   store opens and simply has no retraction (`store.retracted_rows` reads
   nothing there).
-- **A later DDL change goes to version 50**, with its own migration and a
+- **Version 50** (#3672): a fresh store gets the lab schema. `init_schema`
+  ran the lab migration only on a store that recorded version 15 or earlier,
+  so a store created at version 16 to 49 recorded its version without the
+  eight `LAB_TABLE_NAMES` tables and the two widened enumerations, every lab
+  command raised `LabNotInitialised` there and no later `init_schema`
+  repaired it. From version 50 a fresh store runs `_migrate_lab` at the same
+  step as a migrating one (no hypothesis exists, so the tables are empty),
+  and a version-16 to 49 store that lacks the lab tables gets them on its
+  migration to 50 (`_repair_missing_lab`): the same `_migrate_lab`, so every
+  hypothesis registered there without the lab is marked pre-lab and gets its
+  fingerprint and its family's rules, exactly as on a version-15 store. A
+  store that already has the lab tables (every store that migrated through
+  version 16) changes in nothing but its `schema_version` row. No fact table
+  and no `known_at` is read or written. A read-only connection accepts a
+  version-49 store without migrating it: one created without the lab still
+  raises `LabNotInitialised` on a lab read.
+- **A later DDL change goes to version 51**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -974,9 +990,13 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #: - 47 (#2490): nullable `resume_invocations.book_id`.
 #: - 48 (#3076): nullable `classifications.issuer_class`.
 #: - 49 (#3281, T389): additive `retracted_rows` side table.
-#: - A later DDL change goes to version 50, with its own migration and a
+#: - 50 (#3672): a fresh store gets the lab schema (`_migrate_lab`, empty
+#:   tables), and a version-16 to 49 store created without it gets it on
+#:   migration (`_repair_missing_lab`); a store that has the lab tables only
+#:   gains its version row (module docstring, "Schema versions").
+#: - A later DDL change goes to version 51, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 49
+CURRENT_SCHEMA_VERSION = 50
 
 #: The last version without `delisting_reasons` (T326, version 43): the
 #: `snapshot_sightings` version (#2665). A named constant, not
@@ -1008,6 +1028,12 @@ _PRE_ISSUER_CLASS_VERSION = 47
 #: The last version without `retracted_rows` (#3281, T389, version 49): the
 #: `classifications.issuer_class` version. Named, never `CURRENT_SCHEMA_VERSION - 1`.
 _PRE_RETRACTED_ROWS_VERSION = 48
+
+#: The last version at which a fresh store was created without the lab schema
+#: (#3672, version 50): the `retracted_rows` version. Named, never
+#: `CURRENT_SCHEMA_VERSION - 1`. Read-only connections serve every read such a
+#: store served before (a lab read there still raises `LabNotInitialised`).
+_PRE_FRESH_LAB_VERSION = 49
 
 #: Last version without the owner-entered Form 8937 allocation table.
 _PRE_SPINOFF_ALLOCATIONS_VERSION = 38
@@ -2203,8 +2229,8 @@ CREATE TABLE IF NOT EXISTS owner_decisions (
 
 #: The strategy-lab tables (`lab_schema.LAB_TABLE_NAMES`, which imports this
 #: module, so the names are repeated here; a test pins the equality). Created
-#: by the version-16 migration on a migrating store only, never on a fresh one
-#: (module docstring, "Schema versions").
+#: by the version-16 migration on a migrating store and, from version 50, on a
+#: fresh one (module docstring, "Schema versions").
 _LAB_TABLE_NAMES: tuple[str, ...] = (
     "family_rules",
     "sweeps",
@@ -3608,6 +3634,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_RESUME_BOOK_VERSION,
         _PRE_ISSUER_CLASS_VERSION,
         _PRE_RETRACTED_ROWS_VERSION,
+        _PRE_FRESH_LAB_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -3657,7 +3684,10 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # and `collect` read; version 47 every read (`classifications_as_of`
         # returns no `issuer_class` column there, which readers take as no tag,
         # #3076); version 48 every read (no `retracted_rows` until 49, #3281:
-        # `store.retracted_rows` finds no table there and reports no retraction).
+        # `store.retracted_rows` finds no table there and reports no retraction);
+        # version 49 every read it served before (a store created fresh at 16 to
+        # 49 has no lab tables until 50, #3672: `lab_schema.require_lab` raises
+        # `LabNotInitialised` there, as on a version-15 store).
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -4284,8 +4314,11 @@ def _migrate_lab(conn: duckdb.DuckDBPyConnection) -> None:
     family from its earliest hypothesis, with the live `Settings` caps
     (`config.get_settings`, read only when a hypothesis exists), the
     `FAMILY_PARENTS` parent and a NULL SR* seed. Registers no hypothesis.
-    Runs inside `init_schema`'s transaction, only on a store migrating from
-    version 15 or earlier, so a failure leaves the store at its old version.
+    Runs inside `init_schema`'s transaction, on a store migrating from
+    version 15 or earlier, on a fresh store (no hypothesis exists, so the lab
+    tables stay empty; #3672) and, through `_repair_missing_lab`, on a
+    version-16 to 49 store created without the lab; a failure leaves the store
+    at its old version.
 
     The lab modules import this one, so they are imported here, at call
     time."""
@@ -4336,6 +4369,39 @@ def _migrate_lab(conn: duckdb.DuckDBPyConnection) -> None:
             sr_star_seed_annual=None,
             settings=settings,
         )
+
+
+#: The three lab tables `_migrate_lab` fills from the existing hypotheses.
+_LAB_POPULATED_TABLES: Final = ("pre_lab_hypotheses", "hypothesis_fingerprints", "family_rules")
+
+
+def _repair_missing_lab(conn: duckdb.DuckDBPyConnection) -> None:
+    """Version 50 (module docstring, "Schema versions"; #3672): give a
+    version-16 to 49 store that was created fresh, and so without the lab
+    schema, what the lab migration gives a version-15 store. A store where
+    every lab table exists (`lab_schema.is_lab_initialised`: every store that
+    migrated through version 16) is left alone. Otherwise `_migrate_lab` runs:
+    the lab tables and the two widened enumerations, every row kept, and every
+    hypothesis registered there without the lab marked pre-lab with its
+    fingerprint and its family's rules. A store that already holds one of the
+    three tables the migration fills (a hand-applied or partial lab) only gets
+    the missing tables (`lab_schema.apply_lab_schema`), never a second set of
+    rows. Idempotent; runs inside `init_schema`'s transaction. `lab_schema`
+    imports this module, so it is imported here, at call time."""
+    from tradepartner.store import lab_schema
+
+    if lab_schema.is_lab_initialised(conn):
+        return
+    (filled,) = conn.execute(  # type: ignore[misc]
+        "SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = current_database() "
+        "AND schema_name = current_schema() AND table_name IN "
+        f"({', '.join('?' for _ in _LAB_POPULATED_TABLES)})",
+        list(_LAB_POPULATED_TABLES),
+    ).fetchone()
+    if filled:
+        lab_schema.apply_lab_schema(conn)
+        return
+    _migrate_lab(conn)
 
 
 #: The eight journal tables ADR 0015 seams 1 to 3 expand at schema version 17,
@@ -4738,7 +4804,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION` and no lab table; a version-44 store gains the four additive EDGAR
+    `CURRENT_SCHEMA_VERSION` and the empty lab tables (#3672); a version-16 to 49 store
+    created without the lab tables gains them, its hypotheses marked pre-lab
+    (`_repair_missing_lab`); a version-44 store gains the four additive EDGAR
     index tables, preserving all earlier rows; a version-43 store also gains
     `research_exposures` and nullable `trial_results.n_exposure`;
     a version-40 or earlier store
@@ -4931,6 +4999,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_RESUME_BOOK_VERSION,
         _PRE_ISSUER_CLASS_VERSION,
         _PRE_RETRACTED_ROWS_VERSION,
+        _PRE_FRESH_LAB_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -5005,8 +5074,10 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_period_metrics(conn)
         _migrate_cost_level_kind(conn)
         forget_column_types(conn)
-        if max_version is not None and max_version <= _PRE_LAB_VERSION:
+        if max_version is None or max_version <= _PRE_LAB_VERSION:
             _migrate_lab(conn)
+        elif max_version <= _PRE_FRESH_LAB_VERSION:
+            _repair_missing_lab(conn)
         if max_version is not None and max_version <= _PRE_EXPANSION_SEAMS_VERSION:
             _migrate_expansion_seams(conn)
         if max_version is None or max_version <= _PRE_RELEASE_VERSION:

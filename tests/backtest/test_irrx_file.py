@@ -10,6 +10,7 @@ from typing import Any, get_args
 
 import duckdb
 import pytest
+from conftest import strip_lab
 
 from tradepartner.backtest import frozen, hypothesis, strategies
 from tradepartner.backtest.hypothesis import HypothesisFileError
@@ -31,6 +32,7 @@ IRRX = FIXTURES / "fixture-irrx.md"
 def conn(tmp_path: Path) -> duckdb.DuckDBPyConnection:
     connection = duckdb.connect(str(tmp_path / "scratch.duckdb"))
     schema.init_schema(connection)
+    strip_lab(connection)  # the Phase 3 rules: a store without the lab (#3672)
     return connection
 
 

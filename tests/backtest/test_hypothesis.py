@@ -18,7 +18,7 @@ from typing import Any
 
 import duckdb
 import pytest
-from conftest import mark_pre_lab
+from conftest import mark_pre_lab, strip_lab
 
 from tradepartner import config
 from tradepartner.backtest import frozen, hypothesis
@@ -78,6 +78,7 @@ def conn(tmp_path: Path) -> duckdb.DuckDBPyConnection:
     """A registry on a temp file that is not `settings.store.path`."""
     connection = duckdb.connect(str(tmp_path / "scratch.duckdb"))
     schema.init_schema(connection)
+    strip_lab(connection)  # the Phase 3 rules: a store without the lab (#3672)
     return connection
 
 

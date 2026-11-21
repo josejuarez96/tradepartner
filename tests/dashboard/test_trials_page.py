@@ -22,6 +22,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from conftest import strip_lab
 from dashboard_nav import NavCall, app_test, nav_calls_fixture, nav_titles  # noqa: F401
 from streamlit.testing.v1 import AppTest
 
@@ -112,6 +113,7 @@ def _seed(store_path: Path, tmp_path: Path) -> Seeded:
     seeded = Seeded()
     with open_for_write(store_settings) as conn:
         schema.init_schema(conn)
+        strip_lab(conn)  # the Phase 3 registry: a store without the lab (#3672)
         h1 = _hypothesis(conn, seed_settings, "h1-momentum-12-1")
         h2 = _hypothesis(conn, seed_settings, "h2-momentum-top-20")
         ok = _open(conn, seed_settings, h1)
