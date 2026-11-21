@@ -345,29 +345,14 @@ def _root_file(directory: Path, store: Path) -> Path:
     return path
 
 
-def test_a_root_familys_first_sweep_register_needs_the_looks_and_reason_and_prints_the_seed(
+def test_a_root_familys_first_sweep_register_stores_and_prints_the_t_floor(
     store: Path, tmp_path: Path
 ) -> None:
     file = _root_file(tmp_path / "files", store)
-    before = _counts(store)
-    for args in ((), ("--programme-looks", "20"), ("--reason", "r")):
-        out = _cli("sweep", "register", str(file), *args)
-        assert out.exit_code == 2, out.output
-        assert "programme_looks_required" in out.output
-    assert _counts(store) == before
-
-    out = _cli(
-        "sweep",
-        "register",
-        str(file),
-        "--programme-looks",
-        "20",
-        "--reason",
-        "ledger looks at 2026-11-21",
-    )
+    out = _cli("sweep", "register", str(file))
     assert out.exit_code == 0, out.output
-    assert "root family seed: SR*" in out.stdout
-    assert "k = 20" in out.stdout and "ledger looks at 2026-11-21" in out.stdout
+    assert "root family promotion floor: SR* seed" in out.stdout
+    assert "t 1.645" in out.stdout and "month-end periods" in out.stdout
     conn = duckdb.connect(str(store), read_only=True)
     try:
         (seed,) = conn.execute(
@@ -375,25 +360,20 @@ def test_a_root_familys_first_sweep_register_needs_the_looks_and_reason_and_prin
         ).fetchone()  # type: ignore[misc]
     finally:
         conn.close()
-    assert seed is not None and seed > 0.5
+    assert seed is not None and seed > 0.4
+    # An unchanged file prints no floor line and writes nothing.
+    again = _cli("sweep", "register", str(file))
+    assert again.exit_code == 0 and "root family promotion floor" not in again.stdout
 
 
-def test_sweep_register_refuses_the_looks_flags_for_an_existing_family(
+def test_sweep_register_of_an_existing_family_prints_no_floor_and_takes_no_flags(
     store: Path, tmp_path: Path
 ) -> None:
-    before = _counts(store)
-    out = _cli(
-        "sweep",
-        "register",
-        str(_sweep_file(tmp_path / "files")),
-        "--programme-looks",
-        "20",
-        "--reason",
-        "r",
-    )
-    assert out.exit_code == 2, out.output
-    assert "programme_looks_not_allowed" in out.output
-    assert _counts(store) == before
+    file = _sweep_file(tmp_path / "files")
+    out = _cli("sweep", "register", str(file))
+    assert out.exit_code == 0, out.output
+    assert "root family promotion floor" not in out.stdout
+    assert _cli("sweep", "register", str(file), "--programme-looks", "20").exit_code == 2
 
 
 # --- sweep run ----------------------------------------------------------------------

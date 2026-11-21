@@ -858,7 +858,9 @@ def _public_functions() -> set[str]:
 
 
 #: Public functions that take no connection (#3127, #3571).
-_PURE = frozenset({"family_v_floor", "floored_variance", "window_v_floor", "root_family_seed"})
+_PURE = frozenset(
+    {"family_v_floor", "floored_variance", "window_v_floor", "root_family_seed", "window_periods"}
+)
 
 
 def test_every_public_function_is_covered_by_the_not_initialised_case() -> None:

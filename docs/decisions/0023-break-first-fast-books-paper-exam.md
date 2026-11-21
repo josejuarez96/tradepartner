@@ -232,10 +232,21 @@ At IR 0.5, (c)'s gain over the current rule of at least 20 pp does not rest on t
 6. **Keep TP-10 as it is?** *Recommend yes.*
 7. **Run E1's counts first, then IRRX after T184h, then FC-1 (conditional)**? E1's return read would wait for T184h, or start its window in 2019. *Recommend yes.*
 
-## Amendment 2026-11-21 (#3571): k gates a new root family's first sweep, and only that
+## Amendment 2026-11-21 (#3571): a t floor on a new root family's first promotion
 
-*Owner, 2026-11-21: "Go with your recommendations." This is a note on the "Multiple testing" passage of the 2026-11-16 amendment; the accepted text above is not rewritten.*
+*The owner delegated the choice; the quant-auditor reviewed PR #3706. This is a note on the "Multiple testing" passage of the 2026-11-16 amendment. The accepted text above is not rewritten.*
 
-- **What changes.** That passage says "N + k is printed, not a gate" and gives SR\* about 1.28 at N + k = 60 on 40 months. For one case it is now a gate: a **new root family's first `sweep register`** needs `--programme-looks k --reason` and seeds the family's SR\* at `expected_max_sharpe(1 + k, V)`, V = max(`min_sharpe_variance_annual`, 12/T) ([strategy-lab spec, amendment 2026-11-21](../specs/strategy-lab.md)). The reason: at N = 1, SR\* is 0 and line 40's `dsr_excess` >= 0.5 asks only "net Sharpe above zero", which a low-turnover book with no edge passes 39 to 45 % of the time (#3669).
-- **The cost, in the amendment's own terms.** The bar is the seed: about 1.05 at k = 20, 1.26 at k = 51 and 1.29 at k = 60 on 40 months (0.73, 0.87, 0.89 on 84). That is the bar this passage feared ("it would stop any 40-month read from reaching an exam"), applied to the first sweep of a new root family. A true annual Sharpe of 0.5 then passes about 8 % of the time at k = 51 on 40 months (17 % on 84), against about 50 % unseeded; a book with no edge passes about 1 %. The owner supplies k, so a smaller k is a smaller bar, and the choice is his each time.
-- **What does not change.** k is still printed, not a gate, for every later sweep of a family, for a child family (whose seed is its parent's mark), for every event study (`[multiplicity]`, `p_adjusted`) and for the N + k deflated Sharpe each route read prints. The forward exam, the four-exam budget and the exam door's paper basis stay the controls for false confirmation. Nothing is back-filled. #3572 (which DSR the kill rules read) is open.
+- **What does not change.** "N + k is printed, not a gate" stands: k gates nothing, for any sweep, child or event study. A first version of this change seeded a new root family's SR\* from k; it is dropped, because at k = 51 it turned away two thirds of strategies with a true Sharpe of 1.0 (the cost this passage feared).
+- **What changes.** A new root family's rules row stores `lab.root_family_min_t * sqrt(V)` (default 1.645; V = max(`min_sharpe_variance_annual`, 12/T)) as its SR\* seed, once, at its first `sweep register` ([strategy-lab spec, amendment 2026-11-21](../specs/strategy-lab.md)). It is a t floor: the annual Sharpe whose t over the window is 1.645, about 0.90 on 40 months and 0.62 on 84. It sets the family's mark for good, and a child inherits it through the parent's mark.
+- **What it does not reach.** It binds promotion (the door to the holdout and the exam), not line 40: a trial's stored `dsr_excess` at N = 1 is still PSR(0), so a rung-4 read of a new root family can survive line 40 and still be refused promotion. Read it as: a rung-4 survivor of a new root family is promoted only if its t over the window is at least 1.645. Aligning line 40 is #3572.
+- **What the owner is choosing.** Pass rates on 40 months for a long-only book against SPY (tracking error 8 %, turnover 0.5x a year, 50 bp a side, both line-40 legs; simulation, 200,000 draws; true Sharpe is the net annual excess Sharpe):
+
+  | Rule for a new root family | no edge | true Sharpe 0.25 | 0.5 | 1.0 |
+  |---|---:|---:|---:|---:|
+  | (a) SR\* seeded from k = 51 (the dropped first version) | 1.0 % | 3.8 % | 9.3 % | 33.1 % |
+  | (b) V fixed at 0.04, k = 51 | 17.2 % | 35.4 % | 53.4 % | 84.0 % |
+  | (c) t at least 1.0 | 13.5 % | 29.7 % | 46.9 % | 79.7 % |
+  | **(d) t at least 1.645 (this change)** | **4.2 %** | **12.3 %** | **23.8 %** | **57.5 %** |
+  | (e) today, SR\* = 0 | 42.6 % | 65.1 % | 80.0 % | 96.1 % |
+
+  In plain words: about 4 books in 100 with no edge are promoted (it was about 43), about 24 in 100 at a true Sharpe of 0.5, about 58 in 100 at 1.0. The forward exam, not this floor, remains the real test of an edge: a noise book passes it about 0.5 % of the time, a true Sharpe of 0.5 about 3.8 %.
