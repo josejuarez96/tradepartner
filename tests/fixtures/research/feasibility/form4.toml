@@ -1,0 +1,23 @@
+# Fixture design (form4). The window ends before the fixture store's development boundary.
+source = "form4"
+entry = "next_session_after_date"
+hold_sessions = 20
+
+[filter]
+transaction_code = "P"
+is_officer = true
+
+[window]
+start = 2018-01-02
+end = 2019-03-29
+
+[band]
+lookback_sessions = 20
+edges = [200000000, 50000000]
+
+[shape]
+gross_bp = 200.0
+sd_bp = 866.0
+decision_cost_bps = 50.0
+floor_bp = 30.0
+t_floor = 1.0
