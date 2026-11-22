@@ -312,7 +312,7 @@ def write_family_rules(
 # --- sweeps ------------------------------------------------------------------
 
 
-def register_sweep(
+def register_sweep(  # noqa: PLR0913
     conn: duckdb.DuckDBPyConnection,
     *,
     slug: str,

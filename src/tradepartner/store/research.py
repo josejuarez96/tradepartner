@@ -548,7 +548,7 @@ def _name_sealing(
     return frozenset(splits), frozenset(periods)
 
 
-def register_dataset(
+def register_dataset(  # noqa: PLR0913
     conn: duckdb.DuckDBPyConnection,
     *,
     name: str,
@@ -797,7 +797,7 @@ def _chain_usage(conn: duckdb.DuckDBPyConnection, slug: str) -> tuple[int, int]:
     return int(row[0]), int(row[1])
 
 
-def open_run(
+def open_run(  # noqa: PLR0913
     conn: duckdb.DuckDBPyConnection,
     slug: str,
     dataset_id: int,
@@ -1060,7 +1060,7 @@ def _non_finite_as_null(value: Any) -> Any:
     return value
 
 
-def write_result(
+def write_result(  # noqa: PLR0913
     conn: duckdb.DuckDBPyConnection,
     handle: RunHandle,
     *,

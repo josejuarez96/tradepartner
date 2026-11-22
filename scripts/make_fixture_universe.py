@@ -751,7 +751,7 @@ class Rows:
             }
         )
 
-    def statement_fact(
+    def statement_fact(  # noqa: PLR0913
         self,
         cik: str,
         fact_name: str,

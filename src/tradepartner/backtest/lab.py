@@ -541,7 +541,7 @@ def _open_group(
         else:
             try:
                 entry.frozen_settings = load_frozen(conn, record.slug, settings=live)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 entry.status, entry.message = "failed", _describe(exc)
                 entry.error = "".join(traceback.format_exception(exc))
         if entry.status is not None:
@@ -599,7 +599,7 @@ def _close_group(
                     seconds if entry.ran else 0.0,
                     changed.get(entry.handle.trial_id, False),
                 )
-    except Exception:
+    except Exception:  # noqa: BLE001
         # A failed group write rolls back. Retry each trial in its own chunk so
         # one bad result cannot prevent the other variants from being recorded.
         for entry, (status, message) in zip(opened, before, strict=True):
@@ -670,7 +670,7 @@ def _run_engine(
         for entry in running:
             entry.status, entry.message, entry.error = "failed", SHARED_READ_FAILED, error
         return
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         error = "".join(traceback.format_exception(exc))
         for entry in running:
             entry.status, entry.message, entry.error = "failed", _describe(exc), error
@@ -732,7 +732,7 @@ def _close_variant(
     except StoreLockedError as exc:
         entry.status, entry.message = "failed", clean_message(_describe(exc), store)
         entry.error = "".join(traceback.format_exception(exc))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         entry.status, entry.message = "failed", clean_message(_describe(exc), store)
         entry.error = "".join(traceback.format_exception(exc))
         with open_for_write(store) as conn:

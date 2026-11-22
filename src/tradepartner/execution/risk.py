@@ -611,7 +611,7 @@ def _sides_violations(
     return found
 
 
-def check_phase(
+def check_phase(  # noqa: C901, PLR0912, PLR0913, PLR0915
     orders: Sequence[PhaseOrder],
     ledger: Ledger,
     account: Account,

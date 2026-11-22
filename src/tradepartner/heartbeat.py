@@ -47,7 +47,7 @@ def _bounded_get(url: str, timeout: float) -> httpx.Response:
     def work() -> None:
         try:
             box.append(_get(url, timeout))
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001
             box.append(exc)
 
     worker = threading.Thread(target=work, daemon=True)
@@ -88,7 +88,7 @@ def ping(settings: Settings, job: Job, *, ok: bool) -> bool:
         response = _bounded_get(target, settings.alerts.heartbeat_timeout_seconds)
         if not response.is_success:
             raise _PingRefused(f"status {response.status_code}")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         # Only our own text and the exception type are safe; other text may hold the URL.
         detail = str(exc) if isinstance(exc, _PingRefused) else type(exc).__name__
         LOG.warning("heartbeat ping for %s failed (%s); the run is unaffected", job, detail)

@@ -595,7 +595,7 @@ def _first_bar_sessions(
 _NEW_YORK = ZoneInfo("America/New_York")
 
 
-def shares_as_of(
+def shares_as_of(  # noqa: C901
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
     ids: Sequence[str] | None,

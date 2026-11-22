@@ -1236,7 +1236,7 @@ def kept_effective_weights(
     return effective
 
 
-def decisions_from(
+def decisions_from(  # noqa: C901, PLR0912, PLR0913, PLR0915
     plan: Plan,
     ledger: Ledger,
     overrides: Sequence[OverrideRow],

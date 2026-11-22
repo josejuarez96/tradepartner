@@ -1056,7 +1056,7 @@ def _stock_dividends(
     return result
 
 
-def _explanations(
+def _explanations(  # noqa: PLR0913
     conn: duckdb.DuckDBPyConnection,
     state: _JournalState,
     actions: pl.DataFrame,
@@ -2231,7 +2231,7 @@ def _without_acknowledged(
     return result
 
 
-def _write_break_events(
+def _write_break_events(  # noqa: PLR0913
     conn: duckdb.DuckDBPyConnection,
     *,
     window: PaperWindowRow,
@@ -2474,7 +2474,7 @@ def _write_break_events(
             )
 
 
-def reconcile_now(
+def reconcile_now(  # noqa: PLR0915
     settings: Settings,
     connect: Connect,
     broker: Broker,
@@ -3106,7 +3106,7 @@ def reconcile_command(
                     fault_type=_FAULT_TYPE,
                     reason=str(exc),
                 )
-            except Exception as engage_error:  # a bad clock reading, say
+            except Exception as engage_error:  # a bad clock reading, say  # noqa: BLE001
                 engaged = switch.WriteFailed(f"{type(engage_error).__name__}: {engage_error}")
             if isinstance(engaged, switch.WriteFailed):
                 raise ReconciliationError(

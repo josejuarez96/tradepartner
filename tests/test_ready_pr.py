@@ -603,7 +603,7 @@ def test_cross_name_excusal_requires_different_later_run_id() -> None:
 
 
 class FakeRunner:
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         *,
         branch: str = "feat/69-x",

@@ -1174,7 +1174,7 @@ def _price_chunk(
         return outcome(LOCKED, 0, str(exc))
     except _Stale as exc:
         run = outcome(STALE, 0, str(exc))
-    except Exception as exc:  # any source or parse failure halts with a run row
+    except Exception as exc:  # any source or parse failure halts with a run row  # noqa: BLE001
         run = outcome(FAILED, 0, _with_frames(f"{type(exc).__name__}: {exc}", exc, settings))
     return _record_only(settings, run_id, started, clock, run, mode)
 
@@ -1560,7 +1560,7 @@ def _benchmark_chunk(
         return outcome(OK, added, f"{len(bars)} bars and {len(actions)} actions")
     except StoreLockedError as exc:
         return outcome(LOCKED, 0, str(exc))
-    except Exception as exc:  # any source or parse failure halts the run
+    except Exception as exc:  # any source or parse failure halts the run  # noqa: BLE001
         return outcome(FAILED, 0, _with_frames(f"{type(exc).__name__}: {exc}", exc, settings))
 
 
@@ -1857,7 +1857,7 @@ def _allowed_collisions(
     return frozenset(allow), distinct
 
 
-def _refetch_month(
+def _refetch_month(  # noqa: PLR0913
     settings: Settings,
     prices: PriceSource,
     since: date,

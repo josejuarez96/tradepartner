@@ -1684,7 +1684,7 @@ def _close_study_failed(settings: Settings, handle: RunHandle, message: str) -> 
             research.close_run(conn, handle, "failed", message)
     except research.RunAlreadyClosed:
         return f"run {handle.run_id}: already has its result row"
-    except Exception as exc:  # the run stays unfinished: say so, never hide it
+    except Exception as exc:  # the run stays unfinished: say so, never hide it  # noqa: BLE001
         return (
             f"run {handle.run_id}: could not be closed ({type(exc).__name__}: {exc}); it is "
             "unfinished, close it with `experiment abandon`"
@@ -1769,7 +1769,7 @@ def _experiment_study(settings: Settings, run_id: int, *, real: Settings | None 
                 secondary=result.secondary,
                 exploratory=result.exploratory,
             )
-    except BaseException as exc:  # any exception closes the run failed (#2440)
+    except BaseException as exc:  # any exception closes the run failed (#2440)  # noqa: BLE001
         message = _study_scrubbed(f"{type(exc).__name__}: {exc}", settings)
         _echo_scrubbed(
             _study_scrubbed(
@@ -2174,7 +2174,7 @@ def _paper_call[T](settings: Settings, call: Callable[[], T]) -> T:
         message, code = f"refused: {exc}", PAPER_REFUSAL_EXIT["refused"]
     except window.KillWriteFailed as exc:
         message, code = f"failed: {exc}", WRITE_FAILED_EXIT_CODE
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         message, code = f"failed: {_describe_failure(exc)}", CRASH_EXIT_CODE
     raise _fail(_scrubbed(message, settings), code)
 
@@ -2735,7 +2735,7 @@ def _census_lines(
     return lines
 
 
-def make_app(
+def make_app(  # noqa: C901, PLR0915
     *,
     settings: Callable[[], Settings] = get_settings,
     clock: Clock = utc_now,
@@ -2756,7 +2756,7 @@ def make_app(
     app = typer.Typer(no_args_is_help=True, add_completion=False, pretty_exceptions_enable=False)
 
     @app.command()
-    def ingest(
+    def ingest(  # noqa: C901, PLR0912, PLR0913, PLR0915
         source: Annotated[
             str,
             typer.Option(
@@ -4392,7 +4392,7 @@ def make_app(
             # Raised before a trial is opened (unknown slug, stored parameters that
             # fail their hash, a frozen window that cannot be resolved): a refusal.
             raise _fail(_scrubbed(f"{type(exc).__name__}: {exc}", s), USAGE_ERROR) from None
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             raise _fail(_scrubbed(f"{type(exc).__name__}: {exc}", s), 1) from None
         with open_read_only(s) as conn:
             _print_trial(conn, outcome, s)
@@ -5074,7 +5074,7 @@ def make_app(
             raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except (LabNotInitialised, *_SWEEP_RUN_REFUSALS) as exc:
             raise _lab_fail(exc, s) from None
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             # Raised after the run opened: its rows so far stay recorded (the run's
             # row is closed incomplete), so this is a failure, not a refusal.
             message = f"sweep run failed (rows written so far stay recorded): {_describe(exc)}"
@@ -5391,7 +5391,7 @@ def make_app(
     app.add_typer(exposure_app, name="exposure")
 
     @exposure_app.command("record")
-    def exposure_record(
+    def exposure_record(  # noqa: PLR0913
         candidate: Annotated[str, typer.Option(help="the candidate ref, e.g. #2689")],
         source: Annotated[str, typer.Option(help="store or open_data")],
         kill_line_url: Annotated[str, typer.Option(help="the frozen kill line's URL")],
@@ -6100,7 +6100,7 @@ def make_app(
             raise _refusal(exc, s) from None
 
     @research_app.command("label")
-    def research_label(
+    def research_label(  # noqa: C901, PLR0912, PLR0913
         slug: Annotated[str, typer.Argument(help="the registered experiment slug")],
         dataset: Annotated[int, typer.Option(help="the dataset version id to bind")],
         split: Annotated[str, typer.Option(help="the split to bind")],
@@ -6235,7 +6235,7 @@ def make_app(
                         limit=limit,
                         run_by=_REGISTERED_BY,
                     )
-                except (Exception, KeyboardInterrupt) as exc:
+                except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001
                     # The job already committed each run row before calls. Close a
                     # run left open by Ctrl-C or another failure, then commit that
                     # close on exit from open_for_write. run_batch usually returns
@@ -6249,7 +6249,7 @@ def make_app(
                         raise
         except StoreLockedError as exc:
             raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             raise _fail(_scrubbed(f"failed: {_describe(exc)}", s), 1) from None
         if failure is not None:
             if isinstance(failure, KeyboardInterrupt):
@@ -6980,7 +6980,7 @@ def make_app(
             )
             try:
                 broker_value = broker(s, clock, data.book_id).account().short_market_value
-            except Exception:
+            except Exception:  # noqa: BLE001
                 broker_value = None  # diagnostics still print when the broker is unavailable
             return broker_value, ledger_value
 

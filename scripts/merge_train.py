@@ -1036,7 +1036,7 @@ def run_merge(
         return _run_merge_locked(r, bid, resume=resume, say=say)
 
 
-def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str], None]) -> Record:
+def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str], None]) -> Record:  # noqa: PLR0915
     report = say
     say = lambda msg: report(_redact(msg))  # noqa: E731 - redact before anything is shown
     path = record_path(bid)
@@ -1198,7 +1198,7 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
                         entry.number,
                         comment("UNCONFIRMED", bid, main_sha=new_main, reason=mismatch),
                     )
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     say(f"could not post UNCONFIRMED on #{entry.number}: {exc}")
                 break
             verified = True

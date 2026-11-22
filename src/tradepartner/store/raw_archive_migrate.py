@@ -344,7 +344,7 @@ def _settle(
     return "duplicate_kept"
 
 
-def apply_migration(
+def apply_migration(  # noqa: C901
     settings: Settings,
     cache_dir: Path,
     icloud: ICloudItems,

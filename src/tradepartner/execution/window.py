@@ -1192,7 +1192,7 @@ def _refuse_open_release(conn: duckdb.DuckDBPyConnection) -> None:
         )
 
 
-def start(
+def start(  # noqa: C901, PLR0912, PLR0915
     settings: Settings,
     connect: Connect,
     broker: Broker,
@@ -1755,7 +1755,7 @@ def _engage_fault(
             fault_type=ReconciliationError.__name__,
             reason=str(exc),
         )
-    except Exception as engage_error:  # a bad clock reading, say
+    except Exception as engage_error:  # a bad clock reading, say  # noqa: BLE001
         engaged = switch.WriteFailed(f"{type(engage_error).__name__}: {engage_error}")
     return engaged.error if isinstance(engaged, switch.WriteFailed) else None
 
@@ -2053,7 +2053,7 @@ def kill(
             reason=note,
             on_wait=on_wait,
         )
-    except Exception as exc:  # a bad clock reading, say: still not engaged
+    except Exception as exc:  # a bad clock reading, say: still not engaged  # noqa: BLE001
         engaged = switch.WriteFailed(f"{type(exc).__name__}: {exc}")
     if isinstance(engaged, switch.WriteFailed):
         raise KillWriteFailed(

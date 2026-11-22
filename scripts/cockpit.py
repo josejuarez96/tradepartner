@@ -273,7 +273,7 @@ def issue_kind(labels: Iterable[str]) -> str:
     return "issue"
 
 
-def build_graph(
+def build_graph(  # noqa: C901, PLR0912
     *,
     roadmap: list[dict[str, Any]],
     current_phase: int | None,
@@ -997,7 +997,7 @@ def main(argv: list[str] | None = None) -> int:
     while True:  # a transient gh, git or file error must not end the loop
         try:
             once()
-        except (SystemExit, Exception) as exc:  # keep the loop alive, report the round
+        except (SystemExit, Exception) as exc:  # noqa: BLE001  # keep the loop alive, report the round
             print(f"skipped this round: {type(exc).__name__}: {exc}", flush=True)
         time.sleep(args.loop)
 

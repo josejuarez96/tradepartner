@@ -1774,7 +1774,7 @@ def _waiting_shakedown(
         raise
     except ValueError as exc:
         return waiting.ShakedownFacts(error=str(exc))
-    except Exception as exc:  # a diagnostic read must not hide a safety item
+    except Exception as exc:  # a diagnostic read must not hide a safety item  # noqa: BLE001
         return waiting.ShakedownFacts(error=f"{type(exc).__name__}: {exc}")
     return waiting.ShakedownFacts(lines=result.lines)
 
