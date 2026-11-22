@@ -969,11 +969,26 @@ class EdgarFilingSource(FilingSource):
             self.close()
             self._index_released = True
 
-    def _open_index(self, path: Path) -> duckdb.DuckDBPyConnection:
-        """A configured read-write handle; a lock or a same-process mode
-        conflict is `StoreLockedError` with fixed text (no path, no PID)."""
+    def _open_index(
+        self, path: Path, *, read_only: bool = False, prefer_read_only: bool = False
+    ) -> duckdb.DuckDBPyConnection:
+        """A configured handle on the stored index (#3626).
+
+        Read-only for the fetch pass (``prefer_read_only``), so other readers
+        are not locked out while EDGAR is fetched; the writer's read-write
+        mode on a reopen. ``prefer_read_only`` falls back to read-write only
+        when this process already holds the store read-write (a first open
+        inside a write chunk): the lock is already held, nothing new is
+        taken. A lock or a same-process mode conflict is `StoreLockedError`
+        with fixed text (no path, no PID).
+        """
         try:
-            conn = duckdb.connect(str(path))
+            try:
+                conn = duckdb.connect(str(path), read_only=read_only or prefer_read_only)
+            except duckdb.ConnectionException:
+                if not prefer_read_only or read_only:
+                    raise
+                conn = duckdb.connect(str(path))
         except duckdb.IOException as exc:
             if _is_lock_error(exc):
                 raise StoreLockedError("store busy: the filing index is locked") from None
@@ -1009,10 +1024,13 @@ class EdgarFilingSource(FilingSource):
         path = Path(self._settings.store.path)
         if not path.is_file():
             return
-        # Keep the same connection mode as the later writer: DuckDB rejects
-        # simultaneous read-only and read-write handles to one store. The
-        # fetch pass releases it (`release_index`) before any other opens.
-        conn = self._open_index(path)
+        # Read-only for the fetch pass (#3626): every use of this handle is
+        # a read, and a read-write one would lock every other process out of
+        # the store while EDGAR is fetched. Inside a write chunk of this
+        # process it takes the writer's mode instead (DuckDB rejects mixed
+        # modes in one process). The fetch pass releases it
+        # (`release_index`); the reopen above is in the writer's mode.
+        conn = self._open_index(path, prefer_read_only=True)
         try:
             # #2924: a statement backfill's `ok` row reads no index, so it
             # is not a seed and must not make a stale index look fresh.
