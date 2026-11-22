@@ -1,0 +1,22 @@
+# Dependabot version updates (#3649): one grouped PR a week per ecosystem, at most two open.
+# A dependabot PR edits `uv.lock`, `pyproject.toml` or `.github/`, so it is class B: it
+# merges only on the owner's word for that PR, never on the standing approval and never
+# automatically. `scripts/team.py` exempts `dependabot/` branches from the claims check.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 2
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 2
+    groups:
+      python-packages:
+        patterns: ["*"]
