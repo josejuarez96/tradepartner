@@ -113,9 +113,10 @@ SweepStateName = Literal["complete", "incomplete (stale)", "incomplete (unrun)"]
 #: delisting_policy)`: a trial's frozen `adjust.apply_spin_offs` decides whether its
 #: vintage counts the stored `spinoff` rows (`registry.data_vintage`; backtest spec
 #: amendment #1894, item 6; T211d) and its frozen `backtest.delisting_failure_return`
-#: whether it counts `delisting_reasons` and `mergers` (#2670, T328d), so one
+#: whether it counts `delisting_reasons` and `mergers` (#2670, T328d) and its family
+#: whether it counts the EDGAR index's stamps (#3520), so one
 #: variant's cut does not stand in for another's.
-Vintages = dict[tuple[datetime, bool, DelistingFailureReturn], datetime | None]
+Vintages = dict[tuple[datetime, bool, DelistingFailureReturn, bool], datetime | None]
 
 
 class SweepNotCompleteError(LabRegistryError):
@@ -336,13 +337,14 @@ def _is_current(
     if trial.code_tree_sha256 is None or trial.code_tree_sha256 != code_vintage:
         return False
     gates = vintage_gates(get_hypothesis_by_id(conn, trial.hypothesis_id))
-    key = (trial.data_cutoff, gates.spin_offs, gates.delisting_policy)
+    key = (trial.data_cutoff, gates.spin_offs, gates.delisting_policy, gates.index_stamps)
     if key not in vintages:
         vintages[key] = data_vintage(
             conn,
             trial.data_cutoff,
             spin_offs=gates.spin_offs,
             delisting_policy=gates.delisting_policy,
+            index_stamps=gates.index_stamps,
         )
     return vintages[key] == trial.data_vintage
 

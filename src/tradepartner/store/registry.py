@@ -542,7 +542,8 @@ _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
     "statement_facts",
     "filing_events",
     # EDGAR filing_index and its three state tables are ingest inputs only.
-    # An index revision cannot stale a trial whose readers never use it.
+    # An index revision cannot stale a trial whose readers never use it; the one
+    # reader is the `irrx` stamp cross-check (`_INDEX_STAMP_TABLES`, #3520).
     # SEC ownership events are deliberately absent: no registered trial reads
     # them until a separate strategy and input fingerprint rule are approved.
     # #821 (T187): a `successor_chains` row stales every registered trial whose
@@ -559,6 +560,16 @@ _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
 #: then and only then, the same gate as `spin_offs`. At `none` a row of either moves
 #: no vintage, so every stored vintage and pinned digest is unchanged.
 _DELISTING_POLICY_TABLES: Final[tuple[str, ...]] = ("delisting_reasons", "mergers")
+
+#: The conditional trial table (#3520; backtest spec amendment 2026-11-16, #3504, item 5
+#: "Stamps"): the EDGAR index a trial of a family in `INDEX_STAMP_FAMILIES` reads through
+#: `StoreProvider.filing_events`' stamp cross-check, so it counts toward such a trial's
+#: vintage then and only then, the same gate as `spin_offs`. For any other family a row of
+#: it moves no vintage, so every stored vintage and pinned digest is unchanged.
+_INDEX_STAMP_TABLES: Final[tuple[str, ...]] = ("filing_index",)
+
+#: The families whose trials read `filing_events` and so the index's stamps.
+INDEX_STAMP_FAMILIES: Final[frozenset[str]] = frozenset({"irrx"})
 
 #: The rows of a check-only security (`store.benchmarks.CHECK_ONLY_IDS`: RSP, stored for
 #: the index check alone; backtest spec amendment #1598, item 3, question 37) are left
@@ -596,6 +607,7 @@ def data_vintage(
     *,
     spin_offs: bool = False,
     delisting_policy: DelistingFailureReturn = "none",
+    index_stamps: bool = False,
 ) -> datetime | None:
     """The data vintage at `cutoff` (strategy-lab spec, Definitions "Vintage"): the
     latest of the `ingested_at` over trial-readable fact rows with `known_at <=
@@ -631,6 +643,12 @@ def data_vintage(
     (`_DELISTING_POLICY_TABLES`), the exit evidence such a trial reads; a caller
     that has a trial passes its frozen `backtest.delisting_failure_return`, while the
     release-level vintages stay `none`. At `none` neither table moves a vintage.
+
+    `index_stamps` (#3520) adds the `filing_index` rows with `known_at <= cutoff`
+    (`_INDEX_STAMP_TABLES`), which a trial of an `INDEX_STAMP_FAMILIES` family reads for
+    its stamp cross-check; a caller that has a trial passes `VintageGates.index_stamps`,
+    while the release-level vintages stay `False`. At `False` an index row moves no
+    vintage.
     """
     if cutoff.tzinfo is None:
         raise ValueError(f"cutoff must be timezone-aware, got {cutoff!r}")
@@ -645,6 +663,8 @@ def data_vintage(
     candidates = _TRIAL_FACT_TABLES
     if delisting_policy != "none":
         candidates = (*candidates, *_DELISTING_POLICY_TABLES)
+    if index_stamps:
+        candidates = (*candidates, *_INDEX_STAMP_TABLES)
     present = set(_present_fact_tables(conn))
     tables = [table for table in candidates if table in present]
     facts: datetime | None = None
@@ -997,7 +1017,11 @@ def trial_snapshot(
         code_tree_sha256(repo_dir),
         store_max_ingested_at(conn),
         data_vintage(
-            conn, cutoff, spin_offs=gates.spin_offs, delisting_policy=gates.delisting_policy
+            conn,
+            cutoff,
+            spin_offs=gates.spin_offs,
+            delisting_policy=gates.delisting_policy,
+            index_stamps=gates.index_stamps,
         )
         if cutoff is not None
         else None,
@@ -1157,10 +1181,12 @@ def write_result(
 class VintageGates:
     """The frozen values a trial's data vintage is read under: `adjust.apply_spin_offs`
     (backtest spec amendment #1894, item 6; T211d) and
-    `backtest.delisting_failure_return` (#2670, plan T328d)."""
+    `backtest.delisting_failure_return` (#2670, plan T328d), and whether its family reads
+    the EDGAR index's stamps (`INDEX_STAMP_FAMILIES`, #3520)."""
 
     spin_offs: bool = False
     delisting_policy: DelistingFailureReturn = "none"
+    index_stamps: bool = False
 
 
 def vintage_gates(hypothesis: HypothesisRecord) -> VintageGates:
@@ -1170,6 +1196,7 @@ def vintage_gates(hypothesis: HypothesisRecord) -> VintageGates:
     return VintageGates(
         spin_offs=bool(values[SPIN_OFFS_KEY]),
         delisting_policy=values.get(DELISTING_POLICY_KEY, "none"),
+        index_stamps=hypothesis.family in INDEX_STAMP_FAMILIES,
     )
 
 
@@ -1189,6 +1216,7 @@ def registered_data_vintage(
         cutoff,
         spin_offs=gates.spin_offs,
         delisting_policy=gates.delisting_policy,
+        index_stamps=gates.index_stamps,
     )
 
 
