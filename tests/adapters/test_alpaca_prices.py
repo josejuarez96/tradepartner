@@ -2125,6 +2125,31 @@ class TestCorporateActions:
             parse_corporate_actions({"forward_splits": [{"symbol": "AAPL"}]}, resolver.resolve)
 
 
+def _api_error(status: int) -> APIError:
+    """An `APIError` carrying an HTTP status, as alpaca-py raises it."""
+    response = requests.Response()
+    response.status_code = status
+    return APIError('{"message": "x"}', requests.HTTPError(response=response))
+
+
+#: #3631: what the name-change and merger fetches tolerate, and what they
+#: do not (a refused key, a request built wrong, a local OSError).
+_TRANSIENT_ERRORS = [
+    requests.ConnectionError("down"),
+    requests.Timeout("slow"),
+    ConnectionResetError("reset"),
+    _api_error(502),
+    _api_error(429),
+]
+_PERMANENT_ERRORS = [
+    _api_error(401),
+    _api_error(403),
+    _api_error(422),
+    PermissionError("denied"),
+    FileNotFoundError("gone"),
+]
+
+
 def _spinoff(**changes: object) -> dict[str, object]:
     row: dict[str, object] = {
         "id": "alpaca-spin-id",
@@ -3529,15 +3554,24 @@ class TestAlpacaPriceSource:
         assert source.last_actions_report is not None
         assert source.last_actions_report.malformed_categories == ("name_changes",)
 
-    @pytest.mark.parametrize(
-        "error",
-        [
-            requests.ConnectionError("down"),
-            requests.Timeout("slow"),
-            OSError("reset"),
-            APIError('{"message": "bad gateway"}'),
-        ],
-    )
+    @pytest.mark.parametrize("error", _PERMANENT_ERRORS)
+    def test_a_permanent_error_on_the_name_change_request_raises(self, error: Exception) -> None:
+        # #3631: a refused key (401/403), a request we built wrong (422) or
+        # a local OSError is not a network blip; it fails the chunk.
+        def fetch_name_changes(_s: list[str], _a: date, _b: date) -> dict[str, object]:
+            raise error
+
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS),
+            fetch_actions=_Recorded().actions,
+            fetch_name_changes=fetch_name_changes,
+            settings=_settings(),
+        )
+        with pytest.raises(type(error)) as raised:
+            source.symbol_changes(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31))
+        assert raised.value is error
+
+    @pytest.mark.parametrize("error", _TRANSIENT_ERRORS)
     def test_a_transport_error_on_the_name_change_request_is_counted_not_raised(
         self, error: Exception
     ) -> None:
@@ -5914,9 +5948,15 @@ class TestMergerSource:
                 "stock_and_cash_mergers",
             )
 
-    @pytest.mark.parametrize(
-        "error", [requests.ConnectionError("down"), OSError("reset"), APIError('{"m": "x"}')]
-    )
+    @pytest.mark.parametrize("error", _PERMANENT_ERRORS)
+    def test_a_permanent_error_raises(self, error: Exception) -> None:
+        # #3631: as for name changes, only a transient error is tolerated.
+        source = self._source(error)
+        with pytest.raises(type(error)) as raised:
+            source.mergers(date(2020, 10, 1), date(2020, 10, 31))
+        assert raised.value is error
+
+    @pytest.mark.parametrize("error", _TRANSIENT_ERRORS)
     def test_a_transport_error_is_counted_not_raised(self, error: Exception) -> None:
         source = self._source(error)
         assert source.mergers(date(2020, 10, 1), date(2020, 10, 31)) == []
