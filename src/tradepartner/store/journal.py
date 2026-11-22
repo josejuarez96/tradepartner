@@ -73,6 +73,7 @@ from typing import Any, ClassVar, Protocol
 import duckdb
 
 from tradepartner.store.db import ensure_tz_aware, insert_row
+from tradepartner.store.journal_enums import TERMINAL_ORDER_EVENT_STATUSES, OrderEventStatus
 from tradepartner.store.schema import (
     _PRE_ASSETS_INTERSECTION_VERSION,
     _PRE_BREAKS_VERSION,
@@ -1152,11 +1153,17 @@ def all_fill_terms(conn: duckdb.DuckDBPyConnection) -> dict[str, tuple[float, fl
 
 #: `order_events` statuses that end an order. Terminal is absorbing: an order with
 #: any of these rows is terminal whatever rows follow it in `known_at` order.
-TERMINAL_ORDER_STATUSES: tuple[str, ...] = ("filled", "expired", "rejected", "cancelled")
+TERMINAL_ORDER_STATUSES: tuple[str, ...] = tuple(
+    status.value for status in TERMINAL_ORDER_EVENT_STATUSES
+)
 #: Statuses that show the broker has the order; an order with none of them and no
 #: journaled fill is `pending` (spec req 4, "Unknown state"), whatever `cancel_*`
 #: rows follow.
-ACKNOWLEDGED_ORDER_STATUSES: tuple[str, ...] = ("accepted", "replay", *TERMINAL_ORDER_STATUSES)
+ACKNOWLEDGED_ORDER_STATUSES: tuple[str, ...] = (
+    OrderEventStatus.ACCEPTED.value,
+    OrderEventStatus.REPLAY.value,
+    *TERMINAL_ORDER_STATUSES,
+)
 #: `paper_window_stops` states that close a window (`requested` leaves it open).
 CLOSING_STOP_STATES: tuple[str, ...] = ("closed", "abandoned")
 
