@@ -163,9 +163,10 @@ def test_the_figi_source_scan_finds_no_reader_outside_the_check_and_its_writer()
 
 #: Only `health.py` may import the OpenFIGI identity cross-check (plan T399,
 #: #3437): not `backtest/`, `research/`, `universe.py`, the signals, `repair.py`
-#: or `ingest.py`, nor any other module.
+#: or `ingest.py`, nor any other module. `health_reports.py` holds the health
+#: check's report types (T444, #3657) and imports the check's constants only.
 _IDENTITY_NAMING = re.compile(r"figi_identity\b")
-_IDENTITY_ALLOWED = frozenset({"health.py", "store/figi_identity.py"})
+_IDENTITY_ALLOWED = frozenset({"health.py", "health_reports.py", "store/figi_identity.py"})
 
 
 def _identity_offences(relative: str, text: str) -> list[str]:
