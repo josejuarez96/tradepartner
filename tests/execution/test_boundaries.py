@@ -65,6 +65,27 @@ def test_filing_index_stays_out_of_strategy_and_universe() -> None:
         assert "filing_index" not in source, path
 
 
+def test_execution_never_imports_the_dashboard() -> None:
+    """The order path's package must not pull in the UI framework (#3659)."""
+    package = "tradepartner.dashboard"
+    offenders: list[str] = []
+    for path in sorted((SRC / "tradepartner" / "execution").rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                module = node.module or ""
+                names = [module]
+                if module == "tradepartner":
+                    names += [f"tradepartner.{alias.name}" for alias in node.names]
+            else:
+                continue
+            if any(name == package or name.startswith(f"{package}.") for name in names):
+                offenders.append(f"{path.relative_to(SRC)}:{node.lineno}")
+    assert offenders == []
+
+
 def test_sec_ownership_tables_do_not_reach_trading_or_universe() -> None:
     """Research-only SEC forms cannot enter existing signal or order paths."""
     restricted = [SRC / "tradepartner" / "universe.py"]

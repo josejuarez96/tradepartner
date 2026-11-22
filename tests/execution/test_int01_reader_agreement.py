@@ -13,7 +13,8 @@ from typer.testing import CliRunner
 from tradepartner import cli
 from tradepartner.adapters.broker import Asset, OrderRequest, PositionIntent, Side
 from tradepartner.calendar import session_close
-from tradepartner.execution import book_view, headroom, home_view, ops, report
+from tradepartner.dashboard import home_view
+from tradepartner.execution import book_view, headroom, ops, report
 from tradepartner.execution.marks import equity_at, signed_value
 from tradepartner.store import journal, registry
 from tradepartner.store.db import open_read_only
