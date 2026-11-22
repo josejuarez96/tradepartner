@@ -1,0 +1,12 @@
+# Fixture design (form25), no filter.
+source = "form25"
+entry = "next_session_after_date"
+hold_sessions = 10
+
+[window]
+start = 2018-01-02
+end = 2019-03-29
+
+[band]
+lookback_sessions = 20
+edges = [200000000, 50000000]
