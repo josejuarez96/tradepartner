@@ -1948,6 +1948,14 @@ def test_quantity_decimals_matches_the_recorded_paper_fills() -> None:
     assert max(places) == _settings().alpaca.quantity_decimals
 
 
+def test_alpaca_data_request_timeout_default_and_bounds() -> None:
+    """#3622: the market-data clients' per-request timeout defaults to 30 s and is positive."""
+    assert _settings().alpaca.data_request_timeout_seconds == pytest.approx(30.0)
+    for bad in (0, -1.0):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, alpaca={"data_request_timeout_seconds": bad})
+
+
 def test_alpaca_broker_facts_may_still_be_unset() -> None:
     """`None` stays valid, so the adapter's refusal to construct without the
     recorded facts (T48c) can still be exercised."""
