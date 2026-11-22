@@ -65,7 +65,7 @@ def _as_version_48(conn: duckdb.DuckDBPyConnection) -> None:
 
 
 def test_the_table_is_a_state_table_outside_the_fact_tables() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_RETRACTED_ROWS_VERSION + 1 == 49
+    assert schema._PRE_RETRACTED_ROWS_VERSION + 1 == 49 <= schema.CURRENT_SCHEMA_VERSION
     assert "retracted_rows" not in schema.TABLE_NAMES
     assert schema.RETRACTED_ROWS_TABLE_NAMES == ("retracted_rows",)
     conn = duckdb.connect(":memory:")
@@ -98,7 +98,9 @@ def test_version_49_adds_the_table_to_a_version_48_store_and_changes_no_row() ->
         schema.init_schema(conn)
         assert {t: _rows(conn, t) for t in schema.TABLE_NAMES if t != "schema_version"} == before
         assert _rows(conn, "retracted_rows") == []
-        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (49,)
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (
+            schema.CURRENT_SCHEMA_VERSION,
+        )
         schema.init_schema(conn)
         assert conn.execute(
             "SELECT count(*) FROM schema_version WHERE version = 49"

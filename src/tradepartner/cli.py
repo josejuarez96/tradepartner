@@ -462,7 +462,7 @@ import httpx
 import polars as pl
 import typer
 
-from tradepartner import heartbeat
+from tradepartner import fence_cmd, heartbeat
 from tradepartner.action_retract import retract_action
 from tradepartner.adapters import alpaca_raw, edgar_raw
 from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, FetchBars
@@ -663,6 +663,7 @@ from tradepartner.store import (
     schema,
 )
 from tradepartner.store import backup as store_backup_module
+from tradepartner.store import fence as fence_store
 from tradepartner.store import migrate as store_migrate
 from tradepartner.store import stale_keys as stale_keys_module
 from tradepartner.store.asof import ASSETS_SOURCE, prices_as_of
@@ -4989,6 +4990,148 @@ def make_app(
         """Note an alert inside the shakedown span (ADR 0017 E.1 and E.7)."""
         decision_id = _shakedown_write("shakedown_note", {"alert_id": alert}, reason)
         typer.echo(f"decision {decision_id}: shakedown_note for alert {alert}")
+
+    fence_app = typer.Typer(
+        no_args_is_help=True,
+        help="Fence securities out of backtests and paper trading, counted (#3475).",
+    )
+    app.add_typer(fence_app, name="fence")
+
+    def _fence_run(
+        request: fence_cmd.Request, *, dry_run: bool, count: int | None, s: Settings
+    ) -> None:
+        """Plan the request, print the rows, and write them only under the owner's
+        exact `--count` (the `release accept-unreceived` pattern, #3464)."""
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        now = clock()
+        writing = not dry_run and count is not None
+        try:
+            if writing:
+                with open_for_write(s) as conn:
+                    schema.init_schema(conn)
+                    made = fence_cmd.plan(conn, request, now, fence_cmd.members_provider(conn, s))
+                    for line in made.lines:
+                        typer.echo(line)
+                    batch = fence_cmd.write(conn, made, count=int(count or 0), read_at=now)
+            else:
+                with open_read_only(s) as conn:
+                    made = fence_cmd.plan(conn, request, now, fence_cmd.members_provider(conn, s))
+                    for line in made.lines:
+                        typer.echo(line)
+                batch = None
+        except StoreLockedError as exc:
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
+        except schema.SchemaVersionError as exc:
+            raise _fail(_scrubbed(str(exc), s), 1) from None
+        except fence_cmd.FenceRefused as exc:
+            raise _fail(f"fence refused: {_scrubbed(str(exc), s)}; nothing written", 1) from None
+        if dry_run:
+            typer.echo("dry run: nothing written")
+            return
+        if batch is None:
+            typer.echo(f"nothing written: rerun with --count {len(made.rows)} to {request.action}")
+            raise typer.Exit(1)
+        typer.echo(f"decision {batch}: fence_write ({request.action}, count {count})")
+
+    @fence_app.command("add")
+    def fence_add(
+        reason: Annotated[str, typer.Option(help="why these securities are fenced")],
+        issue: Annotated[int, typer.Option(help="the GitHub issue number (required)")],
+        security_id: Annotated[
+            list[str] | None,
+            typer.Option("--security-id", help="a security to fence (repeatable; one window)"),
+        ] = None,
+        from_: Annotated[
+            str | None, typer.Option("--from", help="first fenced session (YYYY-MM-DD)")
+        ] = None,
+        to: Annotated[
+            str | None, typer.Option("--to", help="last fenced session (YYYY-MM-DD), inclusive")
+        ] = None,
+        rule: Annotated[
+            str, typer.Option(help="the health rule that found it, or manual")
+        ] = fence_store.MANUAL_RULE,
+        from_rule: Annotated[
+            str | None,
+            typer.Option(help="take the failing findings of this health rule (id and window)"),
+        ] = None,
+        dry_run: Annotated[
+            bool, typer.Option(help="print the rows and the share, write nothing")
+        ] = False,
+        count: Annotated[
+            int | None,
+            typer.Option(
+                help="the owner's exact count of the printed rows; without it, or unequal, "
+                "nothing is written and the exit code is 1"
+            ),
+        ] = None,
+    ) -> None:
+        """Fence securities inside a closed window of sessions (spec 2026-11-16, item 3).
+
+        Prints each row to be written, the row count and the share of the universe the
+        fence would reach. A write needs `--count N` equal to the printed rows. Refused
+        while a data release is open, while an open paper book holds the id, and while
+        the window overlaps an open paper window whose universe holds it. Nothing is
+        deleted: the fenced bars stay in the store.
+        """
+        s = settings()
+        first = _parse_day("--from", from_, settings)
+        last = _parse_day("--to", to, settings)
+        request = fence_cmd.Request(
+            action="fence",
+            reason=reason,
+            issue=issue,
+            rule=rule,
+            security_ids=tuple(security_id or ()),
+            from_session=first,
+            to_session=last,
+            from_rule=from_rule,
+        )
+        _fence_run(request, dry_run=dry_run, count=count, s=s)
+
+    @fence_app.command("lift")
+    def fence_lift(
+        reason: Annotated[str, typer.Option(help="why the fence is lifted")],
+        issue: Annotated[int, typer.Option(help="the GitHub issue number (required)")],
+        security_id: Annotated[
+            list[str], typer.Option("--security-id", help="a fenced security (repeatable)")
+        ],
+        from_: Annotated[
+            str, typer.Option("--from", help="the fence's first session (YYYY-MM-DD)")
+        ],
+        rule: Annotated[str, typer.Option(help="the fence's rule")] = fence_store.MANUAL_RULE,
+        dry_run: Annotated[
+            bool, typer.Option(help="print the rows and the share, write nothing")
+        ] = False,
+        count: Annotated[
+            int | None, typer.Option(help="the owner's exact count of the printed rows")
+        ] = None,
+    ) -> None:
+        """Lift fences: a new `lift` row per key, the earlier row stays (append-only)."""
+        s = settings()
+        request = fence_cmd.Request(
+            action="lift",
+            reason=reason,
+            issue=issue,
+            rule=rule,
+            security_ids=tuple(security_id),
+            from_session=_parse_day("--from", from_, settings),
+        )
+        _fence_run(request, dry_run=dry_run, count=count, s=s)
+
+    @fence_app.command("list")
+    def fence_list() -> None:
+        """Print the active fence rows and the count line."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            with open_read_only(s) as conn:
+                lines = fence_cmd.list_lines(conn, clock(), fence_cmd.members_provider(conn, s))
+        except StoreLockedError as exc:
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
+        for line in lines:
+            typer.echo(line)
 
     sweep_app = typer.Typer(no_args_is_help=True, help="Register, run and judge sweeps.")
     app.add_typer(sweep_app, name="sweep")
