@@ -3,12 +3,15 @@ or deletes. Temp files only; no real store is touched."""
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import duckdb
 import pytest
@@ -301,3 +304,183 @@ def test_sweep_skips_partial_wrong_name_bad_json_wrong_store_and_symlink(
         assert path.exists()
     assert outside.read_bytes() == b"outside"
     outside.unlink()
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _crashed_real_wal_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A store whose writer died without a checkpoint, so a real WAL sits beside it."""
+    path = tmp_path / "walled.duckdb"
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
+    monkeypatch.setenv("STORE__PATH", str(path))
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE schema_version (version INTEGER)")
+    conn.close()
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import duckdb, os, sys; "
+            "c = duckdb.connect(sys.argv[1]); "
+            "c.execute('INSERT INTO schema_version VALUES (34)'); "
+            "os._exit(0)",
+            str(path),
+        ],
+        check=True,
+    )
+    assert Path(f"{path}.wal").is_file()
+    return path
+
+
+def test_the_manifest_records_the_sha256_of_each_copied_file(store: Path) -> None:
+    """#3625: a copy that rots later can be told from its manifest."""
+    Path(f"{store}.wal").write_bytes(b"log bytes")
+    result = backup_store(Settings(), now=NOW, git_commit="c")
+    manifest = json.loads(result.manifest_path.read_text())
+    assert result.wal_copy_path is not None
+    assert manifest["store_sha256"] == _sha(result.copy_path) == result.store_sha256
+    assert manifest["wal_sha256"] == _sha(result.wal_copy_path) == result.wal_sha256
+    assert manifest["opened_read_only"] is True
+    assert manifest["complete"] is True
+
+
+def test_a_copy_without_a_wal_records_a_null_wal_hash(store: Path) -> None:
+    result = backup_store(Settings(), now=NOW, git_commit="c")
+    manifest = json.loads(result.manifest_path.read_text())
+    assert manifest["wal_sha256"] is None and result.wal_sha256 is None
+    assert manifest["store_sha256"] == _sha(store)
+
+
+def test_the_copies_the_manifest_and_the_directory_are_fsynced(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3625: the store copy, the WAL copy, the manifest and their directory are all
+    fsynced before `backup_store` returns (an inode outlives its rename)."""
+    Path(f"{store}.wal").write_bytes(b"log bytes")
+    synced: list[int] = []
+    real_fsync = os.fsync
+
+    def spy(fd: int) -> None:
+        synced.append(os.fstat(fd).st_ino)
+        real_fsync(fd)
+
+    monkeypatch.setattr(backup.os, "fsync", spy)
+    result = backup_store(Settings(), now=NOW, git_commit="c")
+    assert result.wal_copy_path is not None
+    assert result.copy_path.stat().st_ino in synced
+    assert result.wal_copy_path.stat().st_ino in synced
+    assert result.manifest_path.stat().st_ino in synced
+    # the directory entry of the manifest, the last rename, is the last thing synced
+    assert synced[-1] == store.parent.stat().st_ino
+    assert synced.count(store.parent.stat().st_ino) >= 2
+
+
+def _plant_crashed(store: Path, minute: str, record: dict[str, Any], when: datetime) -> list[Path]:
+    """What a `backup_store` that died mid-way leaves: a copy, a WAL temp and the
+    partial manifest, all last written at `when`."""
+    copy = Path(f"{store}.bak-20261020-{minute}")
+    paths = [copy, Path(f"{copy}.wal.partial"), Path(f"{copy}.manifest.json.partial")]
+    paths[0].write_bytes(b"half a store")
+    paths[1].write_bytes(b"half a wal")
+    paths[2].write_text(json.dumps(record))
+    for path in paths:
+        os.utime(path, (when.timestamp(), when.timestamp()))
+    return paths
+
+
+def test_a_crashed_pre_migration_copy_is_swept_after_the_age(store: Path) -> None:
+    """#3625: a copy whose run died keeps a partial manifest that says what it is;
+    the sweep removes a pre-migration one once it is old enough."""
+    settings = Settings(store={"path": str(store)})
+    keep = backup_store(settings, now=NOW, reason=backup.PRE_MIGRATION)
+    record = {"reason": backup.PRE_MIGRATION, "store_file": store.name, "complete": False}
+    crashed = _plant_crashed(store, "1400", record, NOW - timedelta(days=2))
+    backup.sweep_pre_migration_backups(settings, keep=keep.copy_path, now=NOW)
+    for path in crashed:
+        assert not path.exists()
+    assert keep.copy_path.is_file() and keep.manifest_path.is_file()
+
+
+def test_a_young_crashed_copy_and_an_unmarked_copy_survive_the_sweep(store: Path) -> None:
+    settings = Settings(store={"path": str(store)})
+    keep = backup_store(settings, now=NOW, reason=backup.PRE_MIGRATION)
+    old = NOW - timedelta(days=2)
+    marked = {"reason": backup.PRE_MIGRATION, "store_file": store.name, "complete": False}
+    survivors = [
+        # younger than `store.orphan_backup_min_age_hours`: it may still be running
+        *_plant_crashed(store, "1400", marked, NOW - timedelta(hours=23)),
+        # an owner's crashed copy: no reason
+        *_plant_crashed(store, "1401", {"store_file": store.name, "complete": False}, old),
+        # another store's
+        *_plant_crashed(store, "1402", {**marked, "store_file": "other.duckdb"}, old),
+    ]
+    bare = Path(f"{store}.bak-20261020-1403")  # no manifest of either kind: the owner's
+    bare.write_bytes(b"owner copy")
+    os.utime(bare, (old.timestamp(), old.timestamp()))
+    # an old partial manifest beside `keep` is never a reason to remove `keep`
+    beside_keep = Path(f"{keep.copy_path}.manifest.json.partial")
+    beside_keep.write_text(json.dumps(marked))
+    os.utime(beside_keep, (old.timestamp(), old.timestamp()))
+    # a finished copy with a stray old partial manifest beside it is the count rule's
+    finished = backup_store(
+        settings, now=NOW.replace(minute=6), reason=backup.PRE_MIGRATION, git_commit="c"
+    )
+    stray = Path(f"{finished.copy_path}.manifest.json.partial")
+    stray.write_text(json.dumps(marked))
+    os.utime(stray, (old.timestamp(), old.timestamp()))
+    backup.sweep_pre_migration_backups(settings, keep=keep.copy_path, now=NOW)
+    for path in (*survivors, bare, keep.copy_path, keep.manifest_path, beside_keep):
+        assert path.exists(), path
+    assert finished.copy_path.is_file() and finished.manifest_path.is_file() and stray.exists()
+
+
+def test_the_sweep_refuses_a_naive_now(store: Path) -> None:
+    settings = Settings(store={"path": str(store)})
+    with pytest.raises(ValueError, match="tz-aware"):
+        backup.sweep_pre_migration_backups(
+            settings,
+            keep=Path(f"{store}.bak-20261020-1405"),
+            now=datetime(2026, 10, 20),  # noqa: DTZ001 - the point of the test
+        )
+
+
+def test_a_copy_duckdb_cannot_open_is_refused_and_leaves_nothing(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3625: byte equality is not enough; the copy is opened once before the manifest
+    calls it a backup."""
+    real_connect = duckdb.connect
+
+    def connect(database: Any = ":memory:", *args: Any, **kwargs: Any) -> Any:
+        if ".bak-" in str(database):
+            raise duckdb.IOException("the copy is not a database")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(duckdb, "connect", connect)
+    with pytest.raises(BackupError, match="the copy cannot be opened"):
+        backup_store(Settings(), now=NOW, git_commit="c")
+    assert not list(store.parent.glob("*.bak-*"))
+    assert not list(store.parent.glob("*.partial"))
+    assert store.exists()
+
+
+def test_the_test_open_leaves_the_copy_byte_identical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The read-only open replays the copy's real WAL in memory and writes nothing."""
+    path = _crashed_real_wal_store(tmp_path, monkeypatch)
+    before = {p.name: _sha(p) for p in (path, Path(f"{path}.wal"))}
+    result = backup_store(Settings(), now=NOW, git_commit="c")
+    assert result.wal_copy_path is not None
+    assert _sha(result.copy_path) == before[path.name] == result.store_sha256
+    assert _sha(result.wal_copy_path) == before[f"{path.name}.wal"] == result.wal_sha256
+    assert sorted(p.name for p in tmp_path.iterdir() if ".bak-" in p.name) == sorted(
+        [result.copy_path.name, result.wal_copy_path.name, result.manifest_path.name]
+    )
+    copied = duckdb.connect(str(result.copy_path), read_only=True)
+    try:
+        assert copied.execute("SELECT version FROM schema_version").fetchall() == [(34,)]
+    finally:
+        copied.close()
