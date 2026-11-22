@@ -630,6 +630,7 @@ from tradepartner.research import (
     load_dataset,
 )
 from tradepartner.research.event_study.run import run_study
+from tradepartner.research.event_study.stats import thin_window_reason
 from tradepartner.research.experiment import (
     SPLITS,
     ExperimentFileError,
@@ -1743,6 +1744,15 @@ def _experiment_study(settings: Settings, run_id: int, *, real: Settings | None 
         raise _refusal(ValueError(f"run {run_id}: {record.slug} has no [study] table"), settings)
     try:
         n_configurations = _study_configurations(record.slug, design)
+        # Knowable from the frozen dates: refuse before `load_dataset` reads anything (#3679).
+        if design.get("se_method") == "quarter_cluster_t":
+            thin = thin_window_reason(
+                record.window_start,
+                record.window_end,
+                [line.get("entry_start") for line in design.get("kill", ())],
+            )
+            if thin is not None:
+                raise ValueError(f"{record.slug}: {thin}")
     except ValueError as exc:
         raise _refusal(exc, settings) from None
     study = SimpleNamespace(

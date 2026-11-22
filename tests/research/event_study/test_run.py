@@ -131,6 +131,23 @@ def test_declared_delisting_return_is_refused_until_t412(
         run_study(handle(tmp_path), {"delisting_return": value, "configurations": 1}, [])
 
 
+def test_thin_window_under_quarter_cluster_t_is_refused_before_any_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3679: a window that cannot span 8 entry quarters is refused before any dataset read."""
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("market data read before the se_method window check")
+
+    monkeypatch.setattr("tradepartner.research.event_study.reader.EventStudyReader", forbidden)
+    design = {"se_method": "quarter_cluster_t", "configurations": 1, "kill": [{"name": "long"}]}
+    thin = SimpleNamespace(
+        study=design, window_start=date(2018, 4, 2), window_end=date(2019, 12, 31)
+    )  # 7 quarters
+    with pytest.raises(ValueError, match="at least 8 entry quarters"):
+        run_study(handle(tmp_path), thin, [])
+
+
 @pytest.mark.parametrize("two_horizons", [False, True], ids=["single-horizon", "short-exit-only"])
 def test_event_stage_delisting_and_causal_matching(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, two_horizons: bool

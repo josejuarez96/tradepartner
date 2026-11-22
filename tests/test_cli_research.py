@@ -1116,6 +1116,46 @@ def test_study_writes_an_ok_result_with_the_artifact(
     assert _count("research_results") == 1
 
 
+def _quarter_cluster_registration(entry_start: str | None) -> None:
+    """Model a registered `quarter_cluster_t` study (params_json is what the CLI reads)."""
+    with open_for_write(get_settings()) as conn:
+        [(params,)] = conn.execute(
+            "SELECT params_json FROM research_registrations WHERE slug = ?", [STUDY]
+        ).fetchall()
+        registration = json.loads(params)
+        registration["study"]["se_method"] = "quarter_cluster_t"
+        if entry_start is not None:
+            registration["study"]["kill"][0]["entry_start"] = entry_start  # ISO text after JSON
+        conn.execute(
+            "UPDATE research_registrations SET params_json = ? WHERE slug = ?",
+            [json.dumps(registration), STUDY],
+        )
+
+
+@pytest.mark.parametrize("entry_start", [None, "2018-03-01"], ids=["no-sub-window", "entry_start"])
+def test_study_refuses_a_thin_quarter_window_before_the_dataset_is_read(
+    study_ready: int,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_start: str | None,
+) -> None:
+    """#3679: 3 quarters cannot reach G = 8; refuse (exit 2), read nothing, close no run.
+
+    The stored design is JSON, so `entry_start` is text here (the audit's crash).
+    """
+    run = _first_int(_open_study(study_ready, config_file), "run")
+    _quarter_cluster_registration(entry_start)
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("dataset read before the se_method window check")
+
+    monkeypatch.setattr(cli, "load_dataset", forbidden)
+    out = _cli("experiment", "study", "--run", str(run))
+    assert out.exit_code == 2, out.output
+    assert "at least 8 entry quarters" in out.output
+    assert _count("research_results") == 0  # refusals write nothing: the run stays open
+
+
 def test_study_refuses_a_run_with_a_result_row(study_ready: int, config_file: Path) -> None:
     run = _first_int(_open_study(study_ready, config_file), "run")
     assert _cli("experiment", "abandon", "--run", str(run), "--reason", "x").exit_code == 0
