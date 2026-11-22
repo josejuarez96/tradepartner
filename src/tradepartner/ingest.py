@@ -349,6 +349,12 @@ from tradepartner.calendar import (
 from tradepartner.config import Settings, clean_message
 from tradepartner.diskfloor import ingest_floor_refusal
 from tradepartner.gap import stale_listings_at
+from tradepartner.ingest_status import FAILED as FAILED
+from tradepartner.ingest_status import LOCKED as LOCKED
+from tradepartner.ingest_status import MODE as MODE
+from tradepartner.ingest_status import OK as OK
+from tradepartner.ingest_status import PRICE_SOURCE as PRICE_SOURCE
+from tradepartner.ingest_status import STALE as STALE
 from tradepartner.store import filing_index as stored_index
 from tradepartner.store import raw_archive
 from tradepartner.store.asof import ASSETS_SOURCE, _validate_t
@@ -430,16 +436,11 @@ def show_ingest_progress() -> None:
     _LOGGER.propagate = False
 
 
-OK, STALE, FAILED, LOCKED = "ok", "stale", "failed", "locked"
 ACTIONS_FILLED = "filled"
 ACTIONS_MODE = "actions"  # the actions backfill's run rows (#1676)
 #: The run rows of `tradepartner action-retract` (#2092): a cancel stamped at
 #: such a run's `started_at` is the owner's, and `_add_actions` keeps it.
 ACTION_RETRACT_MODE = "action_retract"
-MODE = "session"
-#: The price side's `ingestion_runs.source`. Its `MODE` runs alone count as
-#: the paper run's fresh prices (staleness and the clock floor, #1440 Q3).
-PRICE_SOURCE = "alpaca"
 SOURCES: tuple[str, ...] = ("edgar", PRICE_SOURCE, "fred")
 OPENFIGI_SOURCE = "openfigi"  # explicit only: never add to SOURCES / all
 #: The `openfigi_types` columns compared against the previous observation, in

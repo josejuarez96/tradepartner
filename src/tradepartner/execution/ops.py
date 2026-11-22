@@ -152,8 +152,8 @@ from tradepartner.execution.reconcile_run import (
 )
 from tradepartner.execution.switch import FAULTED_RUN_STATUSES, SwitchState, derive
 from tradepartner.execution.window import window_cadence
-from tradepartner.ingest import MODE as INGEST_MODE
-from tradepartner.ingest import OK as INGEST_OK
+from tradepartner.ingest_status import MODE as INGEST_MODE
+from tradepartner.ingest_status import OK as INGEST_OK
 from tradepartner.store import journal, registry
 from tradepartner.store.asof import (
     UNEXPLAINED_DUPLICATE,
