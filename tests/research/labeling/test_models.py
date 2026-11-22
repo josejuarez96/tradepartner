@@ -953,6 +953,32 @@ def test_claude_cost_keeps_worst_case_without_usage(clean_env: None) -> None:
     assert models.claude_estimate_usd(request, config) > config.max_output_tokens * 10 / 1_000_000
 
 
+def test_a_rejected_claude_request_costs_nothing(clean_env: None) -> None:
+    """#3660: a request the vendor rejected before running it is not billed; a 5xx
+    with no usage may have been, so it keeps the full estimate."""
+    request = _request("claude-sonnet-5-5")
+    config = Settings(_env_file=None).research.claude
+
+    def final(status: int) -> models.ModelResponse:
+        return models.make_claude_response(
+            request,
+            raw_request="{}",
+            http_status=status,
+            raw_response='{"error": "synthetic"}',
+            attempts=1,
+            latency_ms=0,
+        )
+
+    for status in sorted(models.REJECTED_STATUSES):
+        rejected = final(status)
+        assert (rejected.reason, rejected.input_tokens) == ("refused", None)
+        assert models.claude_call_cost_usd(request, rejected, config) == 0.0
+    estimate = models.claude_estimate_usd(request, config)
+    assert estimate > 0
+    assert models.claude_call_cost_usd(request, final(500), config) == estimate
+    assert models.claude_call_cost_usd(request, final(429), config) == estimate
+
+
 def test_claude_echoed_key_is_absent_from_invalid_record(clean_env: None) -> None:
     client = models.ClaudeModelClient(
         config=Settings(_env_file=None).research.claude,
