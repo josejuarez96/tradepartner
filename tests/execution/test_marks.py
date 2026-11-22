@@ -797,6 +797,30 @@ def test_lapses_computed_at_boundary_session_and_not_one_earlier() -> None:
     ]
 
 
+def test_a_part_executed_rebalance_lapses_only_at_the_next_fill_session() -> None:
+    """#3131: a T_i with a fill is not lapsed past F_i + the frozen bound; it lapses
+    on F_{i+1}, where `planning.due_rebalance` plans T_{i+1} instead."""
+    from tradepartner.backtest.schedule import fill_session
+
+    t0, t1 = date(2026, 9, 30), date(2026, 10, 30)
+    window = _window(first_rebalance_session=t0)
+    frozen = {"paper.max_catch_up_sessions": 2}
+    past = fill_session(t0)
+    for _ in range(3):
+        past = next_session(past)
+    started = frozenset({t0})
+    assert lapses(window, [], [], [], [], past, frozen, cadence=CADENCE) == [
+        Missed(rebalance_session=t0, reason="catch_up_lapsed")
+    ]
+    last = previous_session(fill_session(t1))
+    assert (
+        lapses(window, [], [], [], [], last, frozen, cadence=CADENCE, part_executed=started) == []
+    )
+    assert lapses(
+        window, [], [], [], [], fill_session(t1), frozen, cadence=CADENCE, part_executed=started
+    ) == [Missed(rebalance_session=t0, reason="catch_up_lapsed")]
+
+
 def test_lapses_reason_is_kill_switch_when_the_switch_is_engaged_at_the_checked_session() -> None:
     from tradepartner.backtest.schedule import fill_session
 

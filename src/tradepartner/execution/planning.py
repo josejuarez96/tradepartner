@@ -5,7 +5,12 @@ Plan trial; plan T63c).
 when S is the fill session F_i of a rebalance T_i of the window, `catch_up`
 while T_i is pending (no `executed` or `missed` event of the window's runs)
 and S is at most the frozen `paper.max_catch_up_sessions` sessions after F_i,
-else None (also before the window's first rebalance session, #649).
+else None (also before the window's first rebalance session, #649). A pending
+T_i that is **part-executed** (a fill on one of its orders, the caller's
+`part_executed`: a halt between the sells and the buys, #3131) stays
+`catch_up` past that bound, through the session before F_{i+1}, so its unsent
+buys are placed after a late resume instead of the sell proceeds sitting in
+cash until the next rebalance.
 **`due_rebalance`** returns the same with its T_i.
 
 **`plan_rebalance`** plans T_i once:
@@ -243,10 +248,16 @@ def due_rebalance(
     max_catch_up_sessions: int,
     *,
     cadence: Cadence,
+    part_executed: Collection[date] = frozenset(),
 ) -> tuple[RebalanceKind, date] | None:
     """The run's planning kind on S with its T_i, or None (module docstring). A
     T_i with an `executed` or `missed` event has no kind, on its F_i too, so a
     same-session re-run after a halt that wrote `missed` trades nothing.
+
+    `part_executed` names the rebalances with a fill (`journal.rebalances_with_fills`,
+    #3131): a pending one of them is `catch_up` on any S before F_{i+1}, whatever
+    `max_catch_up_sessions` says. `marks.lapses` takes the same set, so a T_i is
+    never lapsed while this still plans it.
 
     Only the latest rebalance due by S can be planned: an earlier one has a
     later rebalance's fill session between it and S, by which time it lapsed.
@@ -268,7 +279,8 @@ def due_rebalance(
             return None  # executed or missed, even on its own F_i: never traded again
     if session == f_i:
         return _REBALANCE, t_i
-    if _sessions_after(f_i, session) <= max_catch_up_sessions:
+    if _sessions_after(f_i, session) <= max_catch_up_sessions or t_i in part_executed:
+        # `_latest_due` already put S before F_{i+1}: a started T_i is caught up to there.
         return _CATCH_UP, t_i
     return None
 
@@ -281,10 +293,17 @@ def rebalance_kind(
     max_catch_up_sessions: int,
     *,
     cadence: Cadence,
+    part_executed: Collection[date] = frozenset(),
 ) -> RebalanceKind | None:
     """`rebalance`, `catch_up` or None on session S (`due_rebalance`'s kind)."""
     due = due_rebalance(
-        window, runs, rebalance_events, session, max_catch_up_sessions, cadence=cadence
+        window,
+        runs,
+        rebalance_events,
+        session,
+        max_catch_up_sessions,
+        cadence=cadence,
+        part_executed=part_executed,
     )
     return None if due is None else due[0]
 

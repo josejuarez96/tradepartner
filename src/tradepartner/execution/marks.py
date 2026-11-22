@@ -24,6 +24,9 @@ owns the writes and the alerts this task's outputs feed.
   run that crashed or was halted in that span with no `kill_switch` row
   (a halt-path write failure, or a hard crash) counts too, the same rule
   `execution.switch.derive` uses for a run with no result row.
+  A part-executed rebalance (a fill on one of its orders, #3131) has no
+  frozen-bound lapse: it lapses only on F_{i+1}, so a halt between its sells
+  and its buys is still caught up after a late resume.
 - `equity_at` is the one read of ledger equity from `positions_daily` rows,
   shared by the run, `paper resume`, the drawdown check, the outcomes and the
   monthly report (#1116): a session's cash read from any of its rows (every
@@ -42,7 +45,7 @@ import bisect
 import json
 import logging
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
@@ -680,6 +683,7 @@ def lapses(
     frozen: Mapping[str, object],
     *,
     cadence: Cadence,
+    part_executed: Collection[date] = frozenset(),
 ) -> list[Missed]:
     """Every rebalance of `window` whose catch-up window has run out as of
     `session` = S, with no `rebalance_events` row of its own yet (Definitions
@@ -710,6 +714,12 @@ def lapses(
     row of a run not among `runs` raises, so an incomplete run list can
     never hide an already-resolved rebalance. A T_i already journaled
     `executed` or `missed` is not reported again.
+
+    A T_i in `part_executed` (`journal.rebalances_with_fills`, #3131: it has a
+    fill, so a halt landed between its sells and its buys) has no frozen-bound
+    boundary: it is still pending on every session before F_{i+1} and lapses on
+    F_{i+1}, the same span `planning.due_rebalance` plans it in when given the
+    same set. At `daily` that is F_i, as before.
     """
     if window.window_id is None:
         raise ValueError("the window has no window_id")
@@ -726,11 +736,14 @@ def lapses(
         if not _is_pending(rebalance_session, rebalance_events, windows, window.window_id):
             continue
         boundary = _catch_up_boundary(rebalance_session, max_catch_up_sessions, cadence)
-        if index + 1 < len(due):
-            next_fill = fill_session(due[index + 1], cadence)
-            if next_fill <= session:
-                # T_{i+1} is due on and after F_{i+1}: T_i is never planned again.
-                boundary = min(boundary, previous_session(next_fill))
+        next_fill = fill_session(due[index + 1], cadence) if index + 1 < len(due) else None
+        if rebalance_session in part_executed:
+            if next_fill is None or next_fill > session:
+                continue  # part-executed and F_{i+1} not reached: still caught up (#3131)
+            boundary = previous_session(next_fill)
+        elif next_fill is not None and next_fill <= session:
+            # T_{i+1} is due on and after F_{i+1}: T_i is never planned again.
+            boundary = min(boundary, previous_session(next_fill))
         if session <= boundary:
             continue
         period = _period_sessions(fill, boundary)
