@@ -398,7 +398,9 @@ Strategy lab (strategy-lab spec req 15; plan T111):
 
 - `tradepartner sweep register <file>` registers a sweep file
   (`backtest.sweep.register`) and prints the registration and its variant
-  slugs; an unchanged file returns its registration and writes nothing.
+  slugs; an unchanged file returns its registration and writes nothing. A
+  root family's first sweep stores a promotion floor, `lab.root_family_min_t`
+  times the window's null Sharpe sd, as its SR* seed (#3571) and prints it.
 - `tradepartner sweep run <slug> [--time-budget-minutes M] [--rerun]
   [--note TEXT]` runs the sweep's planned variants (`backtest.lab.run_sweep`)
   on `settings.store.path` and prints the run's counts and every trial; it
@@ -506,7 +508,7 @@ from tradepartner.backtest.hypothesis import (
     register,
     register_operations_book,
 )
-from tradepartner.backtest.metrics import METRIC_KEYS
+from tradepartner.backtest.metrics import METRIC_KEYS, dsr_basis_label
 from tradepartner.backtest.run import RunOutcome, run_hypothesis
 from tradepartner.calendar import is_session as _is_session
 from tradepartner.calendar import session_close as _session_close
@@ -1429,10 +1431,18 @@ def _print_trial(conn: duckdb.DuckDBPyConnection, outcome: RunOutcome, settings:
         f"gap max: count share {_fmt(result.get('gap_max_count_share'))}, "
         f"size share {_fmt(result.get('gap_max_size_share'))}"
     )
-    typer.echo(
-        f"dsr {_fmt(result.get('dsr'))}, dsr excess SPY {_fmt(result.get('dsr_excess'))} "
-        f"(basis {result.get('dsr_basis')}, n trials {result.get('n_trials')})"
-    )
+    if result.get("dsr_basis") == "psr":
+        # #3571: nothing was deflated at this N; say so instead of "dsr".
+        label = dsr_basis_label("psr", result.get("n_trials"))
+        typer.echo(
+            f"{label} {_fmt(result.get('dsr'))}, excess SPY {_fmt(result.get('dsr_excess'))} "
+            f"(n trials {result.get('n_trials')})"
+        )
+    else:
+        typer.echo(
+            f"dsr {_fmt(result.get('dsr'))}, dsr excess SPY {_fmt(result.get('dsr_excess'))} "
+            f"(basis {result.get('dsr_basis')}, n trials {result.get('n_trials')})"
+        )
     typer.echo(
         f"flags: red flag {_fmt(result.get('red_flag'))}, synthetic "
         f"{_fmt(trial.get('synthetic'))}, holdout repeat {_fmt(trial.get('holdout_repeat'))}"
@@ -5007,6 +5017,24 @@ def make_app(
             with open_for_write(s) as conn:
                 schema.init_schema(conn)
                 registration = lab_sweep.register(conn, file, s, registered_by=_REGISTERED_BY)
+                rules = lab_registry.family_rules(conn, registration.sweep.family)
+                seed_line = None
+                if (
+                    registration.created
+                    and rules is not None
+                    and rules.parent_family is None
+                    and rules.sr_star_seed_annual is not None
+                    and rules.first_hypothesis_id == registration.hypotheses[0].hypothesis_id
+                ):
+                    seed_line = (
+                        f"root family promotion floor: SR* seed {rules.sr_star_seed_annual:.4f} "
+                        f"annual = t {s.lab.root_family_min_t} x sqrt(V "
+                        f"{lab_registry.family_v_floor(rules):.4f}), V the null variance "
+                        f"12 / T over T = "
+                        f"{lab_registry.window_periods(rules.in_sample_start, rules.holdout_start)}"
+                        " month-end periods (floored at lab.min_sharpe_variance_annual); the "
+                        "family's mark never falls below it and a child inherits it"
+                    )
         except StoreLockedError as exc:
             raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except schema.SchemaVersionError as exc:
@@ -5022,6 +5050,8 @@ def make_app(
             f"selection statistic {record.selection_statistic}, promote at least "
             f"{record.promote_at_least}, retire below {record.retire_below}",
         ]
+        if seed_line is not None:
+            lines.append(seed_line)
         lines += [
             f"  {v.variant_index}: {h.slug} "
             + json.dumps(v.variant_params, sort_keys=True, default=str)

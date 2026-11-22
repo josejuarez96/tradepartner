@@ -453,6 +453,9 @@ class LabConfig(BaseModel):
     max_family_promotions: int = Field(default=2, gt=0)
     promotion_min_dsr_excess: float = Field(default=0.5, ge=0)
     min_sharpe_variance_annual: float = Field(default=0.04, ge=0)
+    #: A new root family's first promotion needs a t over its window of at least this
+    #: (#3571); stored as a seed in its rules row at its first registration.
+    root_family_min_t: float = Field(default=1.645, gt=0)
     max_failures_per_variant: int = Field(default=2, ge=0)
     max_family_holdout_spends: int = Field(default=3, gt=0)
     sweep_time_budget_minutes: float = Field(default=480.0, gt=0)

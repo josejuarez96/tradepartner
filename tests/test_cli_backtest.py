@@ -195,7 +195,8 @@ def test_ok_run_exits_zero_and_prints_trial_metrics_gap_and_flags(
         assert word in out.stdout, word
     assert "gap max" in out.stdout
     assert "red flag" in out.stdout
-    assert "dsr" in out.stdout
+    # #3571: a first read is a PSR at N = 1, printed as what it is, not as a deflated Sharpe.
+    assert "PSR (undeflated, N = 1)" in out.stdout
     for level in ("0 bps", "15 bps", "30 bps", "60 bps", "100 bps"):
         assert level in out.stdout, level
     note = read().execute("SELECT note FROM trials WHERE trial_id = ?", [trial_id]).fetchone()

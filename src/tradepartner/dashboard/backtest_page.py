@@ -72,6 +72,7 @@ from tradepartner.backtest.metrics import (
     Basis,
     DeflatedSharpe,
     deflated_sharpe,
+    dsr_basis_label,
 )
 from tradepartner.backtest.results import (
     BORROW_SERIES_PREFIX,
@@ -476,7 +477,7 @@ def _dsr_table(rows: Sequence[DsrRow]) -> pl.DataFrame:
         [
             {
                 "basis": r.basis,
-                "stored label": r.stored_basis,
+                "stored label": dsr_basis_label(r.stored_basis, r.stored_n),
                 "stored N": r.stored_n,
                 "stored N research": r.stored_n_research,
                 "stored N exposures": r.stored_n_exposure,
@@ -490,7 +491,9 @@ def _dsr_table(rows: Sequence[DsrRow]) -> pl.DataFrame:
                 "today N exposures": r.today_n_exposure,
                 "today V": r.today.sharpe_variance if r.today else None,
                 "today SR*": r.today.sr_star if r.today else None,
-                "today label": r.today.dsr_basis if r.today else None,
+                "today label": (
+                    dsr_basis_label(r.today.dsr_basis, r.today.n_trials) if r.today else None
+                ),
                 "today DSR": r.today.dsr if r.today else None,
             }
             for r in rows

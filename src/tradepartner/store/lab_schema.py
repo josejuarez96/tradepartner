@@ -120,7 +120,8 @@ def _enum_check(column: str, values: tuple[str, ...]) -> str:
 
 # One row per family, written at its first registration (the migration writes
 # one per existing family). `parent_family` NULL for a root family;
-# `sr_star_seed_annual` NULL for a root family and for every migrated family.
+# `sr_star_seed_annual` NULL for every migrated family and every root registered before
+# #3571; a root's first registration now stores its t floor there.
 _CREATE_FAMILY_RULES = """
 CREATE TABLE IF NOT EXISTS family_rules (
     family VARCHAR NOT NULL PRIMARY KEY,
