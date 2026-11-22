@@ -686,6 +686,12 @@ DASHBOARD_APP = Path(__file__).resolve().parent / "dashboard" / "app.py"
 #: The review page (C10) `research gold` and `research review` launch: a path, never
 #: an import, since importing a Streamlit script runs it.
 REVIEW_PAGE = Path(__file__).resolve().parent / "research" / "labeling" / "review_page.py"
+#: Hosts a Streamlit page may be served under; passed as repeated `--server.allowedHosts`
+#: so a rebound hostname is refused (#3588).
+_LOOPBACK_HOSTS = ("localhost", "127.0.0.1")
+_LOOPBACK_HOST_FLAGS = tuple(
+    part for host in _LOOPBACK_HOSTS for part in ("--server.allowedHosts", host)
+)
 #: Relative path-shaped settings resolve against the project root (config.py).
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -1886,6 +1892,9 @@ def _page_argv(session: Path, *page_args: str) -> list[str]:
         "localhost",
         "--browser.gatherUsageStats",
         "false",
+        *_LOOPBACK_HOST_FLAGS,
+        "--client.showErrorDetails",
+        "none",
         "--",
         "--session",
         str(session),
@@ -4262,6 +4271,9 @@ def make_app(
             "localhost",
             "--browser.gatherUsageStats",
             "false",
+            *_LOOPBACK_HOST_FLAGS,
+            "--client.showErrorDetails",
+            "none",
         ]
         raise typer.Exit(launcher(argv))
 

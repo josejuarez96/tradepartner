@@ -451,22 +451,57 @@ def test_config_toml_pins_localhost_and_no_telemetry() -> None:
 
 
 @pytest.mark.parametrize(
-    ("address", "gather_usage_stats", "expected"),
+    ("address", "gather_usage_stats", "allowed_hosts", "expected"),
     [
-        ("localhost", False, True),
-        ("127.0.0.1", False, True),
-        ("0.0.0.0", False, False),
-        (None, False, False),
-        ("localhost", True, False),
-        ("localhost", None, False),
+        ("localhost", False, ["localhost"], True),
+        ("127.0.0.1", False, ["localhost", "127.0.0.1"], True),
+        ("localhost", False, ["LOCALHOST"], True),
+        ("0.0.0.0", False, ["localhost"], False),
+        (None, False, ["localhost"], False),
+        ("localhost", True, ["localhost"], False),
+        ("localhost", None, ["localhost"], False),
+        ("localhost", False, [], False),
+        ("localhost", False, ["*"], False),
+        ("localhost", False, ["evil.example"], False),
+        ("localhost", False, ["localhost", "*"], False),
+        ("localhost", False, ["*.x"], False),
+        ("localhost", False, None, False),
     ],
 )
 def test_server_options_ok(
-    address: str | None, gather_usage_stats: bool | None, expected: bool
+    address: str | None,
+    gather_usage_stats: bool | None,
+    allowed_hosts: list[str] | None,
+    expected: bool,
 ) -> None:
-    ok, message = _server_options_ok(address, gather_usage_stats)
+    ok, message = _server_options_ok(address, gather_usage_stats, allowed_hosts)
     assert ok is expected
     assert bool(message) is not expected
+
+
+def test_render_app_refuses_without_allowed_hosts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    nav_calls: list[NavCall],
+) -> None:
+    """An empty Host allow-list accepts any Host (a DNS-rebound name), so the shell
+    shows only the refusal and never builds its navigation (#3588)."""
+    store_path = tmp_path / "ok.duckdb"
+    settings = Settings(_env_file=None, store={"path": str(store_path)})
+    with open_for_write(settings) as conn:
+        schema.init_schema(conn)
+
+    real_get_option = st.get_option
+    monkeypatch.setattr(
+        st,
+        "get_option",
+        lambda key: [] if key == "server.allowedHosts" else real_get_option(key),
+    )
+    at = _run_app(monkeypatch, store_path)
+
+    assert not at.exception
+    assert any("server.allowedhosts" in e.value.lower() for e in at.error)
+    assert nav_calls == []
 
 
 def test_render_app_refuses_when_server_options_differ(
