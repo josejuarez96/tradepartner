@@ -323,6 +323,7 @@ def test_sleeve_is_held_out_of_the_buys_cash(
         "open_unsent": 0,
         "fallback": "none",
         "opg_after_cutoff": 0,
+        "submit_at": "open",
     }
 
 
