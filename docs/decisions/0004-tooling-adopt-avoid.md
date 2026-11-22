@@ -62,7 +62,7 @@ Oracle and fixture runs are logged in the trial registry with a `synthetic = tru
 ## Consequences
 
 - Good: a small, permissive-license dependency set; every number that matters is produced by code the owner can read; an independent check on the engine; storage chosen with the access pattern in mind.
-- Bad / accepted risks: we maintain our own engine. If the strategy later needs intraday bars, shorting, or event-driven fills, that engine will not be enough and this ADR should be superseded. DuckDB is single-writer, so ingestion and the dashboard must not write concurrently (the dashboard is read-only by design, see roadmap).
+- Bad / accepted risks: we maintain our own engine. If the strategy later needs intraday bars, shorting, or event-driven fills, that engine will not be enough and this ADR should be superseded *(amended 2026-11-20, #3686: read as met for shorting, since the engine was extended and checked, [note below](#amendment-2026-11-20-3686-the-engine-was-extended-for-shorts))*. DuckDB is single-writer, so ingestion and the dashboard must not write concurrently (the dashboard is read-only by design, see roadmap).
 - Reversibility: cheap for adopted libraries; costly for the store schema (which is why it is ours) and moderately costly for the DuckDB choice once data is loaded (mitigated by Parquet exports).
 - Revisit if: the strategy scope leaves daily-bar, long-only rebalancing; a dependency changes license or goes unmaintained for 12 months; or the survey ages past a phase retro without being refreshed.
 
@@ -89,3 +89,11 @@ Phase 3 plan task T30 ([issue #116](https://github.com/josejuarez96/tradepartner
 **`bt` stays dev-only, pinned `==1.2.3`.** It brings `ffn` and `yfinance` into the dev environment as transitive dependencies. None of the three may be imported under `src/`, and `tests/test_no_forbidden_imports.py` enforces that with an AST check. This keeps `yfinance` out of runtime code, as the **We avoid** list requires.
 
 **Oracle comparison under `open` fills.** The engine oracle test above says both engines fill at the official open of session T+1 and agree on equity. Under `execution.fill_price=close`, the default since T3, every session is compared. Under `open`, `bt` receives the stitched open-price series and **only fill sessions are compared**. The two engines mark positions between fills from different series (open vs close), so non-fill sessions are not comparable. Everything else stays as above: the same adjusted-as-of-T stitched frame, zero costs and fractional shares. Backtest spec req 14 records the same rule.
+
+## Amendment 2026-11-20 (#3686): the engine was extended for shorts
+
+One dated note, asked for by the [backtest spec](../specs/backtest.md)'s open question 24 and its amendment #1872, item 9. It is recorded by the owner's merge of the PR that amends [ADR 0005](0005-objective-benchmark-stop-criteria.md#amendment-2026-11-20-the-yardstick-is-the-net-matched-blend-3686) (decision 7 there).
+
+The Consequences above say that if the strategy later needs shorting, "that engine will not be enough and this ADR should be superseded". [ADR 0024](0024-lift-long-only-and-top-1000.md) lifted long-only on 2026-10-19. The engine was then **extended for signed books, not replaced** (backtest plan T219 to T224). The oracle test gained a long/short case: zero costs, fractional shares, gross 1.0, net 0.0, the same lagged signal and the same adjusted frame. Our engine and `bt` agree on equity within the existing tolerance of 1e-9 (`tests/oracle/test_bt_oracle.py`, `test_bt_and_engine_agree_on_a_long_short_book`), and a one-session lag in `bt` fails the comparison. Both tests pass on main at 0c4d7f9f (run 2026-11-20).
+
+So the sentence is read as met for shorting, and this ADR is not superseded for it. It still stands for intraday bars and event-driven fills. The oracle checks the signed book's arithmetic at zero costs. It does not check borrow fees, the shortability proxy or a short's exit, which have their own tests.
