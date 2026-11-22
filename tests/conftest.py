@@ -33,6 +33,10 @@
   connection (e.g. `store.db` lock/retry tests).
 - `_single_threaded_duckdb` (autouse, session) makes every `duckdb.connect`
   in the test process default to `threads=1` (#953): see its docstring.
+- `NO_ENV_FILE` and `_no_real_env_file` (autouse, session) keep the real
+  `.env` out of the test process (#3623): this module points
+  `TRADEPARTNER_ENV_FILE` at a path that does not exist as soon as it is
+  imported, and the fixture fails the run if a test leaks a change to it.
 """
 
 from __future__ import annotations
@@ -57,6 +61,13 @@ from tradepartner.adapters import edgar_raw
 from tradepartner.config import Settings
 from tradepartner.store import lab_schema, schema
 from tradepartner.store.db import configure_connection, utc_now
+
+# Tests never load the real `.env`: the supported override points at a path that does not exist.
+# Set at import, not in a fixture: collection can already construct `Settings`, and every xdist
+# worker imports this file. Unconditional, because an override exported in the shell is the same
+# leak. Child processes inherit it through `os.environ`.
+NO_ENV_FILE = Path(__file__).resolve().parent / "no-such-dir" / "absent.env"
+os.environ["TRADEPARTNER_ENV_FILE"] = str(NO_ENV_FILE)
 
 _FIXTURES_UNIVERSE_DIR = Path(__file__).parent / "fixtures" / "universe"
 _FIXTURES_CHAINS_DIR = _FIXTURES_UNIVERSE_DIR / "chains"
@@ -446,6 +457,34 @@ def _single_threaded_duckdb() -> Iterator[None]:
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(duckdb, "connect", _single_threaded_connect)
         yield
+
+
+def _check_no_real_env_file(when: str) -> None:
+    current = os.environ.get("TRADEPARTNER_ENV_FILE")
+    assert current == str(NO_ENV_FILE), (
+        f"at session {when} TRADEPARTNER_ENV_FILE is {current!r}, not {str(NO_ENV_FILE)!r}: "
+        "a test changed it without monkeypatch (tests/conftest.py:_no_real_env_file)"
+    )
+    assert not NO_ENV_FILE.exists(), (
+        f"at session {when} {NO_ENV_FILE} exists; tests must never create it "
+        "(tests/conftest.py:_no_real_env_file)"
+    )
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_real_env_file() -> Iterator[None]:
+    """Fail the run if the `.env` guard is not in force at session start or end (#3623).
+
+    The guard itself is the module-level `os.environ["TRADEPARTNER_ENV_FILE"]`
+    assignment above. A test that needs an env file writes its own and names it
+    with `monkeypatch.setenv`, which is undone before this fixture's final
+    check; a plain `os.environ[...] =` or `del` leaks and fails here. This stops
+    accidental loading through `Settings`; it does not stop a test that opens
+    the file on purpose, nor hide variables already exported in the shell.
+    """
+    _check_no_real_env_file("start")
+    yield
+    _check_no_real_env_file("end")
 
 
 @pytest.fixture(autouse=True)
