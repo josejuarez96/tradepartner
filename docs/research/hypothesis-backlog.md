@@ -217,7 +217,7 @@ The record of looks before rung 4 (rules L1 to L5 of the [strategy-discovery rep
 | declared read | the one open series (file, weighting, size screen, window) or stored-fact test, and the kill line, written before the read |
 | looks | series and constructions actually read (1 if the rule was kept) |
 | rungs | furthest rung passed; the verdict |
-| feasibility | the result of the feasibility check (research-program 4a): `pass`, `deferred: <item and reason>`, or `pre-gate` (added 2026-10-27, #2409) |
+| feasibility | the result of the feasibility check (research-program 4a): `pass`, `deferred: <item and reason>`, or `pre-gate` (added 2026-10-27, #2409); from 2026-11-21 (#3702) also `rejected: shape`, the card's Shape-block result |
 | decision | `open`, `approved for registered event study`, `deferred: <reason>`, `retired`, `parked` or `promoted` (added 2026-10-27, #2409; approval recorded 2026-10-31) |
 | link | the issue note or desk note |
 

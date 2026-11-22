@@ -166,7 +166,7 @@ At IR 0.5, (c)'s gain over the current rule of at least 20 pp does not rest on t
 1. **Order.** The idea goes through these steps:
    1. its card and stage 4a (a) to (c), (e), (f);
    2. rung 3 (capacity);
-   3. the rung-1 screen (item 4);
+   3. the rung-1 screen (item 4); *(amended 2026-11-21, #3702: answered at step 1, on the card, [amendment below](#amendment-2026-11-21-3702-the-cost-screen-reads-the-decision-cost))*
    4. **rung 4, the registered own-store read, which decides**;
    5. rung 5 placebos, on a pass only;
    6. for an event study that passed, the route to an exam (item 3);
@@ -179,7 +179,7 @@ At IR 0.5, (c)'s gain over the current rule of at least 20 pp does not rest on t
    - **Survivorship.** A pass needs stage 4a (f) delister coverage over the whole pinned window, with a delisting policy that charges a return on exits (for a trial, a `backtest.delisting_failure_return` other than `none`; for an event study, the last-close result reported beside a failure-return result, which decides). Otherwise the window starts where coverage holds.
    - **No scratch reads.** No store return is read outside a registered run (idea-pipeline D5, the narrower option).
 3. **From an event study to an exam.** An event-study pass is not a family. The idea then registers a new family's one-value sweep from the frozen design (strategy-lab req 1). It runs one counted in-sample trial at the same harsh settings, with line 40's rule, and is promoted under strategy-lab req 4. Only then does it reach the exam door. This trial is another look, and it counts.
-4. **Rung 1 becomes a screen at the #2667 arrival measure for the idea's band** (+8.8 bp over $200M today). That figure is provisional while it rests on two rebalance days. A band with no measure is `blocked: cost measurement`, as today.
+4. **Rung 1 becomes a screen at the #2667 arrival measure for the idea's band** (+8.8 bp over $200M today). That figure is provisional while it rests on two rebalance days. A band with no measure is `blocked: cost measurement`, as today. *(Amended 2026-11-21, #3702: the screen is read once, on the idea's card, at the decision cost of item 2, with the arrival measure and the latest paper basis printed beside it, [amendment below](#amendment-2026-11-21-3702-the-cost-screen-reads-the-decision-cost).)*
    - An idea whose plausible gross cannot clear break-even at that measure gets no trial. Stage 4a (d) reads the same screen.
    - #3143's items 1 and 2, and item 5's sentence "a rung-1 read not yet made … is decided at the paper basis", stop deciding before rung 4.
    - #3143's items 3 and 4 stand: **the paper basis still decides at the exam door**. That is where #3143's reason applies: a book that cannot pass the exam should not spend an exam slot.
@@ -231,3 +231,28 @@ At IR 0.5, (c)'s gain over the current rule of at least 20 pp does not rest on t
 5. **Close the second limit at 3 of 4 and open a third** (4 candidates or 2027-01-31)? *Recommend yes. The alternative is to keep the second limit: the first route read becomes candidate 4, and the retro falls on 2026-12-15.*
 6. **Keep TP-10 as it is?** *Recommend yes.*
 7. **Run E1's counts first, then IRRX after T184h, then FC-1 (conditional)**? E1's return read would wait for T184h, or start its window in 2019. *Recommend yes.*
+
+## Amendment 2026-11-21 (#3702): the cost screen reads the decision cost
+
+*For the owner's word on this class-B PR (#3702). It amends item 4 of the [2026-11-16 amendment](#amendment-2026-11-16-3496-own-store-read-first-published-evidence-as-the-prior) (the rung-1 screen) and step 3 of its item 1 (the order). Nothing else in this record changes. Docs only: no code, no store read, no return read. The owner's instruction of 2026-11-21 on the pipeline review (PR #3692, recommendation 1): "Go with your recommendations."*
+
+**Why.** The same break-even was asked three times before a read (card question 3, stage 4a (d), the rung-1 screen), each time at the arrival measure of +8.8 bp. The idea was then decided at 50 bp and re-priced at 60 bp at the exam door. A weak screen ahead of a strong test stops nothing the strong test would pass, and it lets doomed builds start. IRRX cleared the screen at a break-even of 14.5 bp per side and was stopped later by a cost drag of 100 bp a month against 29 bp gross (PR #3683, PR #3692).
+
+**The rule, from the owner's merge.**
+1. **One cost line, at the decision cost.** The rung-1 screen is read once, on the idea's card, as the cost line of the [idea pipeline](../specs/idea-pipeline.md#amendment-2026-11-21-3702-the-passable-shape-on-the-card)'s Shape block. It reads the idea's gross against the round trip at the cost its rung-4 read will charge: the harsh cell of item 2, **50 bp per side for every band** until the owner decides otherwise.
+2. **No build where no count could pass.** An idea is `rejected: shape` when no number of events or months could bring it to the power line at that cost: an event idea whose gross is at or under the round trip plus the net floor its experiment file will freeze (130 bp at today's defaults), or a trial whose expected net is at or under zero. It gets no trial, no spec, no plan and no build. It keeps its ledger row and does not count as a candidate, as a screen kill already did not.
+3. **Twice the round trip is the guide, not a reject line.** The ratio of gross to round trip is printed on every card. Under 2 the card carries a warning and ranks lower, and the card's power line (80% at the idea's own effect) decides whether anything is built. The idea-pipeline amendment derives the 2 from the pass rule and the decision cost, for event ideas; it moves when either moves.
+4. **The arrival measure and the paper basis are printed beside it.** The #2667 arrival measure stays a measurement: the card prints the ratio at it, every read still prints its net result at it (item 2), and the 20 bp revisit trigger still reads it. The latest paper basis is printed too and does not gate at the card.
+5. **A band with no measure.** The card is read at 50 bp like any other. The reject case is `rejected: shape`. Anything else is `blocked: cost measurement`, as today.
+6. **Order.** Step 3 of item 1 (the rung-1 screen) is answered at step 1 (the card). Rung 3 follows the card and stage 4a; rung 4 follows rung 3. Stage 4a (d) reads the same line and is not asked again.
+7. **Unchanged.** Item 2's decision cell and pass rule. #3143's items 3 and 4: **the paper basis still decides at the exam door.** Item 6's list: no look-ahead; kill lines frozen before any read; every run counted; the deflated Sharpe; the holdout and dead-month refusals; the four-exam budget; TP-10. No past rung-1 note or kill is re-read.
+
+**"At least 50 bp, twice a base of at least 25 bp."** PR #3683 found this sentence of item 2 ambiguous (its ambiguity 4): is 50 fixed, does a band with a higher measured base raise its cell, does a lower re-measured base lower it? This amendment does not settle it. Until the owner does, the card uses 50 bp per side for every band. Both legs of the question (upward for a costlier band; downward after the cost work, PR #3692's recommendation 3) are his open call. The card's line follows his answer.
+
+**Consequences.**
+- **Good:** the cost test is read once, before any build, at the cost that decides. The 2026-11-16 amendment's accepted cost ("a screen at 8.8 bp lets through ideas that the harsh cell then kills, and each costs a trial") shrinks to the ideas between the reject case and the power line. Three places that asked one number become one.
+- **Bad / accepted:** this partly reverses the 2026-11-16 amendment's own reasoning. That amendment removed cost gates read on published priors (rung 1 at the 60 bp paper basis, stage 4a (d)) because they stopped own-data ideas before any store read. A prior-based stop now returns: an event idea needs a published or assumed gross above 130 bp to stay alive, where the removed gates asked for a gross above 60 bp (stage 4a (d)) or above a 120 bp round trip (rung 1 at the 60 bp paper basis). It differs in one respect: it stops only an idea that would pass its own-store read less than half the time at any count. The gross figures it rests on are often UNVERIFIED, so a real idea with an understated prior can stop on the card. Between the reject case and twice the round trip nothing is killed by the prior: the card warns and the power line decides. The owner may overrule any card verdict, as today.
+- **Reversibility:** cheap. The line is arithmetic on the card, and a later cost figure re-reads it.
+- **Revisit** with the third limit's retro, and at once if the owner decides the ambiguity above or the paper basis is re-measured at 25 bp or less.
+
+**Decisions for the owner.** They are items 1, 2, 3, 7 and 8 of the idea-pipeline amendment's list ("Decisions this merge records"). Merging the PR records the recommended answer to each unless the owner says otherwise on the PR.
