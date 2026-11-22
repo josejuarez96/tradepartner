@@ -274,6 +274,7 @@ from tradepartner.execution.collect import (
 )
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.lock import sandbox_store_refusal
+from tradepartner.execution.plain import fault_note
 from tradepartner.execution.plan import SHORT, BuyCosts, DecisionState, decision_state, residue
 from tradepartner.execution.planning import current_listings, reference_prices
 from tradepartner.execution.reattempts import attempt_scope, write_offs
@@ -2267,7 +2268,7 @@ class RiskGatedBroker:
             requested = self._acknowledged_open(run)
         except Exception as exc:
             requested = []
-            notes.append(f"open orders not read, no cancel attempted ({type(exc).__name__})")
+            notes.append(self._fault_note("open orders not read, no cancel attempted", exc))
         cancelled = [order for order in requested if self._cancel(order, stamp, notes)]
         for order in cancelled:
             self._read(order, run, stamp, notes, write_offs)
@@ -2279,7 +2280,7 @@ class RiskGatedBroker:
         try:
             self.alert_unsent(run)
         except Exception as exc:
-            notes.extend([f"skipped alert not written ({type(exc).__name__})", *owed])
+            notes.extend([self._fault_note("skipped alert not written", exc), *owed])
         message = self._scrub("; ".join([headline, *dict.fromkeys(notes)]))
         alert_kind = _STALE_DATA if stale else _alert_kind(fault)
         try:
@@ -2292,7 +2293,7 @@ class RiskGatedBroker:
                 book_id=self._run_book(run),
             )
         except Exception as exc:
-            notes.append(f"alert not written ({type(exc).__name__})")
+            notes.append(self._fault_note("alert not written", exc))
             message = self._scrub("; ".join([headline, *dict.fromkeys(notes)]))
         finished = stamp()
         try:
@@ -2311,7 +2312,7 @@ class RiskGatedBroker:
                     ),
                 )
         except Exception as exc:
-            notes.append(f"result row not written ({type(exc).__name__})")
+            notes.append(self._fault_note("result row not written", exc))
         if notes:
             fault.add_note(self._scrub("halt path: " + "; ".join(dict.fromkeys(notes))))
         raise fault
@@ -2337,7 +2338,7 @@ class RiskGatedBroker:
                 self._event(coid, _CANCEL_NOOP, stamp, notes)
             else:
                 self._event(coid, _CANCEL_FAILED, stamp, notes)
-                notes.append(f"cancel of {coid} failed ({type(exc).__name__})")
+                notes.append(self._fault_note(f"cancel of {coid} failed", exc))
         return True
 
     def _read(
@@ -2369,7 +2370,7 @@ class RiskGatedBroker:
             )
         except Exception as exc:
             # A halt still reads back fills when its reference-price read fails.
-            notes.append(f"halt read of {coid} has no price band ({type(exc).__name__})")
+            notes.append(self._fault_note(f"halt read of {coid} has no price band", exc))
         try:
             collected = collect(
                 self._broker,
@@ -2411,17 +2412,13 @@ class RiskGatedBroker:
                     raise SystemExit(WRITE_FAILED_EXIT_CODE) from exc
             else:
                 self._event(coid, _CANCEL_FAILED, stamp, notes)
-            notes.append(
-                f"halt read of {coid} failed ({type(exc).__name__}: {self._scrub(str(exc))})"
-            )
+            notes.append(self._fault_note(f"halt read of {coid} failed", exc))
             return
         except Exception as exc:
             self._event(coid, _CANCEL_FAILED, stamp, notes)
             # The message is kept (scrubbed): a refusal such as #650's names
             # the timestamps that explain it (#730).
-            notes.append(
-                f"halt read of {coid} failed ({type(exc).__name__}: {self._scrub(str(exc))})"
-            )
+            notes.append(self._fault_note(f"halt read of {coid} failed", exc))
             return
         notes.extend(breach.message for breach in collected.rejections)
         note_unjudged(collected, notes)
@@ -2445,12 +2442,17 @@ class RiskGatedBroker:
                     ),
                 )
         except Exception as exc:
-            notes.append(f"{status} of {coid} not journaled ({type(exc).__name__})")
+            notes.append(self._fault_note(f"{status} of {coid} not journaled", exc))
             return False
         return True
 
     def _session(self, run: PaperRunRow, stamp: Callable[[], datetime]) -> date:
         return run.session if run.session is not None else stamp().astimezone(_NEW_YORK).date()
+
+    def _fault_note(self, label: str, exc: BaseException) -> str:
+        """`label (Type: scrubbed message at file.py:line)`, the message cut to
+        `paper.max_fault_note_chars` (#3635)."""
+        return fault_note(label, exc, self._scrub, self._settings.paper.max_fault_note_chars)
 
     def _scrub(self, text: str) -> str:
         """`text` with every configured secret masked, in any case and in its

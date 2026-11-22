@@ -8,6 +8,7 @@ status`, the waiting list, the operations page and the CLI's `failed:` lines.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import Final
 
 #: Where the scheduled paper run's errors land (docs/runbooks/shakedown.md).
@@ -76,3 +77,20 @@ def failure_hint(exc: BaseException, *, scheduled: bool = False) -> str:
         '`tradepartner paper resume --book <book> --reason "..."`. '
         "Tell your agent if it repeats."
     )
+
+
+def fault_note(label: str, exc: BaseException, scrub: Callable[[str], str], max_chars: int) -> str:
+    """`label (Type: message at file.py:line)` for a step that failed (#3635).
+
+    `message` is `scrub(str(exc))` cut to `max_chars`; the place is the file name and
+    line of the innermost frame of `exc.__traceback__`, left out when there is none.
+    Pure: no I/O, no source line, no locals.
+    """
+    message = scrub(str(exc))[:max_chars]
+    tb = exc.__traceback__
+    if tb is None:
+        return f"{label} ({type(exc).__name__}: {message})"
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    name = tb.tb_frame.f_code.co_filename.replace("\\", "/").rsplit("/", 1)[-1]
+    return f"{label} ({type(exc).__name__}: {message} at {name}:{tb.tb_lineno})"
