@@ -135,6 +135,7 @@ QUANT_PREFIXES = (
     "src/tradepartner/backfill.py",
     "src/tradepartner/health",
     "src/tradepartner/diskfloor.py",
+    "src/tradepartner/netwait.py",
     # the data adapters the first lists missed (#3319)
     "src/tradepartner/adapters/accession_rows.py",
     "src/tradepartner/adapters/borrow.py",

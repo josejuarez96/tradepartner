@@ -575,6 +575,7 @@ from tradepartner.ingest import (
     show_ingest_progress,
     statement_backfill_refusal,
 )
+from tradepartner.netwait import wait_for_hosts
 from tradepartner.repair import (
     HeaderLookup,
     RepairRefused,
@@ -3056,6 +3057,14 @@ def make_app(
             if scheduled_ingest:
                 heartbeat.ping(s, "ingest", ok=False)  # same shape as the scheduled job (#2155)
             raise _fail(refusal, 1)
+        if scheduled_ingest and (
+            unreachable := wait_for_hosts(
+                s.ingest.network_wait_hosts,
+                max_wait_seconds=s.ingest.network_wait_seconds,
+                initial_delay_seconds=s.ingest.network_wait_initial_delay_seconds,
+            )
+        ):
+            typer.echo(unreachable, err=True)  # #3551: go on; the sources fail with their rows
         if sec_forms_only and not s.events.sec_forms_enabled:
             raise _fail("--sec-forms-only needs events.sec_forms_enabled", USAGE_ERROR)
         if source == "openfigi" and not s.openfigi.enabled:

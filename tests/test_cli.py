@@ -276,6 +276,54 @@ def _patched(monkeypatch: pytest.MonkeyPatch, name: str, result: IngestResult) -
     return recorder
 
 
+@pytest.fixture(autouse=True)
+def _no_dns_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A scheduled ingest waits on real DNS (#3551); tests never do."""
+    monkeypatch.setattr(cli, "wait_for_hosts", lambda *_a, **_k: None)
+
+
+def test_scheduled_ingest_waits_for_network_before_sources(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    order: list[str] = []
+
+    def wait(hosts: Sequence[str], **kwargs: Any) -> str | None:
+        order.append("wait")
+        assert list(hosts) == secrets_set.ingest.network_wait_hosts
+        assert kwargs["max_wait_seconds"] == secrets_set.ingest.network_wait_seconds
+        return None
+
+    def session(_settings: Settings, **_kwargs: Any) -> IngestResult:
+        order.append("ingest_session")
+        return _ok("edgar", "alpaca")
+
+    monkeypatch.setattr(cli, "wait_for_hosts", wait)
+    monkeypatch.setattr(cli, "ingest_session", session)
+    result = _invoke(secrets_set, ["ingest"])
+    assert result.exit_code == 0, result.output
+    assert order == ["wait", "ingest_session"]
+
+
+def test_scheduled_ingest_runs_anyway_after_a_network_timeout(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    monkeypatch.setattr(cli, "wait_for_hosts", lambda *_a, **_k: "network not ready: x")
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar", "alpaca"))
+    result = _invoke(secrets_set, ["ingest"])
+    assert result.exit_code == 0, result.output
+    assert "network not ready: x" in result.output
+    assert len(session.calls) == 1
+
+
+def test_a_non_scheduled_ingest_makes_no_network_wait(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    monkeypatch.setattr(cli, "wait_for_hosts", lambda *_a, **_k: pytest.fail("waited"))
+    _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    result = _invoke(secrets_set, ["ingest", "--source", "edgar"])
+    assert result.exit_code == 0, result.output
+
+
 @pytest.fixture
 def secrets_set(tmp_path: Path) -> Settings:
     return _settings(

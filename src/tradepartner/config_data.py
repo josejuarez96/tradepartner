@@ -167,6 +167,15 @@ class IngestConfig(_ClosedConfig):
     # ingest refuses before any write (clear message, exit 1, a /fail heartbeat for the
     # scheduled shape). 0 turns the check off. Run-time, same default as the paper floor.
     min_free_disk_gb: float = Field(default=5.0, ge=0)
+    # #3551: a scheduled ingest waits up to this long (exponential backoff from the
+    # initial delay) for these hosts to resolve before its sources start; on a timeout
+    # it prints one line and runs anyway, so the sources fail with their own rows.
+    # 0 turns the wait off.
+    network_wait_seconds: float = Field(default=900, ge=0)
+    network_wait_initial_delay_seconds: float = Field(default=5, gt=0)
+    network_wait_hosts: list[str] = Field(
+        default_factory=lambda: ["www.sec.gov", "data.alpaca.markets", "api.stlouisfed.org"]
+    )
 
 
 class RatesConfig(_ClosedConfig):
