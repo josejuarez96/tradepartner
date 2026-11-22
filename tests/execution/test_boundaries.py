@@ -55,14 +55,89 @@ from tradepartner.store.schema import JOURNAL_TABLE_NAMES
 SRC = Path(__file__).resolve().parents[2] / "src"
 
 
+#: The one trial-side use of the EDGAR index: `StoreProvider.filing_events`' stamp cross-check
+#: (backtest spec amendment 2026-11-16, #3504, item 5 "Stamps"; owner, 2026-11-16).
+FILING_INDEX_ALLOWED = "tradepartner/backtest/store_provider.py"
+FILING_INDEX_NAME = "first_known"
+FILING_INDEX_USER = "filing_events"
+
+
+def _filing_index_violations(source: str, rel_path: str) -> list[str]:
+    """Why `source` (at `rel_path` under `src/`) may not mention `filing_index`; empty if fine.
+
+    Any file but `FILING_INDEX_ALLOWED` may not hold the string at all. The allowed file may
+    import only `first_known` from `tradepartner.store.filing_index`, and may call it only
+    inside the `filing_events` method; any other `filing_index` module use is refused."""
+    if "filing_index" not in source:
+        return []
+    if not rel_path.endswith(FILING_INDEX_ALLOWED):
+        return [f"{rel_path} mentions filing_index"]
+    tree = ast.parse(source)
+    problems: list[str] = []
+    module = "tradepartner.store.filing_index"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            problems += [f"import {a.name}" for a in node.names if a.name.startswith(module)]
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            if node.module == module:
+                problems += [f"imports {a.name}" for a in node.names if a.name != FILING_INDEX_NAME]
+            elif node.module.startswith(module) or (
+                node.module == "tradepartner.store"
+                and any(a.name == "filing_index" for a in node.names)
+            ):
+                problems.append(f"imports from {node.module}")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            inside = {
+                id(n)
+                for n in ast.walk(node)
+                if isinstance(n, ast.Name) and n.id == FILING_INDEX_NAME
+            }
+            if node.name == FILING_INDEX_USER:
+                continue
+            problems += [
+                f"{FILING_INDEX_NAME} used in {node.name}"
+                for n in ast.walk(node)
+                if id(n) in inside
+            ]
+    for node in tree.body:
+        for n in ast.walk(node):
+            if (
+                isinstance(n, ast.Name)
+                and n.id == FILING_INDEX_NAME
+                and not isinstance(node, ast.ImportFrom | ast.ClassDef | ast.FunctionDef)
+            ):
+                problems.append(f"{FILING_INDEX_NAME} used at module level")
+    return problems
+
+
 def test_filing_index_stays_out_of_strategy_and_universe() -> None:
-    """The EDGAR index is an ingest input, never a trial input."""
+    """The EDGAR index is never a signal or universe input. The one trial-side use is the
+    stamp cross-check of the spec's "Stamps" item (#3504): `first_known`, in
+    `backtest/store_provider.py`'s `filing_events` read, and nowhere else."""
     restricted = [SRC / "tradepartner" / "universe.py"]
     restricted.extend((SRC / "tradepartner" / "backtest").rglob("*.py"))
     restricted.extend((SRC / "tradepartner" / "signals").rglob("*.py"))
     for path in restricted:
-        source = path.read_text()
-        assert "filing_index" not in source, path
+        rel = path.relative_to(SRC).as_posix()
+        assert _filing_index_violations(path.read_text(), rel) == [], path
+
+
+def test_filing_index_guard_still_fails_outside_the_one_allowed_use() -> None:
+    other = "tradepartner/backtest/engine.py"
+    assert _filing_index_violations("x = 'filing_index'\n", other)
+    assert _filing_index_violations("x = 'filing_index'\n", "tradepartner/universe.py")
+    allowed = "src/tradepartner/backtest/store_provider.py"
+    ok = (
+        "from tradepartner.store.filing_index import first_known\n"
+        "class P:\n    def filing_events(self):\n        return first_known()\n"
+    )
+    assert _filing_index_violations(ok, allowed) == []
+    wide = ok.replace("import first_known", "import first_known, by_cik")
+    assert _filing_index_violations(wide, allowed)
+    elsewhere = ok + "    def sics(self):\n        return first_known()\n"
+    assert _filing_index_violations(elsewhere, allowed)
+    assert _filing_index_violations("import tradepartner.store.filing_index\n", allowed)
 
 
 def test_sec_ownership_tables_do_not_reach_trading_or_universe() -> None:
