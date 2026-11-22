@@ -680,6 +680,12 @@ INDEX_MEMBERS_MISSING = "index_members_missing"
 #: `health.max_stale_sessions` sessions behind. Reported by `check_failures`
 #: only, so the verdict line and the page keep describing the lag in words.
 STORE_STALE = "store_stale"
+
+#: `check_failures` names for a source whose last `ok` run is older than its limit
+#: (#3553), after `STORE_STALE`.
+EDGAR_STALE = "edgar_stale"
+FRED_STALE = "fred_stale"
+SEC_FORMS_STALE = "sec_forms_stale"
 #: The session-hole rule (#1575): an XNYS session in the universe history
 #: window whose `prices_daily` row count is below
 #: `health.min_session_rows_share` of the previous session's.
@@ -1338,6 +1344,8 @@ class RateSeriesHealth:
             out.append(f"last daily late rows: {self.last_daily_late_rows}")
         if self.longest_gap_sessions > self.max_stale_sessions:
             out.append(f"longest gap: {self.longest_gap_sessions} sessions")
+        if self.stale_sessions is not None and self.stale_sessions > self.max_stale_sessions:
+            out.append(f"stale: {self.stale_sessions} sessions (max {self.max_stale_sessions})")
         if self.implausible_rows:
             out.append(f"outside plausible range: {self.implausible_rows}")
         return tuple(out)
@@ -2549,6 +2557,23 @@ def _chain_rule_rows(conn: duckdb.DuckDBPyConnection, t: datetime) -> dict[str, 
     }
 
 
+@dataclass(frozen=True)
+class SourceFreshness:
+    """One source's age by its last `ok` run (#3553): `sessions_old` is the XNYS
+    sessions after the New York date of `last_ok_finished_at`, up to the report's
+    session; `None` when the source never ran `ok`. Stale above `limit`."""
+
+    source: str
+    last_ok_finished_at: datetime | None
+    sessions_old: int | None
+    limit: int
+
+    @property
+    def stale(self) -> bool:
+        """True when the source never ran `ok` or is older than its limit."""
+        return self.sessions_old is None or self.sessions_old > self.limit
+
+
 @dataclass(frozen=True, eq=False)
 class HealthReport:
     """Everything the health command and page show (module docstring)."""
@@ -2598,6 +2623,8 @@ class HealthReport:
     figi_identity: FigiIdentity = field(
         default_factory=lambda: FigiIdentity(None, 0, pl.DataFrame([], schema=FIGI_IDENTITY_SCHEMA))
     )
+    #: Per-source age by last `ok` run (#3553), read by `check_failures`.
+    freshness: tuple[SourceFreshness, ...] = ()
 
     @property
     def failures(self) -> tuple[str, ...]:
@@ -2632,12 +2659,17 @@ class HealthReport:
         """What `health --check` fails on: `failures`, then `store_stale` when
         the store has no price bars or is more than `health.max_stale_sessions`
         sessions behind; the one-session gap before tonight's ingest
-        (`stale_gap_expected`) is never a failure (#3329)."""
+        (`stale_gap_expected`) is never a failure (#3329); then `edgar_stale`,
+        `fred_stale` and `sec_forms_stale` for a source past its limit (#3553)."""
+        out = self.failures
         stale = stale_sessions(self)
         limit = self.max_stale_sessions
         if stale is None or (stale > limit and not stale_gap_expected(self)):
-            return (*self.failures, STORE_STALE)
-        return self.failures
+            out = (*out, STORE_STALE)
+        return (*out, *(_STALE_NAMES[f.source] for f in self.freshness if f.stale))
+
+
+_STALE_NAMES = {"edgar": EDGAR_STALE, "fred": FRED_STALE, "sec_forms": SEC_FORMS_STALE}
 
 
 #: When the scheduled ingest runs (America/New_York). Source: the launchd plist in
@@ -2680,6 +2712,13 @@ def health_verdict(report: HealthReport, warnings: int = 0) -> str:
     pass, and is a stale session expected before tonight's ingest. `warnings` is the
     count of warnings the caller tallies outside the report. Pure."""
     note = f" with {warnings} warning(s)" if warnings else ""
+    stale_sources = [
+        f"{f.source} never ran ok"
+        if f.sessions_old is None
+        else f"{f.source} {f.sessions_old} sessions since its last ok run"
+        for f in report.freshness
+        if f.stale
+    ]
     if failures := report.failures:
         body = f"{len(failures)} integrity check(s) fail ({', '.join(failures)})"
     else:
@@ -2702,6 +2741,8 @@ def health_verdict(report: HealthReport, warnings: int = 0) -> str:
             )
         else:
             body = f"{stale} session{plural} behind (last bar {last}); run `tradepartner ingest`"
+    if stale_sources:
+        body += "; stale: " + ", ".join(stale_sources)
     return f"Data: {body}. Paper run readiness and halts: `tradepartner paper status`."
 
 
@@ -2744,10 +2785,12 @@ def health_report(
         ),
         (),
     )
+    rates = _rates_report(conn, t, settings)
     return HealthReport(
         t=t,
         session=session,
         ingests=ingests,
+        freshness=_freshness(conn, t, session, settings, ingests, rates),
         coverage=_coverage(conn, t, session, current, securities, classes),
         gaps=bar_gaps(conn, t),
         survivorship=survivorship_gap(conn, t, settings),
@@ -2768,7 +2811,7 @@ def health_report(
         filing_events=_filing_events_report(conn, settings, ingests),
         incremental_edgar=_incremental_edgar_report(conn, t),
         form4_compare=_form4_compare_report(conn, t),
-        rates=_rates_report(conn, t, settings),
+        rates=rates,
         borrow=_borrow_report(conn, t, session, settings),
         mergers=_mergers_report(conn, t, ingests),
         delisting_reasons=delisting_reasons_report(conn, t, listings),
@@ -3038,7 +3081,6 @@ def _filing_events_report(
 
 
 _RATE_COUNT = re.compile(r"\brates_(\w+)=(\d+)\b")
-_RATE_STALE = re.compile(r"\bstale_sessions=(\d+)\b|\bis (\d+) sessions behind\b")
 
 
 def _rates_report(conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings) -> RatesHealth:
@@ -3061,6 +3103,7 @@ def _rates_report(conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settin
     result: list[RateSeriesHealth] = []
     lower, upper = settings.rates.plausible_range_percent
     sessions = all_sessions()
+    current = last_completed_session(t)
     for series in sorted(set(settings.rates.series) | set(by_series)):
         rows = by_series.get(series, [])
         date_counts = Counter(row[0] for row in rows)
@@ -3081,7 +3124,7 @@ def _rates_report(conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settin
         )
         if series_runs:
             counts["rows_added"] = int(series_runs[-1][2])
-        stale_match = _RATE_STALE.search(series_runs[-1][1]) if series_runs else None
+        latest_day = max(days, default=None)
         last_daily = next((msg for mode, msg, _ in reversed(series_runs) if mode == MODE), "")
         daily_counts = {name: int(value) for name, value in _RATE_COUNT.findall(last_daily)}
         result.append(
@@ -3096,7 +3139,13 @@ def _rates_report(conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settin
                 revised_keys=sum(count > 1 for count in date_counts.values()),
                 longest_gap_sessions=max(gaps, default=0),
                 run_counts=counts,
-                stale_sessions=int(stale_match[1] or stale_match[2]) if stale_match else None,
+                stale_sessions=(
+                    None
+                    if latest_day is None
+                    else max(
+                        0, bisect_right(sessions, current) - bisect_right(sessions, latest_day)
+                    )
+                ),
                 last_daily_late_rows=daily_counts.get("late_rows", 0),
                 implausible_rows=sum(
                     row[1] is None or not lower <= row[1] <= upper for row in rows
@@ -3580,6 +3629,48 @@ def last_ingests(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[IngestSt
                 latest_started_at=None if latest is None else latest[2],
                 latest_message=message,
             )
+        )
+    return tuple(out)
+
+
+def _sessions_since(last: datetime, session: date) -> int:
+    """XNYS sessions `s` with `ny_date(last) < s <= session` (never weekdays)."""
+    local = ensure_tz_aware_utc(last, field_name="finished_at").astimezone(_NEW_YORK).date()
+    sessions = all_sessions()
+    return max(0, bisect_right(sessions, session) - bisect_right(sessions, local))
+
+
+def _freshness(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    session: date,
+    settings: Settings,
+    ingests: tuple[IngestStatus, ...],
+    rates: RatesHealth,
+) -> tuple[SourceFreshness, ...]:
+    """Age by last `ok` run for EDGAR, FRED (only once a configured series is
+    stored) and SEC forms (only while `events.sec_forms_enabled`), #3553. Runs
+    finished after `t` are ignored."""
+    ok = {i.source: i.last_ok_finished_at for i in ingests}
+    row = conn.execute(
+        "SELECT max(finished_at) FROM ingestion_runs "
+        "WHERE status = ? AND source = ? AND mode = ? AND finished_at <= ?",
+        [OK, EDGAR, MODE, t],
+    ).fetchone()
+    edgar_ok: datetime | None = None if row is None else row[0]
+
+    def entry(source: str, last: datetime | None, limit: int) -> SourceFreshness:
+        return SourceFreshness(
+            source, last, None if last is None else _sessions_since(last, session), limit
+        )
+
+    out = [entry(EDGAR, edgar_ok, settings.ingest.edgar_max_age_sessions)]
+    if any(s.rows and s.series in settings.rates.series for s in rates.series):
+        out.append(entry("fred", ok.get("fred"), settings.rates.max_stale_sessions))
+    if settings.events.sec_forms_enabled:
+        stamps = [x for x in (edgar_ok, ok.get("sec_forms")) if x is not None]
+        out.append(
+            entry("sec_forms", max(stamps, default=None), settings.ingest.edgar_max_age_sessions)
         )
     return tuple(out)
 

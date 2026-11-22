@@ -3225,7 +3225,7 @@ def test_rates_last_daily_late_count_and_plausible_warning_do_not_fail_check(
     # The last run overall is the backfill; the warning reads the last daily run.
     assert rate.run_counts["rows_added"] == 0
     assert rate.run_counts["late_rows"] == 0
-    assert rate.stale_sessions == 0
+    assert rate.stale_sessions == 2  # measured at report time (#3553)
     assert rate.last_daily_late_rows == 1
     assert rate.implausible_rows == 1
     assert any("last daily late rows" in warning for warning in rate.warnings)
@@ -3290,7 +3290,7 @@ def test_rates_are_covered_by_common_column_rules(
     assert not report.ok
 
 
-def test_rates_staleness_is_read_from_an_aborted_stale_run(
+def test_rates_staleness_ignores_an_aborted_runs_message(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
     insert_row(
@@ -3311,7 +3311,8 @@ def test_rates_staleness_is_read_from_an_aborted_stale_run(
     )
     report = health_report(fixture_store, T_END, _settings())
     rate = next(item for item in report.rates.series if item.series == "DTB3")
-    assert rate.stale_sessions == 17
+    # Measured at report time (#3553), not read from the run's frozen message.
+    assert rate.stale_sessions == 2
 
 
 # --- duplicate_dividends (#1613, T186b) ---------------------------------------
@@ -4746,6 +4747,22 @@ def _at(report: HealthReport, t: datetime, session: date, last_bar: date) -> Hea
 def test_verdict_describes_data_only_when_bars_are_current(
     fixture_store: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
+    for run_id, source in ((9001, "edgar"), (9002, "fred")):  # fresh sources (#3553)
+        insert_row(
+            fixture_store,
+            "ingestion_runs",
+            {
+                "run_id": run_id,
+                "started_at": T_END - timedelta(hours=1),
+                "finished_at": T_END - timedelta(minutes=30),
+                "status": "ok",
+                "source": source,
+                "mode": "session",
+                "rows_added": 0,
+                "chunk_cursor": None,
+                "message": None,
+            },
+        )
     report = health_report(fixture_store, T_END, settings)
     verdict = health_verdict(report)
     assert verdict.startswith("Data: checks pass, bars current to 2020-06-30.")
