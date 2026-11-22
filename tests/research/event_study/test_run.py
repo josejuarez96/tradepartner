@@ -199,6 +199,11 @@ def test_event_stage_delisting_and_causal_matching(
                 return changed, changed
             return bars, bars
 
+        def split_factor(
+            self, _sid: str, _known_at: datetime, *, as_of: date, through: date, facts_read: str
+        ) -> float:
+            return 1.0
+
         def shares(
             self, _sid: str, _known_at: datetime, *, fact_name: str, facts_read: str
         ) -> list[dict[str, object]]:
@@ -350,18 +355,58 @@ def test_event_stage_delisting_and_causal_matching(
         if row["event_id"] == "e"
     )
     assert pooled_event["bucket"] == 1
+    # #3681: the side's flag is the line's own result whatever the line is called, not
+    # `summarise`'s max-horizon / primary-cost figure (forced to a pass here). The line
+    # has one event, so its own t is undefined and it is killed.
+    from typing import Any
+
+    from tradepartner.research.event_study import run as run_module
+
+    real_summarise = run_module.summarise
+
+    def passing_summarise(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        out: dict[str, Any] = real_summarise(*args, **kwargs)
+        out["secondary"]["kill_long"] = 0.0
+        return out
+
+    monkeypatch.setattr(run_module, "summarise", passing_summarise)
+    design["matching"] = "entry_known"
+    for line in design["kill"]:  # type: ignore[attr-defined]
+        if line["name"] == "long":
+            line["name"] = "long_main"
+    renamed = run_study(handle(tmp_path), parsed, events, settings=cfg)
+    assert renamed.secondary["kill_long_main"] == 1.0
+    assert renamed.secondary["kill_long"] == 1.0
 
 
 @pytest.mark.parametrize(
-    ("extra_facts", "expected_mcap"),
+    ("extra_facts", "expected_mcap", "extra_splits"),
     [
-        ([], 13_000_000.0),
+        ([], 13_000_000.0, []),
+        # #3681: a 2:1 split between the fact's date and the price date, known at the
+        # event, doubles the share count the raw close is multiplied by.
+        ([], 26_000_000.0, [(date(2018, 6, 5), 2.0, datetime(2018, 6, 5, 12, tzinfo=UTC))]),
+        # No look-ahead: the same split becoming known after the event changes nothing.
+        ([], 13_000_000.0, [(date(2018, 6, 5), 2.0, datetime(2018, 6, 7, 12, tzinfo=UTC))]),
+        # PINNED, KNOWN DEFECT (#3055 shape): a fact dated 6-04 but filed after the 6-05
+        # split already reports the post-split 2.1M, and is split again (2.1M x 2 x 13 = 54.6M;
+        # 27.3M would be right). Universe rule 8's split-dating test is a closure inside
+        # `shares_as_of`, off by default (`universe.shares_split_dating`, #3070), and not
+        # reusable from this package. Update this expectation when that lands.
+        (
+            [(date(2018, 6, 4), 2_100_000.0, datetime(2018, 6, 6, 12, tzinfo=UTC))],
+            54_600_000.0,
+            [(date(2018, 6, 5), 2.0, datetime(2018, 6, 5, 12, tzinfo=UTC))],
+        ),
+        # A split after the price date (6-06) is not applied even when known.
+        ([], 13_000_000.0, [(date(2018, 6, 7), 2.0, datetime(2018, 6, 5, 12, tzinfo=UTC))]),
         (
             [
                 (date(2018, 6, 5), 1_500_000.0, datetime(2018, 6, 5, 20, tzinfo=UTC)),
                 (date(2018, 6, 4), 3_000_000.0, datetime(2018, 6, 6, 19, tzinfo=UTC)),
             ],
             19_500_000.0,
+            [],
         ),
         (
             [
@@ -370,12 +415,24 @@ def test_event_stage_delisting_and_causal_matching(
                 (date(2018, 6, 5), 9_000_000.0, datetime(2018, 6, 7, 19, tzinfo=UTC)),
             ],
             22_750_000.0,
+            [],
         ),
     ],
-    ids=["baseline", "late-older-period-amendment", "latest-period-revision"],
+    ids=[
+        "baseline",
+        "split-known-at-event",
+        "split-known-after-event",
+        "pinned-double-split-of-a-post-split-fact",
+        "split-after-price-date",
+        "late-older-period-amendment",
+        "latest-period-revision",
+    ],
 )
 def test_stage_b_on_synthetic_store(
-    tmp_path: Path, extra_facts: list[tuple[date, float, datetime]], expected_mcap: float
+    tmp_path: Path,
+    extra_facts: list[tuple[date, float, datetime]],
+    expected_mcap: float,
+    extra_splits: list[tuple[date, float, datetime]],
 ) -> None:
     """The driver reads real as-of bars and shares from the T302 fixture store."""
     import duckdb
@@ -427,6 +484,21 @@ def test_stage_b_on_synthetic_store(
                 "provenance": "filing",
             },
         )
+        for ex_date, ratio, split_known in extra_splits:
+            insert_row(
+                conn,
+                "corporate_actions",
+                {
+                    "security_id": "ISSUER",
+                    "action_type": "split",
+                    "ex_date": ex_date,
+                    "ratio_or_amount": ratio,
+                    "known_at": split_known,
+                    "ingested_at": split_known,
+                    "source": "test",
+                    "provenance": "action",
+                },
+            )
         for as_of_date, value, known_at in extra_facts:
             insert_row(
                 conn,

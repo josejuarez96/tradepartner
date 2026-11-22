@@ -144,7 +144,8 @@ def test_every_store_connection_is_read_only(
     reader.benchmark("SPY", start=date(2018, 6, 1))
     reader.bars(["ISSUER", "SPY_ID"], sessions_from=date(2018, 6, 1))
     reader.shares("ISSUER", EVENT, fact_name="shares_outstanding")
-    assert opened == 3
+    reader.split_factor("ISSUER", EVENT, as_of=date(2018, 6, 4), through=date(2018, 6, 6))
+    assert opened == 4
 
 
 def test_event_study_source_is_isolated_and_read_only() -> None:

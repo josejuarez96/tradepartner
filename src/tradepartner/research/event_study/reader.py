@@ -19,6 +19,7 @@ from tradepartner.store.benchmarks import (
     research_benchmark_security_ids,
 )
 from tradepartner.store.db import open_read_only
+from tradepartner.universe import _split_factors
 
 
 class EventStudyReader:
@@ -87,6 +88,34 @@ class EventStudyReader:
                 sessions_from=sessions_from,
             )
         return adjusted, raw
+
+    def split_factor(
+        self,
+        security_id: str,
+        event_known_at: datetime,
+        *,
+        as_of: date,
+        through: date,
+        facts_read: str = "event_known_at",
+    ) -> float:
+        """Product of the split ratios known at the read time with `as_of < ex_date <= through`.
+
+        Universe rule 8 (#3055): a share count dated `as_of` is carried to the price
+        date `through` by the splits in between, via `universe._split_factors` (the
+        live revision per action, a cancelled split not at all). Only splits known at
+        the event or declared window cut (`facts_read`, as `shares`) count, so a split
+        announced later never moves the count (#3681)."""
+        if facts_read not in {"event_known_at", "window_end"}:
+            raise ValueError("invalid facts_read mode")
+        event_t = self._record(event_known_at)
+        t = self._record(self.cutoff if facts_read == "window_end" else event_t)
+        with open_read_only(self.settings) as conn:
+            splits = _split_factors(conn, t, [security_id], through)
+        factor = 1.0
+        for ex_date, ratio in splits.get(security_id, []):
+            if ex_date > as_of:
+                factor *= ratio
+        return factor
 
     def shares(
         self,

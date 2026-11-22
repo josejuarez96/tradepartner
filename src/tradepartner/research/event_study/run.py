@@ -307,9 +307,12 @@ def summarise_study(
     }
     # A windowed line (`entry_start`) never stands in for its side's full-window line.
     by_side: dict[str, dict[str, Any]] = {}
+    side_line_name: dict[str, str] = {}
+    killed_by_line: dict[str, float] = {}
     for line in design["kill"]:
         if "entry_start" not in line:
             by_side.setdefault(str(line["side"]), kills[str(line["name"])])
+            side_line_name.setdefault(str(line["side"]), str(line["name"]))
     fallback = {
         "readings": ["raw"],
         "metric": "net_bp",
@@ -391,7 +394,13 @@ def summarise_study(
             readings,
         )
         summary["kill"][str(line["name"])] = result
-        summary["secondary"][f"kill_{line['name']}"] = float(result["killed"])
+        killed_by_line[str(line["name"])] = float(result["killed"])
+        summary["secondary"][f"kill_{line['name']}"] = killed_by_line[str(line["name"])]
+    # `summarise`'s kill_long / kill_short judge the max horizon, the first treated
+    # group and the primary cost: the line's own figures only for a line named so. A
+    # side's flag comes from the line `by_side` stood in for, whatever it is called (#3681).
+    for side, name in side_line_name.items():
+        summary["secondary"][f"kill_{side}"] = killed_by_line[name]
     return summary
 
 
@@ -525,7 +534,19 @@ def run_study(
         if not eligible:
             drop(group, "no_mcap")
             continue
-        mcap = float(str(eligible[-1]["value"])) * float(prior_raw["close"])
+        latest = eligible[-1]
+        latest_date = latest["as_of_date"]
+        assert isinstance(latest_date, date)  # `eligible` holds dated facts only
+        # Universe rule 8 (#3681): the raw close is post-split, so a share count dated
+        # before a split is carried over the splits known at the read time.
+        shares = float(str(latest["value"])) * reader.split_factor(
+            sid,
+            known_at,
+            as_of=latest_date,
+            through=prior,
+            facts_read=str(design["facts_read"]),
+        )
+        mcap = shares * float(prior_raw["close"])
         beta = _beta(
             sid,
             entry_i,
