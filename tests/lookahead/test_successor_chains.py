@@ -596,7 +596,7 @@ def test_the_chain_reads_are_truncation_invariant_from_the_known_at(
         lambda c, t: adjusted_prices_as_of(c, t, [_SUCCESSOR], include_dividends=True),
         lambda c, t: live_actions_as_of(c, t, [_SUCCESSOR]),
         lambda c, t: facts_as_of(c, t, [_SUCCESSOR]),
-        lambda c, t: price_jumps_as_of(c, t, [_SUCCESSOR]),
+        lambda c, t: price_jumps_as_of(c, t, [_SUCCESSOR], settings=_settings()),
         lambda c, t: dropped_dividends_as_of(c, t, [_SUCCESSOR]),
     ]
     settings = Settings(_env_file=None)
