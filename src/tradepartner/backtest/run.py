@@ -693,6 +693,10 @@ def replay_trial(
             detail_level=registry.DETAIL_LEVEL_FULL,
             data_vintage=facts.data_vintage,
             database=None,
+            start_session=facts.start_session,
+            end_session=facts.end_session,
+            data_cutoff=facts.data_cutoff,
+            holdout_start=hypothesis.holdout_start,
         )
         cadence = hypothesis_cadence(conn, handle)
     levels = {params.costs.per_side_bps, *params.costs.sensitivity_per_side_bps, *measured}
@@ -716,6 +720,8 @@ def replay_trial(
             family=hypothesis.family,
             keep_marking_frames=False,
         )
+    # A replay recomputes a stored trial by design, so its handle is not spent.
+    engine.release_handle(handle)
     return metric_rows(results, params, cadence=cadence, family=hypothesis.family)
 
 

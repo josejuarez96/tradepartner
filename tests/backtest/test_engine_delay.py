@@ -41,6 +41,8 @@ from tradepartner.config import Cadence, Settings
 from tradepartner.store import registry, schema
 from tradepartner.store.db import configure_connection
 
+pytestmark = pytest.mark.usefixtures("unbound_handles")
+
 #: Every `Plan` field that comes from the reads (all but `session` and `fill_session`).
 READ_FIELDS = (
     "members",

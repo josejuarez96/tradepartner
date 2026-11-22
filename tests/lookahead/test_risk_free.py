@@ -40,6 +40,8 @@ from tradepartner.store import registry, schema
 from tradepartner.store.asof import rates_as_of
 from tradepartner.store.db import configure_connection, insert_row
 
+pytestmark = pytest.mark.usefixtures("unbound_handles")
+
 UNIVERSE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
 START, END = date(2019, 1, 2), date(2019, 9, 30)
 LEVELS = (0.0, 15.0)

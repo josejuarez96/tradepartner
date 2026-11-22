@@ -91,6 +91,8 @@ from tradepartner.store import registry, schema
 from tradepartner.store.asof import prices_as_of
 from tradepartner.store.db import configure_connection, insert_row
 
+pytestmark = pytest.mark.usefixtures("unbound_handles")
+
 UNIVERSE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
 
 #: The fixture's bars run 2017-01-03 through 2020-06-30 (fixture README).
