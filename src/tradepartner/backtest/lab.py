@@ -117,7 +117,12 @@ from tradepartner.backtest.holdout import Flags, Frozen, Reasons, Window, decide
 from tradepartner.backtest.hypothesis import load_frozen
 from tradepartner.backtest.metrics import expected_max_sharpe
 from tradepartner.backtest.results import family_n, write_results
-from tradepartner.backtest.run import exit_coverage_counts, with_exit_coverage
+from tradepartner.backtest.run import (
+    DEFAULT_RUN_BY,
+    _on_store,
+    exit_coverage_counts,
+    with_exit_coverage,
+)
 from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.store_provider import Connect, StoreProvider
 from tradepartner.config import Cadence, HypothesisFamily, Settings, clean_message, get_settings
@@ -128,9 +133,6 @@ from tradepartner.store.lab_registry import LabRegistryError, SweepRecord
 from tradepartner.store.registry import STORE_CHANGED_MESSAGE, TrialHandle
 
 _log = logging.getLogger(__name__)
-
-#: The owner, unless a caller (`backtest-runner`, a test) names itself.
-DEFAULT_RUN_BY: Final = "owner"
 
 #: Bytes per gigabyte for the `lab.registry_size_*` guards (decimal, as `lab status`
 #: prints the store size).
@@ -283,14 +285,6 @@ class _Opened:
     error: str | None = None
     results: dict[float, BacktestResult] | None = None
     ran: bool = False
-
-
-def _on_store(live: Settings, store_path: Path | str | None) -> Settings:
-    if store_path is None:
-        return live
-    return type(live).model_validate(
-        {**live.model_dump(), "store": {**live.store.model_dump(), "path": str(store_path)}}
-    )
 
 
 def _describe(exc: BaseException) -> str:
