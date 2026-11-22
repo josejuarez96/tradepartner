@@ -266,6 +266,7 @@ def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> AppTest:
 def _text(at: AppTest) -> str:
     parts = [m.value for m in at.markdown]
     parts += [c.value for c in at.caption]
+    parts += [t.value for t in at.text]
     parts += [h.value for h in at.subheader]
     parts += [e.value for kind in (at.info, at.warning, at.error, at.success) for e in kind]
     return "\n".join(str(p) for p in parts)
@@ -500,6 +501,62 @@ def test_render_refused_trial_shows_state_and_message(
     text = _text(at)
     assert "refused_holdout" in text
     assert "window touches the holdout" in text
+
+
+_HOSTILE = "see [here](https://evil.test/x) ![p](https://evil.test/p.png)"
+
+
+def _markdown_rendered(at: AppTest) -> list[str]:
+    """Every value drawn by an element that renders markdown."""
+    kinds = (at.markdown, at.caption, at.info, at.warning, at.error, at.success)
+    return [str(e.value) for kind in kinds for e in kind]
+
+
+def test_a_stored_trial_message_is_drawn_as_plain_text_not_markdown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed trial's stored message can carry an exception's or a vendor's words,
+    so a link or an image in it must never reach a markdown renderer (#3674)."""
+    store_path = tmp_path / "hostile.duckdb"
+    seed_settings = Settings(_env_file=None, store={"path": str(tmp_path / "real.duckdb")})
+    with open_for_write(Settings(_env_file=None, store={"path": str(store_path)})) as conn:
+        schema.init_schema(conn)
+        h1 = _hypothesis(conn, seed_settings, "h1-momentum-12-1", 0.1)
+        registry.close_trial(conn, _open(conn, seed_settings, h1), "failed", _HOSTILE)
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    assert not [value for value in _markdown_rendered(at) if "evil.test" in value]
+    assert _HOSTILE in [t.value for t in at.text]
+    assert "failed:" in [e.value for e in at.error]
+
+
+def test_a_stored_note_and_the_owners_reasons_are_drawn_as_plain_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The trial's note, its holdout reason and its gap-override reason are stored
+    free text too (#3674)."""
+    store_path = tmp_path / "hostile.duckdb"
+    seed_settings = Settings(_env_file=None, store={"path": str(tmp_path / "real.duckdb")})
+    with open_for_write(Settings(_env_file=None, store={"path": str(store_path)})) as conn:
+        schema.init_schema(conn)
+        h1 = _hypothesis(conn, seed_settings, "h1-momentum-12-1", 0.1)
+        _open(
+            conn,
+            seed_settings,
+            h1,
+            kind="holdout",
+            note=f"n {_HOSTILE}",
+            holdout_reason=f"h {_HOSTILE}",
+            gap_override_reason=f"g {_HOSTILE}",
+        )
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    assert not [value for value in _markdown_rendered(at) if "evil.test" in value]
+    drawn = [t.value for t in at.text]
+    assert drawn == [f"note: n {_HOSTILE}", f"h {_HOSTILE}", f"g {_HOSTILE}"]
+    warnings = [w.value for w in at.warning]
+    assert "Holdout run. Reason:" in warnings
+    assert "Gap gate overridden by the owner. Reason:" in warnings
 
 
 def test_render_unfinished_trial(

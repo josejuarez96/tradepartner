@@ -522,16 +522,24 @@ def _render_states(view: TrialView) -> None:
         f"run by {trial.run_by} at {trial.started_at:%Y-%m-%d %H:%M} UTC · "
         f"code {view.code_version}{dirty} · data cutoff {view.data_cutoff} · "
         f"base cost {view.base_cost} bps per side"
-        + (f" · note: {trial.note}" if trial.note else "")
     )
+    # Stored free text (a note, a reason, a failure's message) can carry anyone's
+    # words, so it is drawn with `st.text`, never through markdown (issue 3674).
+    if trial.note:
+        st.text(f"note: {trial.note}")
     if trial.synthetic:
         st.info("Synthetic trial: test data, not counted in N or V.")
     if trial.kind == "holdout":
-        st.warning(f"Holdout run. Reason: {view.holdout_reason or '(none recorded)'}")
+        if view.holdout_reason:
+            st.warning("Holdout run. Reason:")
+            st.text(view.holdout_reason)
+        else:
+            st.warning("Holdout run. Reason: (none recorded)")
     if trial.holdout_repeat:
         st.warning("Holdout repeat: this family had already spent the holdout (domain rule 3).")
     if view.gap_override_reason:
-        st.warning(f"Gap gate overridden by the owner: {view.gap_override_reason}")
+        st.warning("Gap gate overridden by the owner. Reason:")
+        st.text(view.gap_override_reason)
     if view.result is not None and view.result["red_flag"]:
         st.warning(
             "Red flag: base-level excess CAGR over SPY is above "
@@ -539,8 +547,11 @@ def _render_states(view: TrialView) -> None:
         )
     if status == registry.UNFINISHED:
         st.info("Unfinished: this trial has no result row (still running, or it crashed).")
+    elif status != "ok" and trial.message:
+        st.error(f"{status}:")
+        st.text(trial.message)
     elif status != "ok":
-        st.error(f"{status}: {trial.message or '(no message)'}")
+        st.error(f"{status}: (no message)")
 
 
 def _render_long_short(view: TrialView) -> None:
