@@ -200,7 +200,7 @@ from tradepartner.adapters.broker import (
 )
 from tradepartner.backtest.frozen import frozen_values
 from tradepartner.calendar import is_session, next_session, previous_session, session_close
-from tradepartner.config import RiskConfig, Settings, render_validation_errors
+from tradepartner.config import PaperConfig, RiskConfig, Settings, render_validation_errors
 from tradepartner.errors import ClockError, LimitBreachError, ReconciliationError
 from tradepartner.execution import breaks as break_rules
 from tradepartner.execution import switch
@@ -2972,11 +2972,68 @@ def read_confirmed(broker: Broker, coid: str, broker_order_id: str) -> Order:
     return found
 
 
+def seen_elsewhere(broker: Broker, orders: Sequence[OrderRow], since: datetime) -> set[str]:
+    """The `client_order_id`s of `orders` that `broker.open_orders()` or
+    `broker.fills(since)` shows: two reads independent of the by-coid index, whose
+    lag (#3335) makes a live order look unknown. `since` is the earliest `known_at`
+    of the orders' `pending` events less the fill-read overlap
+    (`earliest_pending_known_at`). A failed read raises
+    `ReconciliationError` (fail closed); a `ClockError` keeps its type."""
+    wanted = {o.client_order_id for o in orders}
+    try:
+        seen = {o.client_order_id for o in broker.open_orders()}
+        seen |= {f.client_order_id for f in broker.fills(since)}
+    except ClockError:
+        raise
+    except Exception as exc:
+        raise ReconciliationError(
+            f"could not read the broker's open orders and fills to check "
+            f"{len(wanted)} order(s) whose coid lookup missed ({type(exc).__name__}): "
+            f"not closed not_received"
+        ) from exc
+    return wanted & seen
+
+
+def fill_read_overlap(settings: Settings | None) -> timedelta:
+    """`paper.fill_read_overlap_seconds` (the config default when `settings` is
+    `None`, for a caller that holds none)."""
+    paper = PaperConfig() if settings is None else settings.paper
+    return timedelta(seconds=paper.fill_read_overlap_seconds)
+
+
+def earliest_pending_known_at(
+    connect: Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]],
+    orders: Sequence[OrderRow],
+    overlap: timedelta,
+) -> datetime:
+    """The earliest `known_at` of `orders`' `pending` events, less `overlap`
+    (the broker filters fills on its own clock, so our stamp may run ahead of
+    it): where `seen_elsewhere` starts reading fills. Raises `ReconciliationError` when no
+    order has one (a journal this code cannot reason about: fail closed)."""
+    with connect() as conn:
+        events = order_events_for(
+            conn, window_id=None, client_order_ids=[o.client_order_id for o in orders]
+        )
+    stamps = [e.known_at for e in events if e.status == "pending"]
+    if not stamps:
+        raise ReconciliationError("no `pending` event for the orders whose coid lookup missed")
+    return min(stamps) - overlap
+
+
+def not_closed_not_received(coid: str) -> ReconciliationError:
+    """The refusal for an order the broker shows although its coid lookup missed."""
+    return ReconciliationError(
+        f"order {coid} is at the broker (open order / fill) but its coid lookup "
+        f"missed: not closed not_received"
+    )
+
+
 def settle_pending_unresolved(
     broker: Broker,
     connect: Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]],
     clock: Callable[[], datetime],
     orders: Sequence[OrderRow],
+    settings: Settings | None = None,
 ) -> tuple[str, ...]:
     """Read back, by `client_order_id`, each of `orders` (`unresolved_orders`);
     return the ids settled.
@@ -2984,7 +3041,9 @@ def settle_pending_unresolved(
     The broker knows it: an `accepted` event with the broker's order id (the
     collection that follows journals its fills and terminal event). It does not
     (`UnknownOrderError`): `cancelled` with reason `not_received`, so the
-    decision is open again, unless the submit reply was journaled on its
+    decision is open again (unless `open_orders()` or `fills()` shows it, #3575:
+    then `ReconciliationError`; an order cancelled or rejected unfilled still
+    closes, harmlessly), unless the submit reply was journaled on its
     `pending_unresolved` event (#3335): then the order is read by that broker id
     (`read_confirmed`, any state), and a failed lookup raises `ReconciliationError`. A read that
     fails otherwise, or a broker order whose
@@ -2993,6 +3052,7 @@ def settle_pending_unresolved(
     `ClockError` keeps its type)."""
     readings: dict[str, Order | None] = {}
     confirmed = confirmed_broker_ids(connect, orders)
+    elsewhere: set[str] | None = None
     for order in orders:
         coid = order.client_order_id
         try:
@@ -3000,6 +3060,14 @@ def settle_pending_unresolved(
         except UnknownOrderError:
             broker_id = confirmed.get(coid)
             if broker_id is None:
+                if elsewhere is None:
+                    elsewhere = seen_elsewhere(
+                        broker,
+                        orders,
+                        earliest_pending_known_at(connect, orders, fill_read_overlap(settings)),
+                    )
+                if coid in elsewhere:
+                    raise not_closed_not_received(coid) from None
                 readings[coid] = None
                 continue
             got = read_confirmed(broker, coid, broker_id)
@@ -3089,7 +3157,11 @@ def reconcile_command(
                     f"{_window_id(window)}'s {window.account_id!r}"
                 )
             settle_pending_unresolved(
-                broker, connect, clock, unresolved_orders(connect, _window_id(window))
+                broker,
+                connect,
+                clock,
+                unresolved_orders(connect, _window_id(window)),
+                settings,
             )
             now = _read_clock(clock)
             session = command_session(now)

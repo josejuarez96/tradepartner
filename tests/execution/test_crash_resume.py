@@ -60,6 +60,7 @@ from execution.test_run_trade import (
 )
 from tradepartner.adapters.broker import (
     Asset,
+    Fill,
     Order,
     OrderRequest,
     OrderStatus,
@@ -110,6 +111,7 @@ from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
     AdjustmentRow,
+    OrderRow,
     OverrideRow,
     PaperWindowRow,
     fills_for,
@@ -1637,6 +1639,114 @@ def test_an_unresolved_order_with_no_journaled_broker_id_still_closes_not_receiv
     nxt = env.run(at(F_0_PLUS_1))
     assert nxt.status == "ok", env.result(env.latest_run())
     assert _events(env, coid)[-1] == ("cancelled", "not_received")
+
+
+def _unconfirmed_unresolved_buy(env: Env) -> tuple[str, OrderRow]:
+    """`_unresolved_buy` with no journaled broker id (the submit raised after the
+    POST landed, #3575), and the fake's coid lookup missing that order while it
+    stays at the broker."""
+    coid, _ = _unresolved_buy(env)
+    with open_for_write(env.settings) as conn:
+        conn.execute(
+            "UPDATE order_events SET broker_order_id = NULL "
+            "WHERE client_order_id = ? AND status = 'pending_unresolved'",
+            [coid],
+        )
+    (notional,) = env.query("SELECT notional FROM orders WHERE client_order_id = ?", [coid])[0]
+    env.fake.submit(OrderRequest(coid, "TRNS", Side.BUY, notional=notional))
+    with open_read_only(env.settings) as conn:
+        [row] = [o for o in orders_for(conn, window_id=None) if o.client_order_id == coid]
+    return coid, row
+
+
+def _lagging(env: Env, monkeypatch: pytest.MonkeyPatch, coid: str) -> None:
+    real = env.fake.get_order
+
+    def get_order(client_order_id: str) -> Order:
+        if client_order_id == coid:
+            raise UnknownOrderError(client_order_id)
+        return real(client_order_id)
+
+    monkeypatch.setattr(env.fake, "get_order", get_order)
+
+
+def test_a_pending_order_whose_coid_lookup_lags_but_is_open_is_not_closed_not_received(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3575: no journaled broker id, the coid lookup misses, but the order is in
+    `open_orders()`: `paper resume` refuses, writes no `not_received` and builds
+    no new attempt."""
+    coid, _ = _unconfirmed_unresolved_buy(env)
+    _lagging(env, monkeypatch, coid)
+    submits = len(env.submits())
+    with pytest.raises(ReconciliationError, match="at the broker"):
+        _resume(env)
+    assert _events(env, coid) == [("pending", None), ("pending_unresolved", None)]
+    assert len(env.submits()) == submits
+    assert [a[0] for a in _attempts(env, "SEC_TRANSFER")] == [coid]
+
+
+def test_an_unresolved_order_whose_coid_lookup_lags_but_is_filled_is_not_closed_not_received(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3575: the order is already filled, so only `fills()` shows it."""
+    coid, row = _unconfirmed_unresolved_buy(env)
+    env.fake.simulate_fill(coid)
+    assert coid not in {o.client_order_id for o in env.fake.open_orders()}
+    _lagging(env, monkeypatch, coid)
+    with pytest.raises(ReconciliationError, match="at the broker"):
+        settle_pending_unresolved(env.fake, env.connect, env.clock, [row])
+    assert _events(env, coid) == [("pending", None), ("pending_unresolved", None)]
+
+
+def test_the_fill_read_starts_one_overlap_before_the_pending_stamp(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3575: the broker filters fills on its own clock, so the read starts
+    `paper.fill_read_overlap_seconds` before our `pending` stamp."""
+    coid, row = _unconfirmed_unresolved_buy(env)
+    _lagging(env, monkeypatch, coid)
+    (pending_at,) = env.query(
+        "SELECT known_at FROM order_events WHERE client_order_id = ? AND status = 'pending'",
+        [coid],
+    )[0]
+    asked: list[datetime | None] = []
+    real = env.fake.fills
+
+    def fills(since: datetime | None = None) -> list[Fill]:
+        asked.append(since)
+        return real(since)
+
+    monkeypatch.setattr(env.fake, "fills", fills)
+    with pytest.raises(ReconciliationError):
+        settle_pending_unresolved(env.fake, env.connect, env.clock, [row], env.settings)
+    overlap = timedelta(seconds=env.settings.paper.fill_read_overlap_seconds)
+    assert asked == [pending_at - overlap]
+
+
+def test_a_failed_open_orders_read_fails_closed_and_writes_nothing(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coid, row = _unconfirmed_unresolved_buy(env)
+    _lagging(env, monkeypatch, coid)
+
+    def boom() -> list[Order]:
+        raise ConnectionError("down")
+
+    monkeypatch.setattr(env.fake, "open_orders", boom)
+    with pytest.raises(ReconciliationError, match="not closed not_received"):
+        settle_pending_unresolved(env.fake, env.connect, env.clock, [row])
+    assert _events(env, coid) == [("pending", None), ("pending_unresolved", None)]
+
+
+def test_the_extra_reads_happen_only_on_a_coid_miss(env: Env, window: PaperWindowRow) -> None:
+    """#3575: an order the coid lookup finds triggers no `open_orders` / `fills`."""
+    _, row = _unconfirmed_unresolved_buy(env)
+    before = len(env.fake.calls)
+    settle_pending_unresolved(env.fake, env.connect, env.clock, [row])
+    methods = [c.method for c in env.fake.calls[before:]]
+    assert "open_orders" not in methods
+    assert "fills" not in methods
 
 
 def test_a_confirmed_order_whose_coid_lookup_lags_is_not_closed_not_received_or_resent(
