@@ -1,0 +1,4099 @@
+{
+  "commands": [
+    {
+      "commands": [],
+      "params": [
+        {
+          "default": "all",
+          "is_flag": false,
+          "name": "source",
+          "nargs": 1,
+          "opts": [
+            "--source"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "backfill_",
+          "nargs": 1,
+          "opts": [
+            "--backfill"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "since",
+          "nargs": 1,
+          "opts": [
+            "--since"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "actions_backfill",
+          "nargs": 1,
+          "opts": [
+            "--actions-backfill"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "boolean"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "name_changes_only",
+          "nargs": 1,
+          "opts": [
+            "--name-changes-only"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "through",
+          "nargs": 1,
+          "opts": [
+            "--through"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "dry_run",
+          "nargs": 1,
+          "opts": [
+            "--dry-run"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-dry-run"
+          ],
+          "type": "boolean"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "fill_holes_",
+          "nargs": 1,
+          "opts": [
+            "--fill-holes"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "security",
+          "nargs": 1,
+          "opts": [
+            "--security"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "bulk_from_cache",
+          "nargs": 1,
+          "opts": [
+            "--bulk-from-cache"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "boolean"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "rebuild_statement_facts",
+          "nargs": 1,
+          "opts": [
+            "--rebuild-statement-facts"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "boolean"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "rebuild_filing_events",
+          "nargs": 1,
+          "opts": [
+            "--rebuild-filing-events"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "boolean"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "rebuild_classifications",
+          "nargs": 1,
+          "opts": [
+            "--rebuild-classifications"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "boolean"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "rebuild_index",
+          "nargs": 1,
+          "opts": [
+            "--rebuild-index"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "boolean"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "statement_backfill",
+          "nargs": 1,
+          "opts": [
+            "--statement-backfill"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "restamp_from",
+          "nargs": 1,
+          "opts": [
+            "--restamp-from"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "path"
+        },
+        {
+          "is_flag": false,
+          "name": "restamp_window_earlier_ok",
+          "nargs": 1,
+          "opts": [
+            "--restamp-window-earlier-ok"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "path"
+        },
+        {
+          "is_flag": false,
+          "name": "import_dir",
+          "nargs": 1,
+          "opts": [
+            "--import-dir"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "path"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "census_sec_forms",
+          "nargs": 1,
+          "opts": [
+            "--census-sec-forms"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "boolean"
+        },
+        {
+          "default": 20000,
+          "is_flag": false,
+          "name": "census_xml_bytes",
+          "nargs": 1,
+          "opts": [
+            "--census-xml-bytes"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "int"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "sec_forms_only",
+          "nargs": 1,
+          "opts": [
+            "--sec-forms-only"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "boolean"
+        }
+      ],
+      "path": "ingest"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "name": "symbol",
+          "nargs": 1,
+          "opts": [
+            "symbol"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "since",
+          "nargs": 1,
+          "opts": [
+            "--since"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "cik",
+          "nargs": 1,
+          "opts": [
+            "--cik"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "name",
+          "nargs": 1,
+          "opts": [
+            "--name"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "exchange",
+          "nargs": 1,
+          "opts": [
+            "--exchange"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        }
+      ],
+      "path": "backfill-benchmark"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "dry_run",
+          "nargs": 1,
+          "opts": [
+            "--dry-run"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-dry-run"
+          ],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "expect_bar_rows",
+          "nargs": 1,
+          "opts": [
+            "--expect-bar-rows"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "int"
+        },
+        {
+          "is_flag": false,
+          "name": "expect_action_rows",
+          "nargs": 1,
+          "opts": [
+            "--expect-action-rows"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "int"
+        },
+        {
+          "is_flag": false,
+          "name": "release",
+          "nargs": 1,
+          "opts": [
+            "--release"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "allow_orphans",
+          "nargs": 1,
+          "opts": [
+            "--allow-orphans"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "int"
+        }
+      ],
+      "path": "repair-resolution"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "security",
+          "nargs": 1,
+          "opts": [
+            "--security"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "from_",
+          "nargs": 1,
+          "opts": [
+            "--from"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "to",
+          "nargs": 1,
+          "opts": [
+            "--to"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "release",
+          "nargs": 1,
+          "opts": [
+            "--release"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "dry_run",
+          "nargs": 1,
+          "opts": [
+            "--dry-run"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-dry-run"
+          ],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "expect_bar_rows",
+          "nargs": 1,
+          "opts": [
+            "--expect-bar-rows"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "int"
+        },
+        {
+          "is_flag": false,
+          "name": "expect_action_rows",
+          "nargs": 1,
+          "opts": [
+            "--expect-action-rows"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "int"
+        }
+      ],
+      "path": "repair-bars"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "output",
+          "nargs": 1,
+          "opts": [
+            "--output"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "path"
+        },
+        {
+          "is_flag": false,
+          "name": "max_requests",
+          "nargs": 1,
+          "opts": [
+            "--max-requests"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "int"
+        },
+        {
+          "is_flag": false,
+          "name": "from_quarter",
+          "nargs": 1,
+          "opts": [
+            "--from-quarter"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "to_quarter",
+          "nargs": 1,
+          "opts": [
+            "--to-quarter"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "resume_file",
+          "nargs": 1,
+          "opts": [
+            "--resume"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "path"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "count_only",
+          "nargs": 1,
+          "opts": [
+            "--count-only"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-count-only"
+          ],
+          "type": "boolean"
+        }
+      ],
+      "path": "recheck-form4-multi-owner"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "manifest",
+          "nargs": 1,
+          "opts": [
+            "--manifest"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "path"
+        },
+        {
+          "is_flag": false,
+          "name": "release",
+          "nargs": 1,
+          "opts": [
+            "--release"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "expect_rows",
+          "nargs": 1,
+          "opts": [
+            "--expect-rows"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "int"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "dry_run",
+          "nargs": 1,
+          "opts": [
+            "--dry-run"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-dry-run"
+          ],
+          "type": "boolean"
+        }
+      ],
+      "path": "repair-form4-multi-owner"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "manifest",
+          "nargs": 1,
+          "opts": [
+            "--manifest"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "path"
+        },
+        {
+          "is_flag": false,
+          "name": "release",
+          "nargs": 1,
+          "opts": [
+            "--release"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "expect_rows",
+          "nargs": 1,
+          "opts": [
+            "--expect-rows"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "int"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "dry_run",
+          "nargs": 1,
+          "opts": [
+            "--dry-run"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-dry-run"
+          ],
+          "type": "boolean"
+        }
+      ],
+      "path": "repair-form4-roles"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "zip_dir",
+          "nargs": 1,
+          "opts": [
+            "--zip-dir"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "path"
+        },
+        {
+          "is_flag": false,
+          "name": "output",
+          "nargs": 1,
+          "opts": [
+            "--output"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "path"
+        }
+      ],
+      "path": "build-form4-roles-manifest"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "manifest",
+          "nargs": 1,
+          "opts": [
+            "--manifest"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "path"
+        },
+        {
+          "is_flag": false,
+          "name": "release",
+          "nargs": 1,
+          "opts": [
+            "--release"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "expect_rows",
+          "nargs": 1,
+          "opts": [
+            "--expect-rows"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "int"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "dry_run",
+          "nargs": 1,
+          "opts": [
+            "--dry-run"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-dry-run"
+          ],
+          "type": "boolean"
+        }
+      ],
+      "path": "repair-form4-titles"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "output",
+          "nargs": 1,
+          "opts": [
+            "--output"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "path"
+        },
+        {
+          "is_flag": false,
+          "name": "zip_dir",
+          "nargs": 1,
+          "opts": [
+            "--zip-dir"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "path"
+        }
+      ],
+      "path": "build-form4-titles-manifest"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "release",
+          "nargs": 1,
+          "opts": [
+            "--release"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "to",
+          "nargs": 1,
+          "opts": [
+            "--to"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "dry_run",
+          "nargs": 1,
+          "opts": [
+            "--dry-run"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-dry-run"
+          ],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "expect_action_rows",
+          "nargs": 1,
+          "opts": [
+            "--expect-action-rows"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "int"
+        }
+      ],
+      "path": "repair-dividends"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "since",
+          "nargs": 1,
+          "opts": [
+            "--since"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "through",
+          "nargs": 1,
+          "opts": [
+            "--through"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "release",
+          "nargs": 1,
+          "opts": [
+            "--release"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "security",
+          "nargs": 1,
+          "opts": [
+            "--security"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "dry_run",
+          "nargs": 1,
+          "opts": [
+            "--dry-run"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-dry-run"
+          ],
+          "type": "boolean"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "span",
+          "nargs": 1,
+          "opts": [
+            "--span"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-span"
+          ],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "allow_collision",
+          "nargs": 1,
+          "opts": [
+            "--allow-collision"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "skip_collisions",
+          "nargs": 1,
+          "opts": [
+            "--skip-collisions"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-skip-collisions"
+          ],
+          "type": "boolean"
+        }
+      ],
+      "path": "refetch-actions"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "release",
+          "nargs": 1,
+          "opts": [
+            "--release"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "dry_run",
+          "nargs": 1,
+          "opts": [
+            "--dry-run"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-dry-run"
+          ],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "expect_action_rows",
+          "nargs": 1,
+          "opts": [
+            "--expect-action-rows"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "int"
+        }
+      ],
+      "path": "repair-spinoff-splits"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "since",
+          "nargs": 1,
+          "opts": [
+            "--since"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "release",
+          "nargs": 1,
+          "opts": [
+            "--release"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "through",
+          "nargs": 1,
+          "opts": [
+            "--through"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "dry_run",
+          "nargs": 1,
+          "opts": [
+            "--dry-run"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-dry-run"
+          ],
+          "type": "boolean"
+        }
+      ],
+      "path": "spinoff-backfill"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "release",
+          "nargs": 1,
+          "opts": [
+            "--release"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "dry_run",
+          "nargs": 1,
+          "opts": [
+            "--dry-run"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-dry-run"
+          ],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "expect_rows",
+          "nargs": 1,
+          "opts": [
+            "--expect-rows"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "int"
+        }
+      ],
+      "path": "repair-rename-listings"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "release",
+          "nargs": 1,
+          "opts": [
+            "--release"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "from_release",
+          "nargs": 1,
+          "opts": [
+            "--from-release"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "table",
+          "nargs": 1,
+          "opts": [
+            "--table"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "key",
+          "nargs": 1,
+          "opts": [
+            "--key"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "dry_run",
+          "nargs": 1,
+          "opts": [
+            "--dry-run"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-dry-run"
+          ],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "expect_rows",
+          "nargs": 1,
+          "opts": [
+            "--expect-rows"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "int"
+        }
+      ],
+      "path": "repair-restore"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "parent",
+          "nargs": 1,
+          "opts": [
+            "--parent"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "child",
+          "nargs": 1,
+          "opts": [
+            "--child"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "ex_date",
+          "nargs": 1,
+          "opts": [
+            "--ex-date"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "fraction",
+          "nargs": 1,
+          "opts": [
+            "--fraction"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        }
+      ],
+      "path": "spinoff-allocation"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "security",
+          "nargs": 1,
+          "opts": [
+            "--security"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "action_id",
+          "nargs": 1,
+          "opts": [
+            "--action-id"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "reason",
+          "nargs": 1,
+          "opts": [
+            "--reason"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "reinstate",
+          "nargs": 1,
+          "opts": [
+            "--reinstate"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-reinstate"
+          ],
+          "type": "boolean"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "dry_run",
+          "nargs": 1,
+          "opts": [
+            "--dry-run"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-dry-run"
+          ],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "expect_known_at",
+          "nargs": 1,
+          "opts": [
+            "--expect-known-at"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        }
+      ],
+      "path": "action-retract"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "manifest",
+          "nargs": 1,
+          "opts": [
+            "--manifest"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "path"
+        },
+        {
+          "is_flag": false,
+          "name": "release",
+          "nargs": 1,
+          "opts": [
+            "--release"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "dry_run",
+          "nargs": 1,
+          "opts": [
+            "--dry-run"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-dry-run"
+          ],
+          "type": "boolean"
+        }
+      ],
+      "path": "delete-master-rows"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "apply",
+          "nargs": 1,
+          "opts": [
+            "--apply"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "expect_rows",
+          "nargs": 1,
+          "opts": [
+            "--expect-rows"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "int"
+        },
+        {
+          "is_flag": false,
+          "name": "expect_digest",
+          "nargs": 1,
+          "opts": [
+            "--expect-digest"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "allow_traded",
+          "nargs": 1,
+          "opts": [
+            "--allow-traded"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "release",
+          "nargs": 1,
+          "opts": [
+            "--release"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        }
+      ],
+      "path": "master-retract"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "check",
+          "nargs": 1,
+          "opts": [
+            "--check"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-check"
+          ],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "jumps_before",
+          "nargs": 1,
+          "opts": [
+            "--jumps-before"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": true,
+          "name": "coverage",
+          "nargs": 1,
+          "opts": [
+            "--coverage"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-coverage"
+          ],
+          "type": "boolean"
+        }
+      ],
+      "path": "health"
+    },
+    {
+      "commands": [],
+      "params": [],
+      "path": "dashboard"
+    },
+    {
+      "commands": [],
+      "params": [],
+      "path": "stale-keys"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "name": "out_dir",
+          "nargs": 1,
+          "opts": [
+            "out_dir"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "path"
+        }
+      ],
+      "path": "export"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "name": "hypothesis",
+          "nargs": 1,
+          "opts": [
+            "hypothesis"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "start",
+          "nargs": 1,
+          "opts": [
+            "--start"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "end",
+          "nargs": 1,
+          "opts": [
+            "--end"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "spend_holdout",
+          "nargs": 1,
+          "opts": [
+            "--spend-holdout"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-spend-holdout"
+          ],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "holdout_reason",
+          "nargs": 1,
+          "opts": [
+            "--holdout-reason"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "holdout_repeat",
+          "nargs": 1,
+          "opts": [
+            "--holdout-repeat"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-holdout-repeat"
+          ],
+          "type": "boolean"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "override_gap",
+          "nargs": 1,
+          "opts": [
+            "--override-gap"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-override-gap"
+          ],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "gap_reason",
+          "nargs": 1,
+          "opts": [
+            "--gap-reason"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "note",
+          "nargs": 1,
+          "opts": [
+            "--note"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "measured_cost_bps",
+          "nargs": 1,
+          "opts": [
+            "--measured-cost-bps"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "float"
+        }
+      ],
+      "path": "backtest"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "hypothesis",
+          "nargs": 1,
+          "opts": [
+            "--hypothesis"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "include_synthetic",
+          "nargs": 1,
+          "opts": [
+            "--include-synthetic"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-include-synthetic"
+          ],
+          "type": "boolean"
+        }
+      ],
+      "path": "trials"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "name": "trial_id",
+          "nargs": 1,
+          "opts": [
+            "trial_id"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "int"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "holdout_repeat",
+          "nargs": 1,
+          "opts": [
+            "--holdout-repeat"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-holdout-repeat"
+          ],
+          "type": "boolean"
+        }
+      ],
+      "path": "trial-reproduce"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "registration",
+          "nargs": 1,
+          "opts": [
+            "--registration"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "family",
+          "nargs": 1,
+          "opts": [
+            "--family"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "kind",
+          "nargs": 1,
+          "opts": [
+            "--kind"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "include_synthetic",
+          "nargs": 1,
+          "opts": [
+            "--include-synthetic"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-include-synthetic"
+          ],
+          "type": "boolean"
+        }
+      ],
+      "path": "experiments"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "family",
+          "nargs": 1,
+          "opts": [
+            "--family"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "candidate",
+          "nargs": 1,
+          "opts": [
+            "--candidate"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "include_synthetic",
+          "nargs": 1,
+          "opts": [
+            "--include-synthetic"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-include-synthetic"
+          ],
+          "type": "boolean"
+        },
+        {
+          "default": false,
+          "is_flag": true,
+          "name": "candidates",
+          "nargs": 1,
+          "opts": [
+            "--candidates"
+          ],
+          "required": false,
+          "secondary_opts": [
+            "--no-candidates"
+          ],
+          "type": "boolean"
+        },
+        {
+          "is_flag": false,
+          "name": "since",
+          "nargs": 1,
+          "opts": [
+            "--since"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        }
+      ],
+      "path": "exposures"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "start",
+          "nargs": 1,
+          "opts": [
+            "--start"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "end",
+          "nargs": 1,
+          "opts": [
+            "--end"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        },
+        {
+          "is_flag": false,
+          "name": "out",
+          "nargs": 1,
+          "opts": [
+            "--out"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "path"
+        }
+      ],
+      "path": "index-check"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "history",
+          "nargs": 1,
+          "opts": [
+            "--history"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        }
+      ],
+      "path": "identity-check"
+    },
+    {
+      "commands": [],
+      "params": [
+        {
+          "is_flag": false,
+          "name": "reference",
+          "nargs": 1,
+          "opts": [
+            "--reference"
+          ],
+          "required": true,
+          "secondary_opts": [],
+          "type": "path"
+        },
+        {
+          "default": "SPY",
+          "is_flag": false,
+          "name": "symbol",
+          "nargs": 1,
+          "opts": [
+            "--symbol"
+          ],
+          "required": false,
+          "secondary_opts": [],
+          "type": "str"
+        }
+      ],
+      "path": "close-gap"
+    },
+    {
+      "commands": [
+        {
+          "commands": [],
+          "params": [
+            {
+              "name": "file",
+              "nargs": 1,
+              "opts": [
+                "file"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "path"
+            },
+            {
+              "is_flag": false,
+              "name": "operations_book_of",
+              "nargs": 1,
+              "opts": [
+                "--operations-book-of"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "reason",
+              "nargs": 1,
+              "opts": [
+                "--reason"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "hypothesis register"
+        }
+      ],
+      "params": [],
+      "path": "hypothesis"
+    },
+    {
+      "commands": [
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "trial",
+              "nargs": 1,
+              "opts": [
+                "--trial"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "reason",
+              "nargs": 1,
+              "opts": [
+                "--reason"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "decision gap-signoff"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "date_",
+              "nargs": 1,
+              "opts": [
+                "--date"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "reason",
+              "nargs": 1,
+              "opts": [
+                "--reason"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "decision development-boundary"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "sessions",
+              "nargs": 1,
+              "opts": [
+                "--sessions"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "order_sessions",
+              "nargs": 1,
+              "opts": [
+                "--order-sessions"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "reason",
+              "nargs": 1,
+              "opts": [
+                "--reason"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "decision shakedown-span"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "alert",
+              "nargs": 1,
+              "opts": [
+                "--alert"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "reason",
+              "nargs": 1,
+              "opts": [
+                "--reason"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "decision shakedown-note"
+        },
+        {
+          "commands": [
+            {
+              "commands": [],
+              "params": [
+                {
+                  "is_flag": false,
+                  "name": "name",
+                  "nargs": 1,
+                  "opts": [
+                    "--name"
+                  ],
+                  "required": true,
+                  "secondary_opts": [],
+                  "type": "str"
+                },
+                {
+                  "is_flag": false,
+                  "name": "backup",
+                  "nargs": 1,
+                  "opts": [
+                    "--backup"
+                  ],
+                  "required": true,
+                  "secondary_opts": [],
+                  "type": "path"
+                },
+                {
+                  "is_flag": false,
+                  "name": "reason",
+                  "nargs": 1,
+                  "opts": [
+                    "--reason"
+                  ],
+                  "required": true,
+                  "secondary_opts": [],
+                  "type": "str"
+                }
+              ],
+              "path": "decision data-release open"
+            },
+            {
+              "commands": [],
+              "params": [
+                {
+                  "is_flag": false,
+                  "name": "name",
+                  "nargs": 1,
+                  "opts": [
+                    "--name"
+                  ],
+                  "required": true,
+                  "secondary_opts": [],
+                  "type": "str"
+                },
+                {
+                  "is_flag": false,
+                  "name": "from_",
+                  "nargs": 1,
+                  "opts": [
+                    "--from"
+                  ],
+                  "required": true,
+                  "secondary_opts": [],
+                  "type": "str"
+                },
+                {
+                  "is_flag": false,
+                  "name": "to",
+                  "nargs": 1,
+                  "opts": [
+                    "--to"
+                  ],
+                  "required": true,
+                  "secondary_opts": [],
+                  "type": "str"
+                },
+                {
+                  "is_flag": false,
+                  "name": "reason",
+                  "nargs": 1,
+                  "opts": [
+                    "--reason"
+                  ],
+                  "required": false,
+                  "secondary_opts": [],
+                  "type": "str"
+                }
+              ],
+              "path": "decision data-release close"
+            },
+            {
+              "commands": [],
+              "params": [
+                {
+                  "is_flag": false,
+                  "name": "name",
+                  "nargs": 1,
+                  "opts": [
+                    "--name"
+                  ],
+                  "required": true,
+                  "secondary_opts": [],
+                  "type": "str"
+                },
+                {
+                  "default": false,
+                  "is_flag": true,
+                  "name": "record",
+                  "nargs": 1,
+                  "opts": [
+                    "--record"
+                  ],
+                  "required": false,
+                  "secondary_opts": [],
+                  "type": "boolean"
+                }
+              ],
+              "path": "decision data-release coverage"
+            },
+            {
+              "commands": [],
+              "params": [
+                {
+                  "is_flag": false,
+                  "name": "name",
+                  "nargs": 1,
+                  "opts": [
+                    "--name"
+                  ],
+                  "required": true,
+                  "secondary_opts": [],
+                  "type": "str"
+                },
+                {
+                  "is_flag": false,
+                  "name": "count",
+                  "nargs": 1,
+                  "opts": [
+                    "--count"
+                  ],
+                  "required": false,
+                  "secondary_opts": [],
+                  "type": "int"
+                },
+                {
+                  "is_flag": false,
+                  "name": "security_id",
+                  "nargs": 1,
+                  "opts": [
+                    "--security-id"
+                  ],
+                  "required": false,
+                  "secondary_opts": [],
+                  "type": "str"
+                }
+              ],
+              "path": "decision data-release accept-unreceived"
+            },
+            {
+              "commands": [],
+              "params": [
+                {
+                  "is_flag": false,
+                  "name": "name",
+                  "nargs": 1,
+                  "opts": [
+                    "--name"
+                  ],
+                  "required": true,
+                  "secondary_opts": [],
+                  "type": "str"
+                },
+                {
+                  "is_flag": false,
+                  "name": "backup",
+                  "nargs": 1,
+                  "opts": [
+                    "--backup"
+                  ],
+                  "required": true,
+                  "secondary_opts": [],
+                  "type": "path"
+                },
+                {
+                  "is_flag": false,
+                  "name": "trial",
+                  "nargs": 1,
+                  "opts": [
+                    "--trial"
+                  ],
+                  "required": true,
+                  "secondary_opts": [],
+                  "type": "int"
+                },
+                {
+                  "is_flag": false,
+                  "name": "reason",
+                  "nargs": 1,
+                  "opts": [
+                    "--reason"
+                  ],
+                  "required": true,
+                  "secondary_opts": [],
+                  "type": "str"
+                }
+              ],
+              "path": "decision data-release record"
+            },
+            {
+              "commands": [],
+              "params": [
+                {
+                  "name": "path",
+                  "nargs": 1,
+                  "opts": [
+                    "path"
+                  ],
+                  "required": true,
+                  "secondary_opts": [],
+                  "type": "path"
+                }
+              ],
+              "path": "decision data-release import-file"
+            }
+          ],
+          "params": [],
+          "path": "decision data-release"
+        }
+      ],
+      "params": [],
+      "path": "decision"
+    },
+    {
+      "commands": [
+        {
+          "commands": [],
+          "params": [
+            {
+              "name": "file",
+              "nargs": 1,
+              "opts": [
+                "file"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "path"
+            }
+          ],
+          "path": "sweep register"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "name": "slug",
+              "nargs": 1,
+              "opts": [
+                "slug"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "time_budget_minutes",
+              "nargs": 1,
+              "opts": [
+                "--time-budget-minutes"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "float"
+            },
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "rerun",
+              "nargs": 1,
+              "opts": [
+                "--rerun"
+              ],
+              "required": false,
+              "secondary_opts": [
+                "--no-rerun"
+              ],
+              "type": "boolean"
+            },
+            {
+              "is_flag": false,
+              "name": "note",
+              "nargs": 1,
+              "opts": [
+                "--note"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "sweep run"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "name": "slug",
+              "nargs": 1,
+              "opts": [
+                "slug"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "sweep status"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "name": "slug",
+              "nargs": 1,
+              "opts": [
+                "slug"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "sweep report"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "name": "slug",
+              "nargs": 1,
+              "opts": [
+                "slug"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "file",
+              "nargs": 1,
+              "opts": [
+                "--file"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "path"
+            },
+            {
+              "is_flag": false,
+              "name": "reason",
+              "nargs": 1,
+              "opts": [
+                "--reason"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "sweep promote"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "name": "slug",
+              "nargs": 1,
+              "opts": [
+                "slug"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "reason",
+              "nargs": 1,
+              "opts": [
+                "--reason"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "sweep retire"
+        }
+      ],
+      "params": [],
+      "path": "sweep"
+    },
+    {
+      "commands": [
+        {
+          "commands": [],
+          "params": [],
+          "path": "lab status"
+        }
+      ],
+      "params": [],
+      "path": "lab"
+    },
+    {
+      "commands": [
+        {
+          "commands": [],
+          "params": [
+            {
+              "name": "file",
+              "nargs": 1,
+              "opts": [
+                "file"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "path"
+            }
+          ],
+          "path": "experiment register"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "name": "slug",
+              "nargs": 1,
+              "opts": [
+                "slug"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "dataset",
+              "nargs": 1,
+              "opts": [
+                "--dataset"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "split",
+              "nargs": 1,
+              "opts": [
+                "--split"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "config",
+              "nargs": 1,
+              "opts": [
+                "--config"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "path"
+            },
+            {
+              "is_flag": false,
+              "name": "configurations",
+              "nargs": 1,
+              "opts": [
+                "--configurations"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "spend_holdout",
+              "nargs": 1,
+              "opts": [
+                "--spend-holdout"
+              ],
+              "required": false,
+              "secondary_opts": [
+                "--no-spend-holdout"
+              ],
+              "type": "boolean"
+            },
+            {
+              "is_flag": false,
+              "name": "holdout_reason",
+              "nargs": 1,
+              "opts": [
+                "--holdout-reason"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "holdout_repeat",
+              "nargs": 1,
+              "opts": [
+                "--holdout-repeat"
+              ],
+              "required": false,
+              "secondary_opts": [
+                "--no-holdout-repeat"
+              ],
+              "type": "boolean"
+            },
+            {
+              "is_flag": false,
+              "name": "note",
+              "nargs": 1,
+              "opts": [
+                "--note"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "experiment open"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "run",
+              "nargs": 1,
+              "opts": [
+                "--run"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "reason",
+              "nargs": 1,
+              "opts": [
+                "--reason"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "experiment abandon"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "run",
+              "nargs": 1,
+              "opts": [
+                "--run"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "int"
+            }
+          ],
+          "path": "experiment study"
+        }
+      ],
+      "params": [],
+      "path": "experiment"
+    },
+    {
+      "commands": [
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "candidate",
+              "nargs": 1,
+              "opts": [
+                "--candidate"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "source",
+              "nargs": 1,
+              "opts": [
+                "--source"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "kill_line_url",
+              "nargs": 1,
+              "opts": [
+                "--kill-line-url"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "kill_line_file",
+              "nargs": 1,
+              "opts": [
+                "--kill-line-file"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "path"
+            },
+            {
+              "is_flag": false,
+              "name": "kill_line_posted_at",
+              "nargs": 1,
+              "opts": [
+                "--kill-line-posted-at"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "read_at",
+              "nargs": 1,
+              "opts": [
+                "--read-at"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "window_start",
+              "nargs": 1,
+              "opts": [
+                "--window-start"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "window_end",
+              "nargs": 1,
+              "opts": [
+                "--window-end"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "configurations",
+              "nargs": 1,
+              "opts": [
+                "--configurations"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "verdict",
+              "nargs": 1,
+              "opts": [
+                "--verdict"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "desk_read",
+              "nargs": 1,
+              "opts": [
+                "--desk-read"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "family",
+              "nargs": 1,
+              "opts": [
+                "--family"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "probe",
+              "nargs": 1,
+              "opts": [
+                "--probe"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "path"
+            },
+            {
+              "is_flag": false,
+              "name": "probe_sha256",
+              "nargs": 1,
+              "opts": [
+                "--probe-sha256"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "probe_unavailable",
+              "nargs": 1,
+              "opts": [
+                "--probe-unavailable"
+              ],
+              "required": false,
+              "secondary_opts": [
+                "--no-probe-unavailable"
+              ],
+              "type": "boolean"
+            },
+            {
+              "is_flag": false,
+              "name": "reason",
+              "nargs": 1,
+              "opts": [
+                "--reason"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "input_files",
+              "nargs": 1,
+              "opts": [
+                "--input"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "path"
+            },
+            {
+              "is_flag": false,
+              "name": "pin",
+              "nargs": 1,
+              "opts": [
+                "--pin"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "audit_url",
+              "nargs": 1,
+              "opts": [
+                "--audit-url"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "holdout_reason",
+              "nargs": 1,
+              "opts": [
+                "--holdout-reason"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "note",
+              "nargs": 1,
+              "opts": [
+                "--note"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "exposure record"
+        }
+      ],
+      "params": [],
+      "path": "exposure"
+    },
+    {
+      "commands": [
+        {
+          "commands": [],
+          "params": [],
+          "path": "store backup"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "assets",
+              "nargs": 1,
+              "opts": [
+                "--assets"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "path"
+            }
+          ],
+          "path": "store bank-filers"
+        }
+      ],
+      "params": [],
+      "path": "store"
+    },
+    {
+      "commands": [
+        {
+          "commands": [],
+          "params": [
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "apply_",
+              "nargs": 1,
+              "opts": [
+                "--apply"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "boolean"
+            }
+          ],
+          "path": "archive migrate-cache"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "path",
+              "nargs": 1,
+              "opts": [
+                "--path"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "run",
+              "nargs": 1,
+              "opts": [
+                "--run"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "archive restore"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "mode",
+              "nargs": 1,
+              "opts": [
+                "--mode"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "accession",
+              "nargs": 1,
+              "opts": [
+                "--accession"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "file_date",
+              "nargs": 1,
+              "opts": [
+                "--file-date"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "release",
+              "nargs": 1,
+              "opts": [
+                "--release"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "expect",
+              "nargs": 1,
+              "opts": [
+                "--expect"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "expect_digest",
+              "nargs": 1,
+              "opts": [
+                "--expect-digest"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "archive rederive"
+        }
+      ],
+      "params": [],
+      "path": "archive"
+    },
+    {
+      "commands": [
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "name",
+              "nargs": 1,
+              "opts": [
+                "--name"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "version",
+              "nargs": 1,
+              "opts": [
+                "--version"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "path",
+              "nargs": 1,
+              "opts": [
+                "--path"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "path"
+            },
+            {
+              "is_flag": false,
+              "name": "event_start",
+              "nargs": 1,
+              "opts": [
+                "--event-start"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "event_end",
+              "nargs": 1,
+              "opts": [
+                "--event-end"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "event_column",
+              "nargs": 1,
+              "opts": [
+                "--event-column"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "split_json",
+              "nargs": 1,
+              "opts": [
+                "--split-json"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "path"
+            },
+            {
+              "is_flag": false,
+              "name": "sealed",
+              "nargs": 1,
+              "opts": [
+                "--sealed"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "locked",
+              "nargs": 1,
+              "opts": [
+                "--locked"
+              ],
+              "required": false,
+              "secondary_opts": [
+                "--no-locked"
+              ],
+              "type": "boolean"
+            },
+            {
+              "is_flag": false,
+              "name": "seed",
+              "nargs": 1,
+              "opts": [
+                "--seed"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "note",
+              "nargs": 1,
+              "opts": [
+                "--note"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "dataset register"
+        }
+      ],
+      "params": [],
+      "path": "dataset"
+    },
+    {
+      "commands": [
+        {
+          "commands": [
+            {
+              "commands": [],
+              "params": [
+                {
+                  "default": "2016-01-01",
+                  "is_flag": false,
+                  "name": "since",
+                  "nargs": 1,
+                  "opts": [
+                    "--since"
+                  ],
+                  "required": false,
+                  "secondary_opts": [],
+                  "type": "str"
+                },
+                {
+                  "is_flag": false,
+                  "name": "until",
+                  "nargs": 1,
+                  "opts": [
+                    "--until"
+                  ],
+                  "required": false,
+                  "secondary_opts": [],
+                  "type": "str"
+                },
+                {
+                  "is_flag": false,
+                  "name": "cik",
+                  "nargs": 1,
+                  "opts": [
+                    "--cik"
+                  ],
+                  "required": false,
+                  "secondary_opts": [],
+                  "type": "str"
+                },
+                {
+                  "is_flag": false,
+                  "name": "limit",
+                  "nargs": 1,
+                  "opts": [
+                    "--limit"
+                  ],
+                  "required": false,
+                  "secondary_opts": [],
+                  "type": "int"
+                },
+                {
+                  "default": 40000,
+                  "is_flag": false,
+                  "name": "max_requests",
+                  "nargs": 1,
+                  "opts": [
+                    "--max-requests"
+                  ],
+                  "required": false,
+                  "secondary_opts": [],
+                  "type": "int"
+                }
+              ],
+              "path": "corpus fetch departure-reason"
+            }
+          ],
+          "params": [],
+          "path": "corpus fetch"
+        }
+      ],
+      "params": [],
+      "path": "corpus"
+    },
+    {
+      "commands": [
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "frame",
+              "nargs": 1,
+              "opts": [
+                "--frame"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "seed",
+              "nargs": 1,
+              "opts": [
+                "--seed"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "n",
+              "nargs": 1,
+              "opts": [
+                "--n"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "exclude",
+              "nargs": 1,
+              "opts": [
+                "--exclude"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "path"
+            },
+            {
+              "is_flag": false,
+              "name": "seeds",
+              "nargs": 1,
+              "opts": [
+                "--seeds"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "path"
+            },
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "lock",
+              "nargs": 1,
+              "opts": [
+                "--lock"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "boolean"
+            },
+            {
+              "is_flag": false,
+              "name": "extend",
+              "nargs": 1,
+              "opts": [
+                "--extend"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "int"
+            }
+          ],
+          "path": "research gold"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "run",
+              "nargs": 1,
+              "opts": [
+                "--run"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "finish",
+              "nargs": 1,
+              "opts": [
+                "--finish"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "boolean"
+            }
+          ],
+          "path": "research review"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "name": "slug",
+              "nargs": 1,
+              "opts": [
+                "slug"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "dataset",
+              "nargs": 1,
+              "opts": [
+                "--dataset"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "split",
+              "nargs": 1,
+              "opts": [
+                "--split"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "model",
+              "nargs": 1,
+              "opts": [
+                "--model"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "dry_run",
+              "nargs": 1,
+              "opts": [
+                "--dry-run"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "boolean"
+            },
+            {
+              "default": 1,
+              "is_flag": false,
+              "name": "configurations",
+              "nargs": 1,
+              "opts": [
+                "--configurations"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "accepted_from",
+              "nargs": 1,
+              "opts": [
+                "--accepted-from"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "accepted_to",
+              "nargs": 1,
+              "opts": [
+                "--accepted-to"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "limit",
+              "nargs": 1,
+              "opts": [
+                "--limit"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "drift_gold",
+              "nargs": 1,
+              "opts": [
+                "--drift-gold"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "drift_baseline_run",
+              "nargs": 1,
+              "opts": [
+                "--drift-baseline-run"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "reversed_order_baseline_run",
+              "nargs": 1,
+              "opts": [
+                "--reversed-order-baseline-run"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "spend_holdout",
+              "nargs": 1,
+              "opts": [
+                "--spend-holdout"
+              ],
+              "required": false,
+              "secondary_opts": [
+                "--no-spend-holdout"
+              ],
+              "type": "boolean"
+            },
+            {
+              "is_flag": false,
+              "name": "holdout_reason",
+              "nargs": 1,
+              "opts": [
+                "--holdout-reason"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "research label"
+        },
+        {
+          "commands": [
+            {
+              "commands": [
+                {
+                  "commands": [],
+                  "params": [
+                    {
+                      "is_flag": false,
+                      "name": "corpus",
+                      "nargs": 1,
+                      "opts": [
+                        "--corpus"
+                      ],
+                      "required": true,
+                      "secondary_opts": [],
+                      "type": "path"
+                    },
+                    {
+                      "is_flag": false,
+                      "name": "as_of",
+                      "nargs": 1,
+                      "opts": [
+                        "--as-of"
+                      ],
+                      "required": true,
+                      "secondary_opts": [],
+                      "type": "str"
+                    },
+                    {
+                      "default": false,
+                      "is_flag": true,
+                      "name": "register_",
+                      "nargs": 1,
+                      "opts": [
+                        "--register"
+                      ],
+                      "required": false,
+                      "secondary_opts": [],
+                      "type": "boolean"
+                    }
+                  ],
+                  "path": "research frame build departure-reason"
+                }
+              ],
+              "params": [],
+              "path": "research frame build"
+            }
+          ],
+          "params": [],
+          "path": "research frame"
+        }
+      ],
+      "params": [],
+      "path": "research"
+    },
+    {
+      "commands": [
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "hypothesis",
+              "nargs": 1,
+              "opts": [
+                "--hypothesis"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "book",
+              "nargs": 1,
+              "opts": [
+                "--book"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "now",
+              "nargs": 1,
+              "opts": [
+                "--now"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "boolean"
+            }
+          ],
+          "path": "paper start"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "reason",
+              "nargs": 1,
+              "opts": [
+                "--reason"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "book",
+              "nargs": 1,
+              "opts": [
+                "--book"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "paper stop"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "book",
+              "nargs": 1,
+              "opts": [
+                "--book"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "paper run"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "book",
+              "nargs": 1,
+              "opts": [
+                "--book"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "paper reconcile"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "reason",
+              "nargs": 1,
+              "opts": [
+                "--reason"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "book",
+              "nargs": 1,
+              "opts": [
+                "--book"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "every_book",
+              "nargs": 1,
+              "opts": [
+                "--all"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "boolean"
+            }
+          ],
+          "path": "paper kill"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "reason",
+              "nargs": 1,
+              "opts": [
+                "--reason"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "book",
+              "nargs": 1,
+              "opts": [
+                "--book"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "accept_broker_fills",
+              "nargs": 1,
+              "opts": [
+                "--accept-broker-fills"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "boolean"
+            },
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "accept_rejections_flag",
+              "nargs": 1,
+              "opts": [
+                "--accept-rejections"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "boolean"
+            },
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "accept_fill_band_flag",
+              "nargs": 1,
+              "opts": [
+                "--accept-fill-band"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "boolean"
+            },
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "accept_fill_mismatch_flag",
+              "nargs": 1,
+              "opts": [
+                "--accept-fill-mismatch"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "boolean"
+            }
+          ],
+          "path": "paper resume"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "book",
+              "nargs": 1,
+              "opts": [
+                "--book"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "paper report"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "book",
+              "nargs": 1,
+              "opts": [
+                "--book"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "window_id",
+              "nargs": 1,
+              "opts": [
+                "--window"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "through",
+              "nargs": 1,
+              "opts": [
+                "--through"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "paper cost"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "book",
+              "nargs": 1,
+              "opts": [
+                "--book"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "verbose",
+              "nargs": 1,
+              "opts": [
+                "--verbose"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "boolean"
+            }
+          ],
+          "path": "paper check"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "verbose",
+              "nargs": 1,
+              "opts": [
+                "--verbose"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "boolean"
+            }
+          ],
+          "path": "paper shakedown"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "book",
+              "nargs": 1,
+              "opts": [
+                "--book"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "default": false,
+              "is_flag": true,
+              "name": "every_book",
+              "nargs": 1,
+              "opts": [
+                "--all"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "boolean"
+            }
+          ],
+          "path": "paper status"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "reason",
+              "nargs": 1,
+              "opts": [
+                "--reason"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "book",
+              "nargs": 1,
+              "opts": [
+                "--book"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "paper abandon"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "kind",
+              "nargs": 1,
+              "opts": [
+                "--kind"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "reason",
+              "nargs": 1,
+              "opts": [
+                "--reason"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "session",
+              "nargs": 1,
+              "opts": [
+                "--session"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "name",
+              "nargs": 1,
+              "opts": [
+                "--name"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "book",
+              "nargs": 1,
+              "opts": [
+                "--book"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "paper override"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "order",
+              "nargs": 1,
+              "opts": [
+                "--order"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "reason",
+              "nargs": 1,
+              "opts": [
+                "--reason"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "book",
+              "nargs": 1,
+              "opts": [
+                "--book"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "paper settle"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "reason",
+              "nargs": 1,
+              "opts": [
+                "--reason"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "break_id",
+              "nargs": 1,
+              "opts": [
+                "--break"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "book",
+              "nargs": 1,
+              "opts": [
+                "--book"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            },
+            {
+              "is_flag": false,
+              "name": "reverse",
+              "nargs": 1,
+              "opts": [
+                "--reverse"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "paper true-up"
+        },
+        {
+          "commands": [],
+          "params": [
+            {
+              "is_flag": false,
+              "name": "export",
+              "nargs": 1,
+              "opts": [
+                "--export"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "file"
+            },
+            {
+              "is_flag": false,
+              "name": "tax_year",
+              "nargs": 1,
+              "opts": [
+                "--tax-year"
+              ],
+              "required": true,
+              "secondary_opts": [],
+              "type": "int"
+            },
+            {
+              "is_flag": false,
+              "name": "book",
+              "nargs": 1,
+              "opts": [
+                "--book"
+              ],
+              "required": false,
+              "secondary_opts": [],
+              "type": "str"
+            }
+          ],
+          "path": "paper lots-reconcile"
+        }
+      ],
+      "params": [],
+      "path": "paper"
+    }
+  ],
+  "params": [],
+  "path": ""
+}
