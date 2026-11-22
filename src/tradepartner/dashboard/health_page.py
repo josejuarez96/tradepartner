@@ -423,7 +423,8 @@ def _sources_card(report: HealthReport) -> None:
             else:
                 theme.status_badge(f"latest run: {ingest.latest_status}", "critical")
             if ingest.latest_message:
-                st.caption(ingest.latest_message)
+                # Stored text goes through `st.text`, never markdown (no link or image renders).
+                st.text(ingest.latest_message)
 
 
 def _survivorship_card(report: HealthReport) -> None:
@@ -570,8 +571,8 @@ def _delisting_reasons_card(report: HealthReport) -> None:
         return
     with st.container(border=True):
         st.subheader("Delisting reasons")
-        for line in block.lines():
-            st.markdown(line.strip())
+        # Plain text keeps the block's indentation and renders no link or image.
+        st.text("\n".join(block.lines()))
         for label, frame in (
             ("Unknown episodes", block.unknown),
             ("Conflicted episodes", block.conflicted),

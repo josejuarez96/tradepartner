@@ -190,7 +190,8 @@ def _summary_card(summaries: tuple[ops.BookSummary, ...]) -> None:
         st.dataframe(_summary_table(summaries, utc_now()), hide_index=True)
         for row in summaries:
             if message := paper_message.owner_message(row.last_run_message):
-                st.caption(f"{row.book_id} last run: {message}")
+                # Stored text goes through `st.text`, never markdown (no link or image renders).
+                st.text(f"{row.book_id} last run: {message}")
 
 
 def _waiting_card(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
@@ -208,7 +209,8 @@ def _waiting_card(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
             status: theme.Status = "critical" if item.kind == "kill_switch_engaged" else "warning"
             theme.status_badge(f"{item.book_id}: {item.kind}", status)
             detail = scrub_text(item.detail, secrets=_configured_secrets(settings))[0]
-            st.caption(f"{detail} · since {item.since or '-'}")
+            # Stored text goes through `st.text`, never markdown (no link or image renders).
+            st.text(f"{detail} · since {item.since or '-'}")
             if item.command is not None:
                 st.code(item.command, language="bash")
             else:
@@ -455,8 +457,8 @@ def _reconciliation_card(reconciliation: ReconciliationRow | None) -> None:
             events = _reconciliation_events(reconciliation.mismatches_json)
             if events:
                 st.caption("Events on your holdings (dividends, splits, fees, name changes):")
-                for event in events:
-                    st.markdown(f"- {event}")
+                # Stored text goes through `st.text`, never markdown (no link or image renders).
+                st.text("\n".join(f"- {event}" for event in events))
             else:
                 st.caption("No events on your holdings in this check.")
             with st.expander("Raw reconciliation record"):
@@ -603,7 +605,8 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
 
     _kpis(data)
     if message := paper_message.owner_message(data.last_run_message):
-        st.caption(f"Last run: {message}")
+        # Stored text goes through `st.text`, never markdown (no link or image renders).
+        st.text(f"Last run: {message}")
     _risk_card(conn, settings, data.window)
     if data.open_orders_count and data.last_run_kind == "rebalance":
         st.info("Fills are recorded at the next scheduled run")
