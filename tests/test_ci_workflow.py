@@ -240,3 +240,21 @@ def test_the_kill_action_test_still_gates_every_pr() -> None:
     kept = tests / "execution" / "test_book_actions.py"
     assert "from tradepartner.dashboard import book_actions" in kept.read_text()
     assert not (tests / "dashboard" / "test_book_actions.py").exists()
+
+
+def test_checks_fast_scans_the_commit_range_for_secrets() -> None:
+    """#3619: the pre-commit `gitleaks` hook is `protect --staged`, which scans nothing on
+    a CI checkout (nothing is staged). `checks-fast` runs a pinned, checksum-verified
+    gitleaks over the PR's commit range (and main's full history) instead, redacted."""
+    fast = _job("checks-fast", "pytest-shard")
+    assert "fetch-depth: 0" in fast
+    assert "gitleaks git" in fast
+    assert "--redact" in fast
+    assert "gitleaks_8.21.2_linux_x64.tar.gz" in fast
+    assert "sha256sum --check" in fast
+    assert '--log-opts="origin/' in fast
+    hygiene = [ln.strip() for ln in fast.splitlines() if "pre-commit run" in ln]
+    assert hygiene == [
+        "run: SKIP=no-commit-to-branch,gitleaks,ruff-check,ruff-format "
+        "uv run pre-commit run --all-files"
+    ], hygiene
