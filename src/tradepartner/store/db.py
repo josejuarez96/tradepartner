@@ -264,6 +264,8 @@ def open_read_only(
     *,
     retry: bool = False,
     on_wait: Callable[[str], None] | None = None,
+    clock: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> Iterator[duckdb.DuckDBPyConnection]:
     """A single short-lived, read-only connection to the store.
 
@@ -278,8 +280,14 @@ def open_read_only(
     never retried. `on_wait`, when given, is called once, just before the
     first retry, with DuckDB's lock-conflict message (it names the holder's
     process and PID), so a caller can say it is waiting.
+
+    `clock` and `sleep` are test seams (#3661): the monotonic clock the
+    deadline is measured on and the function that waits between attempts.
+    Left out, they are `time.monotonic` and `time.sleep`.
     """
-    deadline = time.monotonic() + settings.store.lock_retry_seconds
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
+    deadline = clock() + settings.store.lock_retry_seconds
     delay = settings.store.lock_retry_initial_delay_seconds
     conn: duckdb.DuckDBPyConnection | None = None
     while conn is None:
@@ -290,7 +298,7 @@ def open_read_only(
         except duckdb.IOException as exc:
             if not _is_lock_error(exc):
                 raise
-            remaining = deadline - time.monotonic()
+            remaining = deadline - clock()
             if not retry or remaining <= 0:
                 raise StoreLockedError(
                     f"could not open a read-only connection to {settings.store.path!r}: "
@@ -300,7 +308,7 @@ def open_read_only(
             if on_wait is not None:
                 on_wait(str(exc))
                 on_wait = None
-            time.sleep(min(delay, remaining))
+            sleep(min(delay, remaining))
             delay = min(delay * 2, settings.store.lock_retry_max_delay_seconds)
     try:
         configure_connection(conn, settings.store)
@@ -311,7 +319,11 @@ def open_read_only(
 
 @contextmanager
 def open_for_write(
-    settings: Settings, *, on_wait: Callable[[str], None] | None = None
+    settings: Settings,
+    *,
+    on_wait: Callable[[str], None] | None = None,
+    clock: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> Iterator[duckdb.DuckDBPyConnection]:
     """A write connection to the store, scoped to one committed chunk.
 
@@ -325,14 +337,20 @@ def open_for_write(
     afterwards so the lock is released between chunks (spec req 1, req 9).
     `on_wait`, when given, is called once, just before the first retry, with
     DuckDB's lock-conflict message (it names the holder's process and PID).
+
+    `clock` and `sleep` are test seams (#3661): the monotonic clock the
+    deadline is measured on and the function that waits between attempts.
+    Left out, they are `time.monotonic` and `time.sleep`.
     """
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
     store_path = Path(settings.store.path)
     if store_path.parent != Path() and not store_path.parent.exists():
         store_path.parent.mkdir(parents=True, exist_ok=True)
 
     max_delay = settings.store.lock_retry_max_delay_seconds
 
-    deadline = time.monotonic() + settings.store.lock_retry_seconds
+    deadline = clock() + settings.store.lock_retry_seconds
     delay = settings.store.lock_retry_initial_delay_seconds
     conn: duckdb.DuckDBPyConnection | None = None
     while conn is None:
@@ -343,7 +361,7 @@ def open_for_write(
         except duckdb.IOException as exc:
             if not _is_lock_error(exc):
                 raise
-            remaining = deadline - time.monotonic()
+            remaining = deadline - clock()
             if remaining <= 0:
                 raise StoreLockedError(
                     f"could not acquire write lock on {settings.store.path!r} "
@@ -352,7 +370,7 @@ def open_for_write(
             if on_wait is not None:
                 on_wait(str(exc))
                 on_wait = None
-            time.sleep(min(delay, remaining))
+            sleep(min(delay, remaining))
             delay = min(delay * 2, max_delay)
 
     try:
